@@ -1,0 +1,33 @@
+# PgBouncer as a container (alternative to the native apt install — see README).
+#
+#   docker compose -f docker-compose.pgbouncer.yml up -d
+#
+# This mounts the hand-written pgbouncer.ini + userlist.txt (rather than letting
+# the image generate config from env), so the tuned pool math stays the source
+# of truth.
+#
+# IMPORTANT — the DB host inside a container is NOT the host's 127.0.0.1:
+#   • Postgres in another compose service -> set  host=<that-service-name>  in
+#     the [databases] line of pgbouncer.ini, and put both on the same network.
+#   • Postgres on the Docker host (Mac/Windows) -> host=host.docker.internal
+#   • Postgres on the Docker host (Linux)       -> add `network_mode: host` below
+#     and keep host=127.0.0.1 (then the ports mapping is ignored).
+
+services:
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: pgbouncer
+    restart: unless-stopped
+    ports:
+      - "6432:6432"          # app connects here (DATABASE_URL ...@host:6432/...)
+    volumes:
+      - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    healthcheck:
+      # Cheap liveness probe against the admin console.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # On Linux with Postgres on the host, uncomment and use host=127.0.0.1 in the ini:
+    # network_mode: host

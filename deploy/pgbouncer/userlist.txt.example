@@ -1,0 +1,28 @@
+;; userlist.txt  — PgBouncer auth file (referenced by auth_file in pgbouncer.ini)
+;; ---------------------------------------------------------------------------
+;; Format:  "username" "password-or-verifier"
+;; One line per user PgBouncer must authenticate. Store the SCRAM/MD5 VERIFIER
+;; exactly as Postgres holds it — never the plaintext password.
+;;
+;; Copy this file to userlist.txt and fill in the real values below.
+;;
+;;   1) App user (must match DATABASE_URL). Pull its verifier straight from
+;;      Postgres so it matches byte-for-byte:
+;;
+;;        psql -h 127.0.0.1 -U postgres -d aksharum_erp -Atq -c \
+;;          "SELECT '\"'||rolname||'\" \"'||rolpassword||'\"' \
+;;           FROM pg_authid WHERE rolname='erp_user';"
+;;
+;;      (Postgres 14+ prints a SCRAM-SHA-256$... verifier; older md5 setups print
+;;       md5<hash>. Whichever it prints must match auth_type in pgbouncer.ini.)
+;;
+;;   2) Admin/stats users for the PgBouncer console (SHOW POOLS etc). These are
+;;      LOCAL to PgBouncer and need not exist in Postgres. For a simple setup you
+;;      may use a plaintext password here (kept safe by file perms, see below);
+;;      for scram, generate a verifier the same way as above.
+;;
+;; Lock it down:  chown pgbouncer:pgbouncer userlist.txt && chmod 600 userlist.txt
+
+"erp_user" "SCRAM-SHA-256$4096:REPLACE_WITH_REAL_VERIFIER_FROM_pg_authid"
+"pgb_admin" "REPLACE_WITH_A_STRONG_PASSWORD"
+"pgb_stats" "REPLACE_WITH_A_STRONG_PASSWORD"

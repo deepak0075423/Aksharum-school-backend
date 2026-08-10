@@ -1,0 +1,37 @@
+name: School2.0
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd School-2.0
+            git fetch --all
+            git reset --hard origin/main
+            npm install --production
+            mkdir -p logs
+
+            # ── nginx: ensure SSE proxying works (port 3010) ─────────
+            NGINX_CONF="/etc/nginx/sites-available/default"
+            if [ -f "$NGINX_CONF" ] && ! grep -q "proxy_buffering off" "$NGINX_CONF"; then
+              sudo sed -i 's|proxy_pass http://localhost:3010;|proxy_pass http://localhost:3010;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_http_version 1.1;\n        proxy_set_header Connection "";|' "$NGINX_CONF"
+              echo "✅ nginx SSE config applied"
+            fi
+            sudo nginx -t && sudo systemctl reload nginx
+
+            # ── PM2: always delete + fresh start with ecosystem ──────
+            pm2 delete school-app 2>/dev/null || true
+            pm2 start ecosystem.config.js
+            pm2 save
