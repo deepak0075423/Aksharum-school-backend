@@ -39,7 +39,7 @@ const perWorkerPool = Math.max(usingPgBouncer ? 10 : 4, Math.floor(pgBudget / wo
 module.exports = {
     apps: [
         {
-            name:        'school-app',
+            name:        'school-backend',
             script:      'server.js',
             instances:   workers,      // one worker per CPU core by default
             exec_mode:   'cluster',    // load-balanced across workers by PM2
@@ -50,9 +50,9 @@ module.exports = {
             log_date_format: 'YYYY-MM-DD HH:mm:ss',
             env: {
                 NODE_ENV: 'production',
-                // Frontend (raw IP mode) calls http://<IP>:5000/api directly, so the
-                // API must listen on 5000. PM2 env overrides any PORT in .env.
-                PORT: 5000,
+                // Frontend (raw IP mode) calls http://<IP>:3010/api directly, so the
+                // API must listen on 3010. PM2 env overrides any PORT in .env.
+                PORT: 3010,
                 PG_POOL_MAX: String(perWorkerPool),
             },
         },
