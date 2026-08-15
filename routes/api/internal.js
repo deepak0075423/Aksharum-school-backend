@@ -14,15 +14,34 @@ const requireInternalSecret = (req, res, next) => {
     next();
 };
 
-router.get('/user-chats', requireInternalSecret, async (req, res) => {
-    const { userId, schoolId } = req.query;
-    if (!userId || !schoolId) {
-        return res.status(400).json({ error: 'userId and schoolId are required' });
-    }
+// Role + school of a user — the gateway calls this when a socket's token
+// carries only userId, so it can still join rooms and stamp chat sends.
+router.get('/user-context', requireInternalSecret, async (req, res) => {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
     try {
-        const memberships = await ChatMember.find({
-            user: userId, school: schoolId, isActive: true,
-        }).select('chat').lean();
+        const user = await User.findById(userId).select('role school isActive').lean();
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        res.json({
+            userId:   String(user._id),
+            role:     user.role,
+            schoolId: user.school ? String(user.school) : '',
+            isActive: user.isActive !== false,
+        });
+    } catch {
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+router.get('/user-chats', requireInternalSecret, async (req, res) => {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    try {
+        // schoolId is an optional narrowing filter — a socket whose token has no
+        // school claim must still get its rooms rather than an empty list.
+        const filter = { user: userId, isActive: true };
+        if (req.query.schoolId) filter.school = req.query.schoolId;
+        const memberships = await ChatMember.find(filter).select('chat').lean();
         res.json({ chatIds: memberships.map(m => String(m.chat)) });
     } catch (err) {
         res.status(500).json({ error: 'Internal error' });

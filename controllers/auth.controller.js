@@ -6,8 +6,16 @@ const User    = require('../models/User');
 const { isEmail, passwordError } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 
-const signToken = (userId) =>
-    jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+// role + schoolId ride along so the WebSocket Gateway can route sockets without
+// a round trip to the API on every handshake (it falls back to /internal/user-context
+// for tokens issued before these claims existed).
+const signToken = (user) => {
+    const payload = { userId: user._id || user };
+    if (user.role)   payload.role     = user.role;
+    const school = user.school?._id || user.school;
+    if (school)      payload.schoolId = String(school);
+    return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+};
 
 const signRefresh = (userId) =>
     jwt.sign({ userId }, process.env.JWT_REFRESH_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' });
@@ -25,7 +33,7 @@ exports.login = async (req, res) => {
         if (!user.isActive) {
             return res.status(403).json({ success: false, message: 'Account disabled' });
         }
-        const token   = signToken(user._id);
+        const token   = signToken(user);
         const refresh = signRefresh(user._id);
         res.json({
             success: true,
@@ -61,7 +69,7 @@ exports.refreshToken = async (req, res) => {
         const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
         const user = await User.findById(decoded.userId).lean();
         if (!user || !user.isActive) return res.status(401).json({ success: false, message: 'Invalid token' });
-        const token = signToken(user._id);
+        const token = signToken(user);
         res.json({ success: true, token });
     } catch (err) {
         res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
@@ -162,7 +170,7 @@ exports.magicLogin = async (req, res) => {
             { new: false },
         ).populate('school');
         if (!user) return res.status(400).json({ success: false, message: 'Invalid or expired magic link' });
-        const jwtToken = signToken(user._id);
+        const jwtToken = signToken(user);
         const refresh  = signRefresh(user._id);
         res.json({
             success: true,
