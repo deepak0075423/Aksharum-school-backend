@@ -15,6 +15,7 @@ const mailer  = require('../config/mailer');
 const { sendSchoolMail, emailHeaderHtml, getMailContext } = require('../utils/schoolMailer');
 const { validate, passwordError } = require('../utils/validators');
 const authCache = require('../utils/authCache');
+const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
 
 const generateOTP = () => {
     const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
@@ -122,7 +123,10 @@ const _buildSchoolData = (body, file) => {
     const data = { ...body };
     // FormData always sends booleans as strings — coerce explicitly
     if (data.isActive !== undefined) data.isActive = data.isActive === 'true' || data.isActive === true;
-    if (file) data.logo = `/uploads/images/${file.filename}`;
+    const removeLogo = data.removeLogo === 'true' || data.removeLogo === true;
+    delete data.removeLogo;              // control flag, not a School field
+    if (file)            data.logo = `/uploads/images/${file.filename}`;
+    else if (removeLogo) data.logo = '';
     return data;
 };
 
@@ -140,8 +144,13 @@ exports.updateSchool = async (req, res) => {
         const err = _validateSchool(req.body);
         if (err) return res.status(400).json({ success: false, message: err });
         const data = _buildSchoolData(req.body, req.file);
+        const previous = data.logo !== undefined
+            ? (await School.findById(req.params.id).select('logo').lean())?.logo || null
+            : null;
         const school = await School.findByIdAndUpdate(req.params.id, data, { new: true, runValidators: true });
         if (!school) return res.status(404).json({ success: false, message: 'School not found' });
+        // Drop the replaced/removed file so uploads/ doesn't collect orphans
+        if (previous && previous !== school.logo) deleteSchoolLogo(previous);
         res.json({ success: true, data: school });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };

@@ -35,4 +35,25 @@ function schoolLogoPath(school) {
     }
 }
 
-module.exports = { schoolLogoPath };
+/**
+ * Delete a school's logo file from disk. Best-effort: a missing or remote logo
+ * is a no-op, and a failed unlink never blocks clearing the DB field.
+ * @param {Object|String} school  School document (or the raw logo value)
+ */
+function deleteSchoolLogo(school) {
+    // Resolve without the extension whitelist — any uploaded logo should be
+    // removable, including SVGs that PDFs cannot embed.
+    const logo = typeof school === 'string' ? school : school?.logo;
+    if (!logo || /^https?:\/\//i.test(logo)) return;
+
+    const cleaned = logo.replace(/^\/+/, '');
+    const rel = cleaned.startsWith('uploads/')
+        ? cleaned.slice('uploads/'.length)
+        : path.join('images', cleaned);
+    const full = path.join(UPLOADS_ROOT, rel);
+    if (!full.startsWith(UPLOADS_ROOT)) return;
+
+    try { fs.unlinkSync(full); } catch { /* already gone, or not ours to delete */ }
+}
+
+module.exports = { schoolLogoPath, deleteSchoolLogo };

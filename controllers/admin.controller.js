@@ -15,6 +15,7 @@ const { sendSchoolMail, emailHeaderHtml, getMailContext, invalidate: invalidateM
 const { notify } = require('../services/notifyService');
 const { validate, isEmail, isPhone, isURL } = require('../utils/validators');
 const authCache = require('../utils/authCache');
+const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -824,11 +825,24 @@ exports.updateSchoolSettings = async (req, res) => {
             if (ls.saturdayMode   !== undefined)   update['leaveSettings.saturdayMode']     = ls.saturdayMode;
             if (ls.saturdayHalfDay !== undefined)  update['leaveSettings.saturdayHalfDay']  = !!ls.saturdayHalfDay;
         }
-        if (req.file) update.logo = req.file.filename;
+        // A new upload replaces the logo; removeLogo clears it. In both cases the
+        // file it replaces is deleted so uploads/ doesn't collect orphans.
+        const removeLogo = req.body.removeLogo === true || req.body.removeLogo === 'true';
+        if (req.file)          update.logo = req.file.filename;
+        else if (removeLogo)   update.logo = '';
+
+        let previousLogo = null;
+        if (update.logo !== undefined) {
+            const current = await School.findById(req.schoolId).select('logo').lean();
+            previousLogo = current?.logo || null;
+        }
 
         const school = await School.findByIdAndUpdate(
             req.schoolId, update, { new: true, select: 'name code email phone website logo leaveSettings' }
         ).lean();
+
+        if (previousLogo && previousLogo !== school?.logo) deleteSchoolLogo(previousLogo);
+
         res.json({ success: true, data: school });
     } catch (e) { jsonErr(res, e); }
 };
