@@ -318,7 +318,7 @@ exports.adminDownloadSectionTimetable = async (req, res) => {
             timetable:   tt,
             entries,
             days,
-        }], school?.name || 'School', `timetable-${section.class?.className}-${section.sectionName}.pdf`);
+        }], school, `timetable-${section.class?.className}-${section.sectionName}.pdf`);
     } catch (e) {
         console.error(e);
         res.status(500).send('Failed to generate timetable PDF.');
@@ -382,7 +382,7 @@ exports.adminDownloadAllTimetables = async (req, res) => {
         }
 
         const school = await School.findById(req.schoolId).lean();
-        generateTimetablePDF(res, validPages, school?.name || 'School',
+        generateTimetablePDF(res, validPages, school,
             `all-timetables-${selectedYear.yearName}.pdf`);
     } catch (e) {
         console.error(e);
@@ -546,7 +546,7 @@ exports.teacherDownloadTimetable = async (req, res) => {
             timetable:   teacherTT,
             entries,
             days,
-        }], school?.name || 'School', 'my-timetable.pdf');
+        }], school, 'my-timetable.pdf');
     } catch (e) {
         console.error(e);
         res.status(500).send('Failed to generate timetable PDF.');
@@ -735,7 +735,7 @@ exports.studentDownloadTimetable = async (req, res) => {
             timetable:   tt,
             entries,
             days,
-        }], school?.name || 'School', 'my-timetable.pdf');
+        }], school, 'my-timetable.pdf');
     } catch (e) {
         console.error(e);
         res.status(500).send('Failed to generate timetable PDF.');

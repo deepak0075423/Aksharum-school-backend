@@ -1,4 +1,5 @@
 const PDFDocument = require('pdfkit');
+const { schoolLogoPath } = require('./schoolLogoFile');
 
 const C = {
     headerBg:  '#1B4F72',
@@ -43,6 +44,15 @@ function _drawReceipt(doc, payment, school, settings) {
     // ── Header ────────────────────────────────────────────────
     doc.rect(tableX, 30, tableW, 80).fill(C.headerBg);
     const schoolName = school?.name || (payment.schoolSnapshot?.name) || 'School';
+
+    // School logo sits on the left of the header band when one is uploaded
+    const logo = schoolLogoPath(school);
+    if (logo) {
+        try {
+            doc.image(logo, tableX + 12, 42, { fit: [56, 56], align: 'left', valign: 'center' });
+        } catch { /* unreadable image — fall back to the name alone */ }
+    }
+
     doc.font('Helvetica-Bold').fontSize(20).fillColor(C.white)
        .text(schoolName, tableX, 40, { width: tableW, align: 'center' });
 

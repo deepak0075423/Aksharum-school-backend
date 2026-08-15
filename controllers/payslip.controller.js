@@ -1,5 +1,6 @@
 'use strict';
 const Payslip = require('../models/Payslip');
+const School  = require('../models/School');
 const { generatePayslipPDF } = require('../utils/payslipPdf');
 
 const MONTH_NAMES = [
@@ -16,7 +17,8 @@ exports.adminDownloadPayslip = async (req, res) => {
 
         const name     = payslip.employeeSnapshot?.name?.replace(/\s+/g, '_') || 'employee';
         const filename = `payslip_${name}_${MONTH_NAMES[payslip.month]}_${payslip.year}.pdf`;
-        generatePayslipPDF(res, payslip, filename);
+        const school   = await School.findById(req.schoolId).select('name logo').lean();
+        generatePayslipPDF(res, payslip, filename, school);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -49,6 +51,7 @@ exports.downloadPayslip = async (req, res) => {
         if (!payslip) return res.status(404).json({ success: false, message: 'Payslip not found' });
 
         const filename = `payslip_${MONTH_NAMES[payslip.month]}_${payslip.year}.pdf`;
-        generatePayslipPDF(res, payslip, filename);
+        const school   = await School.findById(req.schoolId).select('name logo').lean();
+        generatePayslipPDF(res, payslip, filename, school);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

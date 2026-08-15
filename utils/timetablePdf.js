@@ -1,4 +1,5 @@
 const PDFDocument = require('pdfkit');
+const { schoolLogoPath } = require('./schoolLogoFile');
 
 // ── Palette ────────────────────────────────────────────────────
 const HEADER_BG  = '#E8EEF4';
@@ -15,10 +16,12 @@ const RECESS_TXT = '#92400E';
  *
  * @param {import('express').Response} res
  * @param {Array}  pages      - array of page-data objects (see _drawPage)
- * @param {string} schoolName
+ * @param {Object|string} school - school document (carries name + logo) or a name
  * @param {string} filename   - suggested download filename
  */
-function generateTimetablePDF(res, pages, schoolName, filename) {
+// `school` accepts either the school document (preferred — carries the logo)
+// or a plain school-name string, which older callers passed.
+function generateTimetablePDF(res, pages, school, filename) {
     const doc = new PDFDocument({
         size: 'A4',
         layout: 'landscape',
@@ -33,14 +36,16 @@ function generateTimetablePDF(res, pages, schoolName, filename) {
 
     pages.forEach(page => {
         doc.addPage();
-        _drawPage(doc, page, schoolName);
+        _drawPage(doc, page, school);
     });
 
     doc.end();
 }
 
 // ── Draw one page ──────────────────────────────────────────────
-function _drawPage(doc, data, schoolName) {
+function _drawPage(doc, data, school) {
+    const schoolName = typeof school === 'string' ? school : (school?.name || 'School');
+    const logoPath   = typeof school === 'string' ? null   : schoolLogoPath(school);
     const { className, sectionName, yearName, timetable, entries, days } = data;
     if (!timetable || !timetable.periodsStructure || !timetable.periodsStructure.length) return;
 
@@ -50,6 +55,10 @@ function _drawPage(doc, data, schoolName) {
     const contentW = W - ML - MR;
 
     // ── Header ────────────────────────────────────────────────
+    if (logoPath) {
+        try { doc.image(logoPath, ML, MT - 4, { fit: [40, 40] }); }
+        catch { /* unreadable image — the name below still identifies the school */ }
+    }
     doc.font('Helvetica-Bold').fontSize(14).fillColor(TEXT_DARK)
        .text(schoolName || 'School', ML, MT, { width: contentW, align: 'center' });
 

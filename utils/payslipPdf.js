@@ -1,4 +1,5 @@
 const PDFDocument = require('pdfkit');
+const { schoolLogoPath } = require('./schoolLogoFile');
 
 const C = {
     headerBg:    '#1E3A5F',
@@ -24,7 +25,9 @@ const MONTH_NAMES = [
     'July', 'August', 'September', 'October', 'November', 'December',
 ];
 
-function generatePayslipPDF(res, payslip, filename) {
+// `school` is optional — passed so the header can carry the school's own logo
+// (the payslip snapshot only stores text fields).
+function generatePayslipPDF(res, payslip, filename, school = null) {
     const doc = new PDFDocument({
         size: 'A4',
         margins: { top: 40, bottom: 40, left: 50, right: 50 },
@@ -36,11 +39,11 @@ function generatePayslipPDF(res, payslip, filename) {
     res.setHeader('Content-Disposition', `attachment; filename="${filename || 'payslip.pdf'}"`);
     doc.pipe(res);
 
-    _drawPayslip(doc, payslip);
+    _drawPayslip(doc, payslip, school);
     doc.end();
 }
 
-function _drawPayslip(doc, payslip) {
+function _drawPayslip(doc, payslip, school = null) {
     const ML = 50, MR = 50;
     const W  = doc.page.width;
     const contentW = W - ML - MR;
@@ -51,7 +54,16 @@ function _drawPayslip(doc, payslip) {
     // ── Header band ──────────────────────────────────────────────
     doc.rect(tableX, 30, tableW, 72).fill(C.headerBg);
 
-    const schoolName = (payslip.schoolSnapshot && payslip.schoolSnapshot.name) || 'School';
+    const schoolName = (payslip.schoolSnapshot && payslip.schoolSnapshot.name) || school?.name || 'School';
+
+    // School logo on the left of the header band when one is uploaded
+    const logo = schoolLogoPath(school);
+    if (logo) {
+        try {
+            doc.image(logo, tableX + 12, 40, { fit: [52, 52], align: 'left', valign: 'center' });
+        } catch { /* unreadable image — fall back to the name alone */ }
+    }
+
     doc.font('Helvetica-Bold').fontSize(18).fillColor(C.white)
        .text(schoolName, tableX, 40, { width: tableW, align: 'center' });
 
