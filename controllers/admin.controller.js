@@ -724,20 +724,43 @@ exports.checkEmail = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+// Parent search for the student form. Returns every match (not just the first)
+// so an admin can pick the right parent and link them to as many children as
+// they have — one parent account is shared across all their students.
 exports.parentLookup = async (req, res) => {
     try {
         const { q } = req.query;
-        if (!q?.trim()) return res.json({ success: true, data: null });
-        const filter = {
+        if (!q?.trim()) return res.json({ success: true, data: [] });
+
+        const term = q.trim();
+        const rx   = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        const parents = await User.find({
             role: 'parent', school: req.schoolId,
-            $or: [
-                { email: q.toLowerCase() },
-                { phone: q },
-                { name: new RegExp(q, 'i') },
-            ],
-        };
-        const parent = await User.findOne(filter).lean();
-        res.json({ success: true, data: parent });
+            $or: [{ email: rx }, { phone: rx }, { name: rx }],
+        }).select('name email phone').limit(10).lean();
+
+        if (!parents.length) return res.json({ success: true, data: [] });
+
+        // Annotate with the children already linked — linking another child to a
+        // parent who has one is normal, and admins need to see it to be sure.
+        const parentIds = parents.map(p => p._id);
+        const profiles  = await StudentProfile.find({ parent: { $in: parentIds } }, 'parent user').lean();
+        const students  = profiles.length
+            ? await User.find({ _id: { $in: profiles.map(p => p.user) } }).select('name').lean()
+            : [];
+        const nameById  = new Map(students.map(s => [String(s._id), s.name]));
+        const kidsByParent = new Map();
+        profiles.forEach(p => {
+            const key = String(p.parent);
+            if (!kidsByParent.has(key)) kidsByParent.set(key, []);
+            const nm = nameById.get(String(p.user));
+            if (nm) kidsByParent.get(key).push(nm);
+        });
+
+        res.json({
+            success: true,
+            data: parents.map(p => ({ ...p, children: kidsByParent.get(String(p._id)) || [] })),
+        });
     } catch (err) { jsonErr(res, err); }
 };
 

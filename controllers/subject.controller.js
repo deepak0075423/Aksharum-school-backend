@@ -2,6 +2,7 @@
 const Subject             = require('../models/Subject');
 const ClassSubject        = require('../models/ClassSubject');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
+const { syncSectionChatGroup } = require('../services/sectionChatService');
 
 const ok  = (res, d, s=200) => res.status(s).json({ success: true, data: d });
 const err = (res, e, s=500) => res.status(s).json({ success: false, message: e.message||e });
@@ -80,12 +81,15 @@ exports.getSectionSubjectTeachers = async (req, res) => {
 exports.assignSubjectTeacher = async (req, res) => {
     try {
         const sst = await SectionSubjectTeacher.create({ section: req.params.sectionId, ...req.body });
+        // Subject teachers belong to the section's teacher group chat
+        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
         ok(res, sst, 201);
     } catch (e) { err(res, e, 400); }
 };
 exports.removeSectionSubject = async (req, res) => {
     try {
         await SectionSubjectTeacher.deleteOne({ section: req.params.sectionId, subject: req.params.subjectId });
+        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };
@@ -96,6 +100,7 @@ exports.removeSectionSubjectTeacher = async (req, res) => {
             subject: req.params.subjectId,
             teacher: req.params.teacherId,
         });
+        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };

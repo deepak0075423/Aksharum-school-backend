@@ -4,10 +4,29 @@ const Class          = require('../models/Class');
 const ClassSection   = require('../models/ClassSection');
 const StudentProfile = require('../models/StudentProfile');
 const User           = require('../models/User');
+const Chat           = require('../models/Chat');
+const ChatMember     = require('../models/ChatMember');
 const { isDate }     = require('../utils/validators');
+const { syncSectionChatGroup } = require('../services/sectionChatService');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const err = (res, e, status = 500)    => res.status(status).json({ success: false, message: e.message || e });
+
+// Two academic years of the same school may not cover overlapping dates —
+// every "current year" lookup in the app assumes a single year per date.
+async function findOverlappingYear(schoolId, startDate, endDate, excludeId = null) {
+    const filter = {
+        school: schoolId,
+        startDate: { $lte: new Date(endDate) },
+        endDate:   { $gte: new Date(startDate) },
+    };
+    if (excludeId) filter._id = { $ne: excludeId };
+    return AcademicYear.findOne(filter).lean();
+}
+
+const dmy = (d) => new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+const overlapMessage = (clash) =>
+    `These dates overlap academic year "${clash.yearName}" (${dmy(clash.startDate)} – ${dmy(clash.endDate)}). Academic years cannot overlap.`;
 
 // Academic Years
 exports.getAcademicYears = async (req, res) => {
@@ -23,8 +42,16 @@ exports.createAcademicYear = async (req, res) => {
         if (!startDate || !isDate(startDate)) return err(res, 'A valid start date is required', 400);
         if (!endDate   || !isDate(endDate))   return err(res, 'A valid end date is required', 400);
         if (new Date(endDate) <= new Date(startDate)) return err(res, 'End date must be after start date', 400);
+
+        const label = (yearName || name).trim();
+        const dupName = await AcademicYear.findOne({ school: req.schoolId, yearName: label }).lean();
+        if (dupName) return err(res, `Academic year "${label}" already exists.`, 400);
+
+        const clash = await findOverlappingYear(req.schoolId, startDate, endDate);
+        if (clash) return err(res, overlapMessage(clash), 400);
+
         const year = await AcademicYear.create({
-            yearName: yearName || name,
+            yearName: label,
             startDate, endDate,
             status: 'inactive',
             school: req.schoolId,
@@ -37,9 +64,25 @@ exports.updateAcademicYear = async (req, res) => {
         const { name, yearName, startDate, endDate } = req.body;
         if (startDate && !isDate(startDate)) return err(res, 'Start date is invalid', 400);
         if (endDate   && !isDate(endDate))   return err(res, 'End date is invalid', 400);
-        if (startDate && endDate && new Date(endDate) <= new Date(startDate)) return err(res, 'End date must be after start date', 400);
-        const update = { startDate, endDate };
-        if (yearName || name) update.yearName = yearName || name;
+
+        const current = await AcademicYear.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!current) return err(res, 'Academic year not found', 404);
+
+        const newStart = startDate || current.startDate;
+        const newEnd   = endDate   || current.endDate;
+        if (new Date(newEnd) <= new Date(newStart)) return err(res, 'End date must be after start date', 400);
+
+        const label = (yearName || name || '').trim();
+        if (label && label !== current.yearName) {
+            const dupName = await AcademicYear.findOne({ school: req.schoolId, yearName: label }).lean();
+            if (dupName) return err(res, `Academic year "${label}" already exists.`, 400);
+        }
+
+        const clash = await findOverlappingYear(req.schoolId, newStart, newEnd, req.params.id);
+        if (clash) return err(res, overlapMessage(clash), 400);
+
+        const update = { startDate: newStart, endDate: newEnd };
+        if (label) update.yearName = label;
         const year = await AcademicYear.findByIdAndUpdate(req.params.id, update, { new: true });
         ok(res, year);
     } catch (e) { err(res, e, 400); }
@@ -97,8 +140,8 @@ exports.createClass = async (req, res) => {
     try {
         const { name, className, classNumber, level, academicYear } = req.body;
         if (!(className || name)?.trim()) return err(res, 'Class name is required', 400);
-        const num = classNumber ?? level;
-        if (num !== undefined && num !== null && num !== '' && (Number.isNaN(Number(num)) || Number(num) < 0))
+        const rawNum = classNumber ?? level;
+        if (rawNum !== undefined && rawNum !== null && rawNum !== '' && (Number.isNaN(Number(rawNum)) || Number(rawNum) < 0))
             return err(res, 'Class number must be a non-negative number', 400);
         let yearId = academicYear;
         if (!yearId) {
@@ -106,14 +149,44 @@ exports.createClass = async (req, res) => {
             if (!active) return err(res, { message: 'No active academic year. Please set one first.' }, 400);
             yearId = active._id;
         }
+
+        const label = (className || name).trim();
+        // classNumber is part of a unique index (school + year + number). Blank
+        // grades used to all collapse onto 0 and collide — derive it from the
+        // class name instead, and fall back to the next free number.
+        let num = (rawNum === undefined || rawNum === null || rawNum === '') ? null : Number(rawNum);
+        if (num === null) {
+            const digits = label.match(/\d+/);
+            num = digits ? Number(digits[0]) : null;
+        }
+
+        const yearDoc  = await AcademicYear.findById(yearId).lean();
+        const siblings = await Class.find({ school: req.schoolId, academicYear: yearId }, 'className classNumber').lean();
+        const yearLabel = yearDoc?.yearName ? ` in ${yearDoc.yearName}` : '';
+
+        const dupName = siblings.find(c => c.className.trim().toLowerCase() === label.toLowerCase());
+        if (dupName) return err(res, { message: `Class "${label}" already exists${yearLabel}.` }, 400);
+
+        if (num === null) {
+            const used = new Set(siblings.map(c => Number(c.classNumber)));
+            num = 0;
+            while (used.has(num)) num++;
+        } else {
+            const dupNum = siblings.find(c => Number(c.classNumber) === num);
+            if (dupNum) return err(res, { message: `Grade / level ${num} is already used by class "${dupNum.className}"${yearLabel}. Pick a different grade.` }, 400);
+        }
+
         const cls = await Class.create({
-            className: className || name,
-            classNumber: classNumber ?? level ?? 0,
+            className: label,
+            classNumber: num,
             academicYear: yearId,
             school: req.schoolId,
         });
         ok(res, cls, 201);
-    } catch (e) { err(res, e, 400); }
+    } catch (e) {
+        if (e.code === 11000) return err(res, { message: 'A class with this name or grade already exists in this academic year.' }, 400);
+        err(res, e, 400);
+    }
 };
 exports.getClassDetail = async (req, res) => {
     try {
@@ -272,8 +345,15 @@ exports.createSection = async (req, res) => {
         const cap = maxStudents || capacity;
         if (cap !== undefined && cap !== null && cap !== '' && (Number.isNaN(Number(cap)) || Number(cap) < 1))
             return err(res, 'Capacity must be a positive number', 400);
+
+        // Section names are stored uppercase — compare on the same footing so the
+        // form gets a readable message instead of a raw unique-index violation.
+        const label = (sectionName || name).trim().toUpperCase();
+        const dup = await ClassSection.findOne({ class: req.params.classId, sectionName: label }).lean();
+        if (dup) return err(res, { message: `Section "${label}" already exists in ${cls?.className || 'this class'}.` }, 400);
+
         const section = await ClassSection.create({
-            sectionName: sectionName || name,
+            sectionName: label,
             maxStudents: maxStudents || capacity || 40,
             class: req.params.classId,
             academicYear: cls?.academicYear,
@@ -281,10 +361,67 @@ exports.createSection = async (req, res) => {
         });
         ok(res, section, 201);
     } catch (e) {
-        if (e.code === 11000) return err(res, { message: `Section "${req.body.sectionName || req.body.name}" already exists in this class.` }, 400);
+        if (e.code === 11000) return err(res, { message: `Section "${(req.body.sectionName || req.body.name || '').trim().toUpperCase()}" already exists in this class.` }, 400);
         err(res, e, 400);
     }
 };
+// Teacher picker for a section: flags who already holds a class-teacher post in
+// the same academic year so the form can grey them out before submitting.
+exports.getSectionTeacherOptions = async (req, res) => {
+    try {
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+
+        const [teachers, taken] = await Promise.all([
+            User.find({ school: req.schoolId, role: 'teacher', isActive: true }, 'name email').sort({ name: 1 }).lean(),
+            ClassSection.find(
+                { school: req.schoolId, academicYear: section.academicYear, classTeacher: { $ne: null } },
+                'classTeacher sectionName class',
+            ).lean(),
+        ]);
+
+        const classes   = await Class.find({ _id: { $in: taken.map(t => t.class) } }, 'className').lean();
+        const classById = Object.fromEntries(classes.map(c => [String(c._id), c.className]));
+        const takenBy   = new Map(taken.map(t => [String(t.classTeacher), {
+            sectionId: String(t._id),
+            label:     `${classById[String(t.class)] || 'Class'} – ${t.sectionName}`,
+        }]));
+
+        ok(res, {
+            classTeacher:      section.classTeacher      ? String(section.classTeacher)      : null,
+            substituteTeacher: section.substituteTeacher ? String(section.substituteTeacher) : null,
+            teachers: teachers.map(t => {
+                const held = takenBy.get(String(t._id));
+                return {
+                    ...t,
+                    // null when free, or the class/section they already lead
+                    classTeacherOf: held && held.sectionId !== String(section._id) ? held.label : null,
+                };
+            }),
+        });
+    } catch (e) { err(res, e); }
+};
+
+// Section teacher group chat — class teacher + vice class teacher + subject teachers
+exports.getSectionChatGroup = async (req, res) => {
+    try {
+        const chat = await Chat.findOne({
+            school: req.schoolId, classSection: req.params.sectionId, type: 'group',
+        }).lean();
+        if (!chat) return ok(res, null);
+        const members = await ChatMember.find({ chat: chat._id, isActive: true })
+            .populate('user', 'name email').lean();
+        ok(res, { ...chat, members: members.map(m => ({ ...m.user, memberRole: m.role })) });
+    } catch (e) { err(res, e); }
+};
+exports.syncSectionChatGroup = async (req, res) => {
+    try {
+        const chat = await syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId);
+        if (!chat) return err(res, { message: 'Assign a class teacher, vice class teacher or subject teacher first — a group needs at least one member.' }, 400);
+        ok(res, chat, 201);
+    } catch (e) { err(res, e); }
+};
+
 exports.getSectionDetail = async (req, res) => {
     try {
         const section = await ClassSection.findById(req.params.sectionId)
@@ -363,12 +500,44 @@ exports.removeStudentFromSection = async (req, res) => {
 };
 exports.updateSectionTeacher = async (req, res) => {
     try {
+        const current = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
+        if (!current) return err(res, { message: 'Section not found' }, 404);
+
         const update = {};
         if (req.body.teacherId     !== undefined) update.classTeacher      = req.body.teacherId     || null;
         if (req.body.viceTeacherId !== undefined) update.substituteTeacher = req.body.viceTeacherId || null;
+
+        // Resulting pair after this update (either field may be omitted)
+        const nextClassTeacher = update.classTeacher      !== undefined ? update.classTeacher      : current.classTeacher;
+        const nextViceTeacher  = update.substituteTeacher !== undefined ? update.substituteTeacher : current.substituteTeacher;
+
+        // A teacher cannot hold both roles in the same section
+        if (nextClassTeacher && nextViceTeacher && String(nextClassTeacher) === String(nextViceTeacher))
+            return err(res, { message: 'The class teacher and the vice class teacher must be two different teachers.' }, 400);
+
+        // One class teacher post per teacher per academic year. Being vice class
+        // teacher elsewhere (or of several sections) stays allowed.
+        if (update.classTeacher) {
+            const clash = await ClassSection.findOne({
+                school:        req.schoolId,
+                academicYear:  current.academicYear,
+                classTeacher:  update.classTeacher,
+                _id:           { $ne: current._id },
+            }).lean();
+            if (clash) {
+                const cls = await Class.findById(clash.class, 'className').lean();
+                const where = `${cls?.className || 'another class'} – ${clash.sectionName}`;
+                return err(res, { message: `This teacher is already the class teacher of ${where}. A teacher can be class teacher of only one class.` }, 400);
+            }
+        }
+
         const section = await ClassSection.findByIdAndUpdate(req.params.sectionId, update, { new: true })
             .populate('classTeacher',     'name email phone')
             .populate('substituteTeacher','name email phone');
+
+        // Keep the section's teacher group chat in step with the new line-up
+        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
+
         ok(res, section);
     } catch (e) { err(res, e); }
 };

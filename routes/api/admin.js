@@ -154,6 +154,10 @@ router.get('/sections/:sectionId/subjects',           guard, subjectCtrl.getSect
 router.post('/sections/:sectionId/subjects/assign',   guard, subjectCtrl.assignSubjectTeacher);
 router.delete('/sections/:sectionId/subjects/:subjectId',                    guard, subjectCtrl.removeSectionSubject);
 router.delete('/sections/:sectionId/subjects/:subjectId/teachers/:teacherId', guard, subjectCtrl.removeSectionSubjectTeacher);
+router.get('/sections/:sectionId/teacher-options', guard, classCtrl.getSectionTeacherOptions);
+// Section teacher group chat (class teacher + vice class teacher + subject teachers)
+router.get('/sections/:sectionId/chat-group',  guard, classCtrl.getSectionChatGroup);
+router.post('/sections/:sectionId/chat-group', guard, classCtrl.syncSectionChatGroup);
 
 // Timetable (section-scoped)
 router.get('/sections/:sectionId/timetable',           timetableGuard, timetableCtrl.adminManageTimetable);

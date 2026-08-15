@@ -52,36 +52,36 @@ exports.getList = async (req, res) => {
 async function resolveRecipients({ targetType, school, classId, sectionId, targetSchools = [] }) {
     switch (targetType) {
         case 'all':
-            return User.find({ school, role: { $in: ['teacher', 'student', 'parent', 'school_admin'] } }, '_id email name').lean();
+            return User.find({ school, role: { $in: ['teacher', 'student', 'parent', 'school_admin'] } }, '_id email name school').lean();
         case 'all_teachers':
-            return User.find({ school, role: 'teacher' }, '_id email name').lean();
+            return User.find({ school, role: 'teacher' }, '_id email name school').lean();
         case 'all_students':
-            return User.find({ school, role: 'student' }, '_id email name').lean();
+            return User.find({ school, role: 'student' }, '_id email name school').lean();
         case 'all_parents':
-            return User.find({ school, role: 'parent' }, '_id email name').lean();
+            return User.find({ school, role: 'parent' }, '_id email name school').lean();
         case 'class_students': {
             const secs = await ClassSection.find({ class: classId, school }, 'enrolledStudents').lean();
             const ids  = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
-            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name').lean();
+            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school').lean();
         }
         case 'class_parents': {
             const secs       = await ClassSection.find({ class: classId, school }, 'enrolledStudents').lean();
             const studentIds = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
             const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
             const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name').lean();
+            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school').lean();
         }
         case 'section_students': {
             const sec = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
             const ids = (sec?.enrolledStudents || []).map(id => id.toString());
-            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name').lean();
+            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school').lean();
         }
         case 'section_parents': {
             const sec        = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
             const studentIds = (sec?.enrolledStudents || []).map(id => id.toString());
             const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
             const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name').lean();
+            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school').lean();
         }
         case 'section_all': {
             const sec        = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
@@ -89,14 +89,16 @@ async function resolveRecipients({ targetType, school, classId, sectionId, targe
             const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
             const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
             const allIds     = [...new Set([...studentIds, ...parentIds])];
-            return User.find({ _id: { $in: allIds }, school }, '_id email name').lean();
+            return User.find({ _id: { $in: allIds }, school }, '_id email name school').lean();
         }
         // Super-admin targets — only school_admin recipients
         case 'all_schools':
-            return User.find({ role: 'school_admin' }, '_id email name').lean();
+            return User.find({ role: 'school_admin' }, '_id email name school').lean();
         case 'specific_school': {
-            const schoolIds = targetSchools.length ? targetSchools : (school ? [school] : []);
-            return User.find({ school: { $in: schoolIds }, role: 'school_admin' }, '_id email name').lean();
+            const schoolIds = (targetSchools.length ? targetSchools : (school ? [school] : []))
+                .map(String).filter(Boolean);
+            if (!schoolIds.length) return [];
+            return User.find({ school: { $in: schoolIds }, role: 'school_admin' }, '_id email name school').lean();
         }
         default:
             return [];
@@ -151,10 +153,19 @@ exports.send = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Please select a class' });
         if (['section_students','section_parents','section_all'].includes(targetType) && !sectionId)
             return res.status(400).json({ success: false, message: 'Please select a section' });
+        if (targetType === 'specific_school' && !targetSchools.length && !req.schoolId)
+            return res.status(400).json({ success: false, message: 'Please select at least one school' });
 
         const target = { type: targetType };
         if (classId)   target.class   = classId;
         if (sectionId) target.section = sectionId;
+        if (targetType === 'specific_school') target.schools = targetSchools;
+
+        // Resolve first — sending to an empty audience is a mistake worth
+        // reporting, not a stored notification nobody ever receives.
+        const recipients = await resolveRecipients({ targetType, school: req.schoolId, classId, sectionId, targetSchools });
+        if (!recipients.length)
+            return res.status(400).json({ success: false, message: 'No recipients matched this target — nothing was sent.' });
 
         const notification = await Notification.create({
             school:     req.schoolId || null,
@@ -166,14 +177,13 @@ exports.send = async (req, res) => {
             target,
         });
 
-        // Resolve + distribute
-        const recipients = await resolveRecipients({ targetType, school: req.schoolId, classId, sectionId, targetSchools });
-
         if (channels.inApp && recipients.length) {
             const docs = recipients.map(u => ({
                 notification: notification._id,
                 recipient:    u._id,
-                school:       req.schoolId || null,
+                // Super-admin sends have no schoolId of their own — scope each
+                // receipt to the recipient's school so it stays queryable.
+                school:       req.schoolId || u.school || null,
             }));
             await NotificationReceipt.insertMany(docs, { ordered: false }).catch(() => {});
             // Fire-and-forget: real-time event + updated count via the WebSocket Gateway
@@ -194,15 +204,34 @@ exports.send = async (req, res) => {
 
         if (channels.email && recipients.length) {
             const School = require('../models/School');
-            const school = await School.findById(req.schoolId, 'name logo').lean();
-            dispatchEmails({
-                recipients,
-                title:      title.trim(),
-                body:       body.trim(),
-                schoolName: school?.name || 'School',
-                schoolId:   req.schoolId,
-                school,
-            });
+            if (req.schoolId) {
+                const school = await School.findById(req.schoolId, 'name logo').lean();
+                dispatchEmails({
+                    recipients,
+                    title:      title.trim(),
+                    body:       body.trim(),
+                    schoolName: school?.name || 'School',
+                    schoolId:   req.schoolId,
+                    school,
+                });
+            } else {
+                // Super-admin send: mail each school's admins through their own
+                // SMTP/branding instead of a generic "School" header.
+                const schoolIds = [...new Set(recipients.map(u => u.school && String(u.school)).filter(Boolean))];
+                const schools   = await School.find({ _id: { $in: schoolIds } }, 'name logo').lean();
+                const byId      = new Map(schools.map(s => [String(s._id), s]));
+                for (const sid of schoolIds) {
+                    const school = byId.get(sid);
+                    dispatchEmails({
+                        recipients: recipients.filter(u => String(u.school) === sid),
+                        title:      title.trim(),
+                        body:       body.trim(),
+                        schoolName: school?.name || 'School',
+                        schoolId:   sid,
+                        school,
+                    });
+                }
+            }
         }
 
         res.status(201).json({ success: true, data: { ...notification.toObject(), recipientCount: recipients.length } });
