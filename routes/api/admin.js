@@ -97,6 +97,7 @@ router.get('/students/template',            guard, adminCtrl.downloadStudentTemp
 router.get('/students/parent-lookup',       guard, adminCtrl.parentLookup);
 // Address helpers for the student form
 router.get('/states',            guard, adminCtrl.getStates);
+router.get('/admission-number/preview', guard, adminCtrl.previewAdmissionNumber);
 router.get('/pincode/:pincode',  guard, adminCtrl.pincodeLookup);
 router.delete('/students/:id',              guard, adminCtrl.deleteUser);
 router.get('/students/:id',                 guard, adminCtrl.getStudentDetail);

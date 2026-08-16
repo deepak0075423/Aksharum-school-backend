@@ -71,6 +71,12 @@ const SchoolSchema = new db.Schema({
         type: [String],
         default: ['Public Holiday', 'School Specific', 'Optional Holiday', 'Exam Break'],
     },
+    // Template for auto-generated admission numbers — see utils/admissionNumber.js
+    admissionNumberFormat: {
+        type: String,
+        default: '{INITIALS}{YYYY}{####}',
+        trim: true,
+    },
     modules: {
         attendance: {
             type: Boolean,

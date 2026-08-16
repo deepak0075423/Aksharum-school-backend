@@ -18,6 +18,7 @@ const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
 const { STATES_AND_UTS, isPincode, stateFromPincode } = require('../utils/indiaStates');
 const { rollNumberTaken } = require('../utils/rollNumbers');
+const admissionNo = require('../utils/admissionNumber');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -371,7 +372,16 @@ exports.updateStudentFull = async (req, res) => {
         // Update StudentProfile fields
         const profileUpdate = {};
         if (rollNumber      !== undefined) profileUpdate.rollNumber      = rollValue;
-        if (admissionNumber !== undefined) profileUpdate.admissionNumber = admissionNumber;
+        if (admissionNumber !== undefined) {
+            const adm = String(admissionNumber).trim();
+            if (adm) {
+                const admTaken = await StudentProfile.findOne({
+                    school: req.schoolId, admissionNumber: adm, user: { $ne: req.params.id },
+                }).lean();
+                if (admTaken) return res.status(400).json({ success: false, message: `Admission number ${adm} is already in use.` });
+            }
+            profileUpdate.admissionNumber = adm;
+        }
         if (dob             !== undefined) profileUpdate.dob             = dob || null;
         if (gender          !== undefined) profileUpdate.gender          = gender;
         if (bloodGroup      !== undefined) profileUpdate.bloodGroup      = bloodGroup;
@@ -490,6 +500,18 @@ exports.createStudent = async (req, res) => {
         }
         if (!classId) return res.status(400).json({ success: false, message: 'Class is required' });
         profile.currentClass = classId;
+
+        // Admission number: use what was typed, otherwise generate from the
+        // school's configured format.
+        const schoolDoc = await School.findById(req.schoolId).select('name code admissionNumberFormat').lean();
+        const typedAdm  = String(profile.admissionNumber ?? '').trim();
+        if (typedAdm) {
+            const admTaken = await StudentProfile.findOne({ school: req.schoolId, admissionNumber: typedAdm }).lean();
+            if (admTaken) return res.status(400).json({ success: false, message: `Admission number ${typedAdm} is already in use.` });
+            profile.admissionNumber = typedAdm;
+        } else {
+            profile.admissionNumber = await admissionNo.nextAdmissionNumber(schoolDoc || { _id: req.schoolId });
+        }
 
         // Roll number is optional at intake — sections assign them in bulk later
         const roll = String(profile.rollNumber ?? '').trim();
@@ -696,6 +718,7 @@ exports.bulkStudents = async (req, res) => {
 
         push({ type: 'total', total: rows.length });
 
+        const bulkSchool = await School.findById(req.schoolId).select('name code admissionNumberFormat').lean();
         const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
         const classes    = await Class.find({ school: req.schoolId, ...(activeYear ? { academicYear: activeYear._id } : {}) }).lean();
         const sections   = await ClassSection.find({ school: req.schoolId, ...(activeYear ? { academicYear: activeYear._id } : {}) }).lean();
@@ -738,7 +761,6 @@ exports.bulkStudents = async (req, res) => {
             if (!name)        missing.push('Full Name');
             if (!email)       missing.push('Email Address');
             if (!phone)       missing.push('Phone Number');
-            if (!admNo)       missing.push('Admission Number');
             if (!dobRaw)      missing.push('Date of Birth');
             if (!gender)      missing.push('Gender');
             if (!bloodGroup)  missing.push('Blood Group');
@@ -819,8 +841,10 @@ exports.bulkStudents = async (req, res) => {
                     sendWelcomeEmail(parentEmail, parentName, parentEmail, parentOtp, schoolName, req.schoolId);
                 }
 
+                // Blank in the sheet → generated from the school's format
+                const admissionNumber = admNo || await admissionNo.nextAdmissionNumber(bulkSchool);
                 const profileData = {
-                    school: req.schoolId, admissionNumber: admNo,
+                    school: req.schoolId, admissionNumber,
                     dob, gender, bloodGroup, category,
                     address, city, state: stateName || stateFromPincode(pincode), pincode,
                     country: 'India',
@@ -998,6 +1022,27 @@ exports.pincodeLookup = async (req, res) => {
     jsonOk(res, result);
 };
 
+// Live preview of the next admission number for a given (unsaved) format
+exports.previewAdmissionNumber = async (req, res) => {
+    try {
+        const school = await School.findById(req.schoolId).select('name code admissionNumberFormat').lean();
+        if (!school) return res.status(404).json({ success: false, message: 'School not found' });
+
+        const format = String(req.query.format || school.admissionNumberFormat || admissionNo.DEFAULT_FORMAT).trim();
+        const fmtErr = admissionNo.validateFormat(format);
+        if (fmtErr) return res.status(400).json({ success: false, message: fmtErr });
+
+        jsonOk(res, {
+            format,
+            samples: [
+                await admissionNo.previewAdmissionNumber(format, school, 1),
+                await admissionNo.previewAdmissionNumber(format, school, 2),
+            ],
+            next: await admissionNo.nextAdmissionNumber({ ...school, admissionNumberFormat: format }),
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
 // Static list for the address form's state dropdown
 exports.getStates = (_req, res) => jsonOk(res, STATES_AND_UTS);
 
@@ -1067,7 +1112,7 @@ exports.updateDesignations = async (req, res) => {
 exports.getSchoolSettings = async (req, res) => {
     try {
         const school = await School.findById(req.schoolId)
-            .select('name code email phone website logo leaveSettings')
+            .select('name code email phone website logo leaveSettings admissionNumberFormat')
             .lean();
         if (!school) return res.status(404).json({ success: false, message: 'School not found' });
         res.json({ success: true, data: school });
@@ -1089,6 +1134,12 @@ exports.updateSchoolSettings = async (req, res) => {
         if (email   !== undefined) update.email   = (email   || '').trim().toLowerCase();
         if (phone   !== undefined) update.phone   = (phone   || '').trim();
         if (website !== undefined) update.website = (website || '').trim();
+        if (req.body.admissionNumberFormat !== undefined) {
+            const fmt = String(req.body.admissionNumberFormat).trim();
+            const fmtErr = admissionNo.validateFormat(fmt);
+            if (fmtErr) return res.status(400).json({ success: false, message: fmtErr });
+            update.admissionNumberFormat = fmt;
+        }
 
         // leaveSettings may arrive as JSON string (FormData) or object (JSON body)
         let ls = req.body.leaveSettings;
@@ -1111,7 +1162,7 @@ exports.updateSchoolSettings = async (req, res) => {
         }
 
         const school = await School.findByIdAndUpdate(
-            req.schoolId, update, { new: true, select: 'name code email phone website logo leaveSettings' }
+            req.schoolId, update, { new: true, select: 'name code email phone website logo leaveSettings admissionNumberFormat' }
         ).lean();
 
         if (previousLogo && previousLogo !== school?.logo) deleteSchoolLogo(previousLogo);
