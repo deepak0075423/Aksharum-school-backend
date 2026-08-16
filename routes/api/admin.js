@@ -157,6 +157,9 @@ router.post('/sections/:sectionId/assign-student',    guard, classCtrl.assignStu
 router.delete('/sections/:sectionId/remove-student',  guard, classCtrl.removeStudentFromSection);
 router.put('/sections/:sectionId/teachers',           guard, classCtrl.updateSectionTeacher);
 router.put('/sections/:sectionId/capacity',           guard, classCtrl.updateSectionCapacity);
+// Roll numbers — one-time bulk assignment + manual corrections
+router.post('/sections/:sectionId/assign-roll-numbers',            guard, classCtrl.assignRollNumbers);
+router.put('/sections/:sectionId/students/:studentId/roll-number', guard, classCtrl.updateStudentRollNumber);
 router.delete('/sections/:sectionId',                 guard, classCtrl.deleteSection);
 router.get('/sections/:sectionId/subjects',           guard, subjectCtrl.getSectionSubjectTeachers);
 router.post('/sections/:sectionId/subjects/assign',   guard, subjectCtrl.assignSubjectTeacher);

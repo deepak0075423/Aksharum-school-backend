@@ -43,6 +43,12 @@ const ClassSectionSchema = new db.Schema({
         default: 0,
         min: 0,
     },
+    // Set the first (and only) time roll numbers are auto-assigned for this
+    // section; individual numbers can still be corrected by hand afterwards.
+    rollNumbersAssignedAt: {
+        type: Date,
+        default: null,
+    },
     enrolledStudents: [{
         type: db.Types.UUID,
         ref: 'User'

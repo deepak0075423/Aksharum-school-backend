@@ -17,6 +17,7 @@ const { validate, isEmail, isPhone, isURL } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
 const { STATES_AND_UTS, isPincode, stateFromPincode } = require('../utils/indiaStates');
+const { rollNumberTaken } = require('../utils/rollNumbers');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -327,8 +328,16 @@ exports.updateStudentFull = async (req, res) => {
         if (phone !== undefined) userUpdate.phone = phone;
         if (phone && !/^[+\d\s\-]{7,15}$/.test(phone))
             return res.status(400).json({ success: false, message: 'Invalid phone number' });
-        if (rollNumber !== undefined && !String(rollNumber).trim())
-            return res.status(400).json({ success: false, message: 'Roll number is required' });
+        const rollValue = rollNumber !== undefined ? String(rollNumber).trim() : undefined;
+        if (rollValue) {
+            const sectionId = currentSection !== undefined
+                ? currentSection
+                : (await StudentProfile.findOne({ user: req.params.id }, 'currentSection').lean())?.currentSection;
+            if (sectionId) {
+                const takenBy = await rollNumberTaken(sectionId, rollValue, req.params.id);
+                if (takenBy) return res.status(400).json({ success: false, message: `Roll number ${rollValue} is already used by ${takenBy} in this section.` });
+            }
+        }
         // Only the demographic/address fields actually submitted are checked, so
         // partial updates from other screens still work.
         const profileErr = validateStudentProfile(
@@ -355,7 +364,7 @@ exports.updateStudentFull = async (req, res) => {
 
         // Update StudentProfile fields
         const profileUpdate = {};
-        if (rollNumber      !== undefined) profileUpdate.rollNumber      = rollNumber;
+        if (rollNumber      !== undefined) profileUpdate.rollNumber      = rollValue;
         if (admissionNumber !== undefined) profileUpdate.admissionNumber = admissionNumber;
         if (dob             !== undefined) profileUpdate.dob             = dob || null;
         if (gender          !== undefined) profileUpdate.gender          = gender;
@@ -460,8 +469,12 @@ exports.createStudent = async (req, res) => {
         if (!email?.trim()) return res.status(400).json({ success: false, message: 'Email is required' });
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, message: 'Invalid email format' });
         if (phone && !/^[+\d\s\-]{7,15}$/.test(phone)) return res.status(400).json({ success: false, message: 'Invalid phone number' });
-        if (!profile.rollNumber || !String(profile.rollNumber).trim())
-            return res.status(400).json({ success: false, message: 'Roll number is required' });
+        // Roll number is optional at intake — sections assign them in bulk later
+        const roll = String(profile.rollNumber ?? '').trim();
+        if (roll && profile.currentSection) {
+            const takenBy = await rollNumberTaken(profile.currentSection, roll);
+            if (takenBy) return res.status(400).json({ success: false, message: `Roll number ${roll} is already used by ${takenBy} in this section.` });
+        }
         const profileErr = validateStudentProfile(profile);
         if (profileErr) return res.status(400).json({ success: false, message: profileErr });
         const exists = await User.findOne({ email: email.toLowerCase() });

@@ -8,6 +8,7 @@ const Chat           = require('../models/Chat');
 const ChatMember     = require('../models/ChatMember');
 const { isDate }     = require('../utils/validators');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
+const { rollNumberTaken } = require('../utils/rollNumbers');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const err = (res, e, status = 500)    => res.status(status).json({ success: false, message: e.message || e });
@@ -482,6 +483,67 @@ exports.getSectionDetail = async (req, res) => {
         ok(res, section);
     } catch (e) { err(res, e); }
 };
+// ── Roll numbers ──────────────────────────────────────────────────────────────
+
+/** POST /admin/sections/:sectionId/assign-roll-numbers — one-time bulk numbering */
+exports.assignRollNumbers = async (req, res) => {
+    try {
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+        if (section.rollNumbersAssignedAt)
+            return err(res, { message: 'Roll numbers have already been assigned for this section. Edit individual roll numbers instead.' }, 400);
+
+        const ids = (section.enrolledStudents || []).map(String);
+        if (!ids.length) return err(res, { message: 'Enrol students in this section first.' }, 400);
+
+        const students = await User.find({ _id: { $in: ids } }, 'name').lean();
+        students.sort((a, b) =>
+            String(a.name || '').localeCompare(String(b.name || ''), 'en', { numeric: true, sensitivity: 'base' }));
+
+        // Sequential 1..N in alphabetical name order
+        for (let i = 0; i < students.length; i++) {
+            await StudentProfile.updateOne(
+                { user: students[i]._id },
+                { $set: { rollNumber: String(i + 1) } },
+            );
+        }
+        await ClassSection.findByIdAndUpdate(section._id, { rollNumbersAssignedAt: new Date() });
+
+        ok(res, {
+            assigned: students.length,
+            assignedAt: new Date(),
+            students: students.map((s, i) => ({ _id: s._id, name: s.name, rollNumber: String(i + 1) })),
+        });
+    } catch (e) { err(res, e); }
+};
+
+/** PUT /admin/sections/:sectionId/students/:studentId/roll-number */
+exports.updateStudentRollNumber = async (req, res) => {
+    try {
+        const rollNumber = String(req.body.rollNumber ?? '').trim();
+        const { sectionId, studentId } = req.params;
+
+        const section = await ClassSection.findOne({ _id: sectionId, school: req.schoolId }).lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+        if (!(section.enrolledStudents || []).map(String).includes(String(studentId)))
+            return err(res, { message: 'That student is not enrolled in this section' }, 400);
+
+        if (rollNumber) {
+            const takenBy = await rollNumberTaken(sectionId, rollNumber, studentId);
+            if (takenBy) return err(res, { message: `Roll number ${rollNumber} is already used by ${takenBy} in this section.` }, 400);
+        }
+
+        // Writing to StudentProfile is what every other screen reads, so the
+        // change shows up on the student record too — not just here.
+        await StudentProfile.updateOne(
+            { user: studentId, school: req.schoolId },
+            { $set: { rollNumber } },
+            { upsert: true },
+        );
+        ok(res, { student: studentId, rollNumber });
+    } catch (e) { err(res, e); }
+};
+
 exports.assignStudentToSection = async (req, res) => {
     try {
         const { studentId } = req.body;
