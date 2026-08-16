@@ -141,6 +141,17 @@ async function resolveNewParent(newParent, { schoolId, schoolName }) {
 
     const holderKey = (isStructured ? accountFor : 'Guardian').toLowerCase();
     const holder    = blocks[holderKey];
+
+    // Father, mother AND guardian must all be on record — only the account
+    // holder needs an email, since that is what the login is created against.
+    if (isStructured) {
+        for (const [key, b] of Object.entries(blocks)) {
+            const label = key[0].toUpperCase() + key.slice(1);
+            if (!b.name)       return { parentId: null, error: `${label}'s name is required` };
+            if (!b.phone)      return { parentId: null, error: `${label}'s phone number is required` };
+            if (!b.occupation) return { parentId: null, error: `${label}'s occupation is required` };
+        }
+    }
     if (!holder.name)  return { parentId: null, error: `${accountFor}'s name is required to create the parent account` };
     if (!holder.email) return { parentId: null, error: `${accountFor}'s email is required to create the parent account` };
     if (!isEmail(holder.email)) return { parentId: null, error: `${accountFor}'s email is not a valid email address` };
