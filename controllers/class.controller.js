@@ -472,12 +472,20 @@ exports.getSectionDetail = async (req, res) => {
             ).lean();
             const pMap = {};
             profiles.forEach(p => { pMap[p.user.toString()] = p; });
-            section.enrolledStudents = enrolled.map(s => ({
-                ...s,
-                rollNumber:      pMap[s._id.toString()]?.rollNumber || '',
-                admissionNumber: pMap[s._id.toString()]?.admissionNumber || '',
-                gender:          pMap[s._id.toString()]?.gender || '',
-            }));
+            section.enrolledStudents = enrolled
+                .map(s => ({
+                    ...s,
+                    rollNumber:      pMap[s._id.toString()]?.rollNumber || '',
+                    admissionNumber: pMap[s._id.toString()]?.admissionNumber || '',
+                    gender:          pMap[s._id.toString()]?.gender || '',
+                }))
+                // Roll-number order; students without one sort last, by name
+                .sort((a, b) => {
+                    if (!a.rollNumber && !b.rollNumber) return byName('name')(a, b);
+                    if (!a.rollNumber) return 1;
+                    if (!b.rollNumber) return -1;
+                    return byName('rollNumber')(a, b);
+                });
         }
 
         ok(res, section);
