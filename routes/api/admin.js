@@ -147,6 +147,9 @@ router.put('/classes/:classId',               guard, classCtrl.updateClass);
 router.delete('/classes/:classId',            guard, classCtrl.deleteClass);
 router.post('/classes/auto-assign',           guard, classCtrl.autoAssignStudents);
 router.post('/classes/:classId/sections',     guard, classCtrl.createSection);
+// Section shuffle — one random redistribution per class/year, then lockable
+router.post('/classes/:classId/shuffle-sections', guard, classCtrl.shuffleSections);
+router.post('/classes/:classId/lock-sections',    guard, classCtrl.lockSectionShuffle);
 router.get('/classes/:classId/subjects',      guard, subjectCtrl.getClassSubjects);
 router.post('/classes/:classId/subjects/assign', guard, subjectCtrl.assignSubjectToClass);
 router.delete('/classes/:classId/subjects',   guard, subjectCtrl.removeSubjectFromClass);

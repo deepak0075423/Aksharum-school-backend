@@ -228,6 +228,107 @@ exports.updateClass = async (req, res) => {
         err(res, e, 400);
     }
 };
+// ── Section shuffle ───────────────────────────────────────────────────────────
+/**
+ * POST /admin/classes/:classId/shuffle-sections
+ * Redistributes every student of the class across its sections at random,
+ * respecting each section's capacity. Blocked once the class is locked;
+ * moving individual students by hand keeps working either way.
+ */
+exports.shuffleSections = async (req, res) => {
+    try {
+        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
+        if (!cls) return err(res, { message: 'Class not found' }, 404);
+        if (cls.sectionShuffle?.lockedAt)
+            return err(res, { message: `Sections for ${cls.className} are locked for this academic year. Move students individually instead.` }, 400);
+
+        const sections = (await ClassSection.find({ class: cls._id, school: req.schoolId }).lean())
+            .sort(byName('sectionName'));
+        if (sections.length < 2)
+            return err(res, { message: 'Add at least two sections before shuffling.' }, 400);
+
+        // Everyone in the class: already in a section, or admitted to the class
+        // but not placed yet.
+        const enrolled  = sections.flatMap(s => (s.enrolledStudents || []).map(String));
+        const unplaced  = await StudentProfile.find(
+            { school: req.schoolId, currentClass: cls._id, currentSection: null }, 'user',
+        ).lean();
+        const studentIds = [...new Set([...enrolled, ...unplaced.map(p => String(p.user))])];
+        if (!studentIds.length) return err(res, { message: 'This class has no students to shuffle.' }, 400);
+
+        const capacity = sections.reduce((sum, s) => sum + (s.maxStudents || 0), 0);
+        if (studentIds.length > capacity)
+            return err(res, { message: `${studentIds.length} students do not fit in ${capacity} seats across ${sections.length} sections. Raise a section's capacity first.` }, 400);
+
+        // Fisher–Yates, then deal round-robin so sections stay balanced
+        const pool = [...studentIds];
+        for (let i = pool.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [pool[i], pool[j]] = [pool[j], pool[i]];
+        }
+        const buckets = sections.map(s => ({ section: s, students: [] }));
+        let cursor = 0;
+        for (const studentId of pool) {
+            // Skip sections that are already at capacity
+            let placed = false;
+            for (let step = 0; step < buckets.length && !placed; step++) {
+                const b = buckets[(cursor + step) % buckets.length];
+                if (b.students.length < (b.section.maxStudents || 0)) {
+                    b.students.push(studentId);
+                    cursor = (cursor + step + 1) % buckets.length;
+                    placed = true;
+                }
+            }
+            if (!placed) return err(res, { message: 'Could not place every student — check section capacities.' }, 400);
+        }
+
+        // Rewrite rosters, profiles and headcounts
+        for (const { section, students } of buckets) {
+            await ClassSection.findByIdAndUpdate(section._id, {
+                $set: {
+                    enrolledStudents: students,
+                    currentCount: students.length,
+                    // Roll numbers are per section, so a reshuffle invalidates
+                    // them — the admin re-runs "Assign Roll Numbers" after this.
+                    rollNumbersAssignedAt: null,
+                },
+            });
+            if (students.length) {
+                await StudentProfile.updateMany(
+                    { user: { $in: students } },
+                    { $set: { currentSection: section._id, currentClass: cls._id, rollNumber: '' } },
+                );
+            }
+        }
+
+        const shuffledAt = new Date();
+        await Class.findByIdAndUpdate(cls._id, { $set: { 'sectionShuffle.shuffledAt': shuffledAt } });
+
+        ok(res, {
+            shuffledAt,
+            students: studentIds.length,
+            sections: buckets.map(b => ({ _id: b.section._id, sectionName: b.section.sectionName, count: b.students.length })),
+        });
+    } catch (e) { err(res, e); }
+};
+
+/** POST /admin/classes/:classId/lock-sections — freeze shuffling for this year */
+exports.lockSectionShuffle = async (req, res) => {
+    try {
+        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
+        if (!cls) return err(res, { message: 'Class not found' }, 404);
+        if (cls.sectionShuffle?.lockedAt) return err(res, { message: 'Sections are already locked for this class.' }, 400);
+        if (!cls.sectionShuffle?.shuffledAt)
+            return err(res, { message: 'Shuffle the sections before locking them.' }, 400);
+
+        const lockedAt = new Date();
+        await Class.findByIdAndUpdate(cls._id, {
+            $set: { 'sectionShuffle.lockedAt': lockedAt, 'sectionShuffle.lockedBy': req.userId },
+        });
+        ok(res, { lockedAt });
+    } catch (e) { err(res, e); }
+};
+
 exports.deleteClass = async (req, res) => {
     try {
         await Class.findByIdAndDelete(req.params.classId);
@@ -673,10 +774,21 @@ exports.updateSectionTeacher = async (req, res) => {
 };
 exports.updateSectionCapacity = async (req, res) => {
     try {
-        const section = await ClassSection.findByIdAndUpdate(
-            req.params.sectionId, { capacity: req.body.capacity }, { new: true }
+        // The schema field is maxStudents — writing `capacity` silently did nothing
+        const cap = Number(req.body.maxStudents ?? req.body.capacity);
+        if (!Number.isFinite(cap) || cap < 1)
+            return err(res, { message: 'Capacity must be a positive number' }, 400);
+
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+        const enrolled = (section.enrolledStudents || []).length;
+        if (cap < enrolled)
+            return err(res, { message: `${enrolled} students are already enrolled — capacity cannot be below that.` }, 400);
+
+        const updated = await ClassSection.findByIdAndUpdate(
+            req.params.sectionId, { maxStudents: cap }, { new: true }
         );
-        ok(res, section);
+        ok(res, updated);
     } catch (e) { err(res, e); }
 };
 exports.deleteSection = async (req, res) => {

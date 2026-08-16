@@ -25,6 +25,13 @@ const ClassSchema = new db.Schema({
         enum: ['active', 'inactive', 'archived'],
         default: 'active',
     },
+    // Section shuffle state. A Class row belongs to exactly one academic year,
+    // so locking here locks that class for that year only.
+    sectionShuffle: {
+        shuffledAt: { type: Date, default: null },
+        lockedAt:   { type: Date, default: null },
+        lockedBy:   { type: db.Types.UUID, ref: 'User', default: null },
+    },
     createdBy: {
         type: db.Types.UUID,
         ref: 'User',
