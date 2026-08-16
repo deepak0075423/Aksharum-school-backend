@@ -103,6 +103,7 @@ app.use('/api/library',       require('./routes/api/library'));
 app.use('/api/inventory',     require('./routes/api/inventory'));
 app.use('/api/transport',     require('./routes/api/transport'));
 app.use('/api/video',         require('./routes/api/video'));
+app.use('/api/analytics',     require('./routes/api/analytics'));
 app.use('/api/chat',          require('./routes/api/chat'));
 app.use('/api/notifications', require('./routes/api/notifications'));
 app.use('/api/profile',       require('./routes/api/profile'));
