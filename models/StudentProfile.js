@@ -37,6 +37,12 @@ const StudentProfileSchema = new db.Schema({
         type: String,
         default: '',
     },
+    // Class is set at admission; the section can follow later
+    currentClass: {
+        type: db.Types.UUID,
+        ref: 'Class',
+        default: null,
+    },
     // New FK — assigned section
     currentSection: {
         type: db.Types.UUID,

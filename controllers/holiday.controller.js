@@ -3,7 +3,24 @@ const Holiday      = require('../models/Holiday');
 const AcademicYear = require('../models/AcademicYear');
 const XLSX         = require('xlsx');
 
-const VALID_TYPES = ['public', 'school_specific', 'optional', 'exam_break'];
+const School = require('../models/School');
+
+// Legacy slugs kept working alongside the school's own configured list
+const LEGACY_TYPES = ['public', 'school_specific', 'optional', 'exam_break'];
+const DEFAULT_HOLIDAY_TYPES = ['Public Holiday', 'School Specific', 'Optional Holiday', 'Exam Break'];
+
+async function schoolHolidayTypes(schoolId) {
+    const school = await School.findById(schoolId).select('holidayTypes').lean();
+    return school?.holidayTypes?.length ? school.holidayTypes : DEFAULT_HOLIDAY_TYPES;
+}
+
+async function invalidType(schoolId, type) {
+    const value = String(type || '').trim();
+    if (!value) return 'Holiday type is required';
+    const allowed = await schoolHolidayTypes(schoolId);
+    if (allowed.includes(value) || LEGACY_TYPES.includes(value)) return null;
+    return `Type must be one of: ${allowed.join(', ')}`;
+}
 
 // ── In-app notification after holiday creation ────────────────────────────────
 async function sendHolidayNotification(holiday, schoolId, creatorId) {
@@ -97,7 +114,8 @@ exports.adminCreateHoliday = async (req, res) => {
         if (!name?.trim())               return res.status(400).json({ success: false, message: 'Holiday name is required' });
         if (!startDate)                  return res.status(400).json({ success: false, message: 'Start date is required' });
         if (!endDate)                    return res.status(400).json({ success: false, message: 'End date is required' });
-        if (!VALID_TYPES.includes(type)) return res.status(400).json({ success: false, message: `Type must be one of: ${VALID_TYPES.join(', ')}` });
+        const typeErr = await invalidType(req.schoolId, type);
+        if (typeErr) return res.status(400).json({ success: false, message: typeErr });
 
         const start = new Date(startDate);
         const end   = new Date(endDate);
@@ -114,9 +132,10 @@ exports.adminCreateHoliday = async (req, res) => {
             academicYear: academicYear || null,
             createdBy:    req.userId,
             applicability: {
-                scope:       applicability?.scope || 'all',
-                classes:     applicability?.classes || [],
-                departments: applicability?.departments || [],
+                // 'specific_departments' was removed from the form; anything
+                // else unexpected falls back to school-wide.
+                scope:   applicability?.scope === 'specific_classes' ? 'specific_classes' : 'all',
+                classes: applicability?.classes || [],
             },
         });
 
@@ -141,14 +160,13 @@ exports.adminUpdateHoliday = async (req, res) => {
         if (academicYear !== undefined) update.academicYear = academicYear || null;
         if (applicability !== undefined) {
             update.applicability = {
-                scope:       applicability.scope || 'all',
-                classes:     applicability.classes || [],
-                departments: applicability.departments || [],
+                scope:   applicability.scope === 'specific_classes' ? 'specific_classes' : 'all',
+                classes: applicability.classes || [],
             };
         }
         if (type !== undefined) {
-            if (!VALID_TYPES.includes(type))
-                return res.status(400).json({ success: false, message: `Type must be one of: ${VALID_TYPES.join(', ')}` });
+            const typeErr = await invalidType(req.schoolId, type);
+            if (typeErr) return res.status(400).json({ success: false, message: typeErr });
             update.type = type;
         }
 
@@ -184,20 +202,24 @@ exports.adminImportHolidays = async (req, res) => {
 
         const docs   = [];
         const errors = [];
+        const allowedTypes = await schoolHolidayTypes(req.schoolId);
+        const matchType = (raw) =>
+            allowedTypes.find(t => t.toLowerCase() === raw.toLowerCase())
+            || (LEGACY_TYPES.includes(raw.toLowerCase()) ? raw.toLowerCase() : null);
 
         rows.forEach((row, i) => {
             const lineNo      = i + 2;
             const name        = (row.name || row.Name || '').toString().trim();
             const rawStart    = row.startDate || row.start_date || row.StartDate || row.date || row.Date;
             const rawEnd      = row.endDate   || row.end_date   || row.EndDate   || rawStart;
-            const rawType     = (row.type || row.Type || 'public').toString().toLowerCase().trim();
+            const rawType     = (row.type || row.Type || '').toString().trim();
             const description = (row.description || row.Description || '').toString().trim();
 
             if (!name)       { errors.push(`Row ${lineNo}: name is required`); return; }
             const startDate = parseDate(rawStart);
             if (!startDate) { errors.push(`Row ${lineNo}: invalid or missing startDate`); return; }
             const endDate = parseDate(rawEnd) || startDate;
-            const type    = VALID_TYPES.includes(rawType) ? rawType : 'public';
+            const type    = matchType(rawType) || allowedTypes[0];
 
             docs.push({ school: req.schoolId, name, startDate, endDate, type, description, createdBy: req.userId });
         });
@@ -207,6 +229,36 @@ exports.adminImportHolidays = async (req, res) => {
 
         await Holiday.insertMany(docs, { ordered: false });
         res.json({ success: true, imported: docs.length, errors: errors.length ? errors : undefined });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+// ── Admin: holiday types (school-managed dropdown source) ────────────────────
+exports.getHolidayTypes = async (req, res) => {
+    try {
+        res.json({ success: true, data: await schoolHolidayTypes(req.schoolId) });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+exports.updateHolidayTypes = async (req, res) => {
+    try {
+        let { holidayTypes } = req.body;
+        if (!Array.isArray(holidayTypes))
+            return res.status(400).json({ success: false, message: 'holidayTypes must be an array' });
+
+        // Trim, drop blanks, de-duplicate case-insensitively
+        const seen = new Set();
+        holidayTypes = holidayTypes
+            .map(t => String(t || '').trim())
+            .filter(t => {
+                if (!t || seen.has(t.toLowerCase())) return false;
+                seen.add(t.toLowerCase());
+                return true;
+            });
+        if (!holidayTypes.length)
+            return res.status(400).json({ success: false, message: 'Keep at least one holiday type' });
+
+        await School.updateOne({ _id: req.schoolId }, { $set: { holidayTypes } });
+        res.json({ success: true, data: holidayTypes });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 

@@ -66,6 +66,11 @@ const SchoolSchema = new db.Schema({
         type: [String],
         default: ['Teacher', 'Class Teacher', 'Librarian'],
     },
+    // Holiday types the admin can assign (dropdown source), same idea
+    holidayTypes: {
+        type: [String],
+        default: ['Public Holiday', 'School Specific', 'Optional Holiday', 'Exam Break'],
+    },
     modules: {
         attendance: {
             type: Boolean,

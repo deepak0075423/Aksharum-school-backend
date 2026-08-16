@@ -287,6 +287,8 @@ router.post('/documents/:id/archive',                 docGuard, docCtrl.adminArc
 router.post('/documents/:docId/versions/:versionId/restore', docGuard, docCtrl.adminRestoreVersion);
 
 // ── Holidays ──────────────────────────────────────────────────────────────────
+router.get('/holiday-types',       holidayGuard, holidayCtrl.getHolidayTypes);
+router.put('/holiday-types',       holidayGuard, holidayCtrl.updateHolidayTypes);
 router.get('/holidays',            holidayGuard, holidayCtrl.adminGetHolidays);
 router.get('/holidays/mine',       holidayGuard, holidayCtrl.adminGetMyHolidays);
 router.post('/holidays',           holidayGuard, holidayCtrl.adminCreateHoliday);

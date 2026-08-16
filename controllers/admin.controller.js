@@ -277,15 +277,21 @@ exports.getStudents = async (req, res) => {
                         rollNumber:      '$_p.rollNumber',
                         gender:          '$_p.gender',
                         currentSection:  '$_p.currentSection',
+                        currentClass:    '$_p.currentClass',
                     }},
                     { $lookup: { from: 'classsections', localField: 'currentSection', foreignField: '_id', as: '_sec' } },
                     { $addFields: { _sec: { $arrayElemAt: ['$_sec', 0] } } },
                     { $lookup: { from: 'classes', localField: '_sec.class', foreignField: '_id', as: '_cls' } },
+                    // Students with a class but no section yet still show their class
+                    { $lookup: { from: 'classes', localField: 'currentClass', foreignField: '_id', as: '_ownCls' } },
                     { $addFields: {
                         sectionName: '$_sec.sectionName',
-                        className:   { $arrayElemAt: ['$_cls.className', 0] },
+                        className:   { $ifNull: [
+                            { $arrayElemAt: ['$_cls.className', 0] },
+                            { $arrayElemAt: ['$_ownCls.className', 0] },
+                        ] },
                     }},
-                    { $project: { _p: 0, _sec: 0, _cls: 0 } },
+                    { $project: { _p: 0, _sec: 0, _cls: 0, _ownCls: 0 } },
                 ],
                 total: [{ $count: 'n' }],
             }},
@@ -320,7 +326,7 @@ exports.updateStudentFull = async (req, res) => {
     try {
         const { name, phone, password, rollNumber, admissionNumber, dob, gender, bloodGroup,
                 category, address, city, state, pincode, country,
-                currentSection, parentId, newParent } = req.body;
+                currentClass, currentSection, parentId, newParent } = req.body;
 
         // Update User fields
         const userUpdate = {};
@@ -377,6 +383,12 @@ exports.updateStudentFull = async (req, res) => {
         if (country         !== undefined) profileUpdate.country         = country || 'India';
         if (resolvedParentId !== undefined) profileUpdate.parent         = resolvedParentId;
         if (currentSection  !== undefined) profileUpdate.currentSection  = currentSection || null;
+        if (currentClass    !== undefined) profileUpdate.currentClass    = currentClass || null;
+        // Keep the class in step when only a section is sent
+        if (currentClass === undefined && currentSection) {
+            const sec = await ClassSection.findOne({ _id: currentSection, school: req.schoolId }, 'class').lean();
+            if (sec?.class) profileUpdate.currentClass = sec.class;
+        }
 
         await StudentProfile.findOneAndUpdate({ user: req.params.id }, profileUpdate, { upsert: true });
         if (resolvedParentId) {
@@ -469,6 +481,16 @@ exports.createStudent = async (req, res) => {
         if (!email?.trim()) return res.status(400).json({ success: false, message: 'Email is required' });
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, message: 'Invalid email format' });
         if (phone && !/^[+\d\s\-]{7,15}$/.test(phone)) return res.status(400).json({ success: false, message: 'Invalid phone number' });
+        // Class is required; the section can be assigned later. A section on its
+        // own is still accepted (mobile + bulk import) — the class is derived.
+        let classId = profile.currentClass || null;
+        if (!classId && profile.currentSection) {
+            const sec = await ClassSection.findOne({ _id: profile.currentSection, school: req.schoolId }, 'class').lean();
+            classId = sec?.class || null;
+        }
+        if (!classId) return res.status(400).json({ success: false, message: 'Class is required' });
+        profile.currentClass = classId;
+
         // Roll number is optional at intake — sections assign them in bulk later
         const roll = String(profile.rollNumber ?? '').trim();
         if (roll && profile.currentSection) {
@@ -608,6 +630,7 @@ exports.bulkTeachers = async (req, res) => {
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
 
         let created = 0;
+        let updated = 0;
         const errors = [];
         for (let i = 0; i < rows.length; i++) {
             const rowNum = i + 2;
@@ -625,7 +648,23 @@ exports.bulkTeachers = async (req, res) => {
 
             try {
                 const exists = await User.findOne({ email }).lean();
-                if (exists) { errors.push({ row: rowNum, name, reason: `Email "${email}" already registered` }); continue; }
+                if (exists) {
+                    // Re-uploading a sheet updates the existing teacher rather
+                    // than failing the row. Other roles are never overwritten.
+                    if (exists.role !== 'teacher' || String(exists.school) !== String(req.schoolId)) {
+                        errors.push({ row: rowNum, name, reason: `Email "${email}" belongs to another account` });
+                        continue;
+                    }
+                    await User.updateOne({ _id: exists._id }, { $set: { name, ...(phone ? { phone } : {}) } });
+                    await authCache.invalidate(exists._id);
+                    await TeacherProfile.findOneAndUpdate(
+                        { user: exists._id },
+                        { $set: { ...(designation ? { designation } : {}) }, $setOnInsert: { school: req.schoolId } },
+                        { upsert: true },
+                    );
+                    updated++;
+                    continue;
+                }
                 const otp  = generateOTP();
                 const user = await createUserHelper({ name, email, phone, password: otp }, 'teacher', req.schoolId);
                 await TeacherProfile.create({ user: user._id, school: req.schoolId, designation });
@@ -635,7 +674,7 @@ exports.bulkTeachers = async (req, res) => {
                 errors.push({ row: rowNum, name, reason: e.code === 11000 ? 'Duplicate entry' : e.message });
             }
         }
-        res.json({ success: true, created, errors });
+        res.json({ success: true, created, updated, errors });
     } catch (err) { jsonErr(res, err); }
 };
 
@@ -666,6 +705,7 @@ exports.bulkStudents = async (req, res) => {
         sections.forEach(s => { sectionMap[`${s.class.toString()}_${s.sectionName.toLowerCase()}`] = s; });
 
         let created = 0;
+        let updated = 0;
         const errors = [];
 
         for (let i = 0; i < rows.length; i++) {
@@ -754,9 +794,11 @@ exports.bulkStudents = async (req, res) => {
                 continue;
             }
 
+            // A row whose email already exists updates that student instead of
+            // failing, so a corrected sheet can simply be re-uploaded.
             const studentExists = await User.findOne({ email }).lean();
-            if (studentExists) {
-                const reason = `Email "${email}" already registered`;
+            if (studentExists && (studentExists.role !== 'student' || String(studentExists.school) !== String(req.schoolId))) {
+                const reason = `Email "${email}" belongs to another account`;
                 errors.push({ row: rowNum, name, reason });
                 push({ type: 'row_done', row: rowNum, name, success: false, reason });
                 continue;
@@ -777,21 +819,38 @@ exports.bulkStudents = async (req, res) => {
                     sendWelcomeEmail(parentEmail, parentName, parentEmail, parentOtp, schoolName, req.schoolId);
                 }
 
-                const otp = generateOTP();
-                const studentUser = await createUserHelper({ name, email, phone, password: otp }, 'student', req.schoolId);
-                await StudentProfile.create({
-                    user: studentUser._id, school: req.schoolId, admissionNumber: admNo,
+                const profileData = {
+                    school: req.schoolId, admissionNumber: admNo,
                     dob, gender, bloodGroup, category,
-                    address, city, state: stateName, pincode,
-                    // PIN prefix fills the state in when the sheet leaves it blank
-                    ...(stateName ? {} : { state: stateFromPincode(pincode) }),
+                    address, city, state: stateName || stateFromPincode(pincode), pincode,
                     country: 'India',
-                    currentSection: section._id, parent: parentUserId,
-                });
-                await ParentProfile.findOneAndUpdate({ user: parentUserId }, { $addToSet: { children: studentUser._id } });
-                sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
+                    currentClass: clasDoc._id, currentSection: section._id, parent: parentUserId,
+                };
 
-                created++;
+                let studentUser = studentExists;
+                if (studentUser) {
+                    await User.updateOne({ _id: studentUser._id }, { $set: { name, ...(phone ? { phone } : {}) } });
+                    await authCache.invalidate(studentUser._id);
+                    await StudentProfile.findOneAndUpdate(
+                        { user: studentUser._id },
+                        { $set: profileData },
+                        { upsert: true },
+                    );
+                    updated++;
+                } else {
+                    const otp = generateOTP();
+                    studentUser = await createUserHelper({ name, email, phone, password: otp }, 'student', req.schoolId);
+                    await StudentProfile.create({ user: studentUser._id, ...profileData });
+                    sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
+                    created++;
+                }
+                // Enrol (idempotent) so the section roster matches the sheet
+                await ClassSection.updateOne(
+                    { _id: section._id },
+                    { $addToSet: { enrolledStudents: studentUser._id } },
+                );
+                await ParentProfile.findOneAndUpdate({ user: parentUserId }, { $addToSet: { children: studentUser._id } });
+
                 push({ type: 'row_done', row: rowNum, name, success: true });
             } catch (e) {
                 const reason = e.code === 11000 ? 'Duplicate entry' : e.message;
@@ -800,7 +859,14 @@ exports.bulkStudents = async (req, res) => {
             }
         }
 
-        push({ type: 'done', created, errors });
+        // Section rosters changed above — bring their headcounts back in line
+        const touched = await ClassSection.find({ school: req.schoolId }, '_id enrolledStudents').lean();
+        const countOps = touched.map(sec => ({
+            updateOne: { filter: { _id: sec._id }, update: { $set: { currentCount: (sec.enrolledStudents || []).length } } },
+        }));
+        if (countOps.length) await ClassSection.bulkWrite(countOps);
+
+        push({ type: 'done', created, updated, errors });
         res.end();
     } catch (e) {
         push({ type: 'error', message: e.message });

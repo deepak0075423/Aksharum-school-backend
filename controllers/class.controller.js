@@ -574,11 +574,39 @@ exports.assignStudentToSection = async (req, res) => {
         });
         // Keep the student's profile in sync — every read path (my-class,
         // timetable, admin list, parent views) resolves class via currentSection.
+        const profileSet = { currentSection: req.params.sectionId, currentClass: section.class };
+
+        // Once a section has been numbered, a student joining later continues
+        // the sequence instead of arriving without a roll number.
+        let assignedRoll = null;
+        if (section.rollNumbersAssignedAt) {
+            const mine = await StudentProfile.findOne({ user: studentId }, 'rollNumber').lean();
+            const currentRoll = String(mine?.rollNumber || '').trim();
+            const keepExisting = currentRoll && !(await rollNumberTaken(section._id, currentRoll, studentId));
+            if (!keepExisting) {
+                const peers = (section.enrolledStudents || []).map(String).filter(id => id !== String(studentId));
+                const profiles = peers.length
+                    ? await StudentProfile.find({ user: { $in: peers } }, 'rollNumber').lean()
+                    : [];
+                const highest = profiles.reduce((max, p) => {
+                    const n = Number(String(p.rollNumber || '').trim());
+                    return Number.isFinite(n) ? Math.max(max, n) : max;
+                }, 0);
+                assignedRoll = String(highest + 1);
+                profileSet.rollNumber = assignedRoll;
+            }
+        }
+
         await StudentProfile.updateOne(
             { user: studentId, school: req.schoolId },
-            { $set: { currentSection: req.params.sectionId } }
+            { $set: profileSet }
         );
-        ok(res, { message: 'Student enrolled' });
+        ok(res, {
+            message: assignedRoll
+                ? `Student enrolled with roll number ${assignedRoll}`
+                : 'Student enrolled',
+            rollNumber: assignedRoll,
+        });
     } catch (e) { err(res, e); }
 };
 exports.removeStudentFromSection = async (req, res) => {

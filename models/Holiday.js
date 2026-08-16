@@ -19,10 +19,11 @@ const HolidaySchema = new db.Schema({
         type: Date,
         required: true,
     },
+    // Free-form: the school manages its own list of holiday types
     type: {
         type: String,
-        enum: ['public', 'school_specific', 'optional', 'exam_break'],
         required: true,
+        trim: true,
     },
     description: {
         type: String,
@@ -36,6 +37,7 @@ const HolidaySchema = new db.Schema({
     applicability: {
         scope: {
             type: String,
+            // 'specific_departments' is retired — kept readable on legacy rows
             enum: ['all', 'specific_classes', 'specific_departments'],
             default: 'all',
         },
