@@ -28,7 +28,7 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:8081',
-  'http://35.154.216.100:5010',
+  'http://13.50.231.82:3000/',
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
