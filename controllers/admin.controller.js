@@ -19,6 +19,7 @@ const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
 const { STATES_AND_UTS, isPincode, stateFromPincode } = require('../utils/indiaStates');
 const { rollNumberTaken } = require('../utils/rollNumbers');
 const admissionNo = require('../utils/admissionNumber');
+const employeeIdUtil = require('../utils/employeeId');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -465,22 +466,201 @@ const createUserHelper = async (body, role, school) => {
     return User.create({ ...body, email: body.email.toLowerCase(), role, school, password: hashed, isFirstLogin: true });
 };
 
+// ── Teacher intake ────────────────────────────────────────────────────────────
+// The seven-step form posts as multipart (Aadhaar / PAN / experience papers), so
+// every value arrives as a string — booleans included.
+const AADHAAR_RE = /^\d{12}$/;
+const PAN_RE     = /^[A-Z]{5}\d{4}[A-Z]$/i;
+const IFSC_RE    = /^[A-Z]{4}0[A-Z0-9]{6}$/i;
+const isTrue = (v) => v === true || v === 'true' || v === 'on' || v === '1';
+
+/** Validate the teacher payload; returns the first problem, or null. */
+function validateTeacherIntake(b, files = {}) {
+    const req = (value, label) => (!String(value ?? '').trim() ? `${label} is required` : null);
+    const file = (key) => files[key]?.[0]?.filename || '';
+
+    // 1. Personal
+    let e = req(b.name, 'Full name')
+        || req(b.dob, 'Date of birth')
+        || req(b.gender, 'Gender')
+        || req(b.bloodGroup, 'Blood group')
+        || req(b.fatherOrHusbandName, "Father's / husband's name")
+        || req(b.emergencyContactName, 'Emergency contact name')
+        || req(b.emergencyContactPhone, 'Emergency contact phone');
+    if (e) return e;
+    if (b.dob && Number.isNaN(new Date(b.dob).getTime())) return 'Invalid date of birth';
+    if (!isPhone(b.emergencyContactPhone)) return 'Emergency contact phone is not valid';
+
+    // 2. Contact
+    e = req(b.phone, 'Mobile number')
+        || req(b.email, 'Email address');
+    if (e) return e;
+    if (!isPhone(b.phone)) return 'Mobile number is not valid';
+    if (b.alternatePhone && !isPhone(b.alternatePhone)) return 'Secondary phone number is not valid';
+    if (!isEmail(b.email)) return 'Email address is not valid';
+
+    // Addresses use the same street / PIN / city / state shape as student intake
+    const addressError = (prefix, label) => {
+        const err = req(b[`${prefix}Address`], `${label} address`)
+            || req(b[`${prefix}Pincode`], `${label} PIN code`)
+            || req(b[`${prefix}City`],    `${label} city`)
+            || req(b[`${prefix}State`],   `${label} state`);
+        if (err) return err;
+        if (!isPincode(b[`${prefix}Pincode`])) return `${label} PIN code must be 6 digits`;
+        if (!STATES_AND_UTS.includes(String(b[`${prefix}State`]).trim()))
+            return `${label} state is not a valid Indian state or union territory`;
+        return null;
+    };
+    e = addressError('current', 'Current residential');
+    if (e) return e;
+    if (!isTrue(b.sameAsCurrent)) {
+        e = addressError('permanent', 'Permanent home');
+        if (e) return e;
+    }
+
+    // 3. Government ID & tax
+    e = req(b.aadhaarNumber, 'Aadhaar number') || req(b.panNumber, 'PAN number');
+    if (e) return e;
+    if (!AADHAAR_RE.test(String(b.aadhaarNumber).replace(/\s/g, ''))) return 'Aadhaar number must be 12 digits';
+    if (!PAN_RE.test(String(b.panNumber).trim())) return 'PAN number looks invalid (e.g. ABCDE1234F)';
+    if (!file('aadhaarFront')) return 'Aadhaar card front image is required';
+    if (!file('aadhaarBack'))  return 'Aadhaar card back image is required';
+    if (!file('panCard'))      return 'PAN card upload is required';
+
+    // 4. Education — "Other" swaps in a free-text value, which is then required
+    const qualification = b.qualification === 'Other' ? b.qualificationOther : b.qualification;
+    if (!String(qualification ?? '').trim())
+        return b.qualification === 'Other' ? 'Please type the other qualification' : 'Highest qualification is required';
+    if (b.teachingDegree === 'Other' && !String(b.teachingDegreeOther ?? '').trim())
+        return 'Please type the other teaching degree';
+
+    // 5. Work experience
+    if (!['fresher', 'experienced'].includes(b.employmentType))
+        return 'Select whether the teacher is a fresher or experienced';
+    if (b.employmentType === 'experienced') {
+        e = req(b.totalExperience, 'Total years of experience')
+            || req(b.previousSchool, 'Name of previous school')
+            || req(b.lastDesignation, 'Last job designation');
+        if (e) return e;
+        if (!file('resignationLetter')) return 'Resignation letter of the last company is required';
+    }
+
+    // 6. Bank
+    e = req(b.bankAccountHolder, 'Bank account holder name')
+        || req(b.bankAccountNumber, 'Bank account number')
+        || req(b.bankIfsc, 'IFSC code')
+        || req(b.bankBranch, 'Bank branch name');
+    if (e) return e;
+    if (!/^\d{6,20}$/.test(String(b.bankAccountNumber).replace(/\s/g, ''))) return 'Bank account number must be 6–20 digits';
+    if (!IFSC_RE.test(String(b.bankIfsc).trim())) return 'IFSC code looks invalid (e.g. HDFC0001234)';
+
+    // 7. School internal
+    e = req(b.joiningDate, 'Date of joining');
+    if (e) return e;
+    if (Number.isNaN(new Date(b.joiningDate).getTime())) return 'Invalid date of joining';
+
+    return null;
+}
+
+/** Map the validated payload + uploads onto the TeacherProfile shape. */
+function buildTeacherProfile(b, files = {}) {
+    const file = (key) => files[key]?.[0]?.filename || '';
+    const pick = (value, other) => (value === 'Other' ? String(other || '').trim() : String(value || '').trim());
+
+    return {
+        designation:  b.designation || '',
+        dob:          b.dob ? new Date(b.dob) : null,
+        gender:       b.gender || '',
+        bloodGroup:   b.bloodGroup || '',
+        fatherOrHusbandName:   String(b.fatherOrHusbandName || '').trim(),
+        emergencyContactName:  String(b.emergencyContactName || '').trim(),
+        emergencyContactPhone: String(b.emergencyContactPhone || '').trim(),
+
+        alternatePhone:   String(b.alternatePhone || '').trim(),
+        currentAddress:   String(b.currentAddress || '').trim(),
+        currentCity:      String(b.currentCity    || '').trim(),
+        currentState:     String(b.currentState   || '').trim(),
+        currentPincode:   String(b.currentPincode || '').trim(),
+        currentCountry:   String(b.currentCountry || 'India').trim(),
+        // "Same as current" copies the whole block, not just the street line
+        ...(isTrue(b.sameAsCurrent) ? {
+            permanentAddress: String(b.currentAddress || '').trim(),
+            permanentCity:    String(b.currentCity    || '').trim(),
+            permanentState:   String(b.currentState   || '').trim(),
+            permanentPincode: String(b.currentPincode || '').trim(),
+            permanentCountry: String(b.currentCountry || 'India').trim(),
+        } : {
+            permanentAddress: String(b.permanentAddress || '').trim(),
+            permanentCity:    String(b.permanentCity    || '').trim(),
+            permanentState:   String(b.permanentState   || '').trim(),
+            permanentPincode: String(b.permanentPincode || '').trim(),
+            permanentCountry: String(b.permanentCountry || 'India').trim(),
+        }),
+
+        aadhaarNumber:    String(b.aadhaarNumber || '').replace(/\s/g, ''),
+        aadhaarFrontFile: file('aadhaarFront'),
+        aadhaarBackFile:  file('aadhaarBack'),
+        panNumber:        String(b.panNumber || '').trim().toUpperCase(),
+        panCardFile:      file('panCard'),
+        uanNumber:        String(b.uanNumber || '').trim(),
+
+        qualification:  pick(b.qualification, b.qualificationOther),
+        teachingDegree: pick(b.teachingDegree, b.teachingDegreeOther),
+
+        employmentType:  b.employmentType,
+        totalExperience: b.employmentType === 'experienced' ? String(b.totalExperience || '').trim() : '',
+        previousSchool:  b.employmentType === 'experienced' ? String(b.previousSchool || '').trim()  : '',
+        lastDesignation: b.employmentType === 'experienced' ? String(b.lastDesignation || '').trim() : '',
+        // Legacy free-text field kept in step with the structured answer
+        experience: b.employmentType === 'experienced' ? String(b.totalExperience || '').trim() : 'Fresher',
+        experienceCertificateFile: file('experienceCertificate'),
+        resignationLetterFile:     file('resignationLetter'),
+        joiningLetterFile:         file('joiningLetter'),
+
+        bankAccountHolder: String(b.bankAccountHolder || '').trim(),
+        bankAccountNumber: String(b.bankAccountNumber || '').replace(/\s/g, ''),
+        bankIfsc:          String(b.bankIfsc || '').trim().toUpperCase(),
+        bankBranch:        String(b.bankBranch || '').trim(),
+
+        joiningDate: b.joiningDate ? new Date(b.joiningDate) : null,
+    };
+}
+
 exports.createTeacher = async (req, res) => {
     try {
-        const { name, email, phone, designation, password } = req.body;
-        if (!name?.trim())  return res.status(400).json({ success: false, message: 'Full name is required' });
-        if (!email?.trim()) return res.status(400).json({ success: false, message: 'Email is required' });
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, message: 'Invalid email format' });
-        if (phone && !/^[+\d\s\-]{7,15}$/.test(phone)) return res.status(400).json({ success: false, message: 'Invalid phone number' });
-        const exists = await User.findOne({ email: email.toLowerCase() });
+        const b     = req.body;
+        const files = req.files || {};
+        const { name, email, phone, designation } = b;
+
+        const problem = validateTeacherIntake(b, files);
+        if (problem) return res.status(400).json({ success: false, message: problem });
+
+        const exists = await User.findOne({ email: String(email).toLowerCase() });
         if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
 
-        const otp = generateOTP();
+        // Employee ID: use what was typed, else generate from the school's format
+        const schoolDoc = await School.findById(req.schoolId).select('name code employeeIdFormat').lean();
+        const typedId   = String(b.employeeId || '').trim();
+        let employeeId  = typedId;
+        if (typedId) {
+            const idTaken = await TeacherProfile.findOne({ school: req.schoolId, employeeId: typedId }).lean();
+            if (idTaken) return res.status(400).json({ success: false, message: `Employee ID ${typedId} is already in use.` });
+        } else {
+            employeeId = await employeeIdUtil.nextEmployeeId(schoolDoc || { _id: req.schoolId });
+        }
+
+        const otp  = generateOTP();
         const user = await createUserHelper({ name, email, phone, designation, password: otp }, 'teacher', req.schoolId);
-        await TeacherProfile.create({ user: user._id, school: req.schoolId, designation: designation || '' });
+        await TeacherProfile.create({
+            user: user._id,
+            school: req.schoolId,
+            employeeId,
+            ...buildTeacherProfile(b, files),
+        });
+
         const schoolName = req.user?.school?.name || 'School';
         sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
-        jsonOk(res, user, 201);
+        jsonOk(res, { ...user.toObject?.() ?? user, employeeId }, 201);
     } catch (err) { jsonErr(res, err, 400); }
 };
 
@@ -1054,6 +1234,27 @@ exports.previewAdmissionNumber = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+// Live preview of the next employee ID for a given (unsaved) format
+exports.previewEmployeeId = async (req, res) => {
+    try {
+        const school = await School.findById(req.schoolId).select('name code employeeIdFormat').lean();
+        if (!school) return res.status(404).json({ success: false, message: 'School not found' });
+
+        const format = String(req.query.format || school.employeeIdFormat || employeeIdUtil.DEFAULT_FORMAT).trim();
+        const fmtErr = employeeIdUtil.validateFormat(format);
+        if (fmtErr) return res.status(400).json({ success: false, message: fmtErr });
+
+        jsonOk(res, {
+            format,
+            samples: [
+                await employeeIdUtil.previewEmployeeId(format, school, 1),
+                await employeeIdUtil.previewEmployeeId(format, school, 2),
+            ],
+            next: await employeeIdUtil.nextEmployeeId({ ...school, employeeIdFormat: format }),
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
 // Static list for the address form's state dropdown
 exports.getStates = (_req, res) => jsonOk(res, STATES_AND_UTS);
 
@@ -1123,7 +1324,7 @@ exports.updateDesignations = async (req, res) => {
 exports.getSchoolSettings = async (req, res) => {
     try {
         const school = await School.findById(req.schoolId)
-            .select('name code email phone website logo leaveSettings admissionNumberFormat')
+            .select('name code email phone website logo leaveSettings admissionNumberFormat employeeIdFormat')
             .lean();
         if (!school) return res.status(404).json({ success: false, message: 'School not found' });
         res.json({ success: true, data: school });
@@ -1151,6 +1352,12 @@ exports.updateSchoolSettings = async (req, res) => {
             if (fmtErr) return res.status(400).json({ success: false, message: fmtErr });
             update.admissionNumberFormat = fmt;
         }
+        if (req.body.employeeIdFormat !== undefined) {
+            const fmt = String(req.body.employeeIdFormat).trim();
+            const fmtErr = employeeIdUtil.validateFormat(fmt);
+            if (fmtErr) return res.status(400).json({ success: false, message: fmtErr });
+            update.employeeIdFormat = fmt;
+        }
 
         // leaveSettings may arrive as JSON string (FormData) or object (JSON body)
         let ls = req.body.leaveSettings;
@@ -1173,7 +1380,7 @@ exports.updateSchoolSettings = async (req, res) => {
         }
 
         const school = await School.findByIdAndUpdate(
-            req.schoolId, update, { new: true, select: 'name code email phone website logo leaveSettings admissionNumberFormat' }
+            req.schoolId, update, { new: true, select: 'name code email phone website logo leaveSettings admissionNumberFormat employeeIdFormat' }
         ).lean();
 
         if (previousLogo && previousLogo !== school?.logo) deleteSchoolLogo(previousLogo);

@@ -47,6 +47,8 @@ const TeacherProfileSchema = new db.Schema({
         type: [String],
         default: [],
     },
+    // Highest qualification. When the admin picks "Other" the typed text is
+    // stored here directly, so downstream screens never special-case it.
     qualification: {
         type: String,
         default: '',
@@ -55,6 +57,53 @@ const TeacherProfileSchema = new db.Schema({
         type: String,
         default: '',
     },
+
+    // ── Personal ────────────────────────────────────────────────────────────
+    bloodGroup:            { type: String, default: '' },
+    fatherOrHusbandName:   { type: String, default: '', trim: true },
+    emergencyContactName:  { type: String, default: '', trim: true },
+    emergencyContactPhone: { type: String, default: '', trim: true },
+
+    // ── Contact ─────────────────────────────────────────────────────────────
+    alternatePhone:   { type: String, default: '', trim: true },
+    // Street / house line; city–state–pincode are stored separately so they can
+    // be filtered on and auto-filled from the PIN code — same shape as StudentProfile.
+    currentAddress:   { type: String, default: '', trim: true },
+    currentCity:      { type: String, default: '', trim: true },
+    currentState:     { type: String, default: '', trim: true },
+    currentPincode:   { type: String, default: '', trim: true },
+    currentCountry:   { type: String, default: 'India', trim: true },
+    permanentAddress: { type: String, default: '', trim: true },
+    permanentCity:    { type: String, default: '', trim: true },
+    permanentState:   { type: String, default: '', trim: true },
+    permanentPincode: { type: String, default: '', trim: true },
+    permanentCountry: { type: String, default: 'India', trim: true },
+
+    // ── Government ID & tax ─────────────────────────────────────────────────
+    aadhaarNumber:    { type: String, default: '', trim: true },
+    aadhaarFrontFile: { type: String, default: '' },
+    aadhaarBackFile:  { type: String, default: '' },
+    panNumber:        { type: String, default: '', trim: true },
+    panCardFile:      { type: String, default: '' },
+    uanNumber:        { type: String, default: '', trim: true },
+
+    // ── Education ───────────────────────────────────────────────────────────
+    teachingDegree: { type: String, default: '' },
+
+    // ── Work experience ─────────────────────────────────────────────────────
+    employmentType:  { type: String, enum: ['fresher', 'experienced', ''], default: '' },
+    totalExperience: { type: String, default: '', trim: true },
+    previousSchool:  { type: String, default: '', trim: true },
+    lastDesignation: { type: String, default: '', trim: true },
+    experienceCertificateFile: { type: String, default: '' },
+    resignationLetterFile:     { type: String, default: '' },
+    joiningLetterFile:         { type: String, default: '' },
+
+    // ── Bank ────────────────────────────────────────────────────────────────
+    bankAccountHolder: { type: String, default: '', trim: true },
+    bankAccountNumber: { type: String, default: '', trim: true },
+    bankIfsc:          { type: String, default: '', trim: true },
+    bankBranch:        { type: String, default: '', trim: true },
     createdAt: {
         type: Date,
         default: Date.now,

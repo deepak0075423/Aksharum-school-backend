@@ -77,6 +77,12 @@ const SchoolSchema = new db.Schema({
         default: '{INITIALS}{YYYY}{####}',
         trim: true,
     },
+    // Separate template for employee / teacher IDs — see utils/employeeId.js
+    employeeIdFormat: {
+        type: String,
+        default: '{INITIALS}{####}',
+        trim: true,
+    },
     modules: {
         attendance: {
             type: Boolean,

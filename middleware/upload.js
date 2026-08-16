@@ -57,4 +57,7 @@ const uploadCsv      = multer({ storage: multer.memoryStorage(),   fileFilter: e
 const uploadChat     = multer({ storage: diskStorage('chat'),      fileFilter: chatFilter,  limits: { fileSize: 10 * 1024 * 1024 } });
 const uploadVideo    = multer({ storage: diskStorage('videos'),    fileFilter: videoFilter, limits: { fileSize: 2 * 1024 * 1024 * 1024 } }); // 2 GB
 
-module.exports = { uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo };
+// Staff paperwork: Aadhaar / PAN scans, experience, resignation & joining letters
+const uploadStaffDoc = multer({ storage: diskStorage('staff-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024 } });
+
+module.exports = { uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc };

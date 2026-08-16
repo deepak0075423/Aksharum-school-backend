@@ -15,7 +15,7 @@ const docCtrl        = require('../../controllers/document.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule  = require('../../middleware/requireModule');
-const { uploadExcel, uploadDocument, uploadCsv, uploadLeaveDoc, uploadImage } = require('../../middleware/upload');
+const { uploadExcel, uploadDocument, uploadCsv, uploadLeaveDoc, uploadImage, uploadStaffDoc } = require('../../middleware/upload');
 const School         = require('../../models/School');
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('school_admin')];
@@ -82,7 +82,11 @@ router.patch('/users/:id/toggle',   guard, adminCtrl.toggleUser);
 
 // Teachers
 router.get('/teachers',                     guard, adminCtrl.getTeachers);
-router.post('/teachers',                    guard, adminCtrl.createTeacher);
+router.post('/teachers',                    guard, uploadStaffDoc.fields([
+    { name: 'aadhaarFront', maxCount: 1 }, { name: 'aadhaarBack', maxCount: 1 },
+    { name: 'panCard', maxCount: 1 }, { name: 'experienceCertificate', maxCount: 1 },
+    { name: 'resignationLetter', maxCount: 1 }, { name: 'joiningLetter', maxCount: 1 },
+]), adminCtrl.createTeacher);
 router.post('/teachers/bulk',               guard, uploadExcel.single('excelFile'), adminCtrl.bulkTeachers);
 router.get('/teachers/template',            guard, adminCtrl.downloadTeacherTemplate);
 router.delete('/teachers/:id',              guard, adminCtrl.deleteUser);
@@ -98,6 +102,7 @@ router.get('/students/parent-lookup',       guard, adminCtrl.parentLookup);
 // Address helpers for the student form
 router.get('/states',            guard, adminCtrl.getStates);
 router.get('/admission-number/preview', guard, adminCtrl.previewAdmissionNumber);
+router.get('/employee-id/preview',      guard, adminCtrl.previewEmployeeId);
 router.get('/pincode/:pincode',  guard, adminCtrl.pincodeLookup);
 router.delete('/students/:id',              guard, adminCtrl.deleteUser);
 router.get('/students/:id',                 guard, adminCtrl.getStudentDetail);
