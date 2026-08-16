@@ -504,13 +504,14 @@ exports.createStudent = async (req, res) => {
         // Admission number: use what was typed, otherwise generate from the
         // school's configured format.
         const schoolDoc = await School.findById(req.schoolId).select('name code admissionNumberFormat').lean();
+        const classDoc  = await Class.findById(classId).select('className classNumber').lean();
         const typedAdm  = String(profile.admissionNumber ?? '').trim();
         if (typedAdm) {
             const admTaken = await StudentProfile.findOne({ school: req.schoolId, admissionNumber: typedAdm }).lean();
             if (admTaken) return res.status(400).json({ success: false, message: `Admission number ${typedAdm} is already in use.` });
             profile.admissionNumber = typedAdm;
         } else {
-            profile.admissionNumber = await admissionNo.nextAdmissionNumber(schoolDoc || { _id: req.schoolId });
+            profile.admissionNumber = await admissionNo.nextAdmissionNumber(schoolDoc || { _id: req.schoolId }, classDoc);
         }
 
         // Roll number is optional at intake — sections assign them in bulk later
@@ -842,7 +843,7 @@ exports.bulkStudents = async (req, res) => {
                 }
 
                 // Blank in the sheet → generated from the school's format
-                const admissionNumber = admNo || await admissionNo.nextAdmissionNumber(bulkSchool);
+                const admissionNumber = admNo || await admissionNo.nextAdmissionNumber(bulkSchool, clasDoc);
                 const profileData = {
                     school: req.schoolId, admissionNumber,
                     dob, gender, bloodGroup, category,
@@ -1032,13 +1033,23 @@ exports.previewAdmissionNumber = async (req, res) => {
         const fmtErr = admissionNo.validateFormat(format);
         if (fmtErr) return res.status(400).json({ success: false, message: fmtErr });
 
+        // {CLASS}/{CLASSNO} need a class to render — preview against a real one
+        const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).select('_id').lean();
+        const classes = await Class.find({
+            school: req.schoolId, ...(activeYear ? { academicYear: activeYear._id } : {}),
+        }).select('className classNumber').lean();
+        // Stable pick so the preview doesn't jump between classes
+        const classDoc = classes.sort((a, b) =>
+            String(a.className).localeCompare(String(b.className), 'en', { numeric: true }))[0] || null;
+
         jsonOk(res, {
             format,
+            sampleClass: classDoc?.className || null,
             samples: [
-                await admissionNo.previewAdmissionNumber(format, school, 1),
-                await admissionNo.previewAdmissionNumber(format, school, 2),
+                await admissionNo.previewAdmissionNumber(format, school, 1, classDoc),
+                await admissionNo.previewAdmissionNumber(format, school, 2, classDoc),
             ],
-            next: await admissionNo.nextAdmissionNumber({ ...school, admissionNumberFormat: format }),
+            next: await admissionNo.nextAdmissionNumber({ ...school, admissionNumberFormat: format }, classDoc),
         });
     } catch (err) { jsonErr(res, err); }
 };
