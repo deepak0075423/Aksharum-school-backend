@@ -11,6 +11,27 @@ const ParentProfileSchema = new db.Schema({
         ref: 'School',
         required: true,
     },
+    // Full details for each guardian. The login account belongs to whichever of
+    // them `relationship` names; the others are contact records only.
+    father: {
+        name:       { type: String, default: '' },
+        email:      { type: String, default: '' },
+        phone:      { type: String, default: '' },
+        occupation: { type: String, default: '' },
+    },
+    mother: {
+        name:       { type: String, default: '' },
+        email:      { type: String, default: '' },
+        phone:      { type: String, default: '' },
+        occupation: { type: String, default: '' },
+    },
+    guardian: {
+        name:       { type: String, default: '' },
+        email:      { type: String, default: '' },
+        phone:      { type: String, default: '' },
+        occupation: { type: String, default: '' },
+    },
+    // Kept in sync with the blocks above — the mobile profile screens read these
     fatherOccupation: {
         type: String,
         default: '',

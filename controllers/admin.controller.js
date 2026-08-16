@@ -16,6 +16,7 @@ const { notify } = require('../services/notifyService');
 const { validate, isEmail, isPhone, isURL } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
+const { STATES_AND_UTS, isPincode, stateFromPincode } = require('../utils/indiaStates');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -68,6 +69,118 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName, schoolId = null) => 
 
 const jsonOk  = (res, data, status = 200) => res.status(status).json({ success: true,  data });
 const jsonErr = (res, err, status = 500)  => res.status(status).json({ success: false, message: err.message || err });
+
+// ── Student profile: required demographic + address fields ────────────────────
+// Enforced here as well as in the form so bulk/API callers cannot skip them.
+const REQUIRED_PROFILE_FIELDS = [
+    ['dob',        'Date of birth'],
+    ['gender',     'Gender'],
+    ['bloodGroup', 'Blood group'],
+    ['category',   'Category'],
+    ['address',    'Address'],
+    ['city',       'City'],
+    ['state',      'State'],
+    ['pincode',    'PIN code'],
+];
+
+function validateStudentProfile(profile = {}, { partial = false } = {}) {
+    for (const [key, label] of REQUIRED_PROFILE_FIELDS) {
+        // On edit, only validate the fields the client actually sent
+        if (partial && profile[key] === undefined) continue;
+        if (!String(profile[key] ?? '').trim()) return `${label} is required`;
+    }
+    if (profile.dob !== undefined && profile.dob && Number.isNaN(new Date(profile.dob).getTime()))
+        return 'Invalid date of birth';
+    if (profile.pincode !== undefined && String(profile.pincode || '').trim() && !isPincode(profile.pincode))
+        return 'PIN code must be 6 digits';
+    if (profile.state !== undefined && String(profile.state || '').trim() && !STATES_AND_UTS.includes(String(profile.state).trim()))
+        return 'Select a valid state or union territory';
+    return null;
+}
+
+/**
+ * Resolve the parent account for a student.
+ *
+ * `newParent` accepts the full shape — { father, mother, guardian, accountFor }
+ * — where each block is { name, email, phone, occupation }. The login account is
+ * created for (or linked to) whoever `accountFor` names; the other guardians are
+ * stored on the ParentProfile as contact records. The older flat shape
+ * ({ name, email, phone }, still sent by the mobile app) keeps working.
+ *
+ * @returns {Promise<{ parentId: String|null, error: String|null }>}
+ */
+async function resolveNewParent(newParent, { schoolId, schoolName }) {
+    if (!newParent) return { parentId: null, error: null };
+
+    const blocks = ['father', 'mother', 'guardian'].reduce((acc, key) => {
+        const b = newParent[key] || {};
+        acc[key] = {
+            name:       String(b.name || '').trim(),
+            email:      String(b.email || '').trim().toLowerCase(),
+            phone:      String(b.phone || '').trim(),
+            occupation: String(b.occupation || '').trim(),
+        };
+        return acc;
+    }, {});
+
+    const isStructured = Object.values(blocks).some(b => b.name || b.email);
+    const accountFor   = ['Father', 'Mother', 'Guardian'].includes(newParent.accountFor)
+        ? newParent.accountFor
+        : 'Guardian';
+
+    // Legacy flat payload — treat it as the guardian block
+    if (!isStructured) {
+        if (!newParent.name || !newParent.email) return { parentId: null, error: null };
+        blocks.guardian = {
+            name:  String(newParent.name).trim(),
+            email: String(newParent.email).trim().toLowerCase(),
+            phone: String(newParent.phone || '').trim(),
+            occupation: '',
+        };
+    }
+
+    const holderKey = (isStructured ? accountFor : 'Guardian').toLowerCase();
+    const holder    = blocks[holderKey];
+    if (!holder.name)  return { parentId: null, error: `${accountFor}'s name is required to create the parent account` };
+    if (!holder.email) return { parentId: null, error: `${accountFor}'s email is required to create the parent account` };
+    if (!isEmail(holder.email)) return { parentId: null, error: `${accountFor}'s email is not a valid email address` };
+    for (const [key, b] of Object.entries(blocks)) {
+        if (b.email && !isEmail(b.email)) return { parentId: null, error: `${key[0].toUpperCase() + key.slice(1)}'s email is not a valid email address` };
+        if (b.phone && !isPhone(b.phone)) return { parentId: null, error: `${key[0].toUpperCase() + key.slice(1)}'s phone number is not valid` };
+    }
+
+    // Link to the existing account when that email is already registered
+    let parentUser = await User.findOne({ email: holder.email });
+    if (parentUser && parentUser.role !== 'parent')
+        return { parentId: null, error: `${holder.email} already belongs to a ${String(parentUser.role).replace('_', ' ')} account — use a different email for the parent` };
+    if (parentUser && String(parentUser.school) !== String(schoolId))
+        return { parentId: null, error: `${holder.email} is registered with another school` };
+    if (!parentUser) {
+        const otp = generateOTP();
+        parentUser = await createUserHelper(
+            { name: holder.name, email: holder.email, phone: holder.phone, password: otp },
+            'parent', schoolId,
+        );
+        sendWelcomeEmail(holder.email, holder.name, holder.email, otp, schoolName, schoolId);
+    }
+
+    await ParentProfile.findOneAndUpdate(
+        { user: parentUser._id },
+        {
+            $set: {
+                father: blocks.father, mother: blocks.mother, guardian: blocks.guardian,
+                fatherOccupation:   blocks.father.occupation,
+                motherOccupation:   blocks.mother.occupation,
+                guardianOccupation: blocks.guardian.occupation,
+                relationship: isStructured ? accountFor : 'Guardian',
+            },
+            $setOnInsert: { school: schoolId },
+        },
+        { upsert: true },
+    );
+
+    return { parentId: parentUser._id, error: null };
+}
 
 exports.getDashboard = async (req, res) => {
     try {
@@ -193,7 +306,9 @@ exports.getStudentDetail = async (req, res) => {
 
 exports.updateStudentFull = async (req, res) => {
     try {
-        const { name, phone, password, rollNumber, admissionNumber, dob, gender, bloodGroup, category, address, currentSection, parentId, newParent } = req.body;
+        const { name, phone, password, rollNumber, admissionNumber, dob, gender, bloodGroup,
+                category, address, city, state, pincode, country,
+                currentSection, parentId, newParent } = req.body;
 
         // Update User fields
         const userUpdate = {};
@@ -203,8 +318,13 @@ exports.updateStudentFull = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid phone number' });
         if (rollNumber !== undefined && !String(rollNumber).trim())
             return res.status(400).json({ success: false, message: 'Roll number is required' });
-        if (dob && Number.isNaN(new Date(dob).getTime()))
-            return res.status(400).json({ success: false, message: 'Invalid date of birth' });
+        // Only the demographic/address fields actually submitted are checked, so
+        // partial updates from other screens still work.
+        const profileErr = validateStudentProfile(
+            { dob, gender, bloodGroup, category, address, city, state, pincode },
+            { partial: true },
+        );
+        if (profileErr) return res.status(400).json({ success: false, message: profileErr });
         if (password) {
             if (password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
             userUpdate.password = await bcrypt.hash(password, 12);
@@ -215,18 +335,11 @@ exports.updateStudentFull = async (req, res) => {
 
         // Resolve parent
         let resolvedParentId = parentId !== undefined ? (parentId || null) : undefined;
-        if (resolvedParentId === undefined && newParent?.name && newParent?.email) {
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newParent.email)) return res.status(400).json({ success: false, message: 'Invalid parent email format' });
-            const existing = await User.findOne({ email: newParent.email.toLowerCase() });
-            if (existing) {
-                resolvedParentId = existing._id;
-            } else {
-                const parentOtp = generateOTP();
-                const parent = await createUserHelper({ name: newParent.name, email: newParent.email, phone: newParent.phone || '', password: parentOtp }, 'parent', req.schoolId);
-                resolvedParentId = parent._id;
-                const schoolName = req.user?.school?.name || 'School';
-                sendWelcomeEmail(newParent.email, newParent.name, newParent.email, parentOtp, schoolName, req.schoolId);
-            }
+        if (resolvedParentId === undefined && newParent) {
+            const schoolName = req.user?.school?.name || 'School';
+            const { parentId: newId, error } = await resolveNewParent(newParent, { schoolId: req.schoolId, schoolName });
+            if (error) return res.status(400).json({ success: false, message: error });
+            if (newId) resolvedParentId = newId;
         }
 
         // Update StudentProfile fields
@@ -238,6 +351,10 @@ exports.updateStudentFull = async (req, res) => {
         if (bloodGroup      !== undefined) profileUpdate.bloodGroup      = bloodGroup;
         if (category        !== undefined) profileUpdate.category        = category;
         if (address         !== undefined) profileUpdate.address         = address;
+        if (city            !== undefined) profileUpdate.city            = city;
+        if (state           !== undefined) profileUpdate.state           = state;
+        if (pincode         !== undefined) profileUpdate.pincode         = pincode;
+        if (country         !== undefined) profileUpdate.country         = country || 'India';
         if (resolvedParentId !== undefined) profileUpdate.parent         = resolvedParentId;
         if (currentSection  !== undefined) profileUpdate.currentSection  = currentSection || null;
 
@@ -334,25 +451,19 @@ exports.createStudent = async (req, res) => {
         if (phone && !/^[+\d\s\-]{7,15}$/.test(phone)) return res.status(400).json({ success: false, message: 'Invalid phone number' });
         if (!profile.rollNumber || !String(profile.rollNumber).trim())
             return res.status(400).json({ success: false, message: 'Roll number is required' });
-        if (profile.dob && Number.isNaN(new Date(profile.dob).getTime()))
-            return res.status(400).json({ success: false, message: 'Invalid date of birth' });
+        const profileErr = validateStudentProfile(profile);
+        if (profileErr) return res.status(400).json({ success: false, message: profileErr });
         const exists = await User.findOne({ email: email.toLowerCase() });
         if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
 
-        // Auto-create parent if new parent details provided
+        // Create (or link) the parent account before the student, so a bad
+        // parent payload doesn't leave a student behind
         const schoolName = req.user?.school?.name || 'School';
         let resolvedParentId = parentId || null;
-        if (!resolvedParentId && newParent?.name && newParent?.email) {
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newParent.email)) return res.status(400).json({ success: false, message: 'Invalid parent email format' });
-            const parentExists = await User.findOne({ email: newParent.email.toLowerCase() });
-            if (parentExists) {
-                resolvedParentId = parentExists._id;
-            } else {
-                const parentOtp = generateOTP();
-                const parent = await createUserHelper({ name: newParent.name, email: newParent.email, phone: newParent.phone || '', password: parentOtp }, 'parent', req.schoolId);
-                resolvedParentId = parent._id;
-                sendWelcomeEmail(newParent.email, newParent.name, newParent.email, parentOtp, schoolName, req.schoolId);
-            }
+        if (!resolvedParentId) {
+            const { parentId: newId, error } = await resolveNewParent(newParent, { schoolId: req.schoolId, schoolName });
+            if (error) return res.status(400).json({ success: false, message: error });
+            resolvedParentId = newId;
         }
 
         const otp = generateOTP();
@@ -550,6 +661,9 @@ exports.bulkStudents = async (req, res) => {
             const className   = r['class']               || '';
             const sectionName = r['section']             || '';
             const address     = r['address']             || '';
+            const city        = r['city']                || '';
+            const stateName   = r['state']               || '';
+            const pincode     = String(r['pincode'] || r['pin code'] || r['postal code'] || '').trim();
             const parentName  = r['parent full name']    || r['parent name'] || '';
             const parentEmail = (r['parent email']       || '').toLowerCase();
             const parentPhone = r['parent phone number'] || r['parent phone'] || '';
@@ -641,7 +755,15 @@ exports.bulkStudents = async (req, res) => {
 
                 const otp = generateOTP();
                 const studentUser = await createUserHelper({ name, email, phone, password: otp }, 'student', req.schoolId);
-                await StudentProfile.create({ user: studentUser._id, school: req.schoolId, admissionNumber: admNo, dob, gender, bloodGroup, category, address, currentSection: section._id, parent: parentUserId });
+                await StudentProfile.create({
+                    user: studentUser._id, school: req.schoolId, admissionNumber: admNo,
+                    dob, gender, bloodGroup, category,
+                    address, city, state: stateName, pincode,
+                    // PIN prefix fills the state in when the sheet leaves it blank
+                    ...(stateName ? {} : { state: stateFromPincode(pincode) }),
+                    country: 'India',
+                    currentSection: section._id, parent: parentUserId,
+                });
                 await ParentProfile.findOneAndUpdate({ user: parentUserId }, { $addToSet: { children: studentUser._id } });
                 sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
 
@@ -666,13 +788,13 @@ exports.downloadStudentTemplate = (req, res) => {
     const headers = [
         'Full Name', 'Email Address', 'Phone Number', 'Admission Number',
         'Date of Birth', 'Gender', 'Blood Group', 'Category',
-        'Class', 'Section', 'Address',
+        'Class', 'Section', 'Address', 'City', 'State', 'Pincode',
         'Parent Full Name', 'Parent Email', 'Parent Phone Number',
     ];
     const sample = [
         'Ravi Kumar', 'ravi.kumar@example.com', '9876543210', 'ADM2024001',
         '15/08/2010', 'Male', 'B+', 'General',
-        'Class 10', 'A', '123 Main Street, City',
+        'Class 10', 'A', '123 Main Street', 'Pune', 'Maharashtra', '411001',
         'Suresh Kumar', 'suresh.kumar@example.com', '9876543200',
     ];
 
@@ -680,8 +802,9 @@ exports.downloadStudentTemplate = (req, res) => {
     const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
 
     // Force text format on columns that Excel would otherwise misinterpret:
-    // col 2 = Phone Number, col 3 = Admission Number, col 4 = Date of Birth, col 13 = Parent Phone
-    [2, 3, 4, 13].forEach(col => {
+    // col 2 = Phone Number, col 3 = Admission Number, col 4 = Date of Birth,
+    // col 13 = Pincode, col 16 = Parent Phone
+    [2, 3, 4, 13, 16].forEach(col => {
         const addr = XLSX.utils.encode_cell({ r: 1, c: col });
         if (ws[addr]) { ws[addr].t = 's'; ws[addr].z = '@'; }
     });
@@ -728,6 +851,66 @@ exports.checkEmail = async (req, res) => {
 // Parent search for the student form. Returns every match (not just the first)
 // so an admin can pick the right parent and link them to as many children as
 // they have — one parent account is shared across all their students.
+// ── PIN code → country / state / city ─────────────────────────────────────────
+// Proxied through the API (not called from the browser) so the response can be
+// cached and a CORS-less public API stays server-side. When India Post is
+// unreachable the PIN prefix still yields the state, so the form is never stuck.
+const PIN_CACHE = new Map();          // pincode -> resolved payload
+const PIN_CACHE_MAX = 2000;
+
+exports.pincodeLookup = async (req, res) => {
+    const pincode = String(req.params.pincode || '').trim();
+    if (!isPincode(pincode))
+        return res.status(400).json({ success: false, message: 'PIN code must be 6 digits' });
+
+    if (PIN_CACHE.has(pincode)) return jsonOk(res, PIN_CACHE.get(pincode));
+
+    const fallback = {
+        pincode,
+        country: 'India',
+        state:   stateFromPincode(pincode),
+        city:    '',
+        district: '',
+        areas:   [],
+        source:  'offline',
+    };
+
+    let result = fallback;
+    try {
+        const r = await fetch(`https://api.postalpincode.in/pincode/${pincode}`, {
+            signal: AbortSignal.timeout(4000),
+        });
+        if (r.ok) {
+            const body = await r.json();
+            const entry = Array.isArray(body) ? body[0] : null;
+            const offices = entry?.Status === 'Success' ? (entry.PostOffice || []) : [];
+            if (offices.length) {
+                const first = offices[0];
+                const state = STATES_AND_UTS.includes(first.State) ? first.State : stateFromPincode(pincode);
+                result = {
+                    pincode,
+                    country:  first.Country || 'India',
+                    state,
+                    city:     first.District || first.Division || '',
+                    district: first.District || '',
+                    areas:    [...new Set(offices.map(o => o.Name).filter(Boolean))],
+                    source:   'india-post',
+                };
+            }
+        }
+    } catch { /* offline / timeout — fall through to the prefix-derived state */ }
+
+    if (!result.state && !result.city)
+        return res.status(404).json({ success: false, message: `No location found for PIN code ${pincode}` });
+
+    if (PIN_CACHE.size >= PIN_CACHE_MAX) PIN_CACHE.clear();
+    PIN_CACHE.set(pincode, result);
+    jsonOk(res, result);
+};
+
+// Static list for the address form's state dropdown
+exports.getStates = (_req, res) => jsonOk(res, STATES_AND_UTS);
+
 exports.parentLookup = async (req, res) => {
     try {
         const { q } = req.query;

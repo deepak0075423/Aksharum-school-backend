@@ -95,6 +95,9 @@ router.put('/students/:id',                 guard, adminCtrl.updateStudentFull);
 router.post('/students/bulk',               guard, uploadExcel.single('excelFile'), adminCtrl.bulkStudents);
 router.get('/students/template',            guard, adminCtrl.downloadStudentTemplate);
 router.get('/students/parent-lookup',       guard, adminCtrl.parentLookup);
+// Address helpers for the student form
+router.get('/states',            guard, adminCtrl.getStates);
+router.get('/pincode/:pincode',  guard, adminCtrl.pincodeLookup);
 router.delete('/students/:id',              guard, adminCtrl.deleteUser);
 router.get('/students/:id',                 guard, adminCtrl.getStudentDetail);
 
