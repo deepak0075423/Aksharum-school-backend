@@ -16,3 +16,9 @@ uploads/
 
 # OS
 .DS_Store
+
+# Redis snapshots — Redis runs with dir set to this folder, so its RDB/AOF
+# persistence lands here. Machine-local cache, regenerated automatically.
+dump.rdb
+*.rdb
+*.aof
