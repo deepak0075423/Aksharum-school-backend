@@ -120,10 +120,14 @@ router.get('/classes-with-sections', guard, async (req, res) => {
             secFilter.academicYear   = activeYear._id;
             secFilter.status         = 'active';
         }
-        const classes  = await Class.find(classFilter).sort({ classNumber: 1 }).lean();
+        // Alphabetical (digit-aware) so dropdowns match the Classes page order
+        const byName = (key) => (a, b) =>
+            String(a[key] || '').localeCompare(String(b[key] || ''), 'en', { numeric: true, sensitivity: 'base' });
+        const classes  = (await Class.find(classFilter).lean()).sort(byName('className'));
         const sections = await ClassSection.find(secFilter).lean();
         const secMap   = {};
         sections.forEach(s => { const k = s.class.toString(); (secMap[k] = secMap[k] || []).push(s); });
+        Object.values(secMap).forEach(list => list.sort(byName('sectionName')));
         res.json({ success: true, data: classes.map(c => ({ ...c, sections: secMap[c._id.toString()] || [] })) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -139,6 +143,7 @@ router.patch('/academic-years/:id/set-active', guard, classCtrl.setActiveAcademi
 router.get('/classes',                        guard, classCtrl.getClasses);
 router.post('/classes',                       guard, classCtrl.createClass);
 router.get('/classes/:classId',               guard, classCtrl.getClassDetail);
+router.put('/classes/:classId',               guard, classCtrl.updateClass);
 router.delete('/classes/:classId',            guard, classCtrl.deleteClass);
 router.post('/classes/auto-assign',           guard, classCtrl.autoAssignStudents);
 router.post('/classes/:classId/sections',     guard, classCtrl.createSection);

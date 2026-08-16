@@ -24,6 +24,10 @@ async function findOverlappingYear(schoolId, startDate, endDate, excludeId = nul
     return AcademicYear.findOne(filter).lean();
 }
 
+// Alphabetical, but digit-aware so "Class 2" sorts before "Class 10"
+const byName = (key) => (a, b) =>
+    String(a[key] || '').localeCompare(String(b[key] || ''), 'en', { numeric: true, sensitivity: 'base' });
+
 const dmy = (d) => new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 const overlapMessage = (clash) =>
     `These dates overlap academic year "${clash.yearName}" (${dmy(clash.startDate)} – ${dmy(clash.endDate)}). Academic years cannot overlap.`;
@@ -116,10 +120,10 @@ exports.getClasses = async (req, res) => {
             const active = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
             if (active) filter.academicYear = active._id;
         }
-        const classes = await Class.find(filter)
+        const classes = (await Class.find(filter)
             .populate('academicYear', 'yearName status')
-            .sort({ classNumber: 1 })
-            .lean();
+            .lean())
+            .sort(byName('className'));
         const classIds = classes.map(c => c._id);
         const sections = await ClassSection.find({ class: { $in: classIds } }, 'class enrolledStudents').lean();
         const secMap = {};
@@ -191,9 +195,37 @@ exports.createClass = async (req, res) => {
 exports.getClassDetail = async (req, res) => {
     try {
         const cls = await Class.findById(req.params.classId).lean();
-        const sections = await ClassSection.find({ class: req.params.classId }).lean();
+        const sections = (await ClassSection.find({ class: req.params.classId }).lean())
+            .sort(byName('sectionName'));
         ok(res, { class: cls, sections });
     } catch (e) { err(res, e); }
+};
+exports.updateClass = async (req, res) => {
+    try {
+        const { name, className, status } = req.body;
+        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
+        if (!cls) return err(res, { message: 'Class not found' }, 404);
+
+        const update = {};
+        const label  = (className || name || '').trim();
+        if (label) {
+            const siblings = await Class.find(
+                { school: req.schoolId, academicYear: cls.academicYear, _id: { $ne: cls._id } },
+                'className',
+            ).lean();
+            if (siblings.some(c => c.className.trim().toLowerCase() === label.toLowerCase()))
+                return err(res, { message: `Class "${label}" already exists in this academic year.` }, 400);
+            update.className = label;
+        }
+        if (status && ['active', 'inactive', 'archived'].includes(status)) update.status = status;
+        if (!Object.keys(update).length) return err(res, { message: 'Nothing to update' }, 400);
+
+        const updated = await Class.findByIdAndUpdate(req.params.classId, update, { new: true }).lean();
+        ok(res, updated);
+    } catch (e) {
+        if (e.code === 11000) return err(res, { message: 'A class with this name already exists in this academic year.' }, 400);
+        err(res, e, 400);
+    }
 };
 exports.deleteClass = async (req, res) => {
     try {
