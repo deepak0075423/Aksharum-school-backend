@@ -15,7 +15,7 @@ const docCtrl        = require('../../controllers/document.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule  = require('../../middleware/requireModule');
-const { uploadExcel, uploadDocument, uploadCsv, uploadLeaveDoc, uploadImage, uploadStaffDoc } = require('../../middleware/upload');
+const { uploadExcel, uploadDocument, uploadCsv, uploadLeaveDoc, uploadImage, uploadStaffDoc, uploadStudentDoc } = require('../../middleware/upload');
 const School         = require('../../models/School');
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('school_admin')];
@@ -93,9 +93,12 @@ router.delete('/teachers/:id',              guard, adminCtrl.deleteUser);
 router.get('/teachers/:id',                 guard, adminCtrl.getTeacherDetail);
 
 // Students
+// Admission paperwork is posted as multipart; multer passes plain JSON bodies
+// straight through, so the mobile app's older JSON payload still works.
+const studentDocFields = uploadStudentDoc.fields(adminCtrl.STUDENT_DOC_FIELDS.map(name => ({ name, maxCount: 1 })));
 router.get('/students',                     guard, adminCtrl.getStudents);
-router.post('/students',                    guard, adminCtrl.createStudent);
-router.put('/students/:id',                 guard, adminCtrl.updateStudentFull);
+router.post('/students',                    guard, studentDocFields, adminCtrl.createStudent);
+router.put('/students/:id',                 guard, studentDocFields, adminCtrl.updateStudentFull);
 router.post('/students/bulk',               guard, uploadExcel.single('excelFile'), adminCtrl.bulkStudents);
 router.get('/students/template',            guard, adminCtrl.downloadStudentTemplate);
 router.get('/students/parent-lookup',       guard, adminCtrl.parentLookup);

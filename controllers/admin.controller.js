@@ -73,55 +73,261 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName, schoolId = null) => 
 const jsonOk  = (res, data, status = 200) => res.status(status).json({ success: true,  data });
 const jsonErr = (res, err, status = 500)  => res.status(status).json({ success: false, message: err.message || err });
 
+// Shared by the student and teacher intakes. Both post as multipart (ID scans
+// and certificates), so every value arrives as a string — booleans included.
+const AADHAAR_RE = /^\d{12}$/;
+const PAN_RE     = /^[A-Z]{5}\d{4}[A-Z]$/i;
+const IFSC_RE    = /^[A-Z]{4}0[A-Z0-9]{6}$/i;
+const isTrue = (v) => v === true || v === 'true' || v === 'on' || v === '1';
+
 // ── Student profile: required demographic + address fields ────────────────────
 // Enforced here as well as in the form so bulk/API callers cannot skip them.
+// `address`/`city`/`state`/`pincode` are the CURRENT address; the permanent one
+// is a separate prefixed block, required unless "same as current" is ticked.
 const REQUIRED_PROFILE_FIELDS = [
     ['dob',        'Date of birth'],
     ['gender',     'Gender'],
     ['bloodGroup', 'Blood group'],
     ['category',   'Category'],
-    ['address',    'Address'],
-    ['city',       'City'],
-    ['state',      'State'],
-    ['pincode',    'PIN code'],
+    ['nationality', 'Nationality'],
+    ['emergencyContactName',     'Emergency contact name'],
+    ['emergencyContactPhone',    'Emergency contact phone'],
+    ['emergencyContactRelation', 'Emergency contact relation to the student'],
+    ['aadhaarNumber', 'Aadhaar card number'],
+    ['address',    'Current address'],
+    ['city',       'Current city'],
+    ['state',      'Current state'],
+    ['pincode',    'Current PIN code'],
 ];
 
+// Transfer admissions only — gated on `isTransferStudent`. The migration
+// certificate stays optional; it is only issued when the board changes.
+const REQUIRED_TRANSFER_FIELDS = [
+    ['previousSchoolName',        'Previous school name'],
+    ['previousSchoolAddress',     'Previous school address'],
+    ['previousSchoolCity',        'Previous school city'],
+    ['previousSchoolState',       'Previous school state'],
+    ['previousSchoolPincode',     'Previous school PIN code'],
+    ['previousSchoolMedium',      'Previous school medium'],
+    ['previousSchoolBoard',       'Previous school board'],
+    ['previousClass',             'Previous class'],
+    ['previousAcademicYear',      'Previous academic year'],
+    ['previousSchoolLeavingDate', 'Previous school leaving date'],
+    ['previousSchoolContact',     'Previous school contact'],
+    ['tcNumber',                  'TC number'],
+    ['tcDate',                    'TC date'],
+];
+
+// Every StudentProfile field the intake form owns. Enrolment (class/section),
+// roll and admission numbers are handled separately because they carry their
+// own uniqueness checks.
+const STUDENT_PROFILE_KEYS = [
+    'dob', 'gender', 'bloodGroup', 'category', 'religion', 'nationality',
+    'emergencyContactName', 'emergencyContactPhone', 'emergencyContactRelation',
+    'address', 'city', 'state', 'pincode', 'country',
+    'permanentAddress', 'permanentCity', 'permanentState', 'permanentPincode', 'permanentCountry',
+    'sameAsCurrent', 'aadhaarNumber', 'isTransferStudent', 'previousSchoolCountry',
+    'previousSchoolStateBoardName',
+    ...REQUIRED_TRANSFER_FIELDS.map(([key]) => key),
+];
+
+// Multipart field name -> StudentProfile key. Kept in one place because the
+// route, the validator and the profile builder all need the same list.
+const STUDENT_FILE_MAP = {
+    photo:                 'photoFile',
+    aadhaarFront:          'aadhaarFrontFile',
+    aadhaarBack:           'aadhaarBackFile',
+    birthCertificate:      'birthCertificateFile',
+    casteCertificate:      'casteCertificateFile',
+    disabilityCertificate: 'disabilityCertificateFile',
+    medicalCertificate:    'medicalCertificateFile',
+    tc:                    'tcFile',
+    migrationCertificate:  'migrationCertificateFile',
+};
+
+// Guardian uploads are namespaced by role: fatherAadhaarFront, motherPanCard, …
+const PARENT_FILE_MAP = {
+    AadhaarFront: 'aadhaarFrontFile',
+    AadhaarBack:  'aadhaarBackFile',
+    PanCard:      'panCardFile',
+    Photo:        'photoFile',
+};
+const PARENT_ROLES = ['father', 'mother', 'guardian'];
+
+exports.STUDENT_DOC_FIELDS = [
+    ...Object.keys(STUDENT_FILE_MAP),
+    ...PARENT_ROLES.flatMap(role => Object.keys(PARENT_FILE_MAP).map(suffix => `${role}${suffix}`)),
+];
+
+/** `req.files` (multer .fields) -> { [fieldName]: storedFilename }. */
+const uploadedNames = (files = {}) => Object.fromEntries(
+    Object.entries(files).map(([key, list]) => [key, list?.[0]?.filename || '']).filter(([, v]) => v),
+);
+
+/**
+ * Accept a value that may arrive as a real object (JSON request) or as a JSON
+ * string (multipart request, where every field is text). Anything unparseable
+ * is treated as absent rather than throwing.
+ */
+function parseMaybeJson(value) {
+    if (value == null || value === '') return undefined;
+    if (typeof value !== 'string') return value;
+    try { return JSON.parse(value); } catch { return undefined; }
+}
+
 function validateStudentProfile(profile = {}, { partial = false } = {}) {
+    const sent = (key) => !partial || profile[key] !== undefined;
+    const missing = (key, label) => (sent(key) && !String(profile[key] ?? '').trim() ? `${label} is required` : null);
+
     for (const [key, label] of REQUIRED_PROFILE_FIELDS) {
         // On edit, only validate the fields the client actually sent
-        if (partial && profile[key] === undefined) continue;
-        if (!String(profile[key] ?? '').trim()) return `${label} is required`;
+        const err = missing(key, label);
+        if (err) return err;
     }
     if (profile.dob !== undefined && profile.dob && Number.isNaN(new Date(profile.dob).getTime()))
         return 'Invalid date of birth';
+    if (profile.emergencyContactPhone !== undefined && String(profile.emergencyContactPhone || '').trim()
+        && !isPhone(profile.emergencyContactPhone))
+        return 'Emergency contact phone is not valid';
+    if (profile.aadhaarNumber !== undefined && String(profile.aadhaarNumber || '').trim()
+        && !AADHAAR_RE.test(String(profile.aadhaarNumber).replace(/\s/g, '')))
+        return 'Aadhaar number must be 12 digits';
     if (profile.pincode !== undefined && String(profile.pincode || '').trim() && !isPincode(profile.pincode))
-        return 'PIN code must be 6 digits';
+        return 'Current PIN code must be 6 digits';
     if (profile.state !== undefined && String(profile.state || '').trim() && !STATES_AND_UTS.includes(String(profile.state).trim()))
-        return 'Select a valid state or union territory';
+        return 'Select a valid current state or union territory';
+
+    // Permanent address — skipped entirely when it mirrors the current one
+    if (sent('sameAsCurrent') && !isTrue(profile.sameAsCurrent)) {
+        const err = missing('permanentAddress', 'Permanent address')
+            || missing('permanentPincode', 'Permanent PIN code')
+            || missing('permanentCity',    'Permanent city')
+            || missing('permanentState',   'Permanent state');
+        if (err) return err;
+        if (!isPincode(profile.permanentPincode)) return 'Permanent PIN code must be 6 digits';
+        if (!STATES_AND_UTS.includes(String(profile.permanentState).trim()))
+            return 'Select a valid permanent state or union territory';
+    }
+
+    // Previous school — only when the student transferred in
+    if (sent('isTransferStudent') && isTrue(profile.isTransferStudent)) {
+        for (const [key, label] of REQUIRED_TRANSFER_FIELDS) {
+            const err = missing(key, label);
+            if (err) return err;
+        }
+        // A state board only identifies the school once it is named
+        if (String(profile.previousSchoolBoard).trim() === 'State Board'
+            && !String(profile.previousSchoolStateBoardName ?? '').trim())
+            return 'Name of the state board is required';
+        if (profile.previousSchoolPincode && !isPincode(profile.previousSchoolPincode))
+            return 'Previous school PIN code must be 6 digits';
+        if (profile.previousSchoolState && !STATES_AND_UTS.includes(String(profile.previousSchoolState).trim()))
+            return 'Select a valid previous school state or union territory';
+        if (profile.previousSchoolContact && !isPhone(profile.previousSchoolContact))
+            return 'Previous school contact number is not valid';
+        for (const [key, label] of [['previousSchoolLeavingDate', 'leaving date'], ['tcDate', 'TC date']]) {
+            if (profile[key] && Number.isNaN(new Date(profile[key]).getTime())) return `Invalid previous school ${label}`;
+        }
+    }
     return null;
+}
+
+/**
+ * Document rules. A requirement is met by a file uploaded on this request or
+ * by one already stored, so editing a student does not force a re-upload.
+ */
+function validateStudentDocs(profile = {}, uploads = {}, existing = null) {
+    const has = (field) => !!uploads[field] || !!existing?.[STUDENT_FILE_MAP[field]];
+    if (!has('photo'))            return "Student's passport size photo is required";
+    if (!has('aadhaarFront'))     return "Aadhaar card front image is required";
+    if (!has('aadhaarBack'))      return "Aadhaar card back image is required";
+    if (!has('birthCertificate')) return 'Birth certificate is required';
+    if (isTrue(profile.isTransferStudent) && !has('tc'))
+        return 'Transfer Certificate (TC) upload is required for a transfer admission';
+    return null;
+}
+
+/** Map the submitted profile + uploads onto the StudentProfile document shape. */
+function buildStudentProfile(profile = {}, uploads = {}) {
+    const out = { ...profile };
+    const str = (v) => String(v ?? '').trim();
+
+    out.nationality  = str(profile.nationality) || 'Indian';
+    out.country      = str(profile.country) || 'India';
+    if (profile.aadhaarNumber !== undefined) out.aadhaarNumber = str(profile.aadhaarNumber).replace(/\s/g, '');
+
+    // "Same as current" copies the whole block, not just the street line
+    out.sameAsCurrent = isTrue(profile.sameAsCurrent);
+    if (out.sameAsCurrent) {
+        out.permanentAddress = str(profile.address);
+        out.permanentCity    = str(profile.city);
+        out.permanentState   = str(profile.state);
+        out.permanentPincode = str(profile.pincode);
+        out.permanentCountry = out.country;
+    } else if (profile.permanentAddress !== undefined) {
+        out.permanentCountry = str(profile.permanentCountry) || 'India';
+    }
+
+    // A student who is not a transfer admission carries no previous-school data
+    out.isTransferStudent = isTrue(profile.isTransferStudent);
+    if (!out.isTransferStudent) {
+        REQUIRED_TRANSFER_FIELDS.forEach(([key]) => { out[key] = ''; });
+        out.previousSchoolCountry = 'India';
+        out.previousSchoolStateBoardName = '';
+        out.previousSchoolLeavingDate = null;
+        out.tcDate = null;
+    } else {
+        out.previousSchoolCountry = str(profile.previousSchoolCountry) || 'India';
+        // The board name only belongs to a state board
+        out.previousSchoolStateBoardName = str(profile.previousSchoolBoard) === 'State Board'
+            ? str(profile.previousSchoolStateBoardName) : '';
+        out.previousSchoolLeavingDate = profile.previousSchoolLeavingDate ? new Date(profile.previousSchoolLeavingDate) : null;
+        out.tcDate = profile.tcDate ? new Date(profile.tcDate) : null;
+    }
+
+    for (const [field, key] of Object.entries(STUDENT_FILE_MAP)) {
+        if (uploads[field]) out[key] = uploads[field];
+    }
+    return out;
 }
 
 /**
  * Resolve the parent account for a student.
  *
  * `newParent` accepts the full shape — { father, mother, guardian, accountFor }
- * — where each block is { name, email, phone, occupation }. The login account is
- * created for (or linked to) whoever `accountFor` names; the other guardians are
- * stored on the ParentProfile as contact records. The older flat shape
- * ({ name, email, phone }, still sent by the mobile app) keeps working.
+ * — where each block carries the guardian's contact, employment and ID details.
+ * Father and mother are always required; the `guardian` block is only used when
+ * `accountFor` is 'Guardian', i.e. neither parent is the legal guardian. The
+ * login account is created for (or linked to) whoever `accountFor` names, and
+ * only that person needs an email address. The older flat shape
+ * ({ name, email, phone }) keeps working and is treated as the guardian.
  *
  * @returns {Promise<{ parentId: String|null, error: String|null }>}
  */
-async function resolveNewParent(newParent, { schoolId, schoolName }) {
+async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {}, existingBlocks = null }) {
     if (!newParent) return { parentId: null, error: null };
 
-    const blocks = ['father', 'mother', 'guardian'].reduce((acc, key) => {
+    const str = (v) => String(v ?? '').trim();
+    const blocks = PARENT_ROLES.reduce((acc, key) => {
         const b = newParent[key] || {};
+        const prev = existingBlocks?.[key] || {};
         acc[key] = {
-            name:       String(b.name || '').trim(),
-            email:      String(b.email || '').trim().toLowerCase(),
-            phone:      String(b.phone || '').trim(),
-            occupation: String(b.occupation || '').trim(),
+            name:          str(b.name),
+            email:         str(b.email).toLowerCase(),
+            phone:         str(b.phone),
+            occupation:    str(b.occupation),
+            organization:  str(b.organization),
+            designation:   str(b.designation),
+            qualification: str(b.qualification),
+            annualIncome:  str(b.annualIncome),
+            aadhaarNumber: str(b.aadhaarNumber).replace(/\s/g, ''),
+            panNumber:     str(b.panNumber).toUpperCase(),
+            // A document keeps whatever is on file unless this request replaces it
+            aadhaarFrontFile: uploads[`${key}AadhaarFront`] || prev.aadhaarFrontFile || '',
+            aadhaarBackFile:  uploads[`${key}AadhaarBack`]  || prev.aadhaarBackFile  || '',
+            panCardFile:      uploads[`${key}PanCard`]      || prev.panCardFile      || '',
+            photoFile:        uploads[`${key}Photo`]        || prev.photoFile        || '',
+            ...(key === 'guardian' ? { relation: str(b.relation) } : {}),
         };
         return acc;
     }, {});
@@ -135,32 +341,40 @@ async function resolveNewParent(newParent, { schoolId, schoolName }) {
     if (!isStructured) {
         if (!newParent.name || !newParent.email) return { parentId: null, error: null };
         blocks.guardian = {
-            name:  String(newParent.name).trim(),
-            email: String(newParent.email).trim().toLowerCase(),
-            phone: String(newParent.phone || '').trim(),
-            occupation: '',
+            ...blocks.guardian,
+            name:  str(newParent.name),
+            email: str(newParent.email).toLowerCase(),
+            phone: str(newParent.phone),
         };
     }
 
     const holderKey = (isStructured ? accountFor : 'Guardian').toLowerCase();
     const holder    = blocks[holderKey];
 
-    // Father, mother AND guardian must all be on record — only the account
-    // holder needs an email, since that is what the login is created against.
+    // Both parents are always on record. The guardian block is only filled in
+    // when someone other than a parent holds the account.
     if (isStructured) {
-        for (const [key, b] of Object.entries(blocks)) {
+        const needed = accountFor === 'Guardian' ? PARENT_ROLES : ['father', 'mother'];
+        for (const key of needed) {
+            const b = blocks[key];
             const label = key[0].toUpperCase() + key.slice(1);
-            if (!b.name)       return { parentId: null, error: `${label}'s name is required` };
-            if (!b.phone)      return { parentId: null, error: `${label}'s phone number is required` };
-            if (!b.occupation) return { parentId: null, error: `${label}'s occupation is required` };
+            if (!b.name)          return { parentId: null, error: `${label}'s name is required` };
+            if (!b.phone)         return { parentId: null, error: `${label}'s phone number is required` };
+            if (!b.occupation)    return { parentId: null, error: `${label}'s occupation is required` };
+            if (!b.aadhaarNumber) return { parentId: null, error: `${label}'s Aadhaar number is required` };
         }
+        if (accountFor === 'Guardian' && !blocks.guardian.relation)
+            return { parentId: null, error: "Guardian's relation to the student is required" };
     }
     if (!holder.name)  return { parentId: null, error: `${accountFor}'s name is required to create the parent account` };
     if (!holder.email) return { parentId: null, error: `${accountFor}'s email is required to create the parent account` };
     if (!isEmail(holder.email)) return { parentId: null, error: `${accountFor}'s email is not a valid email address` };
     for (const [key, b] of Object.entries(blocks)) {
-        if (b.email && !isEmail(b.email)) return { parentId: null, error: `${key[0].toUpperCase() + key.slice(1)}'s email is not a valid email address` };
-        if (b.phone && !isPhone(b.phone)) return { parentId: null, error: `${key[0].toUpperCase() + key.slice(1)}'s phone number is not valid` };
+        const label = key[0].toUpperCase() + key.slice(1);
+        if (b.email && !isEmail(b.email)) return { parentId: null, error: `${label}'s email is not a valid email address` };
+        if (b.phone && !isPhone(b.phone)) return { parentId: null, error: `${label}'s phone number is not valid` };
+        if (b.aadhaarNumber && !AADHAAR_RE.test(b.aadhaarNumber)) return { parentId: null, error: `${label}'s Aadhaar number must be 12 digits` };
+        if (b.panNumber && !PAN_RE.test(b.panNumber)) return { parentId: null, error: `${label}'s PAN number looks invalid (e.g. ABCDE1234F)` };
     }
 
     // Link to the existing account when that email is already registered
@@ -186,6 +400,7 @@ async function resolveNewParent(newParent, { schoolId, schoolName }) {
                 fatherOccupation:   blocks.father.occupation,
                 motherOccupation:   blocks.mother.occupation,
                 guardianOccupation: blocks.guardian.occupation,
+                annualIncome:       holder.annualIncome,
                 relationship: isStructured ? accountFor : 'Guardian',
             },
             $setOnInsert: { school: schoolId },
@@ -320,20 +535,34 @@ exports.getStudentDetail = async (req, res) => {
             .populate('parent', 'name email phone')
             .populate({ path: 'currentSection', select: 'sectionName class', populate: { path: 'class', select: 'className classNumber' } })
             .lean();
-        jsonOk(res, { user, profile });
+        // The edit wizard prefills the father / mother / guardian blocks from here
+        const parentProfile = profile?.parent
+            ? await ParentProfile.findOne({ user: profile.parent._id || profile.parent }).lean()
+            : null;
+        jsonOk(res, { user, profile, parentProfile });
     } catch (err) { jsonErr(res, err); }
 };
 
 exports.updateStudentFull = async (req, res) => {
     try {
-        const { name, phone, password, rollNumber, admissionNumber, dob, gender, bloodGroup,
-                category, address, city, state, pincode, country,
-                currentClass, currentSection, parentId, newParent } = req.body;
+        // Same dual shape as createStudent: a multipart edit sends `profile` as
+        // a JSON string plus any replacement uploads; older callers post the
+        // profile fields flat on the body.
+        const uploads     = uploadedNames(req.files);
+        const sentProfile = parseMaybeJson(req.body.profile);
+        const b           = sentProfile ? { ...req.body, ...sentProfile } : req.body;
+        const newParent   = parseMaybeJson(req.body.newParent);
+        // An omitted parentId leaves the link alone; an empty one unlinks.
+        const parentId    = req.body.parentId;
+        const { name, phone, password, rollNumber, admissionNumber, currentClass, currentSection } = b;
 
         // Update User fields
         const userUpdate = {};
         if (name  !== undefined) userUpdate.name  = name;
         if (phone !== undefined) userUpdate.phone = phone;
+        // Only a freshly uploaded photo replaces the avatar — an edit that
+        // leaves the photo alone must not clobber one the student set themselves
+        if (uploads.photo) userUpdate.profileImage = `/uploads/student-docs/${uploads.photo}`;
         if (phone && !/^[+\d\s\-]{7,15}$/.test(phone))
             return res.status(400).json({ success: false, message: 'Invalid phone number' });
         const rollValue = rollNumber !== undefined ? String(rollNumber).trim() : undefined;
@@ -346,12 +575,16 @@ exports.updateStudentFull = async (req, res) => {
                 if (takenBy) return res.status(400).json({ success: false, message: `Roll number ${rollValue} is already used by ${takenBy} in this section.` });
             }
         }
-        // Only the demographic/address fields actually submitted are checked, so
-        // partial updates from other screens still work.
-        const profileErr = validateStudentProfile(
-            { dob, gender, bloodGroup, category, address, city, state, pincode },
-            { partial: true },
+        // Only the profile fields actually submitted are checked, so partial
+        // updates from other screens still work.
+        const existing = await StudentProfile.findOne({ user: req.params.id }).lean();
+        const sentFields = Object.fromEntries(
+            STUDENT_PROFILE_KEYS.filter(k => b[k] !== undefined).map(k => [k, b[k]]),
         );
+        const profileErr = validateStudentProfile(sentFields, { partial: true })
+            // A document already on file counts as present, so an edit never
+            // forces the admin to re-upload paperwork.
+            || (sentProfile ? validateStudentDocs({ ...existing, ...sentFields }, uploads, existing) : null);
         if (profileErr) return res.status(400).json({ success: false, message: profileErr });
         if (password) {
             if (password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
@@ -365,13 +598,29 @@ exports.updateStudentFull = async (req, res) => {
         let resolvedParentId = parentId !== undefined ? (parentId || null) : undefined;
         if (resolvedParentId === undefined && newParent) {
             const schoolName = req.user?.school?.name || 'School';
-            const { parentId: newId, error } = await resolveNewParent(newParent, { schoolId: req.schoolId, schoolName });
+            // Documents already on the parent record survive an edit that does
+            // not re-upload them.
+            const existingParent = existing?.parent
+                ? await ParentProfile.findOne({ user: existing.parent }).lean()
+                : null;
+            const { parentId: newId, error } = await resolveNewParent(newParent, {
+                schoolId: req.schoolId, schoolName, uploads, existingBlocks: existingParent,
+            });
             if (error) return res.status(400).json({ success: false, message: error });
             if (newId) resolvedParentId = newId;
         }
 
         // Update StudentProfile fields
-        const profileUpdate = {};
+        const profileUpdate = buildStudentProfile(sentFields, uploads);
+        if (!sentProfile) {
+            // Legacy flat body: only touch what was sent, and never let the
+            // builder's defaults overwrite untouched columns.
+            const fromUpload = new Set(Object.entries(STUDENT_FILE_MAP)
+                .filter(([field]) => uploads[field]).map(([, key]) => key));
+            for (const key of Object.keys(profileUpdate)) {
+                if (sentFields[key] === undefined && !fromUpload.has(key)) delete profileUpdate[key];
+            }
+        }
         if (rollNumber      !== undefined) profileUpdate.rollNumber      = rollValue;
         if (admissionNumber !== undefined) {
             const adm = String(admissionNumber).trim();
@@ -383,15 +632,7 @@ exports.updateStudentFull = async (req, res) => {
             }
             profileUpdate.admissionNumber = adm;
         }
-        if (dob             !== undefined) profileUpdate.dob             = dob || null;
-        if (gender          !== undefined) profileUpdate.gender          = gender;
-        if (bloodGroup      !== undefined) profileUpdate.bloodGroup      = bloodGroup;
-        if (category        !== undefined) profileUpdate.category        = category;
-        if (address         !== undefined) profileUpdate.address         = address;
-        if (city            !== undefined) profileUpdate.city            = city;
-        if (state           !== undefined) profileUpdate.state           = state;
-        if (pincode         !== undefined) profileUpdate.pincode         = pincode;
-        if (country         !== undefined) profileUpdate.country         = country || 'India';
+        if (profileUpdate.dob !== undefined) profileUpdate.dob = profileUpdate.dob || null;
         if (resolvedParentId !== undefined) profileUpdate.parent         = resolvedParentId;
         if (currentSection  !== undefined) profileUpdate.currentSection  = currentSection || null;
         if (currentClass    !== undefined) profileUpdate.currentClass    = currentClass || null;
@@ -467,12 +708,6 @@ const createUserHelper = async (body, role, school) => {
 };
 
 // ── Teacher intake ────────────────────────────────────────────────────────────
-// The seven-step form posts as multipart (Aadhaar / PAN / experience papers), so
-// every value arrives as a string — booleans included.
-const AADHAAR_RE = /^\d{12}$/;
-const PAN_RE     = /^[A-Z]{5}\d{4}[A-Z]$/i;
-const IFSC_RE    = /^[A-Z]{4}0[A-Z0-9]{6}$/i;
-const isTrue = (v) => v === true || v === 'true' || v === 'on' || v === '1';
 
 /** Validate the teacher payload; returns the first problem, or null. */
 function validateTeacherIntake(b, files = {}) {
@@ -666,7 +901,13 @@ exports.createTeacher = async (req, res) => {
 
 exports.createStudent = async (req, res) => {
     try {
-        const { name, email, phone, password, profile = {}, parentId, newParent } = req.body;
+        // Multipart posts send `profile` / `newParent` as JSON strings alongside
+        // the uploads; a plain JSON body sends them as objects.
+        const { name, email, phone } = req.body;
+        const uploads   = uploadedNames(req.files);
+        const profile   = parseMaybeJson(req.body.profile) || {};
+        const newParent = parseMaybeJson(req.body.newParent);
+        const parentId  = req.body.parentId || null;
         if (!name?.trim())  return res.status(400).json({ success: false, message: 'Full name is required' });
         if (!email?.trim()) return res.status(400).json({ success: false, message: 'Email is required' });
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, message: 'Invalid email format' });
@@ -700,7 +941,7 @@ exports.createStudent = async (req, res) => {
             const takenBy = await rollNumberTaken(profile.currentSection, roll);
             if (takenBy) return res.status(400).json({ success: false, message: `Roll number ${roll} is already used by ${takenBy} in this section.` });
         }
-        const profileErr = validateStudentProfile(profile);
+        const profileErr = validateStudentProfile(profile) || validateStudentDocs(profile, uploads);
         if (profileErr) return res.status(400).json({ success: false, message: profileErr });
         const exists = await User.findOne({ email: email.toLowerCase() });
         if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
@@ -710,14 +951,18 @@ exports.createStudent = async (req, res) => {
         const schoolName = req.user?.school?.name || 'School';
         let resolvedParentId = parentId || null;
         if (!resolvedParentId) {
-            const { parentId: newId, error } = await resolveNewParent(newParent, { schoolId: req.schoolId, schoolName });
+            const { parentId: newId, error } = await resolveNewParent(newParent, { schoolId: req.schoolId, schoolName, uploads });
             if (error) return res.status(400).json({ success: false, message: error });
             resolvedParentId = newId;
         }
 
         const otp = generateOTP();
-        const user = await createUserHelper({ name, email, phone, password: otp }, 'student', req.schoolId);
-        const profileData = { user: user._id, school: req.schoolId, ...profile };
+        // The passport photo doubles as the account avatar
+        const user = await createUserHelper(
+            { name, email, phone, password: otp, ...(uploads.photo ? { profileImage: `/uploads/student-docs/${uploads.photo}` } : {}) },
+            'student', req.schoolId,
+        );
+        const profileData = { user: user._id, school: req.schoolId, ...buildStudentProfile(profile, uploads) };
         if (resolvedParentId) profileData.parent = resolvedParentId;
         await StudentProfile.create(profileData);
         if (resolvedParentId) {

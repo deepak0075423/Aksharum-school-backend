@@ -13,23 +13,60 @@ const ParentProfileSchema = new db.Schema({
     },
     // Full details for each guardian. The login account belongs to whichever of
     // them `relationship` names; the others are contact records only.
+    //
+    // Father and mother are always on record. The `guardian` block is only
+    // filled in when someone other than a parent is the legal guardian — that
+    // is what `relationship: 'Guardian'` means, and `guardian.relation` then
+    // says how they are related to the student.
     father: {
-        name:       { type: String, default: '' },
-        email:      { type: String, default: '' },
-        phone:      { type: String, default: '' },
-        occupation: { type: String, default: '' },
+        name:         { type: String, default: '' },
+        email:        { type: String, default: '' },
+        phone:        { type: String, default: '' },
+        occupation:   { type: String, default: '' },
+        organization: { type: String, default: '' },
+        designation:  { type: String, default: '' },
+        qualification: { type: String, default: '' },
+        annualIncome: { type: String, default: '' },
+        aadhaarNumber:    { type: String, default: '' },
+        aadhaarFrontFile: { type: String, default: '' },
+        aadhaarBackFile:  { type: String, default: '' },
+        panNumber:        { type: String, default: '' },
+        panCardFile:      { type: String, default: '' },
+        photoFile:        { type: String, default: '' },
     },
     mother: {
-        name:       { type: String, default: '' },
-        email:      { type: String, default: '' },
-        phone:      { type: String, default: '' },
-        occupation: { type: String, default: '' },
+        name:         { type: String, default: '' },
+        email:        { type: String, default: '' },
+        phone:        { type: String, default: '' },
+        occupation:   { type: String, default: '' },
+        organization: { type: String, default: '' },
+        designation:  { type: String, default: '' },
+        qualification: { type: String, default: '' },
+        annualIncome: { type: String, default: '' },
+        aadhaarNumber:    { type: String, default: '' },
+        aadhaarFrontFile: { type: String, default: '' },
+        aadhaarBackFile:  { type: String, default: '' },
+        panNumber:        { type: String, default: '' },
+        panCardFile:      { type: String, default: '' },
+        photoFile:        { type: String, default: '' },
     },
     guardian: {
-        name:       { type: String, default: '' },
-        email:      { type: String, default: '' },
-        phone:      { type: String, default: '' },
-        occupation: { type: String, default: '' },
+        name:         { type: String, default: '' },
+        email:        { type: String, default: '' },
+        phone:        { type: String, default: '' },
+        occupation:   { type: String, default: '' },
+        organization: { type: String, default: '' },
+        designation:  { type: String, default: '' },
+        qualification: { type: String, default: '' },
+        annualIncome: { type: String, default: '' },
+        // How the guardian is related to the student (uncle, grandmother, …)
+        relation:     { type: String, default: '' },
+        aadhaarNumber:    { type: String, default: '' },
+        aadhaarFrontFile: { type: String, default: '' },
+        aadhaarBackFile:  { type: String, default: '' },
+        panNumber:        { type: String, default: '' },
+        panCardFile:      { type: String, default: '' },
+        photoFile:        { type: String, default: '' },
     },
     // Kept in sync with the blocks above — the mobile profile screens read these
     fatherOccupation: {
