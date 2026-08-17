@@ -64,7 +64,7 @@ const SchoolSchema = new db.Schema({
     // Teacher designations the admin can assign (dropdown source)
     designations: {
         type: [String],
-        default: ['Teacher', 'Class Teacher', 'Librarian'],
+        default: ['Teacher', 'Class Teacher', 'Librarian', 'Principal', 'Vice Principal'],
     },
     // Holiday types the admin can assign (dropdown source), same idea
     holidayTypes: {
@@ -141,6 +141,10 @@ const SchoolSchema = new db.Schema({
             default: false,
         },
         videoLibrary: {
+            type: Boolean,
+            default: false,
+        },
+        feedback: {
             type: Boolean,
             default: false,
         },

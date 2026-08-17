@@ -103,6 +103,7 @@ app.use('/api/library',       require('./routes/api/library'));
 app.use('/api/inventory',     require('./routes/api/inventory'));
 app.use('/api/transport',     require('./routes/api/transport'));
 app.use('/api/video',         require('./routes/api/video'));
+app.use('/api/feedback',      require('./routes/api/feedback'));
 app.use('/api/analytics',     require('./routes/api/analytics'));
 app.use('/api/chat',          require('./routes/api/chat'));
 app.use('/api/notifications', require('./routes/api/notifications'));
@@ -160,6 +161,24 @@ if (isPrimaryWorker) {
             console.error('[Leave] Monthly accrual error:', err.message);
         }
     }, 60 * 60 * 1000); // check every hour; fires for real on 1st of each month
+    }());
+
+    // ── Feedback campaign clock ───────────────────────────────────────────────
+    // Flips scheduled campaigns live on their start date, closes them when the
+    // window ends, and fires the reminder / closing-soon nudges. Every step is
+    // idempotent by date+state, so a restart mid-sweep changes nothing.
+    (function scheduleFeedbackCampaigns() {
+        const { runCampaignSchedule } = require('./controllers/feedback.controller');
+        const tick = async () => {
+            try {
+                const r = await runCampaignSchedule();
+                if (r.activated || r.closed || r.reminded || r.closingSoon) {
+                    console.log(`[Feedback] campaigns: ${r.activated} activated, ${r.closed} closed, ${r.reminded} reminded, ${r.closingSoon} closing-soon`);
+                }
+            } catch (err) { console.error('[Feedback] campaign schedule error:', err.message); }
+        };
+        setTimeout(tick, 30 * 1000);          // once shortly after boot
+        setInterval(tick, 30 * 60 * 1000);    // then every 30 minutes
     }());
 
     // ── Video scheduled-publish worker ────────────────────────────────────────

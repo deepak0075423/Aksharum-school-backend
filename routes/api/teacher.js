@@ -42,6 +42,10 @@ router.get('/modules', guard, async (req, res) => {
         const ls = school?.leaveSettings ?? {};
         res.json({ success: true, data: {
             isLibrarian:  profile?.designation === 'Librarian',
+            // Designation-based RBAC, same idea as isLibrarian: unlocks the
+            // school-wide feedback view for principals / vice principals.
+            isPrincipal:  require('../../services/feedbackService')
+                .PRINCIPAL_DESIGNATIONS.includes(profile?.designation || ''),
             attendance:   !!m.attendance,
             notification: !!m.notification,
             aptitudeExam: !!m.aptitudeExam,
@@ -57,6 +61,7 @@ router.get('/modules', guard, async (req, res) => {
             inventory:    !!m.inventory,
             transport:    !!m.transport,
             videoLibrary: !!m.videoLibrary,
+            feedback:     !!m.feedback,
             saturdayConfig: {
                 working: ls.saturdayWorking !== false,
                 mode:    ls.saturdayMode    || 'all',

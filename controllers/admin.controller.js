@@ -1544,7 +1544,9 @@ exports.parentLookup = async (req, res) => {
 
 // ── Teacher designations (dropdown source, admin-managed) ─────────────────────
 
-const DEFAULT_DESIGNATIONS = ['Teacher', 'Class Teacher', 'Librarian'];
+// 'Librarian' and 'Principal'/'Vice Principal' are RBAC-significant — they
+// unlock library management and the school-wide feedback view respectively.
+const DEFAULT_DESIGNATIONS = ['Teacher', 'Class Teacher', 'Librarian', 'Principal', 'Vice Principal'];
 
 exports.getDesignations = async (req, res) => {
     try {

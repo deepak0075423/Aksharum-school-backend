@@ -62,6 +62,7 @@ router.get('/modules', guard, async (req, res) => {
             inventory:    !!m.inventory,
             transport:    !!m.transport,
             videoLibrary: !!m.videoLibrary,
+            feedback:     !!m.feedback,
             saturdayConfig: {
                 working: ls.saturdayWorking !== false,
                 mode:    ls.saturdayMode    || 'all',
