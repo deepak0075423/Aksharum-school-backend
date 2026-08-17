@@ -163,6 +163,33 @@ if (isPrimaryWorker) {
     }, 60 * 60 * 1000); // check every hour; fires for real on 1st of each month
     }());
 
+    // ── Comp Off expiry clock ────────────────────────────────────────────────
+    // Lapses comp off that outlived its validity window and sends the
+    // "expiring soon" nudge. Both steps are idempotent — an expired lot has no
+    // remaining days to expire twice, and a notified request carries a
+    // expiryNotifiedAt stamp — so a restart mid-sweep changes nothing.
+    (function scheduleCompOffExpiry() {
+        const School = require('./models/School');
+        const compOff = require('./services/compOffService');
+        const tick = async () => {
+            try {
+                const schools = await School.find({ 'modules.leave': true }).select('_id').lean();
+                let expired = 0, notified = 0;
+                for (const s of schools) {
+                    const a = await compOff.runExpirySweep(s._id);
+                    const b = await compOff.runExpiryNotifications(s._id);
+                    expired  += a.expired  || 0;
+                    notified += b.notified || 0;
+                }
+                if (expired || notified) {
+                    console.log(`[CompOff] expiry: ${expired} day(s) lapsed, ${notified} reminder(s) sent across ${schools.length} school(s)`);
+                }
+            } catch (err) { console.error('[CompOff] expiry sweep error:', err.message); }
+        };
+        setTimeout(tick, 60 * 1000);          // once shortly after boot
+        setInterval(tick, 6 * 60 * 60 * 1000); // then every 6 hours
+    }());
+
     // ── Feedback campaign clock ───────────────────────────────────────────────
     // Flips scheduled campaigns live on their start date, closes them when the
     // window ends, and fires the reminder / closing-soon nudges. Every step is

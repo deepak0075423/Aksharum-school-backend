@@ -10,6 +10,7 @@ const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
+const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
@@ -133,7 +134,29 @@ router.post('/exams/:id/result-approval',           examGuard, examCtrl.approveR
 // ── Leave ─────────────────────────────────────────────────────────────────────
 router.get('/leave',           leaveGuard, leaveCtrl.teacherGetMyLeaves);
 router.get('/leave/balance',   leaveGuard, leaveCtrl.teacherGetLeaveBalance);
+// The rules behind each leave type, and whether this employee qualifies
+router.get('/leave/policies',  leaveGuard, leaveCtrl.teacherGetPolicies);
+// Designation-based approvers are teachers — this is their sign-off queue
+router.get('/leave/approvals',              leaveGuard, leaveCtrl.teacherGetApprovals);
+router.post('/leave/approvals/:id/approve', leaveGuard, leaveCtrl.adminApproveRequest);
+router.post('/leave/approvals/:id/reject',  leaveGuard, leaveCtrl.adminRejectRequest);
 router.post('/leave/apply',    leaveGuard, uploadLeaveDoc.single('document'), leaveCtrl.teacherApplyLeave);
+
+// Comp Off — registered before '/leave/:id' so the delete route below cannot
+// capture '/leave/compoff/...'.
+router.get('/leave/compoff',              leaveGuard, compOffCtrl.myCompOff);
+router.get('/leave/compoff/preview',      leaveGuard, compOffCtrl.previewWorkDate);
+router.get('/leave/compoff/ledger',       leaveGuard, compOffCtrl.myLedger);
+// Designation-based approvers (e.g. Principal) are teachers, so their queue and
+// their approve/reject actions live on the teacher router. Both endpoints
+// re-check canApprove() against the policy before doing anything.
+router.get('/leave/compoff/approvals',    leaveGuard, compOffCtrl.listRequests);
+router.post('/leave/compoff',             leaveGuard, uploadLeaveDoc.single('document'), compOffCtrl.applyCompOff);
+router.post('/leave/compoff/:id/apply',   leaveGuard, compOffCtrl.submitDraft);
+router.post('/leave/compoff/:id/approve', leaveGuard, compOffCtrl.approve);
+router.post('/leave/compoff/:id/reject',  leaveGuard, compOffCtrl.reject);
+router.delete('/leave/compoff/:id',       leaveGuard, compOffCtrl.cancelOwn);
+
 router.delete('/leave/:id',    leaveGuard, leaveCtrl.teacherCancelLeave);
 
 // ── Document Categories (read-only for teachers) ──────────────────────────────

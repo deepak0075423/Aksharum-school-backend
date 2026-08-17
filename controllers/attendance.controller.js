@@ -25,6 +25,22 @@ const dayRange = (dateStr) => {
     return { start, end };
 };
 
+// ── Comp Off bridge (scenario 3) ─────────────────────────────────────────────
+// Once a day's attendance is settled, the Comp Off engine decides — entirely
+// from the school's Comp Off policy — whether that day earns a ready-to-apply
+// draft. Fire-and-forget: comp off must never be able to fail a clock-out or an
+// attendance approval, and the engine is idempotent per work date, so a repeat
+// call on the same day creates nothing new.
+function maybeGenerateCompOff(record, actorId) {
+    if (!record) return;
+    const plain = record.toObject ? record.toObject() : record;
+    setImmediate(() => {
+        require('../services/compOffService')
+            .generateFromAttendance(plain, { actorId })
+            .catch(e => console.error('[compOff] attendance hook failed:', e.message));
+    });
+}
+
 const teacherSection = (req) => ClassSection.findOne({
     school: req.schoolId,
     $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
@@ -122,7 +138,7 @@ exports.adminReviewRegularization = async (req, res) => {
             } else {
                 set.status = request.requestedStatus;
             }
-            await TeacherAttendance.findOneAndUpdate(
+            const rec = await TeacherAttendance.findOneAndUpdate(
                 { teacher: request.teacher, school: request.school, date: { $gte: start, $lte: end } },
                 {
                     $set: set,
@@ -132,8 +148,13 @@ exports.adminReviewRegularization = async (req, res) => {
                         date:    new Date(dateStr + 'T00:00:00.000Z'),
                     },
                 },
-                { upsert: true }
+                { upsert: true, new: true }
             );
+            // Scenario 3: attendance is now approved. If the day was a holiday /
+            // weekly off / Sunday, hand the teacher a pre-filled, ready-to-apply
+            // Comp Off draft. Nothing is credited here — they still have to
+            // apply, and an approver still has to sign it off.
+            maybeGenerateCompOff(rec, req.userId);
         }
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
@@ -176,6 +197,7 @@ exports.adminRegularizeAttendance = async (req, res) => {
             { $set: set, $setOnInsert: { teacher: teacherId, school: req.schoolId, date: new Date(dateStr + 'T00:00:00.000Z') } },
             { upsert: true, new: true }
         );
+        maybeGenerateCompOff(rec, req.userId);
         ok(res, { ...rec.toObject(), status: low(rec.status) });
     } catch (e) { err(res, e); }
 };
@@ -439,6 +461,9 @@ exports.clockOut = async (req, res) => {
         rec.checkOut = hhmm();
         if (!rec.markedBy) rec.markedBy = req.userId;
         await rec.save();
+        // The day is complete — self-marked attendance needs no further sign-off,
+        // so this is the point at which it can qualify for a Comp Off draft.
+        maybeGenerateCompOff(rec, req.userId);
         ok(res, { checkIn: rec.checkIn, checkOut: rec.checkOut });
     } catch (e) { err(res, e); }
 };

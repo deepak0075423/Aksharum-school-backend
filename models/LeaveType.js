@@ -8,6 +8,14 @@ const LeaveTypeSchema = new db.Schema({
     },
     name: { type: String, required: true, trim: true },
     code: { type: String, required: true, trim: true, uppercase: true },
+    // What kind of leave this is. 'compoff' switches the type over to the
+    // Comp Off engine: its balance is credited only by an approved
+    // CompOffRequest, never by allocation or accrual.
+    category: {
+        type: String,
+        enum: ['general', 'compoff'],
+        default: 'general',
+    },
     annualAllocation: { type: Number, required: true, default: 0 },
     monthlyAccrual: {
         enabled: { type: Boolean, default: false },

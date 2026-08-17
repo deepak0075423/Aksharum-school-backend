@@ -33,6 +33,18 @@ const LeaveApplicationSchema = new db.Schema({
     },
     adminComment: { type: String, default: '' },
     approvedBy: { type: db.Types.UUID, ref: 'User', default: null },
+
+    // ── Approval trail ──────────────────────────────────────────────────────
+    // Snapshot of LeavePolicy.approval.twoLevel taken when the application was
+    // filed, so a later policy edit cannot change the terms of a request that
+    // is already in flight. 1 keeps the historical single-approval behaviour.
+    approvalsRequired: { type: Number, default: 1 },
+    approvalLevel:     { type: Number, default: 0 },
+    approvals: {
+        type: [db.Types.JSON],
+        default: [],   // [{ level, by, byName, at, comment }]
+    },
+
     appliedAt: { type: Date, default: Date.now },
     approvedAt: { type: Date, default: null },
     rejectedAt: { type: Date, default: null },

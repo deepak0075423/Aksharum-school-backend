@@ -12,6 +12,7 @@ const notifCtrl      = require('../../controllers/notification.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
+const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
@@ -288,6 +289,10 @@ router.post('/leave/types',                        leaveGuard, leaveCtrl.adminCr
 router.put('/leave/types/:id',                     leaveGuard, leaveCtrl.adminUpdateLeaveType);
 router.delete('/leave/types/:id',                  leaveGuard, leaveCtrl.adminDeleteLeaveType);
 router.put('/leave/settings',                      leaveGuard, leaveCtrl.adminUpdateLeaveSettings);
+// Per-leave-type policies — every type gets its own configurable rule set
+router.get('/leave/policies',                      leaveGuard, leaveCtrl.adminGetPolicies);
+router.get('/leave/policies/:leaveTypeId',         leaveGuard, leaveCtrl.adminGetPolicy);
+router.put('/leave/policies/:leaveTypeId',         leaveGuard, leaveCtrl.adminUpdatePolicy);
 router.get('/leave/requests',                      leaveGuard, leaveCtrl.adminGetRequests);
 router.post('/leave/requests',                     leaveGuard, uploadLeaveDoc.single('document'), leaveCtrl.adminApplyLeave);
 router.get('/leave/balance',                       leaveGuard, leaveCtrl.adminGetTeacherBalance);
@@ -304,6 +309,26 @@ router.get('/leave/requests/export',               leaveGuard, leaveCtrl.adminEx
 router.get('/leave/allocations/export',            leaveGuard, leaveCtrl.adminExportAllocations);
 router.get('/leave/reports',                       leaveGuard, leaveCtrl.adminGetReports);
 router.get('/leave/reports/export',                leaveGuard, leaveCtrl.adminExportReports);
+router.post('/leave/requests/:id/reverse',         leaveGuard, leaveCtrl.adminReverseApproved);
+
+// Comp Off — lives inside the leave module, so it rides the same guard.
+// Static paths first: '/leave/compoff/policy' must not be swallowed by '/:id'.
+router.get('/leave/compoff/policy',        leaveGuard, compOffCtrl.getPolicy);
+router.put('/leave/compoff/policy',        leaveGuard, compOffCtrl.updatePolicy);
+router.get('/leave/compoff/ledger',        leaveGuard, compOffCtrl.adminLedger);
+router.get('/leave/compoff/balances',      leaveGuard, compOffCtrl.adminBalances);
+router.get('/leave/compoff/reports',       leaveGuard, compOffCtrl.adminReports);
+router.get('/leave/compoff/export',        leaveGuard, compOffCtrl.adminExport);
+router.get('/leave/compoff/preview',       leaveGuard, compOffCtrl.previewWorkDate);
+router.get('/leave/compoff/employees',     leaveGuard, compOffCtrl.adminEmployees);
+router.post('/leave/compoff/adjust',       leaveGuard, compOffCtrl.adminAdjust);
+router.post('/leave/compoff/expire/run',   leaveGuard, compOffCtrl.adminRunExpiry);
+router.post('/leave/compoff/generate',     leaveGuard, compOffCtrl.adminGenerateFromAttendance);
+router.get('/leave/compoff',               leaveGuard, compOffCtrl.listRequests);
+router.post('/leave/compoff',              leaveGuard, uploadLeaveDoc.single('document'), compOffCtrl.adminApplyFor);
+router.post('/leave/compoff/:id/approve',  leaveGuard, compOffCtrl.approve);
+router.post('/leave/compoff/:id/reject',   leaveGuard, compOffCtrl.reject);
+router.post('/leave/compoff/:id/cancel',   leaveGuard, compOffCtrl.adminCancelApproved);
 
 // ── Document Categories ────────────────────────────────────────────────────────
 const DocumentCategory = require('../../models/DocumentCategory');

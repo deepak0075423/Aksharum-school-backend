@@ -30,6 +30,89 @@ function hash8(s) {
     return crypto.createHash('md5').update(s).digest('hex').slice(0, 8);
 }
 
+// ── Partial index predicates ────────────────────────────────────────────────
+// `schema.index(fields, { partialFilterExpression })` narrows a unique index to
+// a subset of rows — e.g. "these dates are unique only among *active* leave
+// applications, so a rejected one doesn't block re-applying".
+//
+// An index predicate cannot carry bind parameters and every function in it must
+// be IMMUTABLE, so the values are inlined as literals and only the types that
+// are safe to inline are accepted. Anything else returns null, and the caller
+// then skips the index entirely — a missing index is a performance problem,
+// while a unique index that silently ignored its predicate is a correctness one.
+function sqlLiteral(kind, v) {
+    if (typeof v === 'string') {
+        const quoted = `'${v.replace(/'/g, "''")}'`;
+        return kind === 'id' ? `${quoted}::uuid` : quoted;
+    }
+    if (typeof v === 'number') return Number.isFinite(v) ? String(v) : null;
+    if (typeof v === 'boolean') return v ? 'true' : 'false';
+    // Dates deliberately excluded: text → timestamptz is only STABLE, not
+    // IMMUTABLE, so Postgres refuses it inside an index predicate.
+    return null;
+}
+
+function partialPredicate(parsed, expr) {
+    if (!expr || typeof expr !== 'object') return null;
+
+    const parts = [];
+    for (const [key, val] of Object.entries(expr)) {
+        if (key === '$and' || key === '$or') {
+            if (!Array.isArray(val) || !val.length) return null;
+            const subs = val.map((sub) => partialPredicate(parsed, sub));
+            if (subs.some((s) => s == null)) return null;
+            parts.push(`(${subs.join(key === '$and' ? ' AND ' : ' OR ')})`);
+            continue;
+        }
+
+        const r = resolvePath(parsed, key);
+        let col;
+        if (r.mode === 'column') col = qi(r.name);
+        else if (r.mode === 'json') col = `((${qi(r.name)} #>> '{${r.segs.join(',')}}'))`;
+        else return null;
+
+        const kind = r.mode === 'column' ? (r.kind || 'string') : 'string';
+        // A timestamptz column can only be compared against a literal through a
+        // STABLE cast, which an index predicate rejects — bail out rather than
+        // emit DDL that will fail.
+        if (kind === 'date' && val !== null) return null;
+
+        if (val === null) { parts.push(`${col} IS NULL`); continue; }
+
+        if (typeof val === 'object' && !Array.isArray(val) && !(val instanceof Date)) {
+            for (const [op, v] of Object.entries(val)) {
+                if (op === '$exists') { parts.push(v ? `${col} IS NOT NULL` : `${col} IS NULL`); continue; }
+                if (op === '$in' || op === '$nin') {
+                    if (!Array.isArray(v) || !v.length) return null;
+                    const lits = v.map((x) => sqlLiteral(kind, x));
+                    if (lits.some((l) => l == null)) return null;
+                    parts.push(`${col} ${op === '$in' ? 'IN' : 'NOT IN'} (${lits.join(', ')})`);
+                    continue;
+                }
+                if (op === '$ne') {
+                    if (v === null) { parts.push(`${col} IS NOT NULL`); continue; }
+                    const lit = sqlLiteral(kind, v);
+                    if (lit == null) return null;
+                    parts.push(`${col} IS DISTINCT FROM ${lit}`);
+                    continue;
+                }
+                const cmp = { $gt: '>', $gte: '>=', $lt: '<', $lte: '<=', $eq: '=' }[op];
+                if (!cmp) return null;
+                const lit = sqlLiteral(kind, v);
+                if (lit == null) return null;
+                parts.push(`${col} ${cmp} ${lit}`);
+            }
+            continue;
+        }
+
+        const lit = sqlLiteral(kind, val);
+        if (lit == null) return null;
+        parts.push(`${col} = ${lit}`);
+    }
+
+    return parts.length ? parts.join(' AND ') : null;
+}
+
 let trgmReady = null;
 async function ensureTrgmExtension(run) {
     if (trgmReady) return trgmReady;
@@ -381,8 +464,44 @@ function createModel(name, schema) {
             if (skip || !exprs.length) continue;
             const unique = opts && opts.unique;
             const idxName = `${unique ? 'ux' : 'ix'}_${tableName}_${hash8(JSON.stringify(f))}`;
+
+            // A partial unique index only constrains the rows matching its
+            // predicate. Dropping the predicate would turn "unique among active
+            // rows" into "unique across all rows" — a silently wrong constraint
+            // — so an untranslatable predicate skips the index instead.
+            let predicate = null;
+            if (opts && opts.partialFilterExpression) {
+                predicate = partialPredicate(parsed, opts.partialFilterExpression);
+                if (!predicate) {
+                    console.warn(`[db] index ${idxName} on ${tableName} skipped: partialFilterExpression could not be expressed as an index predicate`);
+                    continue;
+                }
+            }
+
+            const ddlTail = `ON ${T} (${exprs.join(', ')})${predicate ? ` WHERE (${predicate})` : ''}`;
+            const create = (nm) => run(`CREATE ${unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ${qi(nm)} ${ddlTail}`);
+
             try {
-                await run(`CREATE ${unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ${qi(idxName)} ON ${T} (${exprs.join(', ')})`);
+                // Repair pass: an index built before predicate support existed
+                // has no WHERE clause and is therefore over-constraining. Build
+                // the corrected one under a temporary name first so a failure
+                // leaves the old index in place, then swap.
+                const { rows: existing } = await run(
+                    `SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename = $1 AND indexname = $2`,
+                    [tableName, idxName],
+                );
+                const hasPredicate = existing.length ? / WHERE /i.test(existing[0].indexdef) : null;
+
+                if (existing.length && hasPredicate !== !!predicate) {
+                    const tmp = `${idxName}_rebuild`.slice(0, 62);
+                    await run(`DROP INDEX IF EXISTS ${qi(tmp)}`);
+                    await create(tmp);
+                    await run(`DROP INDEX ${qi(idxName)}`);
+                    await run(`ALTER INDEX ${qi(tmp)} RENAME TO ${qi(idxName)}`);
+                    console.log(`[db] index ${idxName} on ${tableName} rebuilt ${predicate ? 'with' : 'without'} its partial predicate`);
+                } else {
+                    await create(idxName);
+                }
             } catch (e) {
                 console.warn(`[db] index ${idxName} on ${tableName} skipped: ${e.message}`);
             }
