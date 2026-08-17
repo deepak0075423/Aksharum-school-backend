@@ -23,47 +23,53 @@ async function invalidType(schoolId, type) {
 }
 
 // ── In-app notification after holiday creation ────────────────────────────────
+const fmtDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+
+function holidayDateRange(holiday) {
+    const sStr = fmtDate(holiday.startDate);
+    const eStr = fmtDate(holiday.endDate || holiday.startDate);
+    return sStr === eStr ? sStr : `${sStr} – ${eStr}`;
+}
+
+// Resolve the users a holiday applies to, based on its applicability scope
+async function holidayRecipients(holiday, schoolId) {
+    const User  = require('../models/User');
+    const scope = holiday.applicability?.scope || 'all';
+
+    if (scope === 'specific_classes') {
+        const classIds = (holiday.applicability?.classes || []).map(c => c._id || c);
+        if (!classIds.length) return [];
+        const ClassSection   = require('../models/ClassSection');
+        const StudentProfile = require('../models/StudentProfile');
+        const secs       = await ClassSection.find({ class: { $in: classIds }, school: schoolId }, 'enrolledStudents').lean();
+        const studentIds = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
+        const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
+        const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
+        const allIds     = [...new Set([...studentIds, ...parentIds])];
+        if (!allIds.length) return [];
+        return User.find({ _id: { $in: allIds }, isActive: true }, '_id').lean();
+    }
+
+    if (scope === 'specific_departments') {
+        const depts = holiday.applicability?.departments || [];
+        const roles = [];
+        if (depts.includes('teaching_staff')) roles.push('teacher');
+        if (depts.includes('admin_staff'))    roles.push('school_admin');
+        if (!roles.length) return [];
+        return User.find({ school: schoolId, role: { $in: roles }, isActive: true }, '_id').lean();
+    }
+
+    return User.find(
+        { school: schoolId, role: { $in: ['teacher', 'student', 'parent'] }, isActive: true },
+        '_id'
+    ).lean();
+}
+
 async function sendHolidayNotification(holiday, schoolId, creatorId) {
     try {
-        const Notification        = require('../models/Notification');
-        const NotificationReceipt = require('../models/NotificationReceipt');
-        const User                = require('../models/User');
-
-        const scope = holiday.applicability?.scope || 'all';
-        let recipients = [];
-
-        if (scope === 'all') {
-            recipients = await User.find(
-                { school: schoolId, role: { $in: ['teacher', 'student', 'parent'] }, isActive: true },
-                '_id'
-            ).lean();
-        } else if (scope === 'specific_classes') {
-            const classIds = (holiday.applicability?.classes || []).map(c => c._id || c);
-            if (!classIds.length) return;
-            const ClassSection   = require('../models/ClassSection');
-            const StudentProfile = require('../models/StudentProfile');
-            const secs       = await ClassSection.find({ class: { $in: classIds }, school: schoolId }, 'enrolledStudents').lean();
-            const studentIds = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
-            const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
-            const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            const allIds     = [...new Set([...studentIds, ...parentIds])];
-            if (!allIds.length) return;
-            recipients = await User.find({ _id: { $in: allIds }, isActive: true }, '_id').lean();
-        } else if (scope === 'specific_departments') {
-            const depts = holiday.applicability?.departments || [];
-            const roles = [];
-            if (depts.includes('teaching_staff')) roles.push('teacher');
-            if (depts.includes('admin_staff'))    roles.push('school_admin');
-            if (!roles.length) return;
-            recipients = await User.find({ school: schoolId, role: { $in: roles }, isActive: true }, '_id').lean();
-        }
-
+        const recipients = await holidayRecipients(holiday, schoolId);
         if (!recipients.length) return;
 
-        const fmt  = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-        const sStr = fmt(holiday.startDate);
-        const eStr = fmt(holiday.endDate || holiday.startDate);
-        const dateStr   = sStr === eStr ? sStr : `${sStr} – ${eStr}`;
         const typeLabel = holiday.type.replace(/_/g, ' ');
 
         const { notify } = require('../services/notifyService');
@@ -72,12 +78,48 @@ async function sendHolidayNotification(holiday, schoolId, creatorId) {
             sender:     creatorId,
             senderRole: 'school_admin',
             title:      `🎉 Holiday: ${holiday.name}`,
-            body:       `A ${typeLabel} holiday "${holiday.name}" has been scheduled on ${dateStr}.${holiday.description ? ' ' + holiday.description : ''}`,
+            body:       `A ${typeLabel} holiday "${holiday.name}" has been scheduled on ${holidayDateRange(holiday)}.${holiday.description ? ' ' + holiday.description : ''}`,
             recipients,
             includeSender: true,
         });
     } catch (e) {
         console.error('[holiday-notif]', e.message);
+    }
+}
+
+// ── In-app notification after a bulk XLSX/CSV import ──────────────────────────
+// One summary notification for the whole batch instead of N separate ones, so a
+// 30-row sheet doesn't spam every teacher/student/parent with 30 pushes.
+const IMPORT_NOTIF_PREVIEW = 8;
+
+async function sendImportedHolidaysNotification(holidays, schoolId, creatorId) {
+    try {
+        const list = (holidays || []).filter(Boolean);
+        if (!list.length) return;
+        if (list.length === 1) return sendHolidayNotification(list[0], schoolId, creatorId);
+
+        // Imported rows are always school-wide
+        const recipients = await holidayRecipients({ applicability: { scope: 'all' } }, schoolId);
+        if (!recipients.length) return;
+
+        const sorted  = [...list].sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+        const preview = sorted.slice(0, IMPORT_NOTIF_PREVIEW)
+            .map(h => `• ${h.name} — ${holidayDateRange(h)}`)
+            .join('\n');
+        const rest = sorted.length - IMPORT_NOTIF_PREVIEW;
+
+        const { notify } = require('../services/notifyService');
+        notify({
+            school:     schoolId,
+            sender:     creatorId,
+            senderRole: 'school_admin',
+            title:      `🎉 ${sorted.length} New Holidays Announced`,
+            body:       `The holiday calendar has been updated:\n${preview}${rest > 0 ? `\n…and ${rest} more` : ''}`,
+            recipients,
+            includeSender: true,
+        });
+    } catch (e) {
+        console.error('[holiday-import-notif]', e.message);
     }
 }
 
@@ -221,13 +263,21 @@ exports.adminImportHolidays = async (req, res) => {
             const endDate = parseDate(rawEnd) || startDate;
             const type    = matchType(rawType) || allowedTypes[0];
 
-            docs.push({ school: req.schoolId, name, startDate, endDate, type, description, createdBy: req.userId });
+            docs.push({
+                school: req.schoolId, name, startDate, endDate, type, description,
+                createdBy: req.userId,
+                applicability: { scope: 'all', classes: [] },
+            });
         });
 
         if (!docs.length)
             return res.status(400).json({ success: false, message: 'No valid rows to import', errors });
 
-        await Holiday.insertMany(docs, { ordered: false });
+        const created = await Holiday.insertMany(docs, { ordered: false });
+
+        // Fire-and-forget in-app notification (pushed live over the WebSocket Gateway)
+        sendImportedHolidaysNotification(created.length ? created : docs, req.schoolId, req.userId);
+
         res.json({ success: true, imported: docs.length, errors: errors.length ? errors : undefined });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
