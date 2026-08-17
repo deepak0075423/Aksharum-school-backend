@@ -7,6 +7,7 @@ const subjectCtrl   = require('../../controllers/subject.controller');
 const reportCtrl    = require('../../controllers/report.controller');
 const attendanceCtrl = require('../../controllers/attendance.controller');
 const timetableCtrl  = require('../../controllers/timetable.controller');
+const ttGenCtrl      = require('../../controllers/timetableGen.controller');
 const notifCtrl      = require('../../controllers/notification.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
@@ -199,6 +200,49 @@ router.delete('/subjects/:id',   guard, subjectCtrl.deleteSubject);
 // Timetable
 router.get('/timetable/download-all', timetableGuard, timetableCtrl.adminDownloadAllTimetables);
 router.get('/timetable/teachers',     timetableGuard, timetableCtrl.getTeachersBySubject);
+
+// ── Timetable generation, versioning & publishing ────────────────────────────
+// Static segments are declared before '/timetable/versions/:id' so a literal
+// path like '/timetable/versions' is never captured as an id.
+router.get('/timetable/meta',            timetableGuard, ttGenCtrl.getMeta);
+router.get('/timetable/config',          timetableGuard, ttGenCtrl.getConfig);
+router.put('/timetable/config',          timetableGuard, ttGenCtrl.saveConfig);
+
+router.get('/timetable/rooms',           timetableGuard, ttGenCtrl.listRooms);
+router.post('/timetable/rooms',          timetableGuard, ttGenCtrl.createRoom);
+router.put('/timetable/rooms/:id',       timetableGuard, ttGenCtrl.updateRoom);
+router.delete('/timetable/rooms/:id',    timetableGuard, ttGenCtrl.deleteRoom);
+
+router.get('/timetable/availability',              timetableGuard, ttGenCtrl.listAvailability);
+router.put('/timetable/availability/:teacherId',   timetableGuard, ttGenCtrl.saveAvailability);
+
+router.get('/timetable/requirements',                    timetableGuard, ttGenCtrl.listRequirements);
+router.put('/timetable/requirements/:sectionId',         timetableGuard, ttGenCtrl.saveRequirements);
+router.post('/timetable/requirements/seed',              timetableGuard, ttGenCtrl.seedRequirements);
+router.delete('/timetable/requirements/item/:id',        timetableGuard, ttGenCtrl.deleteRequirement);
+
+router.post('/timetable/generate',       timetableGuard, ttGenCtrl.generate);
+router.get('/timetable/versions',        timetableGuard, ttGenCtrl.listVersions);
+router.get('/timetable/audit',           timetableGuard, ttGenCtrl.listAudit);
+
+router.get('/timetable/versions/:id',                     timetableGuard, ttGenCtrl.getVersion);
+router.put('/timetable/versions/:id',                     timetableGuard, ttGenCtrl.updateVersion);
+router.delete('/timetable/versions/:id',                  timetableGuard, ttGenCtrl.deleteVersion);
+router.get('/timetable/versions/:id/progress',            timetableGuard, ttGenCtrl.getProgress);
+router.get('/timetable/versions/:id/conflicts',           timetableGuard, ttGenCtrl.getConflicts);
+router.get('/timetable/versions/:id/export',              timetableGuard, ttGenCtrl.exportVersion);
+router.get('/timetable/versions/:id/compare/:otherId',    timetableGuard, ttGenCtrl.compareVersions);
+router.post('/timetable/versions/:id/validate',           timetableGuard, ttGenCtrl.validateVersion);
+router.post('/timetable/versions/:id/publish',            timetableGuard, ttGenCtrl.publishVersion);
+router.post('/timetable/versions/:id/regenerate',         timetableGuard, ttGenCtrl.regenerate);
+router.post('/timetable/versions/:id/duplicate',          timetableGuard, ttGenCtrl.duplicateVersion);
+router.post('/timetable/versions/:id/restore',            timetableGuard, ttGenCtrl.restoreVersion);
+router.post('/timetable/versions/:id/archive',            timetableGuard, ttGenCtrl.archiveVersion);
+router.post('/timetable/versions/:id/release-lock',       timetableGuard, ttGenCtrl.releaseLock);
+router.post('/timetable/versions/:id/entries',            timetableGuard, ttGenCtrl.createEntry);
+router.post('/timetable/versions/:id/entries/:entryId/move', timetableGuard, ttGenCtrl.moveEntry);
+router.put('/timetable/versions/:id/entries/:entryId',    timetableGuard, ttGenCtrl.updateEntry);
+router.delete('/timetable/versions/:id/entries/:entryId', timetableGuard, ttGenCtrl.deleteEntry);
 
 // ── Reports ──────────────────────────────────────────────────────────────────
 router.get('/reports', guard, reportCtrl.getReports);

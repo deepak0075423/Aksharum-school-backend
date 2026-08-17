@@ -26,6 +26,18 @@ const TimetableEntrySchema = new db.Schema({
         ref: 'User',
         default: null,
     },
+    // Allocated by the timetable generator; null for hand-built timetables.
+    room: {
+        type: db.Types.UUID,
+        ref: 'Room',
+        default: null,
+    },
+    // The draft version this entry was published from, for traceability.
+    sourceVersion: {
+        type: db.Types.UUID,
+        ref: 'TimetableVersion',
+        default: null,
+    },
     additionalSubjects: [{
         subject: { type: db.Types.UUID, ref: 'Subject' },
         teacher: { type: db.Types.UUID, ref: 'User', default: null },

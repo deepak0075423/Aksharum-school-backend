@@ -30,7 +30,11 @@ const TimetableSchema = new db.Schema({
             startTime: { type: String, default: '' },
             endTime: { type: String, default: '' },
             isRecess: { type: Boolean, default: false },
-            recessName: { type: String, default: 'Break' }
+            recessName: { type: String, default: 'Break' },
+            // Added with the generator: distinguishes an Assembly/Activity slot
+            // from a plain Break. Legacy rows have no value — readers fall back
+            // to isRecess (see services/timetable/types.js periodTypeOf).
+            periodType: { type: String, default: '' }
         }
     ],
     createdAt: {
