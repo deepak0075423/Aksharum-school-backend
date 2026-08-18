@@ -8,6 +8,11 @@ const { uploadProfile } = require('../../middleware/upload');
 router.get('/',       verifyToken, ctrl.getProfile);
 router.put('/update', verifyToken, uploadProfile.single('profileImage'), ctrl.updateProfile);
 
+// The employee half of "my profile". Staff only, and limited to the fields an
+// employee may correct about themselves — see SELF_EDITABLE in the controller.
+router.get('/employee', verifyToken, ctrl.getMyEmployeeRecord);
+router.put('/employee', verifyToken, ctrl.updateMyEmployeeRecord);
+
 // Shared school config — accessible to all roles via verifyToken
 router.get('/school-config', verifyToken, async (req, res) => {
     try {

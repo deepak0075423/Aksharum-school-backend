@@ -67,6 +67,17 @@ const daysAhead = (n) => new Date(today.getTime() + n * 86400000);
 const daysAgo   = (n) => new Date(today.getTime() - n * 86400000);
 
 const used = new Set();
+// Back-dating tests need a working day in the past for the same reason the
+// forward tests do: a Saturday or Sunday is rejected for having no working days
+// before the back-dating rule is evaluated, which made these assertions fail on
+// any Sunday, Monday or Tuesday.
+function pickPast(pred, start = 1, limit = 200) {
+    for (let i = start; i < limit; i += 1) {
+        const d = daysAgo(i);
+        if (pred(d)) return d;
+    }
+    throw new Error('no matching past date');
+}
 function pickFuture(pred, start = 1) {
     for (let i = start; i < 200; i += 1) {
         const d = daysAhead(i);
@@ -237,7 +248,8 @@ async function cleanup(schoolId) {
         check('… and satisfied by a later date', (await applyAs(alice, SL, dLater, dLater)).status === 201);
         await setPolicy(SL, { advanceNoticeDays: 0 });
 
-        const past = daysAgo(3);
+        // Inside the 5-day window opened below, and a working day.
+        const past = pickPast(isWeekday, 1, 5);
         const backdated = await applyAs(alice, SL, past, past);
         check('Back-dated applications are refused by default',
             backdated.status === 400 && /past dates/i.test(backdated.message), backdated.message);
@@ -245,7 +257,7 @@ async function cleanup(schoolId) {
         await setPolicy(SL, { allowBackdated: true, backdatedWithinDays: 5 });
         const backOk = await applyAs(alice, SL, past, past);
         check('… allowed once the policy opens the window', backOk.status === 201, backOk.message);
-        const tooOld = daysAgo(40);
+        const tooOld = pickPast(isWeekday, 40);
         const backTooOld = await applyAs(alice, SL, tooOld, tooOld);
         check('… but only inside that window',
             backTooOld.status === 400 && /within 5 day\(s\)/i.test(backTooOld.message), backTooOld.message);

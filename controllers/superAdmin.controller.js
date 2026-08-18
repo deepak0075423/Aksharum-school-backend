@@ -151,13 +151,125 @@ exports.updateSchool = async (req, res) => {
         if (!school) return res.status(404).json({ success: false, message: 'School not found' });
         // Drop the replaced/removed file so uploads/ doesn't collect orphans
         if (previous && previous !== school.logo) deleteSchoolLogo(previous);
+        // Deactivating a school locks out everyone in it. The auth cache would
+        // otherwise keep their sessions alive until its TTL expired, so drop
+        // their entries now and make the lockout take effect immediately.
+        if (data.isActive === false) {
+            const members = await User.find({ school: req.params.id }).select('_id').lean();
+            if (members.length) await authCache.invalidateMany(members.map((u) => String(u._id)));
+        }
         res.json({ success: true, data: school });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Deleting a school.
+//
+//  A school with accounts in it is never deleted: every student record, payroll
+//  run, attendance register and document in the system hangs off those users,
+//  and removing the school row would orphan all of it silently. The delete is
+//  refused and the blocking accounts are reported so they can be dealt with
+//  first.
+// ─────────────────────────────────────────────────────────────────────────────
+const ROLE_LABEL = {
+    school_admin: 'School Admin',
+    teacher:      'Teacher',
+    student:      'Student',
+    parent:       'Parent',
+    super_admin:  'Super Admin',
+};
+
+async function schoolMembers(schoolId) {
+    return User.find({ school: schoolId })
+        .select('name email role phone isActive createdAt')
+        .sort({ role: 1, name: 1 })
+        .lean();
+}
+
+const countByRole = (users) => users.reduce((acc, u) => {
+    acc[u.role] = (acc[u.role] || 0) + 1;
+    return acc;
+}, {});
+
+// GET /schools/:id/delete-check — what the confirm dialog needs to decide.
+exports.checkSchoolDeletable = async (req, res) => {
+    try {
+        const school = await School.findById(req.params.id).select('name code isActive').lean();
+        if (!school) return res.status(404).json({ success: false, message: 'School not found' });
+
+        const users = await schoolMembers(req.params.id);
+        res.json({
+            success: true,
+            data: {
+                school: { _id: school._id, name: school.name, code: school.code, isActive: school.isActive },
+                canDelete: users.length === 0,
+                userCount: users.length,
+                byRole: Object.entries(countByRole(users))
+                    .map(([role, count]) => ({ role, label: ROLE_LABEL[role] || role, count }))
+                    .sort((a, b) => b.count - a.count),
+                // Enough to recognise the accounts; the spreadsheet carries the rest.
+                users: users.map((u) => ({
+                    _id: u._id, name: u.name, email: u.email,
+                    role: u.role, roleLabel: ROLE_LABEL[u.role] || u.role,
+                    phone: u.phone || '', isActive: u.isActive,
+                })),
+            },
+        });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+// GET /schools/:id/users/export — the blocking accounts as a spreadsheet.
+exports.exportSchoolUsers = async (req, res) => {
+    try {
+        const school = await School.findById(req.params.id).select('name code').lean();
+        if (!school) return res.status(404).json({ success: false, message: 'School not found' });
+
+        const users = await schoolMembers(req.params.id);
+        const rows = [
+            ['Name', 'Email', 'Role', 'Phone', 'Status', 'Created'],
+            ...users.map((u) => [
+                u.name || '',
+                u.email || '',
+                ROLE_LABEL[u.role] || u.role,
+                u.phone || '',
+                u.isActive ? 'Active' : 'Inactive',
+                u.createdAt ? new Date(u.createdAt).toISOString().slice(0, 10) : '',
+            ]),
+        ];
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), 'Users');
+        const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+        const safe = String(school.name || 'school').replace(/[^\w]+/g, '-').toLowerCase();
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${safe}-users.xlsx"`);
+        res.send(buf);
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
 exports.deleteSchool = async (req, res) => {
     try {
+        const school = await School.findById(req.params.id).select('name logo').lean();
+        if (!school) return res.status(404).json({ success: false, message: 'School not found' });
+
+        // Re-checked here, not just in the dialog: the confirm screen is a
+        // courtesy, this is the rule.
+        const users = await schoolMembers(req.params.id);
+        if (users.length) {
+            return res.status(409).json({
+                success: false,
+                code: 'SCHOOL_HAS_USERS',
+                message: `${school.name} still has ${users.length} account${users.length === 1 ? '' : 's'}. Remove or move them before deleting the school.`,
+                data: {
+                    userCount: users.length,
+                    byRole: Object.entries(countByRole(users))
+                        .map(([role, count]) => ({ role, label: ROLE_LABEL[role] || role, count })),
+                },
+            });
+        }
+
         await School.findByIdAndDelete(req.params.id);
+        if (school.logo) deleteSchoolLogo(school.logo);
         res.json({ success: true, message: 'School deleted' });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };

@@ -5,7 +5,6 @@ const ctrl    = require('../../controllers/superAdmin.controller');
 const notifCtrl = require('../../controllers/notification.controller');
 const logsCtrl  = require('../../controllers/logs.controller');
 const holidayCtrl = require('../../controllers/holiday.controller');
-const desigCtrl   = require('../../controllers/designation.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { uploadExcel, uploadImage } = require('../../middleware/upload');
 
@@ -17,6 +16,9 @@ router.get('/dashboard', guard, ctrl.getDashboard);
 // Schools
 router.get('/schools',          guard, ctrl.getSchools);
 router.post('/schools',         guard, uploadImage.single('logo'), ctrl.createSchool);
+// Declared before /schools/:id so the parameter never swallows them.
+router.get('/schools/:id/delete-check',  guard, ctrl.checkSchoolDeletable);
+router.get('/schools/:id/users/export',  guard, ctrl.exportSchoolUsers);
 router.get('/schools/:id',      guard, ctrl.getSchool);
 router.put('/schools/:id',      guard, uploadImage.single('logo'), ctrl.updateSchool);
 router.delete('/schools/:id',   guard, ctrl.deleteSchool);
@@ -43,13 +45,6 @@ router.put('/permissions/bulk',    guard, ctrl.bulkUpdatePermissions);
 // Designation Permissions — the middle of the hierarchy, per school. Same
 // controller the school admin uses; the school comes from the route instead of
 // from the token.
-router.get   ('/schools/:schoolId/designations',              guard, desigCtrl.getMatrix);
-router.put   ('/schools/:schoolId/designations',              guard, desigCtrl.updateMatrix);
-router.post  ('/schools/:schoolId/designations/new',          guard, desigCtrl.create);
-router.get   ('/schools/:schoolId/designations/:id/teachers',        guard, desigCtrl.getTeachers);
-router.get   ('/schools/:schoolId/designations/:id/teachers/export', guard, desigCtrl.exportTeachers);
-router.put   ('/schools/:schoolId/designations/:id',          guard, desigCtrl.update);
-router.delete('/schools/:schoolId/designations/:id',          guard, desigCtrl.remove);
 
 // Notifications
 router.get('/notifications',       guard, notifCtrl.getList);

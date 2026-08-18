@@ -105,6 +105,7 @@ app.use('/api/transport',     require('./routes/api/transport'));
 app.use('/api/video',         require('./routes/api/video'));
 app.use('/api/feedback',      require('./routes/api/feedback'));
 app.use('/api/analytics',     require('./routes/api/analytics'));
+app.use('/api/employee-directory', require('./routes/api/employeeDirectory'));
 app.use('/api/chat',          require('./routes/api/chat'));
 app.use('/api/notifications', require('./routes/api/notifications'));
 app.use('/api/profile',       require('./routes/api/profile'));

@@ -9,6 +9,7 @@ const ChatMember     = require('../models/ChatMember');
 const { isDate }     = require('../utils/validators');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
+const { capacityError }   = require('../utils/sectionCapacity');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const err = (res, e, status = 500)    => res.status(status).json({ success: false, message: e.message || e });
@@ -235,30 +236,79 @@ exports.updateClass = async (req, res) => {
  * respecting each section's capacity. Blocked once the class is locked;
  * moving individual students by hand keeps working either way.
  */
+/**
+ * Everything both the shuffle and its preview need: the class, its sections,
+ * who is being redistributed and whether they fit. Shared so the dialog can
+ * never promise something the shuffle would then refuse.
+ */
+async function gatherShuffle(req) {
+    const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
+    if (!cls) return { error: { message: 'Class not found' }, status: 404 };
+
+    const sections = (await ClassSection.find({ class: cls._id, school: req.schoolId }).lean())
+        .sort(byName('sectionName'));
+
+    // Everyone in the class: already in a section, or admitted to the class
+    // but not placed yet.
+    const enrolled = sections.flatMap(s => (s.enrolledStudents || []).map(String));
+    const unplaced = await StudentProfile.find(
+        { school: req.schoolId, currentClass: cls._id, currentSection: null }, 'user',
+    ).lean();
+    const studentIds = [...new Set([...enrolled, ...unplaced.map(p => String(p.user))])];
+    const capacity = sections.reduce((sum, s) => sum + (s.maxStudents || 0), 0);
+
+    // Ordered by how the admin should act on them.
+    let blocked = null;
+    if (cls.sectionShuffle?.lockedAt)
+        blocked = `Sections for ${cls.className} are locked for this academic year. Move students individually instead.`;
+    else if (sections.length < 2)
+        blocked = 'Add at least two sections before shuffling.';
+    else if (!studentIds.length)
+        blocked = 'This class has no students to shuffle.';
+    else if (studentIds.length > capacity)
+        blocked = `${studentIds.length} students do not fit in ${capacity} seats across ${sections.length} sections. `
+                + `Raise a section's capacity by at least ${studentIds.length - capacity} before shuffling.`;
+
+    return { cls, sections, studentIds, capacity, blocked };
+}
+
+/**
+ * GET /admin/classes/:classId/shuffle-preview
+ * What the confirm dialog shows before anything is moved: how many students
+ * would be redistributed, how many seats exist across the sections, and the
+ * reason when the answer is that it cannot be done.
+ */
+exports.shufflePreview = async (req, res) => {
+    try {
+        const g = await gatherShuffle(req);
+        if (g.error) return err(res, g.error, g.status);
+        ok(res, {
+            className: g.cls.className,
+            students: g.studentIds.length,
+            capacity: g.capacity,
+            shortfall: Math.max(0, g.studentIds.length - g.capacity),
+            sectionCount: g.sections.length,
+            sections: g.sections.map(s => ({
+                _id: String(s._id),
+                sectionName: s.sectionName,
+                maxStudents: s.maxStudents || 0,
+                currentCount: (s.enrolledStudents || []).length,
+            })),
+            locked: !!g.cls.sectionShuffle?.lockedAt,
+            canShuffle: !g.blocked,
+            reason: g.blocked || '',
+        });
+    } catch (e) { err(res, e); }
+};
+
 exports.shuffleSections = async (req, res) => {
     try {
-        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
-        if (!cls) return err(res, { message: 'Class not found' }, 404);
-        if (cls.sectionShuffle?.lockedAt)
-            return err(res, { message: `Sections for ${cls.className} are locked for this academic year. Move students individually instead.` }, 400);
-
-        const sections = (await ClassSection.find({ class: cls._id, school: req.schoolId }).lean())
-            .sort(byName('sectionName'));
-        if (sections.length < 2)
-            return err(res, { message: 'Add at least two sections before shuffling.' }, 400);
-
-        // Everyone in the class: already in a section, or admitted to the class
-        // but not placed yet.
-        const enrolled  = sections.flatMap(s => (s.enrolledStudents || []).map(String));
-        const unplaced  = await StudentProfile.find(
-            { school: req.schoolId, currentClass: cls._id, currentSection: null }, 'user',
-        ).lean();
-        const studentIds = [...new Set([...enrolled, ...unplaced.map(p => String(p.user))])];
-        if (!studentIds.length) return err(res, { message: 'This class has no students to shuffle.' }, 400);
-
-        const capacity = sections.reduce((sum, s) => sum + (s.maxStudents || 0), 0);
-        if (studentIds.length > capacity)
-            return err(res, { message: `${studentIds.length} students do not fit in ${capacity} seats across ${sections.length} sections. Raise a section's capacity first.` }, 400);
+        const g = await gatherShuffle(req);
+        if (g.error) return err(res, g.error, g.status);
+        // Re-checked here, not just in the dialog: the preview is a courtesy,
+        // this is the rule.
+        if (g.blocked) return err(res, { message: g.blocked }, 400);
+        const { cls, sections, studentIds } = g;
 
         // Fisher–Yates, then deal round-robin so sections stay balanced
         const pool = [...studentIds];
@@ -668,6 +718,12 @@ exports.assignStudentToSection = async (req, res) => {
             _id: { $ne: section._id },
         }).lean();
         if (alreadyIn) return err(res, { message: `Student is already enrolled in section "${alreadyIn.sectionName}". Remove them first.` }, 400);
+
+        // A section's capacity is a limit, not a suggestion. The student is
+        // excluded from the count so re-adding someone already on the roster
+        // never reports the section as full.
+        const full = capacityError(section, studentId);
+        if (full) return err(res, { message: full }, 400);
 
         await ClassSection.findByIdAndUpdate(req.params.sectionId, {
             $addToSet: { enrolledStudents: studentId },

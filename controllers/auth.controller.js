@@ -20,6 +20,34 @@ const signToken = (user) => {
 const signRefresh = (userId) =>
     jwt.sign({ userId }, process.env.JWT_REFRESH_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' });
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  A deactivated school locks out everyone who belongs to it.
+//
+//  The two audiences get different instructions because they have different
+//  remedies: a teacher / student / parent needs their own school administrator,
+//  while the school admin's own school is the thing that was switched off, so
+//  only the platform can help. Super admin has no school and is never affected.
+//
+//  Returns null when the caller may proceed, or {code, message} when they may not.
+// ─────────────────────────────────────────────────────────────────────────────
+const SCHOOL_INACTIVE = 'SCHOOL_INACTIVE';
+
+function schoolLockout(user) {
+    if (user.role === 'super_admin') return null;
+    const school = user.school;
+    // A missing school ref is not a lockout — that is an account-shape problem
+    // the existing checks already cover.
+    if (!school || typeof school !== 'object') return null;
+    if (school.isActive !== false) return null;
+
+    return {
+        code: SCHOOL_INACTIVE,
+        message: user.role === 'school_admin'
+            ? `${school.name || 'Your school'} has been deactivated. Please contact support.`
+            : `${school.name || 'Your school'} is currently inactive. Please contact your school administrator.`,
+    };
+}
+
 exports.login = async (req, res) => {
     try {
         const { email, password, schoolCode } = req.body;
@@ -32,6 +60,12 @@ exports.login = async (req, res) => {
         }
         if (!user.isActive) {
             return res.status(403).json({ success: false, message: 'Account disabled' });
+        }
+        // Checked after the password so a wrong password never reveals whether
+        // the account exists or which school it belongs to.
+        const locked = schoolLockout(user);
+        if (locked) {
+            return res.status(403).json({ success: false, code: locked.code, message: locked.message });
         }
         const token   = signToken(user);
         const refresh = signRefresh(user._id);
@@ -67,8 +101,10 @@ exports.refreshToken = async (req, res) => {
         const { refreshToken } = req.body;
         if (!refreshToken) return res.status(400).json({ success: false, message: 'Refresh token required' });
         const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-        const user = await User.findById(decoded.userId).lean();
+        const user = await User.findById(decoded.userId).populate('school');
         if (!user || !user.isActive) return res.status(401).json({ success: false, message: 'Invalid token' });
+        const locked = schoolLockout(user);
+        if (locked) return res.status(403).json({ success: false, code: locked.code, message: locked.message });
         const token = signToken(user);
         res.json({ success: true, token });
     } catch (err) {

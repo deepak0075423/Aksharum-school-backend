@@ -26,6 +26,7 @@ const School         = require('../models/School');
 const User           = require('../models/User');
 const TeacherProfile = require('../models/TeacherProfile');
 const Designation    = require('../models/Designation');
+const { MODULE_KEYS } = require('../config/modules');
 
 let passed = 0; let failed = 0;
 const results = [];
@@ -161,7 +162,10 @@ async function cleanup(schoolId, superAdminId) {
         check('Matrix loads for the school admin', m0.status === 200, m0.message);
         check('… one row per existing designation',
             m0.data.designations.length === 4, `${m0.data?.designations?.length} rows`);
-        check('… every module is described once', m0.data.modules.length === 16, `${m0.data?.modules?.length}`);
+        // Counted from the registry, not hard-coded — adding a module must not
+        // break this assertion, only its arithmetic.
+        check('… every module is described once', m0.data.modules.length === MODULE_KEYS.length,
+            `${m0.data?.modules?.length} vs ${MODULE_KEYS.length} registered`);
         check('… only school-enabled modules are offered for configuration',
             m0.data.enabledModules.includes('library') && m0.data.enabledModules.includes('fees')
             && !m0.data.enabledModules.includes('payroll'),
@@ -435,23 +439,22 @@ async function cleanup(schoolId, superAdminId) {
         });
         check('A teacher cannot grant themselves permissions', teacherWrite.status === 403, `${teacherWrite.status}`);
 
+        // Designations belong to the school that owns them. The Super Admin
+        // decides which MODULES a school has; who inside the school may reach
+        // them is the school admin's call, so the per-school designation
+        // surface no longer exists.
         const saMatrix = await GET(`/super-admin/schools/${schoolId}/designations`, { as: superAdmin });
-        check('The super admin can read any school\'s matrix', saMatrix.status === 200, saMatrix.message);
+        check('The super admin has no route to a school\'s matrix', saMatrix.status === 404, `${saMatrix.status}`);
         const saWrite = await PUT(`/super-admin/schools/${schoolId}/designations/${teacherRow._id}`, {
             as: superAdmin, body: { permissions: { transport: 'admin' } },
         });
-        check('… and configure it', saWrite.status === 200, saWrite.message);
+        check('… nor any route to configure one', saWrite.status === 404, `${saWrite.status}`);
         const m4 = await matrix();
-        check('… with the school admin seeing the same result',
-            byName(m4, 'Teacher').permissions.transport === 'admin');
-
-        const otherSchool = await School.create({ name: `${TAG} Other`, modules: {} });
-        const crossSchool = await PUT(`/super-admin/schools/${sid(otherSchool)}/designations/${teacherRow._id}`, {
-            as: superAdmin, body: { permissions: { fees: 'admin' } },
-        });
-        check('A designation cannot be edited through another school\'s scope',
-            crossSchool.status === 404, `${crossSchool.status}`);
-        await School.findByIdAndDelete(sid(otherSchool));
+        check('… and the school admin\'s configuration is untouched by the attempt',
+            byName(m4, 'Teacher').permissions.transport !== 'admin',
+            byName(m4, 'Teacher').permissions.transport);
+        check('The school admin still owns the matrix',
+            m4.status === 200 && m4.data.designations.length > 0, `${m4.status}`);
 
         section('Roles that are not designation-driven are unchanged');
 

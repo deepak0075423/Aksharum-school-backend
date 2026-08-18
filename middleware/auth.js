@@ -58,6 +58,20 @@ const verifyToken = async (req, res, next) => {
         if (!user || !user.isActive) {
             return res.status(401).json({ success: false, message: 'User not found or inactive' });
         }
+        // A school switched off mid-session ends that session too — otherwise
+        // "no one from this school may sign in" would only hold for new logins
+        // and existing tokens would keep working for their whole lifetime.
+        // Super admin has no school and is never caught by this.
+        if (user.role !== 'super_admin' && user.school && typeof user.school === 'object'
+            && user.school.isActive === false) {
+            return res.status(403).json({
+                success: false,
+                code: 'SCHOOL_INACTIVE',
+                message: user.role === 'school_admin'
+                    ? `${user.school.name || 'Your school'} has been deactivated. Please contact support.`
+                    : `${user.school.name || 'Your school'} is currently inactive. Please contact your school administrator.`,
+            });
+        }
         req.user    = user;
         req.userId  = user._id;
         req.schoolId = user.school?._id || user.school;

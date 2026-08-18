@@ -22,6 +22,7 @@ const { STATES_AND_UTS, isPincode, stateFromPincode } = require('../utils/indiaS
 const { rollNumberTaken } = require('../utils/rollNumbers');
 const admissionNo = require('../utils/admissionNumber');
 const employeeIdUtil = require('../utils/employeeId');
+const { capacityErrorById } = require('../utils/sectionCapacity');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -592,6 +593,10 @@ exports.updateStudentFull = async (req, res) => {
             if (password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
             userUpdate.password = await bcrypt.hash(password, 12);
         }
+        if (currentSection !== undefined && currentSection) {
+            const full = await capacityErrorById(currentSection, req.params.id);
+            if (full) return res.status(400).json({ success: false, message: full });
+        }
         const user = await User.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, userUpdate, { new: true });
         if (!user) return res.status(404).json({ success: false, message: 'Student not found' });
         await authCache.invalidate(user._id);
@@ -808,6 +813,9 @@ function buildTeacherProfile(b, files = {}) {
 
     return {
         designation:  b.designation || '',
+        // Department drives the directory's grouping and its main filter, so the
+        // intake form collects it rather than leaving it to a later edit.
+        department:   String(b.department || '').trim(),
         dob:          b.dob ? new Date(b.dob) : null,
         gender:       b.gender || '',
         bloodGroup:   b.bloodGroup || '',
@@ -865,6 +873,41 @@ function buildTeacherProfile(b, files = {}) {
     };
 }
 
+// Profile keys whose value is derived from more than one posted field. Anything
+// not listed here is fed by the field of the same name.
+const TEACHER_FIELD_SOURCES = {
+    qualification:   ['qualification', 'qualificationOther'],
+    teachingDegree:  ['teachingDegree', 'teachingDegreeOther'],
+    experience:      ['employmentType', 'totalExperience'],
+    totalExperience: ['employmentType', 'totalExperience'],
+    previousSchool:  ['employmentType', 'previousSchool'],
+    lastDesignation: ['employmentType', 'lastDesignation'],
+    permanentAddress: ['permanentAddress', 'sameAsCurrent'],
+    permanentCity:    ['permanentCity', 'sameAsCurrent'],
+    permanentState:   ['permanentState', 'sameAsCurrent'],
+    permanentPincode: ['permanentPincode', 'sameAsCurrent'],
+    permanentCountry: ['permanentCountry', 'sameAsCurrent'],
+};
+
+const TEACHER_FILE_FIELDS = [
+    'aadhaarFrontFile', 'aadhaarBackFile', 'panCardFile',
+    'experienceCertificateFile', 'resignationLetterFile', 'joiningLetterFile',
+];
+const TEACHER_FILE_BY_INPUT = {
+    aadhaarFront: 'aadhaarFrontFile', aadhaarBack: 'aadhaarBackFile', panCard: 'panCardFile',
+    experienceCertificate: 'experienceCertificateFile', resignationLetter: 'resignationLetterFile',
+    joiningLetter: 'joiningLetterFile',
+};
+/** Files already on the profile, shaped like multer's req.files. */
+function fileStubsFor(profile) {
+    const out = {};
+    if (!profile) return out;
+    for (const [input, field] of Object.entries(TEACHER_FILE_BY_INPUT)) {
+        if (profile[field]) out[input] = [{ filename: profile[field] }];
+    }
+    return out;
+}
+
 exports.createTeacher = async (req, res) => {
     try {
         const b     = req.body;
@@ -900,6 +943,85 @@ exports.createTeacher = async (req, res) => {
         const schoolName = req.user?.school?.name || 'School';
         sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
         jsonOk(res, { ...user.toObject?.() ?? user, employeeId }, 201);
+    } catch (err) { jsonErr(res, err, 400); }
+};
+
+/**
+ * PUT /admin/teachers/:id — the full teacher record, edited with the same form
+ * that created it.
+ *
+ * The edit is PARTIAL by design: only the fields the request actually sent are
+ * written, and a document already on file counts as present. That is what lets
+ * the wizard reopen on an existing teacher without forcing the admin to
+ * re-upload paperwork just to correct a phone number.
+ */
+exports.updateTeacherFull = async (req, res) => {
+    try {
+        const b     = req.body;
+        const files = req.files || {};
+
+        const user = await User.findOne({ _id: req.params.id, school: req.schoolId, role: 'teacher' });
+        if (!user) return res.status(404).json({ success: false, message: 'Teacher not found' });
+        const existing = await TeacherProfile.findOne({ user: user._id, school: req.schoolId }).lean();
+
+        // Validated against the merged record, so paperwork already on file
+        // satisfies the intake rules.
+        const problem = validateTeacherIntake(
+            { ...(existing || {}), ...b },
+            { ...fileStubsFor(existing), ...files },
+        );
+        if (problem) return res.status(400).json({ success: false, message: problem });
+
+        if (b.email && String(b.email).toLowerCase() !== String(user.email).toLowerCase()) {
+            const taken = await User.findOne({ email: String(b.email).toLowerCase() }).lean();
+            if (taken) return res.status(400).json({ success: false, message: 'Email already registered' });
+        }
+
+        const typedId = String(b.employeeId ?? '').trim();
+        if (typedId && typedId !== (existing?.employeeId || '')) {
+            const idTaken = await TeacherProfile.findOne({ school: req.schoolId, employeeId: typedId }).lean();
+            if (idTaken) return res.status(400).json({ success: false, message: `Employee ID ${typedId} is already in use.` });
+        }
+
+        const userUpdate = {};
+        if (b.name  !== undefined) userUpdate.name  = String(b.name).trim();
+        if (b.phone !== undefined) userUpdate.phone = String(b.phone).trim();
+        if (b.email !== undefined) userUpdate.email = String(b.email).toLowerCase().trim();
+        if (b.password) {
+            if (String(b.password).length < 6)
+                return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+            userUpdate.password = await bcrypt.hash(b.password, 12);
+        }
+        if (Object.keys(userUpdate).length) {
+            await User.findByIdAndUpdate(user._id, userUpdate);
+            await authCache.invalidate(user._id);
+        }
+
+        // A blank upload must not wipe the file already on record.
+        const built = buildTeacherProfile(b, files);
+        for (const key of TEACHER_FILE_FIELDS) {
+            if (!built[key] && existing?.[key]) built[key] = existing[key];
+        }
+        // ...and neither must an omitted field. buildTeacherProfile fills every
+        // key with a default, so writing it wholesale would blank anything the
+        // caller did not send. Keep only what this request actually supplied.
+        for (const key of Object.keys(built)) {
+            if (TEACHER_FILE_FIELDS.includes(key)) continue;
+            const feeds = TEACHER_FIELD_SOURCES[key] || [key];
+            if (!feeds.some((f) => b[f] !== undefined)) delete built[key];
+        }
+        if (typedId) built.employeeId = typedId;
+
+        await TeacherProfile.findOneAndUpdate(
+            { user: user._id, school: req.schoolId },
+            { $set: built, $setOnInsert: { user: user._id, school: req.schoolId } },
+            { upsert: true },
+        );
+        // The designation decides which modules this teacher reaches.
+        if (built.designation !== (existing?.designation || '')) {
+            await designationSvc.invalidateUser(user._id);
+        }
+        jsonOk(res, { _id: String(user._id) });
     } catch (err) { jsonErr(res, err, 400); }
 };
 
@@ -947,6 +1069,11 @@ exports.createStudent = async (req, res) => {
         }
         const profileErr = validateStudentProfile(profile) || validateStudentDocs(profile, uploads);
         if (profileErr) return res.status(400).json({ success: false, message: profileErr });
+        // A section that is already at capacity does not take another student.
+        if (profile.currentSection) {
+            const full = await capacityErrorById(profile.currentSection);
+            if (full) return res.status(400).json({ success: false, message: full });
+        }
         const exists = await User.findOne({ email: email.toLowerCase() });
         if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
 
@@ -1074,12 +1201,28 @@ exports.bulkDeleteUsers = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+// Sheet dates arrive as dd/mm/yyyy text (the templates force the column to
+// text so Excel cannot silently reformat them). Returns null on anything else,
+// which the callers turn into a row error rather than a wrong date.
+function parseSheetDate(raw) {
+    const value = String(raw ?? '').trim();
+    if (!value) return null;
+    const parts = value.replace(/-/g, '/').split('/');
+    if (parts.length !== 3) return null;
+    const [d, m, y] = parts;
+    if (String(y).length !== 4) return null;
+    const dt = new Date(`${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
 exports.bulkTeachers = async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
         const schoolName = req.user?.school?.name || 'School';
         const wb   = XLSX.read(req.file.buffer, { type: 'buffer' });
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+        // Needed once for the employee-ID format, not per row.
+        const bulkSchoolDoc = await School.findById(req.schoolId).select('name code employeeIdFormat').lean();
 
         let created = 0;
         let updated = 0;
@@ -1093,10 +1236,41 @@ exports.bulkTeachers = async (req, res) => {
             const email       = (r['email address'] || r['email'] || '').toLowerCase();
             const phone       = r['phone number']   || r['phone'] || '';
             const designation = r['designation']    || '';
+            const employeeId  = r['employee id']    || r['employeeid'] || '';
+            const department  = r['department']     || '';
+            const gender      = r['gender']         || '';
+            const bloodGroup  = r['blood group']    || r['bloodgroup'] || '';
+            const qualification  = r['qualification']    || '';
+            const teachingDegree = r['teaching degree']  || r['teachingdegree'] || '';
+            const experience     = r['experience']       || '';
+            const dob         = parseSheetDate(r['date of birth']   || r['dob'] || '');
+            const joiningDate = parseSheetDate(r['date of joining'] || r['joining date'] || r['joiningdate'] || '');
 
             if (!name || !email) { errors.push({ row: rowNum, name: name || '?', reason: 'Full Name and Email Address are required' }); continue; }
             if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errors.push({ row: rowNum, name, reason: `Invalid email "${email}"` }); continue; }
             if (phone && !/^[+\d\s\-]{7,15}$/.test(phone)) { errors.push({ row: rowNum, name, reason: `Invalid phone "${phone}"` }); continue; }
+            if (gender && !['Male', 'Female', 'Other'].includes(gender)) {
+                errors.push({ row: rowNum, name, reason: `Gender must be Male, Female or Other — got "${gender}"` }); continue;
+            }
+            if ((r['date of birth'] || r['dob']) && !dob) {
+                errors.push({ row: rowNum, name, reason: 'Invalid Date of Birth (use dd/mm/yyyy)' }); continue;
+            }
+            if ((r['date of joining'] || r['joining date']) && !joiningDate) {
+                errors.push({ row: rowNum, name, reason: 'Invalid Date of Joining (use dd/mm/yyyy)' }); continue;
+            }
+            // Only the fields this row actually supplied are written, so
+            // re-uploading a partial sheet never blanks what is already on file.
+            const profileFields = {
+                ...(designation    ? { designation } : {}),
+                ...(department     ? { department } : {}),
+                ...(gender         ? { gender } : {}),
+                ...(bloodGroup     ? { bloodGroup } : {}),
+                ...(qualification  ? { qualification } : {}),
+                ...(teachingDegree ? { teachingDegree } : {}),
+                ...(experience     ? { experience, totalExperience: experience } : {}),
+                ...(dob            ? { dob } : {}),
+                ...(joiningDate    ? { joiningDate } : {}),
+            };
 
             try {
                 const exists = await User.findOne({ email }).lean();
@@ -1111,16 +1285,28 @@ exports.bulkTeachers = async (req, res) => {
                     await authCache.invalidate(exists._id);
                     await TeacherProfile.findOneAndUpdate(
                         { user: exists._id },
-                        { $set: { ...(designation ? { designation } : {}) }, $setOnInsert: { school: req.schoolId } },
+                        { $set: profileFields, $setOnInsert: { school: req.schoolId } },
                         { upsert: true },
                     );
                     if (designation) await designationSvc.invalidateUser(exists._id);
                     updated++;
                     continue;
                 }
+                // An employee ID is part of the employee record, so a bulk-created
+                // teacher gets one the same way the add-teacher form does —
+                // typed if supplied, otherwise generated from the school's format.
+                let resolvedId = employeeId;
+                if (resolvedId) {
+                    const taken = await TeacherProfile.findOne({ school: req.schoolId, employeeId: resolvedId }).lean();
+                    if (taken) { errors.push({ row: rowNum, name, reason: `Employee ID "${resolvedId}" is already in use` }); continue; }
+                } else {
+                    resolvedId = await employeeIdUtil.nextEmployeeId(bulkSchoolDoc || { _id: req.schoolId });
+                }
                 const otp  = generateOTP();
                 const user = await createUserHelper({ name, email, phone, password: otp }, 'teacher', req.schoolId);
-                await TeacherProfile.create({ user: user._id, school: req.schoolId, designation });
+                await TeacherProfile.create({
+                    user: user._id, school: req.schoolId, employeeId: resolvedId, ...profileFields,
+                });
                 sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
                 created++;
             } catch (e) {
@@ -1161,6 +1347,8 @@ exports.bulkStudents = async (req, res) => {
         let created = 0;
         let updated = 0;
         const errors = [];
+        // sectionId -> live set of student ids seated there during this import.
+        const rosterBySection = new Map();
 
         for (let i = 0; i < rows.length; i++) {
             const row = rows[i];
@@ -1182,6 +1370,7 @@ exports.bulkStudents = async (req, res) => {
             const city        = r['city']                || '';
             const stateName   = r['state']               || '';
             const pincode     = String(r['pincode'] || r['pin code'] || r['postal code'] || '').trim();
+            const rollNumber  = r['roll number']         || r['rollnumber']  || '';
             const parentName  = r['parent full name']    || r['parent name'] || '';
             const parentEmail = (r['parent email']       || '').toLowerCase();
             const parentPhone = r['parent phone number'] || r['parent phone'] || '';
@@ -1219,13 +1408,7 @@ exports.bulkStudents = async (req, res) => {
                 continue;
             }
 
-            let dob = null;
-            const dobParts = dobRaw.replace(/-/g, '/').split('/');
-            if (dobParts.length === 3) {
-                const [d, m, y] = dobParts;
-                dob = new Date(`${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`);
-                if (isNaN(dob.getTime())) dob = null;
-            }
+            const dob = parseSheetDate(dobRaw);
             if (!dob) {
                 errors.push({ row: rowNum, name, reason: 'Invalid Date of Birth (use dd/mm/yyyy)' });
                 push({ type: 'row_done', row: rowNum, name, success: false, reason: 'Invalid Date of Birth (use dd/mm/yyyy)' });
@@ -1247,11 +1430,32 @@ exports.bulkStudents = async (req, res) => {
                 continue;
             }
 
+            // Seats filled earlier in THIS import must count, so the roster is
+            // tracked across rows rather than re-read from the pre-run snapshot.
+            const secKey = String(section._id);
+            if (!rosterBySection.has(secKey)) {
+                rosterBySection.set(secKey, new Set((section.enrolledStudents || []).map(String)));
+            }
+            const sectionRoster = rosterBySection.get(secKey);
+            const sectionSeats  = Number(section.maxStudents) || 0;
+
             // A row whose email already exists updates that student instead of
             // failing, so a corrected sheet can simply be re-uploaded.
             const studentExists = await User.findOne({ email }).lean();
             if (studentExists && (studentExists.role !== 'student' || String(studentExists.school) !== String(req.schoolId))) {
                 const reason = `Email "${email}" belongs to another account`;
+                errors.push({ row: rowNum, name, reason });
+                push({ type: 'row_done', row: rowNum, name, success: false, reason });
+                continue;
+            }
+
+            // Seats are counted against the roster as it grows during this run,
+            // so a sheet with more rows than seats fails the surplus rows rather
+            // than overfilling the section.
+            const alreadySeated = studentExists && sectionRoster.has(String(studentExists._id));
+            if (sectionSeats > 0 && !alreadySeated && sectionRoster.size >= sectionSeats) {
+                const reason = `Section "${section.sectionName}" of ${className} is full `
+                             + `(${sectionRoster.size} of ${sectionSeats} seats taken)`;
                 errors.push({ row: rowNum, name, reason });
                 push({ type: 'row_done', row: rowNum, name, success: false, reason });
                 continue;
@@ -1280,6 +1484,8 @@ exports.bulkStudents = async (req, res) => {
                     address, city, state: stateName || stateFromPincode(pincode), pincode,
                     country: 'India',
                     currentClass: clasDoc._id, currentSection: section._id, parent: parentUserId,
+                    // Optional in the sheet: sections assign roll numbers in bulk later.
+                    ...(rollNumber ? { rollNumber } : {}),
                 };
 
                 let studentUser = studentExists;
@@ -1292,10 +1498,12 @@ exports.bulkStudents = async (req, res) => {
                         { upsert: true },
                     );
                     updated++;
+                    sectionRoster.add(String(studentUser._id));
                 } else {
                     const otp = generateOTP();
                     studentUser = await createUserHelper({ name, email, phone, password: otp }, 'student', req.schoolId);
                     await StudentProfile.create({ user: studentUser._id, ...profileData });
+                    sectionRoster.add(String(studentUser._id));
                     sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
                     created++;
                 }
@@ -1329,59 +1537,152 @@ exports.bulkStudents = async (req, res) => {
     }
 };
 
-exports.downloadStudentTemplate = (req, res) => {
-    const headers = [
-        'Full Name', 'Email Address', 'Phone Number', 'Admission Number',
-        'Date of Birth', 'Gender', 'Blood Group', 'Category',
-        'Class', 'Section', 'Address', 'City', 'State', 'Pincode',
-        'Parent Full Name', 'Parent Email', 'Parent Phone Number',
-    ];
-    const sample = [
-        'Ravi Kumar', 'ravi.kumar@example.com', '9876543210', 'ADM2024001',
-        '15/08/2010', 'Male', 'B+', 'General',
-        'Class 10', 'A', '123 Main Street', 'Pune', 'Maharashtra', '411001',
-        'Suresh Kumar', 'suresh.kumar@example.com', '9876543200',
-    ];
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bulk-import templates.
+//
+//  A template is only useful if the sheet it produces actually imports. Both of
+//  these are therefore built from the school's OWN data: the sample row uses a
+//  class and section that exist, and a second "Reference" sheet lists the exact
+//  values the importer will accept. The previous fixed sample ("Class 10") did
+//  not exist in most schools, so the template's own example row was rejected.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+// Marks the columns Excel would otherwise mangle (leading zeros, dd/mm/yyyy)
+// as text, so what the admin typed is what the importer reads.
+function forceTextColumns(ws, cols, lastRow) {
+    for (let r = 1; r <= lastRow; r += 1) {
+        for (const c of cols) {
+            const addr = XLSX.utils.encode_cell({ r, c });
+            if (ws[addr]) { ws[addr].t = 's'; ws[addr].z = '@'; }
+        }
+    }
+}
 
-    // Force text format on columns that Excel would otherwise misinterpret:
-    // col 2 = Phone Number, col 3 = Admission Number, col 4 = Date of Birth,
-    // col 13 = Pincode, col 16 = Parent Phone
-    [2, 3, 4, 13, 16].forEach(col => {
-        const addr = XLSX.utils.encode_cell({ r: 1, c: col });
-        if (ws[addr]) { ws[addr].t = 's'; ws[addr].z = '@'; }
-    });
+const widthsFor = (headers) => headers.map((h) => ({ wch: Math.max(12, Math.min(30, h.length + 4)) }));
 
-    // Column widths so the file looks usable when opened
-    ws['!cols'] = [
-        { wch: 20 }, { wch: 28 }, { wch: 15 }, { wch: 16 },
-        { wch: 16 }, { wch: 10 }, { wch: 12 }, { wch: 12 },
-        { wch: 12 }, { wch: 10 }, { wch: 28 },
-        { wch: 20 }, { wch: 28 }, { wch: 18 },
-    ];
-
-    XLSX.utils.book_append_sheet(wb, ws, 'Students');
+function sendWorkbook(res, wb, filename) {
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    res.setHeader('Content-Disposition', 'attachment; filename="student-template.xlsx"');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.send(buf);
+}
+
+// One "Reference" sheet per template: the accepted values, so an admin does not
+// have to guess what the importer will take.
+function referenceSheet(wb, sections) {
+    const rows = [];
+    for (const [title, values] of sections) {
+        rows.push([title]);
+        if (values.length) values.forEach((v) => rows.push(['', v]));
+        else rows.push(['', '(none configured yet)']);
+        rows.push([]);
+    }
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws['!cols'] = [{ wch: 26 }, { wch: 40 }];
+    XLSX.utils.book_append_sheet(wb, ws, 'Reference');
+}
+
+exports.downloadStudentTemplate = async (req, res) => {
+    try {
+        const headers = [
+            'Full Name', 'Email Address', 'Phone Number', 'Admission Number', 'Roll Number',
+            'Date of Birth', 'Gender', 'Blood Group', 'Category',
+            'Class', 'Section', 'Address', 'City', 'State', 'Pincode',
+            'Parent Full Name', 'Parent Email', 'Parent Phone Number',
+        ];
+
+        // Sample row built from this school's real classes and sections, so the
+        // example imports as-is instead of failing on a class that never existed.
+        const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
+        const yearFilter = activeYear ? { academicYear: activeYear._id } : {};
+        const classes  = await Class.find({ school: req.schoolId, ...yearFilter }).sort('classNumber').lean();
+        const sections = await ClassSection.find({ school: req.schoolId, ...yearFilter }).lean();
+
+        const firstClass   = classes[0] || null;
+        const firstSection = firstClass
+            ? sections.find((s) => String(s.class) === String(firstClass._id))
+            : null;
+        const school = await School.findById(req.schoolId).select('city state').lean();
+
+        const sample = [
+            'Ravi Kumar', 'ravi.kumar@example.com', '9876543210', '', '',
+            '15/08/2010', 'Male', 'B+', 'General',
+            firstClass?.className || 'Class 1', firstSection?.sectionName || 'A',
+            '123 Main Street', school?.city || 'Pune', school?.state || 'Maharashtra', '411001',
+            'Suresh Kumar', 'suresh.kumar@example.com', '9876543200',
+        ];
+
+        const wb = XLSX.utils.book_new();
+        const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+        // Phone, Admission No, Roll No, DOB, Pincode, Parent Phone
+        forceTextColumns(ws, [2, 3, 4, 5, 14, 17], 1);
+        ws['!cols'] = widthsFor(headers);
+        XLSX.utils.book_append_sheet(wb, ws, 'Students');
+
+        const sectionLabels = classes.flatMap((c) => sections
+            .filter((sec) => String(sec.class) === String(c._id))
+            .map((sec) => `${c.className}  →  ${sec.sectionName}`));
+
+        referenceSheet(wb, [
+            ['Classes (use exactly this text)', classes.map((c) => c.className)],
+            ['Class → Section pairs', sectionLabels],
+            ['Gender', ['Male', 'Female', 'Other']],
+            ['Blood Group', ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']],
+            ['Date of Birth format', ['dd/mm/yyyy  (e.g. 15/08/2010)']],
+            ['Leave blank to auto-generate', ['Admission Number', 'Roll Number']],
+            ['Required in every row', [
+                'Full Name', 'Email Address', 'Phone Number', 'Date of Birth', 'Gender',
+                'Blood Group', 'Category', 'Class', 'Section', 'Address',
+                'Parent Full Name', 'Parent Email', 'Parent Phone Number',
+            ]],
+        ]);
+
+        sendWorkbook(res, wb, 'student-template.xlsx');
+    } catch (err) { jsonErr(res, err); }
 };
 
-exports.downloadTeacherTemplate = (req, res) => {
-    const headers = ['Full Name', 'Email Address', 'Phone Number', 'Designation'];
-    const sample  = ['Anita Sharma', 'anita.sharma@example.com', '9876543210', 'Teacher'];
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
-    const phoneCell = XLSX.utils.encode_cell({ r: 1, c: 2 });
-    if (ws[phoneCell]) { ws[phoneCell].t = 's'; ws[phoneCell].z = '@'; }
-    ws['!cols'] = [{ wch: 20 }, { wch: 28 }, { wch: 15 }, { wch: 18 }];
-    XLSX.utils.book_append_sheet(wb, ws, 'Teachers');
-    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    res.setHeader('Content-Disposition', 'attachment; filename="teacher-template.xlsx"');
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.send(buf);
+exports.downloadTeacherTemplate = async (req, res) => {
+    try {
+        // The four-column template produced teachers with no employee ID, no
+        // joining date and no personal details — every one of them showing as an
+        // incomplete profile. These are the fields the importer now reads.
+        const headers = [
+            'Full Name', 'Email Address', 'Phone Number',
+            'Employee ID', 'Designation', 'Department',
+            'Gender', 'Date of Birth', 'Blood Group', 'Date of Joining',
+            'Qualification', 'Teaching Degree', 'Experience',
+        ];
+        const sample = [
+            'Anita Sharma', 'anita.sharma@example.com', '9876543210',
+            '', 'Teacher', 'Mathematics',
+            'Female', '12/04/1990', 'B+', '01/06/2021',
+            'M.Sc.', 'B.Ed.', '5 years',
+        ];
+
+        const school = await School.findById(req.schoolId).select('designations').lean();
+
+        const wb = XLSX.utils.book_new();
+        const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+        // Phone, Employee ID, Date of Birth, Date of Joining
+        forceTextColumns(ws, [2, 3, 7, 9], 1);
+        ws['!cols'] = widthsFor(headers);
+        XLSX.utils.book_append_sheet(wb, ws, 'Teachers');
+
+        referenceSheet(wb, [
+            ['Designations (this school)', school?.designations || []],
+            ['Gender', ['Male', 'Female', 'Other']],
+            ['Blood Group', ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']],
+            ['Date format', ['dd/mm/yyyy  (e.g. 01/06/2021)']],
+            ['Leave blank to auto-generate', ['Employee ID']],
+            ['Required in every row', ['Full Name', 'Email Address']],
+            ['Note', [
+                'Government ID, bank and document details cannot be imported.',
+                'Add them by editing the teacher after import.',
+            ]],
+        ]);
+
+        sendWorkbook(res, wb, 'teacher-template.xlsx');
+    } catch (err) { jsonErr(res, err); }
 };
 
 exports.checkEmail = async (req, res) => {

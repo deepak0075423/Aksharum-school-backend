@@ -77,6 +77,13 @@ router.post('/teachers',                    guard, uploadStaffDoc.fields([
     { name: 'panCard', maxCount: 1 }, { name: 'experienceCertificate', maxCount: 1 },
     { name: 'resignationLetter', maxCount: 1 }, { name: 'joiningLetter', maxCount: 1 },
 ]), adminCtrl.createTeacher);
+const teacherDocFields = uploadStaffDoc.fields([
+    { name: 'aadhaarFront', maxCount: 1 }, { name: 'aadhaarBack', maxCount: 1 },
+    { name: 'panCard', maxCount: 1 }, { name: 'experienceCertificate', maxCount: 1 },
+    { name: 'resignationLetter', maxCount: 1 }, { name: 'joiningLetter', maxCount: 1 },
+]);
+// The full record, edited with the same wizard that created it.
+router.put('/teachers/:id',                 guard, teacherDocFields, adminCtrl.updateTeacherFull);
 router.post('/teachers/bulk',               guard, uploadExcel.single('excelFile'), adminCtrl.bulkTeachers);
 router.get('/teachers/template',            guard, adminCtrl.downloadTeacherTemplate);
 router.delete('/teachers/:id',              guard, adminCtrl.deleteUser);
@@ -147,6 +154,7 @@ router.delete('/classes/:classId',            guard, classCtrl.deleteClass);
 router.post('/classes/auto-assign',           guard, classCtrl.autoAssignStudents);
 router.post('/classes/:classId/sections',     guard, classCtrl.createSection);
 // Section shuffle — one random redistribution per class/year, then lockable
+router.get ('/classes/:classId/shuffle-preview',  guard, classCtrl.shufflePreview);
 router.post('/classes/:classId/shuffle-sections', guard, classCtrl.shuffleSections);
 router.post('/classes/:classId/lock-sections',    guard, classCtrl.lockSectionShuffle);
 router.get('/classes/:classId/subjects',      guard, subjectCtrl.getClassSubjects);

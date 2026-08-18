@@ -128,6 +128,11 @@ async function setModules(schoolId, mods) {
     await School.findByIdAndUpdate(schoolId, {
         $set: Object.fromEntries(Object.entries(mods).map(([k, v]) => [`modules.${k}`, v])),
     });
+    // Writing School.modules straight to the DB skips the API path that clears
+    // the designation snapshot, so with Redis up the next request would resolve
+    // access against the previous flags. Drop it here, exactly as the
+    // Super Admin controller does after a real toggle.
+    await require('../services/designationService').invalidate(String(schoolId));
 }
 
 async function buildFixture() {

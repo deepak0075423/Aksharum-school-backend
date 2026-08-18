@@ -39,6 +39,27 @@ const TeacherProfileSchema = new db.Schema({
         type: String,
         default: '',
     },
+    // ── Organisation placement ──────────────────────────────────────────────
+    // Added with the Employee Directory. Both are additive and default to the
+    // pre-existing behaviour, so every teacher record written before this
+    // module reads back exactly as it did.
+    //
+    // reportingManager — the employee this person reports to. This is employee
+    // master data: it belongs on the employee record itself, and giving it its
+    // own table would have meant a second employee master keyed by user id.
+    reportingManager: {
+        type: db.Types.UUID,
+        ref: 'User',
+        default: null,
+    },
+    // staffType — an explicit teaching / non-teaching classification. Empty
+    // means "not stated", in which case the directory derives it from the
+    // employee's academic assignments, so existing rows need no backfill.
+    staffType: {
+        type: String,
+        enum: ['teaching', 'non_teaching', ''],
+        default: '',
+    },
     subjects: {
         type: [String],
         default: [],

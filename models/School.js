@@ -148,6 +148,10 @@ const SchoolSchema = new db.Schema({
             type: Boolean,
             default: false,
         },
+        employeeDirectory: {
+            type: Boolean,
+            default: false,
+        },
     },
     leaveSettings: {
         saturdayWorking:  { type: Boolean, default: true },

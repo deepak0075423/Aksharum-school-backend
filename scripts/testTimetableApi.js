@@ -70,7 +70,38 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ── Seed ────────────────────────────────────────────────────────────────── */
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Safety gate.
+//
+//  seed() below calls deleteMany({}) with NO filter on User and School — it
+//  empties them. That is fine against the throwaway database this script is
+//  documented to use, and catastrophic against anything else. Refuse to run
+//  unless the database name says it is a test database, or the operator opts in
+//  explicitly with ALLOW_DESTRUCTIVE=1.
+// ─────────────────────────────────────────────────────────────────────────────
+function assertDisposableDatabase() {
+    const url = process.env.DATABASE_URL || '';
+    const name = (url.split('/').pop() || '').split('?')[0];
+    const looksDisposable = /test|_tt|scratch|temp/i.test(name);
+    if (looksDisposable || process.env.ALLOW_DESTRUCTIVE === '1') return;
+    console.error(`
+✋ Refusing to run: this script EMPTIES the users and schools tables.
+
+   Database  : ${name || '(unset)'}
+   That name does not look like a throwaway test database.
+
+   Run it the way the header describes:
+     DATABASE_URL=postgres://localhost:5432/aksharum_tt_test PORT=5099 node server.js &
+     API=http://127.0.0.1:5099/api DATABASE_URL=postgres://localhost:5432/aksharum_tt_test \
+       node scripts/testTimetableApi.js
+
+   Or set ALLOW_DESTRUCTIVE=1 if you really mean to wipe "${name}".
+`);
+    process.exit(1);
+}
+
 async function seed() {
+    assertDisposableDatabase();
     step('Seeding a throwaway school');
     // Clean the tables this script owns so reruns start from a known state.
     for (const M of [TimetableConflict, TimetableVersionEntry, TimetableVersion, TimetableAuditLog,
