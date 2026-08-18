@@ -16,26 +16,44 @@ const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
-const requireModule  = require('../../middleware/requireModule');
+const { modulesHandler } = require('../../utils/moduleResponse');
+const { allowModuleAdmin } = require('../../middleware/moduleAccess');
+const desigCtrl      = require('../../controllers/designation.controller');
 const { uploadExcel, uploadDocument, uploadCsv, uploadLeaveDoc, uploadImage, uploadStaffDoc, uploadStudentDoc } = require('../../middleware/upload');
-const School         = require('../../models/School');
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('school_admin')];
-const attendanceGuard  = [...guard, requireModule('attendance')];
-const timetableGuard   = [...guard, requireModule('timetable')];
-const notifGuard       = [...guard, requireModule('notification')];
-const examGuard        = [...guard, requireModule('aptitudeExam')];
-const resultGuard      = [...guard, requireModule('result')];
-const leaveGuard       = [...guard, requireModule('leave')];
-const docGuard         = [...guard, requireModule('document')];
-const holidayGuard     = [...guard, requireModule('holiday')];
+
+// Module-scoped admin routes. allowModuleAdmin() admits the school_admin plus any
+// teacher whose designation grants ADMIN access to that module, so a designation
+// carrying administrative privileges reaches the module's admin surface — while a
+// module disabled at the school level is refused for everyone.
+const moduleAdminGuard = (moduleName) => [verifyToken, requirePasswordReset, allowModuleAdmin(moduleName)];
+
+const attendanceGuard  = moduleAdminGuard('attendance');
+const timetableGuard   = moduleAdminGuard('timetable');
+const notifGuard       = moduleAdminGuard('notification');
+const examGuard        = moduleAdminGuard('aptitudeExam');
+const resultGuard      = moduleAdminGuard('result');
+const leaveGuard       = moduleAdminGuard('leave');
+const docGuard         = moduleAdminGuard('document');
+const holidayGuard     = moduleAdminGuard('holiday');
 
 // Dashboard
 router.get('/dashboard', guard, adminCtrl.getDashboard);
 
 // School Settings
-router.get('/designations', guard, adminCtrl.getDesignations);
-router.put('/designations', guard, adminCtrl.updateDesignations);
+// ── Teacher designations & module permissions ─────────────────────────────────
+// The bare list stays a string[] — it is the dropdown source used by the teacher
+// forms. /matrix carries the permission grid the management screens edit.
+router.get   ('/designations',              guard, adminCtrl.getDesignations);
+router.put   ('/designations',              guard, adminCtrl.updateDesignations);
+router.get   ('/designations/matrix',       guard, desigCtrl.getMatrix);
+router.put   ('/designations/matrix',       guard, desigCtrl.updateMatrix);
+router.post  ('/designations',              guard, desigCtrl.create);
+router.get   ('/designations/:id/teachers',        guard, desigCtrl.getTeachers);
+router.get   ('/designations/:id/teachers/export', guard, desigCtrl.exportTeachers);
+router.put   ('/designations/:id',          guard, desigCtrl.update);
+router.delete('/designations/:id',          guard, desigCtrl.remove);
 router.get('/school-settings', guard, adminCtrl.getSchoolSettings);
 router.put('/school-settings', guard, uploadImage.single('logo'), adminCtrl.updateSchoolSettings);
 router.get('/smtp-settings',  guard, adminCtrl.getSmtpSettings);
@@ -43,38 +61,7 @@ router.put('/smtp-settings',  guard, adminCtrl.updateSmtpSettings);
 router.post('/smtp-settings/test', guard, adminCtrl.testSmtp);
 
 // Modules — returns enabled module flags for the current school
-router.get('/modules', guard, async (req, res) => {
-    try {
-        const school = await School.findById(req.schoolId).select('modules leaveSettings').lean();
-        const m  = school?.modules      ?? {};
-        const ls = school?.leaveSettings ?? {};
-        res.json({ success: true, data: {
-            attendance:   !!m.attendance,
-            notification: !!m.notification,
-            aptitudeExam: !!m.aptitudeExam,
-            result:       !!m.result,
-            timetable:    !!m.timetable,
-            holiday:      !!m.holiday,
-            leave:        !!m.leave,
-            document:     !!m.document,
-            library:      !!m.library,
-            payroll:      !!m.payroll,
-            fees:         !!m.fees,
-            chat:         !!m.chat,
-            inventory:    !!m.inventory,
-            transport:    !!m.transport,
-            videoLibrary: !!m.videoLibrary,
-            feedback:     !!m.feedback,
-            saturdayConfig: {
-                working: ls.saturdayWorking !== false,
-                mode:    ls.saturdayMode    || 'all',
-                halfDay: !!ls.saturdayHalfDay,
-            },
-        }});
-    } catch (e) {
-        res.status(500).json({ success: false, message: e.message });
-    }
-});
+router.get('/modules', guard, modulesHandler);
 
 // ── Users ──────────────────────────────────────────────────────────────────────
 router.get('/users/check-email',    guard, adminCtrl.checkEmail);

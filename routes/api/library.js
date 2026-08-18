@@ -6,7 +6,7 @@ const stuCtrl  = require('../../controllers/libraryStudent.controller');
 const parCtrl  = require('../../controllers/libraryParent.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule  = require('../../middleware/requireModule');
-const TeacherProfile = require('../../models/TeacherProfile');
+const { allowModuleAdmin } = require('../../middleware/moduleAccess');
 const { uploadExcel } = require('../../middleware/upload');
 
 const baseGuard    = [verifyToken, requirePasswordReset, requireModule('library')];
@@ -15,18 +15,11 @@ const parentGuard  = [...baseGuard, requireRole('parent')];
 const teacherBrowseGuard = [...baseGuard, requireRole('teacher')];
 const adminOnlyGuard = [...baseGuard, requireRole('school_admin')];
 
-const librarianGuard = [
-    ...baseGuard,
-    async (req, res, next) => {
-        const role = req.userRole;
-        if (role === 'school_admin') return next();
-        if (role === 'teacher') {
-            const profile = await TeacherProfile.findOne({ user: req.userId }).lean();
-            if (profile?.designation === 'Librarian') return next();
-        }
-        return res.status(403).json({ success: false, message: 'Librarian access required' });
-    },
-];
+// Library management. Was a hard-coded designation === 'Librarian' test; it is
+// now "administrative access to the library module", which the designation
+// permission matrix decides (a designation named Librarian with no configured
+// row still resolves to admin, so nothing changed for existing schools).
+const librarianGuard = [...baseGuard, allowModuleAdmin('library')];
 
 // ── Librarian / Admin ─────────────────────────────────────────────────────────
 router.get('/dashboard', librarianGuard, libCtrl.getDashboard);

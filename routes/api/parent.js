@@ -9,6 +9,7 @@ const classTestCtrl  = require('../../controllers/classTest.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
+const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('parent')];
@@ -22,36 +23,7 @@ router.get('/dashboard',   guard, parentCtrl.getDashboard);
 router.get('/child-class', guard, parentCtrl.getChildClass);
 
 // Enabled modules for this school
-router.get('/modules', guard, async (req, res) => {
-    try {
-        const School = require('../../models/School');
-        const school = await School.findById(req.schoolId).select('modules leaveSettings').lean();
-        const m  = school?.modules      ?? {};
-        const ls = school?.leaveSettings ?? {};
-        res.json({ success: true, data: {
-            attendance:   !!m.attendance,
-            notification: !!m.notification,
-            aptitudeExam: !!m.aptitudeExam,
-            result:       !!m.result,
-            timetable:    !!m.timetable,
-            holiday:      !!m.holiday,
-            leave:        !!m.leave,
-            document:     !!m.document,
-            library:      !!m.library,
-            payroll:      !!m.payroll,
-            fees:         !!m.fees,
-            chat:         !!m.chat,
-            transport:    !!m.transport,
-            videoLibrary: !!m.videoLibrary,
-            feedback:     !!m.feedback,
-            saturdayConfig: {
-                working: ls.saturdayWorking !== false,
-                mode:    ls.saturdayMode    || 'all',
-                halfDay: !!ls.saturdayHalfDay,
-            },
-        }});
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
+router.get('/modules', guard, modulesHandler);
 
 // Attendance
 router.get('/child-attendance', attendanceGuard, attendanceCtrl.getParentChildAttendance);

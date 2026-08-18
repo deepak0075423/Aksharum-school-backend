@@ -40,9 +40,11 @@ const round2 = (n) => (n == null ? null : Math.round(Number(n) * 100) / 100);
 const pct   = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 10 : 0);
 const idSet = (arr) => new Set((arr || []).map(sid).filter(Boolean));
 
-// Designations that unlock the school-wide (principal) analytics view. Mirrors
-// the Librarian designation pattern used by the library module — the ERP has no
-// principal role on User.
+// Designation names that resolve to feedback-admin (the school-wide analytics
+// view) when a school has not configured its permission matrix yet — the ERP has
+// no principal role on User. The live source of truth is
+// services/designationService.LEGACY_ADMIN_GRANTS; this stays exported because it
+// is the human-readable answer to "which designations are principals by default".
 const PRINCIPAL_DESIGNATIONS = ['Principal', 'Vice Principal', 'Headmaster', 'Headmistress'];
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -150,12 +152,22 @@ async function getSettings(schoolId) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  ROLE RESOLUTION
 // ═════════════════════════════════════════════════════════════════════════════
-// Feedback recognises four capability levels. `school_admin` is the manager,
-// a teacher whose designation is Principal / Vice Principal additionally gets
-// the school-wide read-only view, every other teacher sees only their own.
-async function isPrincipal(userId) {
-    const p = await TeacherProfile.findOne({ user: userId }).select('designation').lean();
-    return PRINCIPAL_DESIGNATIONS.includes(p?.designation || '');
+// Feedback recognises four capability levels. `school_admin` is the manager, a
+// teacher whose designation grants ADMIN access to the feedback module
+// additionally gets the school-wide read-only view, every other teacher sees only
+// their own.
+//
+// The school-wide grant used to be a designation-name test against
+// PRINCIPAL_DESIGNATIONS; it is now the designation permission matrix, which
+// still resolves those names to feedback-admin when a school has not configured
+// anything, so existing principals keep the view.
+const designationSvc = require('./designationService');
+
+async function isPrincipal(userId, schoolId = null) {
+    const p = await TeacherProfile.findOne({ user: userId }).select('designation school').lean();
+    if (!p) return false;
+    const { permissions } = await designationSvc.resolveDesignation(schoolId || p.school, p.designation);
+    return permissions.feedback === designationSvc.ADMIN;
 }
 
 async function resolveAccess(req) {
@@ -163,7 +175,8 @@ async function resolveAccess(req) {
         return { canManage: true, canSeeSchoolWide: true, isPrincipal: false };
     }
     if (req.userRole === 'teacher') {
-        const principal = await isPrincipal(req.userId);
+        const access = await designationSvc.requestAccess(req);
+        const principal = access.permissions.feedback === designationSvc.ADMIN;
         return { canManage: false, canSeeSchoolWide: principal, isPrincipal: principal };
     }
     return { canManage: false, canSeeSchoolWide: false, isPrincipal: false };

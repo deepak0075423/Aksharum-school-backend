@@ -5,6 +5,7 @@ const ctrl    = require('../../controllers/superAdmin.controller');
 const notifCtrl = require('../../controllers/notification.controller');
 const logsCtrl  = require('../../controllers/logs.controller');
 const holidayCtrl = require('../../controllers/holiday.controller');
+const desigCtrl   = require('../../controllers/designation.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { uploadExcel, uploadImage } = require('../../middleware/upload');
 
@@ -34,10 +35,21 @@ router.delete('/users/:id',                   guard, ctrl.deleteUser);
 router.patch('/users/:id/toggle',             guard, ctrl.toggleUserStatus);
 router.post('/users/:id/login-link',          guard, ctrl.generateLoginLink);
 
-// Module Permissions
+// Module Permissions — school-level enablement (the top of the hierarchy)
 router.get('/permissions',         guard, ctrl.getPermissions);
 router.put('/permissions',         guard, ctrl.updatePermissions);
 router.put('/permissions/bulk',    guard, ctrl.bulkUpdatePermissions);
+
+// Designation Permissions — the middle of the hierarchy, per school. Same
+// controller the school admin uses; the school comes from the route instead of
+// from the token.
+router.get   ('/schools/:schoolId/designations',              guard, desigCtrl.getMatrix);
+router.put   ('/schools/:schoolId/designations',              guard, desigCtrl.updateMatrix);
+router.post  ('/schools/:schoolId/designations/new',          guard, desigCtrl.create);
+router.get   ('/schools/:schoolId/designations/:id/teachers',        guard, desigCtrl.getTeachers);
+router.get   ('/schools/:schoolId/designations/:id/teachers/export', guard, desigCtrl.exportTeachers);
+router.put   ('/schools/:schoolId/designations/:id',          guard, desigCtrl.update);
+router.delete('/schools/:schoolId/designations/:id',          guard, desigCtrl.remove);
 
 // Notifications
 router.get('/notifications',       guard, notifCtrl.getList);

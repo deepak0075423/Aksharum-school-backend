@@ -544,9 +544,17 @@ exports.generateLoginLink = async (req, res) => {
 };
 
 // ── Module Permissions ────────────────────────────────────────────────────────
+//  The top of the access hierarchy: School module enablement → Designation
+//  permission → User access. Turning a module off here revokes it for every
+//  designation and every user of that school immediately — the designation rows
+//  keep whatever was configured, and resolution AND-s this flag over them, so
+//  turning the module back on reapplies those levels untouched.
+//  invalidate() drops the cached resolution so the change is not delayed by TTL.
+const designationSvc = require('../services/designationService');
+
 exports.getPermissions = async (req, res) => {
     try {
-        const schools = await School.find().select('name modules').lean();
+        const schools = await School.find().select('name logo modules designations').lean();
         res.json({ success: true, data: schools });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
@@ -555,6 +563,7 @@ exports.updatePermissions = async (req, res) => {
     try {
         const { schoolId, modules } = req.body;
         const school = await School.findByIdAndUpdate(schoolId, { modules }, { new: true });
+        await designationSvc.invalidate(schoolId);
         res.json({ success: true, data: school });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
@@ -565,6 +574,7 @@ exports.bulkUpdatePermissions = async (req, res) => {
         await Promise.all(updates.map(({ schoolId, modules }) =>
             School.findByIdAndUpdate(schoolId, { modules }),
         ));
+        await Promise.all(updates.map(({ schoolId }) => designationSvc.invalidate(schoolId)));
         res.json({ success: true, message: 'Permissions updated' });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };

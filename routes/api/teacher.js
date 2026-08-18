@@ -14,6 +14,7 @@ const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
+const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
 const { uploadExcel, uploadDocument, uploadLeaveDoc } = require('../../middleware/upload');
 
@@ -31,46 +32,7 @@ const holidayGuard     = [...guard, requireModule('holiday')];
 router.get('/dashboard', guard, teacherCtrl.getDashboard);
 
 // Enabled modules for this school (used by frontend to show/hide nav items)
-router.get('/modules', guard, async (req, res) => {
-    try {
-        const School = require('../../models/School');
-        const TeacherProfile = require('../../models/TeacherProfile');
-        const [school, profile] = await Promise.all([
-            School.findById(req.schoolId).select('modules leaveSettings').lean(),
-            TeacherProfile.findOne({ user: req.userId }).select('designation').lean(),
-        ]);
-        const m  = school?.modules      ?? {};
-        const ls = school?.leaveSettings ?? {};
-        res.json({ success: true, data: {
-            isLibrarian:  profile?.designation === 'Librarian',
-            // Designation-based RBAC, same idea as isLibrarian: unlocks the
-            // school-wide feedback view for principals / vice principals.
-            isPrincipal:  require('../../services/feedbackService')
-                .PRINCIPAL_DESIGNATIONS.includes(profile?.designation || ''),
-            attendance:   !!m.attendance,
-            notification: !!m.notification,
-            aptitudeExam: !!m.aptitudeExam,
-            result:       !!m.result,
-            timetable:    !!m.timetable,
-            holiday:      !!m.holiday,
-            leave:        !!m.leave,
-            document:     !!m.document,
-            library:      !!m.library,
-            payroll:      !!m.payroll,
-            fees:         !!m.fees,
-            chat:         !!m.chat,
-            inventory:    !!m.inventory,
-            transport:    !!m.transport,
-            videoLibrary: !!m.videoLibrary,
-            feedback:     !!m.feedback,
-            saturdayConfig: {
-                working: ls.saturdayWorking !== false,
-                mode:    ls.saturdayMode    || 'all',
-                halfDay: !!ls.saturdayHalfDay,
-            },
-        }});
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
+router.get('/modules', guard, modulesHandler);
 
 // ── My Section ────────────────────────────────────────────────────────────────
 router.get('/my-section',              guard, sectionCtrl.getMySection);

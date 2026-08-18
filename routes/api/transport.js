@@ -5,8 +5,9 @@ const t       = require('../../controllers/transport.controller');
 const p       = require('../../controllers/transportPortal.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule = require('../../middleware/requireModule');
+const { allowModuleAdmin } = require('../../middleware/moduleAccess');
 
-const adminGuard   = [verifyToken, requirePasswordReset, requireRole('school_admin'), requireModule('transport')];
+const adminGuard   = [verifyToken, requirePasswordReset, allowModuleAdmin('transport')];
 const parentGuard  = [verifyToken, requirePasswordReset, requireRole('parent'),       requireModule('transport')];
 const studentGuard = [verifyToken, requirePasswordReset, requireRole('student'),      requireModule('transport')];
 

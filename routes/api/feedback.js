@@ -23,6 +23,7 @@ const teacher = require('../../controllers/feedbackTeacher.controller');
 
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule = require('../../middleware/requireModule');
+const { allowModuleAdmin } = require('../../middleware/moduleAccess');
 const { rateLimit } = require('../../middleware/rateLimit');
 const fb = require('../../services/feedbackService');
 
@@ -32,20 +33,13 @@ const adminGuard   = [...base, requireRole('school_admin')];
 const teacherGuard = [...base, requireRole('teacher')];
 const studentGuard = [...base, requireRole('student')];
 
-// School-wide analytics: admins always, plus principals (checked against the
-// live profile on every request, so revoking the designation takes effect at once).
+// School-wide analytics: admins always, plus any teacher whose designation grants
+// administrative access to the feedback module (resolved on every request, so
+// changing the designation or disabling the module takes effect at once).
 const analyticsGuard = [
     ...base,
-    async (req, res, next) => {
-        try {
-            if (req.userRole === 'school_admin') return next();
-            if (req.userRole === 'teacher' && await fb.isPrincipal(req.userId)) {
-                req.isPrincipal = true;
-                return next();
-            }
-            return res.status(403).json({ success: false, message: 'Insufficient permissions' });
-        } catch (e) { next(e); }
-    },
+    allowModuleAdmin('feedback'),
+    (req, res, next) => { req.isPrincipal = req.userRole === 'teacher'; next(); },
 ];
 
 // Submissions are cheap but write-heavy and student-triggered; a per-user bucket

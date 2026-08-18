@@ -10,6 +10,8 @@ const ClassSection   = require('../models/ClassSection');
 const Class          = require('../models/Class');
 const AcademicYear   = require('../models/AcademicYear');
 const School         = require('../models/School');
+const Designation    = require('../models/Designation');
+const designationSvc = require('../services/designationService');
 const mailer         = require('../config/mailer');
 const { sendSchoolMail, emailHeaderHtml, getMailContext, invalidate: invalidateMailer } = require('../utils/schoolMailer');
 const { notify } = require('../services/notifyService');
@@ -679,13 +681,15 @@ exports.updateUser = async (req, res) => {
         );
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         await authCache.invalidate(user._id);
-        // designation lives on TeacherProfile (drives Librarian RBAC)
+        // designation lives on TeacherProfile — it decides which module
+        // permissions this teacher inherits, so the cached resolution has to go.
         if (designation !== undefined && user.role === 'teacher') {
             await TeacherProfile.findOneAndUpdate(
                 { user: user._id },
                 { $set: { designation: designation || '' }, $setOnInsert: { school: req.schoolId } },
                 { upsert: true }
             );
+            await designationSvc.invalidateUser(user._id);
         }
         jsonOk(res, user);
     } catch (err) { jsonErr(res, err); }
@@ -1110,6 +1114,7 @@ exports.bulkTeachers = async (req, res) => {
                         { $set: { ...(designation ? { designation } : {}) }, $setOnInsert: { school: req.schoolId } },
                         { upsert: true },
                     );
+                    if (designation) await designationSvc.invalidateUser(exists._id);
                     updated++;
                     continue;
                 }
@@ -1544,18 +1549,27 @@ exports.parentLookup = async (req, res) => {
 
 // ── Teacher designations (dropdown source, admin-managed) ─────────────────────
 
-// 'Librarian' and 'Principal'/'Vice Principal' are RBAC-significant — they
-// unlock library management and the school-wide feedback view respectively.
-const DEFAULT_DESIGNATIONS = ['Teacher', 'Class Teacher', 'Librarian', 'Principal', 'Vice Principal'];
+// Designations now live in their own table together with the module access they
+// grant — see models/Designation.js and controllers/designation.controller.js.
+// These two endpoints keep the original string[] contract the teacher create /
+// edit forms consume; the permission grid is served from /designations/matrix.
+const DEFAULT_DESIGNATIONS = designationSvc.DEFAULT_DESIGNATIONS;
 
 exports.getDesignations = async (req, res) => {
     try {
+        await designationSvc.ensureSeeded(req.schoolId, req.userId);
+        const rows = await Designation.find({ school: req.schoolId, isActive: true })
+            .sort('name').select('name').lean();
+        if (rows.length) return jsonOk(res, rows.map(r => r.name));
+        // A school with no rows at all (e.g. no designations configured yet)
         const school = await School.findById(req.schoolId).select('designations').lean();
-        const list = (school?.designations?.length ? school.designations : DEFAULT_DESIGNATIONS);
-        jsonOk(res, list);
+        jsonOk(res, school?.designations?.length ? school.designations : DEFAULT_DESIGNATIONS);
     } catch (err) { jsonErr(res, err); }
 };
 
+// Bulk save of just the names. Rows that disappear from the list are removed only
+// when no teacher holds them, and new names arrive with the default permission
+// set; existing rows keep the permissions already configured for them.
 exports.updateDesignations = async (req, res) => {
     try {
         let { designations } = req.body;
@@ -1563,7 +1577,35 @@ exports.updateDesignations = async (req, res) => {
         designations = [...new Set(designations.map(d => String(d).trim()).filter(Boolean))];
         if (!designations.length) return res.status(400).json({ success: false, message: 'At least one designation is required' });
 
+        await designationSvc.ensureSeeded(req.schoolId, req.userId);
+        const rows = await Designation.find({ school: req.schoolId }).lean();
+        const byKey = new Map(rows.map(r => [r.name.trim().toLowerCase(), r]));
+        const keep  = new Set(designations.map(d => d.toLowerCase()));
+
+        for (const name of designations) {
+            const existing = byKey.get(name.toLowerCase());
+            if (existing) {
+                if (existing.isActive === false) await Designation.findByIdAndUpdate(existing._id, { $set: { isActive: true } });
+                continue;
+            }
+            await Designation.create({
+                school: req.schoolId,
+                name,
+                permissions: designationSvc.defaultPermissionsFor(name),
+                createdBy: req.userId || null,
+            });
+        }
+        for (const row of rows) {
+            if (keep.has(row.name.trim().toLowerCase())) continue;
+            const inUse = await designationSvc.countTeachers(req.schoolId, row.name);
+            // Still held by someone: deactivate rather than delete, so the
+            // permission row survives for anyone who has it.
+            if (inUse > 0) await Designation.findByIdAndUpdate(row._id, { $set: { isActive: false } });
+            else await Designation.findByIdAndDelete(row._id);
+        }
+
         await School.findByIdAndUpdate(req.schoolId, { designations });
+        await designationSvc.invalidate(req.schoolId);
         jsonOk(res, designations);
     } catch (err) { jsonErr(res, err); }
 };

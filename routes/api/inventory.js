@@ -5,8 +5,9 @@ const inv           = require('../../controllers/inventory.controller');
 const invTeacher    = require('../../controllers/inventoryTeacher.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule = require('../../middleware/requireModule');
+const { allowModuleAdmin } = require('../../middleware/moduleAccess');
 
-const adminGuard   = [verifyToken, requirePasswordReset, requireRole('school_admin'), requireModule('inventory')];
+const adminGuard   = [verifyToken, requirePasswordReset, allowModuleAdmin('inventory')];
 const teacherGuard = [verifyToken, requirePasswordReset, requireRole('teacher'),      requireModule('inventory')];
 
 // ── Admin ───────────────────────────────────────────────────────────────────

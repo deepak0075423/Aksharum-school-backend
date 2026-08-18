@@ -5,8 +5,9 @@ const adminCtrl    = require('../../controllers/fees.controller');
 const studentCtrl  = require('../../controllers/feesStudent.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule = require('../../middleware/requireModule');
+const { allowModuleAdmin } = require('../../middleware/moduleAccess');
 
-const adminGuard   = [verifyToken, requirePasswordReset, requireRole('school_admin'), requireModule('fees')];
+const adminGuard   = [verifyToken, requirePasswordReset, allowModuleAdmin('fees')];
 const studentGuard = [verifyToken, requirePasswordReset, requireRole('student'),      requireModule('fees')];
 const parentGuard  = [verifyToken, requirePasswordReset, requireRole('parent'),       requireModule('fees')];
 const apiGuard     = [verifyToken, requirePasswordReset, requireRole('school_admin', 'teacher'), requireModule('fees')];

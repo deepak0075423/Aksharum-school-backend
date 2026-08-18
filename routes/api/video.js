@@ -16,10 +16,11 @@ const student = require('../../controllers/videoStudent.controller');   // stude
 
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule = require('../../middleware/requireModule');
+const { allowModuleAdmin } = require('../../middleware/moduleAccess');
 const { uploadVideo, uploadDocument } = require('../../middleware/upload');
 
 const superGuard   = [verifyToken, requirePasswordReset, requireRole('super_admin')];
-const schoolGuard  = [verifyToken, requirePasswordReset, requireRole('school_admin'), requireModule('videoLibrary')];
+const schoolGuard  = [verifyToken, requirePasswordReset, allowModuleAdmin('videoLibrary')];
 const teacherGuard = [verifyToken, requirePasswordReset, requireRole('teacher'),      requireModule('videoLibrary')];
 const studentGuard = [verifyToken, requirePasswordReset, requireRole('student'),      requireModule('videoLibrary')];
 
