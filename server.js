@@ -102,6 +102,7 @@ app.use('/api/payroll',       require('./routes/api/payroll'));
 app.use('/api/library',       require('./routes/api/library'));
 app.use('/api/inventory',     require('./routes/api/inventory'));
 app.use('/api/transport',     require('./routes/api/transport'));
+app.use('/api/hostel',        require('./routes/api/hostel'));
 app.use('/api/video',         require('./routes/api/video'));
 app.use('/api/feedback',      require('./routes/api/feedback'));
 app.use('/api/analytics',     require('./routes/api/analytics'));
@@ -207,6 +208,29 @@ if (isPrimaryWorker) {
         };
         setTimeout(tick, 30 * 1000);          // once shortly after boot
         setInterval(tick, 30 * 60 * 1000);    // then every 30 minutes
+    }());
+
+    // ── Hostel overdue & SLA clock ────────────────────────────────────────────
+    // Flips outpasses/leaves whose return time has passed to 'overdue' and
+    // escalates complaints that breached their SLA. Both steps are idempotent
+    // (an overdue row is already overdue; an escalated complaint has its due
+    // date pushed with the level), so a restart mid-sweep changes nothing.
+    (function scheduleHostelSweep() {
+        const School = require('./models/School');
+        const hostel = require('./controllers/hostel.controller');
+        const tick = async () => {
+            try {
+                const schools = await School.find({ 'modules.hostel': true }).select('_id').lean();
+                let overdue = 0;
+                for (const s of schools) {
+                    const r = await hostel.sweepOverdue(s._id);
+                    overdue += (r.outpasses || 0) + (r.leaves || 0);
+                }
+                if (overdue > 0) console.log(`[Hostel] overdue sweep: ${overdue} record(s) across ${schools.length} school(s)`);
+            } catch (err) { console.error('[Hostel] overdue sweep error:', err.message); }
+        };
+        setTimeout(tick, 90 * 1000);           // once shortly after boot
+        setInterval(tick, 30 * 60 * 1000);     // then every 30 minutes
     }());
 
     // ── Video scheduled-publish worker ────────────────────────────────────────

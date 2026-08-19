@@ -64,4 +64,8 @@ const uploadStaffDoc = multer({ storage: diskStorage('staff-docs'), fileFilter: 
 // guardian's Aadhaar, PAN and passport photos.
 const uploadStudentDoc = multer({ storage: diskStorage('student-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
-module.exports = { uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc };
+// Hostel paperwork: admission documents, undertakings, visitor ID proofs and
+// photos, incident/complaint attachments.
+const uploadHostelDoc = multer({ storage: diskStorage('hostel-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024 } });
+
+module.exports = { uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

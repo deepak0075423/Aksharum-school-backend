@@ -140,6 +140,10 @@ const SchoolSchema = new db.Schema({
             type: Boolean,
             default: false,
         },
+        hostel: {
+            type: Boolean,
+            default: false,
+        },
         videoLibrary: {
             type: Boolean,
             default: false,

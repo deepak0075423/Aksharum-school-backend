@@ -15,7 +15,7 @@ const FeeLedgerSchema = new db.Schema({
     description: { type: String, required: true },
     referenceType: {
         type: String,
-        enum: ['FeeStructure', 'StudentFeeAssignment', 'FeePayment', 'StudentConcession', 'FineRule', 'Manual'],
+        enum: ['FeeStructure', 'StudentFeeAssignment', 'FeePayment', 'StudentConcession', 'FineRule', 'HostelFeeInvoice', 'Manual'],
         default: 'Manual',
     },
     referenceId: { type: db.Types.UUID, default: null },
