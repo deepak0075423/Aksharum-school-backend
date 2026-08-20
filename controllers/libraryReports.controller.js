@@ -254,6 +254,8 @@ exports.fineLedger = async (req, res) => {
         const { from, to } = window_(req.query);
         const { rows } = await pool.query(
             `SELECT u."name" AS "member", u."role", f."fineType", f."amount",
+                    COALESCE(f."waivedAmount", 0) AS "waived",
+                    COALESCE(f."paidAmount", 0)   AS "paid",
                     f."status", f."daysOverdue", f."createdAt", f."paidAt", f."waiverReason"
                FROM ${T.fine()} f
                JOIN ${T.user()} u ON u."_id" = f."user"
@@ -265,14 +267,17 @@ exports.fineLedger = async (req, res) => {
             [String(req.schoolId), from, to, cap(req.query.limit, 500, 5000)],
         );
         const data = rows.map(r => ({
-            Member: r.member, Role: r.role, Type: r.fineType, Amount: num(r.amount),
+            Member: r.member, Role: r.role, Type: r.fineType,
+            Charged: num(r.amount), Waived: num(r.waived), Collected: num(r.paid),
+            Outstanding: Math.max(0, num(r.amount) - num(r.waived) - num(r.paid)),
             Status: r.status, 'Days late': num(r.daysOverdue),
             Raised: day(r.createdAt), Paid: r.paidAt ? day(r.paidAt) : '',
             'Waiver reason': r.waiverReason || '',
         }));
-        const total = (st) => data.filter(r => r.Status === st).reduce((s, r) => s + r.Amount, 0);
+        // Summed from the arithmetic, so a part-waived fine reports both halves.
+        const sum = (key) => data.reduce((s, r) => s + r[key], 0);
         deliver(req, res, 'fine_ledger', data, {
-            summary: { pending: total('pending'), paid: total('paid'), waived: total('waived') },
+            summary: { pending: sum('Outstanding'), paid: sum('Collected'), waived: sum('Waived') },
         });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

@@ -10,6 +10,27 @@ const ClassSection   = require('../models/ClassSection');
 const Class          = require('../models/Class');
 const AcademicYear   = require('../models/AcademicYear');
 const School         = require('../models/School');
+const { GATEWAY_MODULES } = require('../services/paymentGateway');
+const ReceiptTemplate = require('../models/ReceiptTemplate');
+const { PRESETS, renderReceipt, defaultTemplate, sampleReceipt } = require('../services/receiptRenderer');
+
+// The design fields a school may set; everything else on the row is bookkeeping.
+const TEMPLATE_FIELDS = [
+    'preset', 'accentColor', 'headerText', 'footerText', 'notes', 'signatoryName',
+    'showLogo', 'showBreakdown', 'showSignature', 'showPaymentMode',
+];
+
+/** School details as the receipt wants them, with the logo made absolute. */
+function schoolForReceipt(school, req) {
+    if (!school) return null;
+    const origin = `${req.protocol}://${req.get('host')}`;
+    return {
+        name: school.name,
+        address: school.address,
+        logoUrl: school.logo ? (/^https?:/.test(school.logo) ? school.logo : `${origin}${school.logo}`) : '',
+    };
+}
+exports._schoolForReceipt = schoolForReceipt;
 const Designation    = require('../models/Designation');
 const designationSvc = require('../services/designationService');
 const mailer         = require('../config/mailer');
@@ -1976,6 +1997,209 @@ exports.updateSchoolSettings = async (req, res) => {
         if (previousLogo && previousLogo !== school?.logo) deleteSchoolLogo(previousLogo);
 
         res.json({ success: true, data: school });
+    } catch (e) { jsonErr(res, e); }
+};
+
+// ── Payment gateway (per-school, shared by every module that takes money) ─────
+//
+// Lives here rather than in Fees because library fines are payable too, and a
+// school has one merchant account, not one per module.
+
+exports.getPaymentGateway = async (req, res) => {
+    try {
+        const school = await School.findById(req.schoolId).select('paymentGateway modules').lean();
+        const gw = school?.paymentGateway || {};
+        // Secrets are never returned — only whether one is stored.
+        jsonOk(res, {
+            enabled:  !!gw.enabled,
+            provider: gw.provider || 'none',
+            razorpayKeyId:        gw.razorpayKeyId || '',
+            stripePublishableKey: gw.stripePublishableKey || '',
+            currency:       gw.currency || 'INR',
+            currencySymbol: gw.currencySymbol || '₹',
+            modules: {
+                fees:    !!gw.modules?.fees,
+                library: !!gw.modules?.library,
+            },
+            hasRazorpaySecret: !!gw.razorpayKeySecret,
+            hasStripeSecret:   !!gw.stripeSecretKey,
+            // Which modules the school runs at all — the screen only offers
+            // those, and hides itself entirely when neither is on.
+            availableModules: {
+                fees:    !!school?.modules?.fees,
+                library: !!school?.modules?.library,
+            },
+        });
+    } catch (e) { jsonErr(res, e); }
+};
+
+exports.updatePaymentGateway = async (req, res) => {
+    try {
+        const {
+            enabled, provider, razorpayKeyId, razorpayKeySecret,
+            stripePublishableKey, stripeSecretKey, currency, currencySymbol, modules,
+        } = req.body;
+
+        const school = await School.findById(req.schoolId).select('paymentGateway modules').lean();
+        const current = school?.paymentGateway || {};
+        const wantProvider = provider === undefined ? (current.provider || 'none') : provider;
+
+        if (!['razorpay', 'stripe', 'none'].includes(wantProvider))
+            return res.status(400).json({ success: false, message: 'Choose a supported payment gateway' });
+
+        const update = {};
+        if (enabled !== undefined) update['paymentGateway.enabled'] = !!enabled;
+        if (provider !== undefined) update['paymentGateway.provider'] = provider;
+        if (razorpayKeyId        !== undefined) update['paymentGateway.razorpayKeyId'] = String(razorpayKeyId).trim();
+        if (stripePublishableKey !== undefined) update['paymentGateway.stripePublishableKey'] = String(stripePublishableKey).trim();
+        if (currency       !== undefined) update['paymentGateway.currency'] = String(currency).trim().toUpperCase() || 'INR';
+        if (currencySymbol !== undefined) update['paymentGateway.currencySymbol'] = String(currencySymbol).trim() || '₹';
+
+        // A blank secret means "leave the stored one alone", so a save from a
+        // form that never shows the secret cannot wipe it.
+        if (razorpayKeySecret) update['paymentGateway.razorpayKeySecret'] = String(razorpayKeySecret).trim();
+        if (stripeSecretKey)   update['paymentGateway.stripeSecretKey']   = String(stripeSecretKey).trim();
+
+        // A module can only be pointed at the gateway if the school runs it.
+        if (modules !== undefined) {
+            for (const key of GATEWAY_MODULES) {
+                const wanted = !!modules[key];
+                if (wanted && !school?.modules?.[key])
+                    return res.status(400).json({ success: false, message: `The ${key} module is not enabled for this school` });
+                update[`paymentGateway.modules.${key}`] = wanted;
+            }
+        }
+
+        // Turning it on with nothing behind it would fail at the checkout, in
+        // front of a parent — refuse here instead.
+        const finalEnabled = enabled !== undefined ? !!enabled : !!current.enabled;
+        if (finalEnabled) {
+            if (wantProvider === 'none')
+                return res.status(400).json({ success: false, message: 'Choose a gateway before switching online payment on' });
+            if (wantProvider === 'razorpay') {
+                const keyId  = update['paymentGateway.razorpayKeyId'] ?? current.razorpayKeyId;
+                const secret = update['paymentGateway.razorpayKeySecret'] ?? current.razorpayKeySecret;
+                if (!keyId || !secret)
+                    return res.status(400).json({ success: false, message: 'Enter both the Razorpay key id and key secret' });
+            }
+            if (wantProvider === 'stripe') {
+                const pk = update['paymentGateway.stripePublishableKey'] ?? current.stripePublishableKey;
+                const sk = update['paymentGateway.stripeSecretKey'] ?? current.stripeSecretKey;
+                if (!pk || !sk)
+                    return res.status(400).json({ success: false, message: 'Enter both the Stripe publishable key and secret key' });
+            }
+            const pointedAt = GATEWAY_MODULES.some(k =>
+                update[`paymentGateway.modules.${k}`] ?? current.modules?.[k]);
+            if (!pointedAt)
+                return res.status(400).json({ success: false, message: 'Pick at least one module that should use this gateway' });
+        }
+
+        await School.findByIdAndUpdate(req.schoolId, { $set: update });
+        return exports.getPaymentGateway(req, res);   // reads no query params, so re-dispatch is safe here
+    } catch (e) { jsonErr(res, e); }
+};
+
+// ── Receipt templates ─────────────────────────────────────────────────────────
+//
+// One design per module per payment mode. A school that wants the same receipt
+// whether a parent paid at the counter or online ticks "use for both", and the
+// controller writes the same design to both rows — so nothing downstream has to
+// work out which case it is looking at.
+
+/**
+ * The designs for one module, as the settings screen wants them.
+ *
+ * A plain function rather than something both handlers reach by re-dispatching:
+ * the save used to reload by assigning `req.query.module` and calling the GET
+ * handler, and `req.query` is a getter — the assignment never took, the reload
+ * fell back to 'fees', and a library-only school was told the fees module was
+ * not enabled when it had just saved a library design.
+ */
+async function receiptTemplatePayload(schoolId, moduleRaw) {
+    const module = ['fees', 'library'].includes(moduleRaw) ? moduleRaw : 'fees';
+    const school = await School.findById(schoolId).select('modules').lean();
+    if (!school?.modules?.[module]) {
+        return { error: `The ${module} module is not enabled for this school` };
+    }
+
+    const saved = await ReceiptTemplate.find({ school: schoolId, module }).lean();
+    const pick = (mode) => saved.find(t => t.paymentMode === mode) || defaultTemplate(module, mode);
+
+    const online  = pick('online');
+    const offline = pick('offline');
+    return {
+        data: {
+            module,
+            online,
+            offline,
+            // Two identical designs mean the school never wanted them apart.
+            sameForBoth: TEMPLATE_FIELDS.every(k => String(online[k] ?? '') === String(offline[k] ?? '')),
+            presets: Object.entries(PRESETS).map(([key, p]) => ({ key, ...p })),
+        },
+    };
+}
+
+exports.getReceiptTemplates = async (req, res) => {
+    try {
+        const result = await receiptTemplatePayload(req.schoolId, req.query.module);
+        if (result.error) return res.status(400).json({ success: false, message: result.error });
+        jsonOk(res, result.data);
+    } catch (e) { jsonErr(res, e); }
+};
+
+exports.updateReceiptTemplate = async (req, res) => {
+    try {
+        const { module, paymentMode, sameForBoth, ...rest } = req.body;
+        if (!['fees', 'library'].includes(module))
+            return res.status(400).json({ success: false, message: 'Choose a module' });
+        if (!sameForBoth && !['online', 'offline'].includes(paymentMode))
+            return res.status(400).json({ success: false, message: 'Choose which payments this design is for' });
+
+        const school = await School.findById(req.schoolId).select('modules').lean();
+        if (!school?.modules?.[module])
+            return res.status(400).json({ success: false, message: `The ${module} module is not enabled for this school` });
+
+        if (rest.preset && !PRESETS[rest.preset])
+            return res.status(400).json({ success: false, message: 'Choose one of the available designs' });
+        if (rest.accentColor && !/^#[0-9a-fA-F]{3,8}$/.test(rest.accentColor))
+            return res.status(400).json({ success: false, message: 'The accent colour must be a hex value like #4F46E5' });
+
+        const design = {};
+        for (const key of TEMPLATE_FIELDS) if (rest[key] !== undefined) design[key] = rest[key];
+
+        const modes = sameForBoth ? ['online', 'offline'] : [paymentMode];
+        for (const mode of modes) {
+            await ReceiptTemplate.findOneAndUpdate(
+                { school: req.schoolId, module, paymentMode: mode },
+                { ...design, school: req.schoolId, module, paymentMode: mode, updatedBy: req.userId },
+                { upsert: true, new: true },
+            );
+        }
+
+        const result = await receiptTemplatePayload(req.schoolId, module);
+        if (result.error) return res.status(400).json({ success: false, message: result.error });
+        jsonOk(res, result.data);
+    } catch (e) { jsonErr(res, e); }
+};
+
+/** Renders the design against sample data, so the screen previews truthfully. */
+exports.previewReceiptTemplate = async (req, res) => {
+    try {
+        const module = ['fees', 'library'].includes(req.query.module) ? req.query.module : 'fees';
+        const school = await School.findById(req.schoolId).select('name address logo').lean();
+
+        const design = {};
+        for (const key of TEMPLATE_FIELDS) {
+            if (req.query[key] === undefined) continue;
+            design[key] = ['showLogo', 'showBreakdown', 'showSignature', 'showPaymentMode'].includes(key)
+                ? req.query[key] === 'true'
+                : req.query[key];
+        }
+        const sample = sampleReceipt(module);
+        sample.paymentMode = req.query.paymentMode === 'offline' ? 'offline' : 'online';
+
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.send(renderReceipt(sample, design, { school: schoolForReceipt(school, req) }));
     } catch (e) { jsonErr(res, e); }
 };
 

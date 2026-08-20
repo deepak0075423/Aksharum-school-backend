@@ -81,6 +81,16 @@ const LibraryPolicySchema = new db.Schema({
         type: Number,
         default: 0,
     },
+    // Receipt numbering for fine payments, same shape as the copy counter.
+    receiptPrefix: {
+        type: String,
+        default: 'LIB',
+        trim: true,
+    },
+    lastReceiptNumber: {
+        type: Number,
+        default: 0,
+    },
     updatedBy: {
         type: db.Types.UUID,
         ref: 'User',

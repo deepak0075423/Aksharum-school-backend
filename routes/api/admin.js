@@ -60,6 +60,15 @@ router.get('/smtp-settings',  guard, adminCtrl.getSmtpSettings);
 router.put('/smtp-settings',  guard, adminCtrl.updateSmtpSettings);
 router.post('/smtp-settings/test', guard, adminCtrl.testSmtp);
 
+// Payment gateway — school-level, shared by fees and library fines
+router.get('/payment-gateway', guard, adminCtrl.getPaymentGateway);
+router.put('/payment-gateway', guard, adminCtrl.updatePaymentGateway);
+
+// Receipt designs, per module and payment mode
+router.get('/receipt-templates',         guard, adminCtrl.getReceiptTemplates);
+router.put('/receipt-templates',         guard, adminCtrl.updateReceiptTemplate);
+router.get('/receipt-templates/preview', guard, adminCtrl.previewReceiptTemplate);
+
 // Modules — returns enabled module flags for the current school
 router.get('/modules', guard, modulesHandler);
 

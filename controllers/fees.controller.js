@@ -14,6 +14,9 @@ const ClassSection        = require('../models/ClassSection');
 const User                = require('../models/User');
 const StudentProfile      = require('../models/StudentProfile');
 const School              = require('../models/School');
+const ReceiptTemplate = require('../models/ReceiptTemplate');
+const ParentProfile   = require('../models/ParentProfile');
+const { renderReceipt, defaultTemplate } = require('../services/receiptRenderer');
 const XLSX                = require('xlsx');
 const { notify, withParents } = require('../services/notifyService');
 
@@ -683,25 +686,51 @@ exports.downloadReceipt = async (req, res) => {
         const payment = await FeePayment.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!payment) return res.status(404).json({ success: false, message: 'Payment not found' });
 
-        const ss = payment.schoolSnapshot || {};
+        // A parent or student may only open their own receipt.
+        if (['student', 'parent'].includes(req.userRole)) {
+            const allowed = req.userRole === 'student'
+                ? String(payment.student) === String(req.userId)
+                : ((await ParentProfile.findOne({ user: req.userId, school: req.schoolId }).lean())?.children || [])
+                    .map(String).includes(String(payment.student));
+            if (!allowed) return res.status(403).json({ success: false, message: 'This receipt belongs to someone else' });
+        }
+
+        const mode = payment.paymentMode === 'online' ? 'online' : 'offline';
+        const [school, template] = await Promise.all([
+            School.findById(req.schoolId).select('name address logo').lean(),
+            ReceiptTemplate.findOne({ school: req.schoolId, module: 'fees', paymentMode: mode }).lean(),
+        ]);
+
         const st = payment.studentSnapshot || {};
-        const text = [
-            `PAYMENT RECEIPT`,
-            `Receipt No: ${payment.receiptNumber || ''}`,
-            `Date: ${payment.paymentDate?.toISOString().slice(0,10) || ''}`,
-            '',
-            `School: ${ss.name || ''}`,
-            `Student: ${st.name || ''} | Roll: ${st.rollNumber || ''}`,
-            '',
-            `Payment Mode: ${payment.paymentMode}`,
-            `Amount: ₹${(payment.amount || 0).toFixed(2)}`,
-            '',
-            '--- FEE BREAKDOWN ---',
-            ...(payment.lines || []).map(l => `  ${l.feeName.padEnd(25)} ₹${l.amount.toFixed(2)}`),
-        ].join('\n');
-        res.setHeader('Content-Disposition', `attachment; filename="receipt_${payment.receiptNumber || req.params.id}.txt"`);
-        res.setHeader('Content-Type', 'text/plain');
-        res.send(text);
+        const settings = await getOrCreateSettings(req.schoolId);
+        const origin = `${req.protocol}://${req.get('host')}`;
+
+        // Rendered from the school's chosen design — this used to be a .txt
+        // file, which is not something anyone can hand to a parent.
+        const html = renderReceipt({
+            module: 'fees',
+            number: payment.receiptNumber || '',
+            date: payment.paymentDate || payment.createdAt,
+            paidBy: st.name || '',
+            paidByDetailLabel: 'Class',
+            paidByDetail: [st.className, st.section].filter(Boolean).join(' · ') || st.rollNumber || '',
+            title: 'Fee receipt',
+            paymentMode: mode,
+            offlineModeLabel: payment.paymentMode || 'Cash',
+            reference: payment.gatewayPaymentId || payment.transactionId || '',
+            lines: (payment.lines || []).map(l => ({ label: l.feeName, amount: l.amount })),
+            total: payment.amount || 0,
+            currencySymbol: settings?.currencySymbol || '₹',
+        }, template || defaultTemplate('fees', mode), {
+            school: school && {
+                name: school.name,
+                address: school.address,
+                logoUrl: school.logo ? (/^https?:/.test(school.logo) ? school.logo : `${origin}${school.logo}`) : '',
+            },
+        });
+
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.send(html);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -790,36 +819,44 @@ exports.getConcessionReport = async (req, res) => {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+// Gateway credentials are no longer part of fees settings — they belong to the
+// school (Settings → Payment Gateway), because library fines charge through the
+// same merchant account. What remains here is how fees are counted and numbered.
+
 exports.getSettings = async (req, res) => {
     try {
         const settings = await getOrCreateSettings(req.schoolId);
-        // Hide secret keys from response
-        const safe = { ...settings, razorpayKeySecret: settings.razorpayKeySecret ? '***' : '', stripeSecretKey: settings.stripeSecretKey ? '***' : '' };
-        res.json({ success: true, data: safe });
+        const school   = await School.findById(req.schoolId).select('paymentGateway').lean();
+        res.json({
+            success: true,
+            data: {
+                ...settings,
+                // Read-only here, so the screen can say whether online fee
+                // payment is live and point at where it is configured.
+                onlinePaymentEnabled: !!(school?.paymentGateway?.enabled && school.paymentGateway.modules?.fees),
+                paymentGatewayProvider: school?.paymentGateway?.provider || 'none',
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.updateSettings = async (req, res) => {
     try {
-        const { onlinePaymentEnabled, paymentGateway, razorpayKeyId, razorpayKeySecret,
-                stripePublishableKey, stripeSecretKey, currency, currencySymbol, receipt, receiptPrefix } = req.body;
+        const { currency, currencySymbol, receipt, receiptPrefix, roundingRule } = req.body;
 
         const update = { createdBy: req.userId };
-        if (onlinePaymentEnabled !== undefined) update.onlinePaymentEnabled = !!onlinePaymentEnabled;
-        if (paymentGateway       !== undefined) update.paymentGateway       = paymentGateway;
-        if (razorpayKeyId        !== undefined) update.razorpayKeyId        = razorpayKeyId;
-        // '***' is the mask sent back by the form — keep the stored secret
-        if (razorpayKeySecret    !== undefined && razorpayKeySecret !== '***') update.razorpayKeySecret = razorpayKeySecret;
-        if (stripePublishableKey !== undefined) update.stripePublishableKey = stripePublishableKey;
-        if (stripeSecretKey      !== undefined && stripeSecretKey !== '***') update.stripeSecretKey = stripeSecretKey;
-        if (currency             !== undefined) update.currency             = currency;
-        if (currencySymbol       !== undefined) update.currencySymbol       = currencySymbol;
-        if (receipt              !== undefined) update.receipt              = receipt;
-        if (receiptPrefix        !== undefined) update.receiptPrefix        = receiptPrefix;
+        if (currency       !== undefined) update.currency       = currency;
+        if (currencySymbol !== undefined) update.currencySymbol = currencySymbol;
+        if (receipt        !== undefined) update.receipt        = receipt;
+        if (receiptPrefix  !== undefined) update.receiptPrefix  = String(receiptPrefix).trim().toUpperCase() || 'REC';
+        if (roundingRule   !== undefined) {
+            if (!['none', 'round', 'ceil', 'floor'].includes(roundingRule))
+                return res.status(400).json({ success: false, message: 'Choose a valid rounding rule' });
+            update.roundingRule = roundingRule;
+        }
 
         const settings = await FeeSettings.findOneAndUpdate({ school: req.schoolId }, update, { upsert: true, new: true }).lean();
-        const safe = { ...settings, razorpayKeySecret: settings.razorpayKeySecret ? '***' : '', stripeSecretKey: settings.stripeSecretKey ? '***' : '' };
-        res.json({ success: true, data: safe });
+        res.json({ success: true, data: settings });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

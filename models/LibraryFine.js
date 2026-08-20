@@ -23,6 +23,20 @@ const LibraryFineSchema = new db.Schema({
         enum: ['late_return', 'lost', 'damaged'],
         required: true,
     },
+    // `amount` is the charge as raised and never changes — it is the record of
+    // what was levied. What has since been forgiven or collected is tracked
+    // separately, so a fine can be part-waived and the rest still paid.
+    //   outstanding = amount − waivedAmount − paidAmount
+    waivedAmount: {
+        type: Number,
+        default: 0,
+        min: 0,
+    },
+    paidAmount: {
+        type: Number,
+        default: 0,
+        min: 0,
+    },
     amount: {
         type: Number,
         required: true,
@@ -40,6 +54,35 @@ const LibraryFineSchema = new db.Schema({
     },
     paidAt: {
         type: Date,
+        default: null,
+    },
+    // ── How it was paid ──────────────────────────────────────────────────────
+    // A fine settled at the counter and one paid on a phone both end up 'paid';
+    // these say which, and give the parent something to show for it.
+    paymentMode: {
+        type: String,
+        enum: ['cash', 'online'],
+        default: 'cash',
+    },
+    receiptNumber: {
+        type: String,
+        default: '',
+        trim: true,
+    },
+    gatewayOrderId: {
+        type: String,
+        default: '',
+        trim: true,
+    },
+    gatewayPaymentId: {
+        type: String,
+        default: '',
+        trim: true,
+    },
+    // Who actually paid — a parent may settle a child's fine.
+    paidBy: {
+        type: db.Types.UUID,
+        ref: 'User',
         default: null,
     },
     collectedBy: {

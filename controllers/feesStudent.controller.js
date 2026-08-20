@@ -4,6 +4,7 @@ const AcademicYear         = require('../models/AcademicYear');
 const FeeLedger            = require('../models/FeeLedger');
 const FeePayment           = require('../models/FeePayment');
 const FeeSettings          = require('../models/FeeSettings');
+const paymentGateway = require('../services/paymentGateway');
 const StudentConcession    = require('../models/StudentConcession');
 const FineRule             = require('../models/FineRule');
 const StudentProfile       = require('../models/StudentProfile');
@@ -251,8 +252,10 @@ async function buildFeeBook(schoolId, studentId) {
     const monthlySchedule   = await buildMonthlySchedule(resolved, studentId, ay?._id, schoolId, totalPaid + ledgerConcessions);
 
     const dueTotal = monthlySchedule.filter(m => m.payStatus === 'due' || m.payStatus === 'partial').reduce((s, m) => s + m.amountDue, 0);
-    const gateway  = settings?.onlinePaymentEnabled && settings?.paymentGateway !== 'none'
-        ? settings.paymentGateway : 'none';
+    // Whether fees may take card payments is now the school's call, module by
+    // module — FeeSettings no longer carries credentials at all.
+    const school = await School.findById(schoolId).select('paymentGateway').lean();
+    const online = paymentGateway.publicGateway(school?.paymentGateway, 'fees');
 
     return {
         activeYear: ay ? { _id: ay._id, yearName: ay.yearName } : null,
@@ -261,11 +264,13 @@ async function buildFeeBook(schoolId, studentId) {
         suggestedAmount: dueTotal > 0 ? dueTotal : (balance > 0 ? balance : 0),
         concessions,
         payments,
-        gateway,
-        razorpayKeyId:        gateway === 'razorpay' ? settings?.razorpayKeyId        : '',
-        stripePublishableKey: gateway === 'stripe'   ? settings?.stripePublishableKey : '',
-        currency:       settings?.currency       || 'INR',
-        currencySymbol: settings?.currencySymbol || '₹',
+        // Gateway now belongs to the school and is switched on per module, so
+        // this reports what the school has actually opened up for fees.
+        gateway: online.enabled ? online.provider : 'none',
+        razorpayKeyId:        online.enabled && online.provider === 'razorpay' ? online.keyId : '',
+        stripePublishableKey: '',
+        currency:       online.currency       || settings?.currency       || 'INR',
+        currencySymbol: online.currencySymbol || settings?.currencySymbol || '₹',
     };
 }
 
@@ -432,24 +437,10 @@ exports.payNow = async (req, res) => {
 // ── Razorpay: create order ───────────────────────────────────────────────────
 
 async function createRazorpayOrderFor(schoolId, studentId, amount, receiptPrefix) {
-    const payAmt = parseFloat(amount);
-    if (!payAmt || payAmt <= 0) return { error: 'Invalid amount' };
-
-    const settings = await FeeSettings.findOne({ school: schoolId });
-    if (!settings?.razorpayKeyId || !settings?.razorpayKeySecret)
-        return { error: 'Razorpay not configured.' };
-
-    const Razorpay = require('razorpay');
-    const rzp = new Razorpay({ key_id: settings.razorpayKeyId, key_secret: settings.razorpayKeySecret });
-
-    const ay = await getActiveAcademicYear(schoolId);
-    const order = await rzp.orders.create({
-        amount: Math.round(payAmt * 100),
-        currency: settings.currency || 'INR',
-        receipt: `${receiptPrefix}-${studentId.toString().slice(-8)}-${Date.now().toString().slice(-8)}`,
-        notes: { schoolId: schoolId.toString(), studentId: studentId.toString(), academicYearId: ay?._id?.toString() },
-    });
-    return { orderId: order.id, amount: order.amount, currency: order.currency, keyId: settings.razorpayKeyId };
+    return paymentGateway.createOrder(
+        schoolId, 'fees', amount,
+        `${receiptPrefix}-${studentId.toString().slice(-8)}-${Date.now().toString().slice(-8)}`,
+    );
 }
 
 exports.createRazorpayOrder = async (req, res) => {
@@ -466,13 +457,10 @@ exports.createRazorpayOrder = async (req, res) => {
 async function verifyRazorpayAndRecord({ schoolId, studentId, body, schoolName }) {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, amount, remarks } = body;
 
-    const settings = await FeeSettings.findOne({ school: schoolId });
-    if (!settings?.razorpayKeySecret) throw new Error('Gateway not configured.');
-
-    const expectedSig = crypto.createHmac('sha256', settings.razorpayKeySecret)
-        .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-        .digest('hex');
-    if (expectedSig !== razorpay_signature) throw new Error('Payment verification failed. Please contact admin.');
+    const verified = await paymentGateway.verifySignature(schoolId, 'fees', {
+        orderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature,
+    });
+    if (!verified.ok) throw new Error(verified.reason);
 
     const ay      = await getActiveAcademicYear(schoolId);
     const student = await User.findById(studentId).select('name');
@@ -508,17 +496,19 @@ async function createStripeIntentFor(schoolId, studentId, amount, extraMeta = {}
     const payAmt = parseFloat(amount);
     if (!payAmt || payAmt <= 0) return { error: 'Invalid amount' };
 
-    const settings = await FeeSettings.findOne({ school: schoolId });
-    if (!settings?.stripeSecretKey) return { error: 'Stripe not configured.' };
+    const resolved = await paymentGateway.resolveGateway(schoolId, 'fees');
+    if (!resolved.ok) return { error: resolved.reason };
+    const gw = resolved.gateway;
+    if (gw.provider !== 'stripe') return { error: 'The school is not configured for Stripe' };
 
-    const stripe = require('stripe')(settings.stripeSecretKey);
+    const stripe = require('stripe')(gw.stripeSecretKey);
     const ay = await getActiveAcademicYear(schoolId);
     const intent = await stripe.paymentIntents.create({
         amount: Math.round(payAmt * 100),
-        currency: (settings.currency || 'INR').toLowerCase(),
+        currency: (gw.currency || 'INR').toLowerCase(),
         metadata: { schoolId: schoolId.toString(), studentId: studentId.toString(), academicYearId: ay?._id?.toString(), ...extraMeta },
     });
-    return { clientSecret: intent.client_secret, publishableKey: settings.stripePublishableKey };
+    return { clientSecret: intent.client_secret, publishableKey: gw.stripePublishableKey };
 }
 
 exports.createStripeIntent = async (req, res) => {
@@ -536,9 +526,11 @@ async function verifyStripeAndRecord({ schoolId, studentId, body, schoolName }) 
     const { paymentIntentId, amount, remarks } = body;
 
     const settings = await FeeSettings.findOne({ school: schoolId });
-    if (!settings?.stripeSecretKey) throw new Error('Gateway not configured.');
+    const resolvedSk = await paymentGateway.resolveGateway(schoolId, 'fees');
+    if (!resolvedSk.ok) throw new Error(resolvedSk.reason);
+    const gwStripe = resolvedSk.gateway;
 
-    const stripe = require('stripe')(settings.stripeSecretKey);
+    const stripe = require('stripe')(settings2.stripeSecretKey);
     const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
     if (intent.status !== 'succeeded') throw new Error(`Payment not completed. Status: ${intent.status}`);
 

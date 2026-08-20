@@ -24,7 +24,8 @@ const {
     normIsbn, normText, isValidIsbn, findDuplicateBook, duplicateResponse,
     checkBorrowerEligibility, buildCopy, calcFine, reindexQueue,
     sweepOverdue, expireStaleHolds, promoteQueue, fineApplies, renewIssuance,
-    BORROWER_ROLES, commitIssue, commitReturn, borrowerAudience,
+    BORROWER_ROLES, commitIssue, commitReturn, borrowerAudience, nextFineReceiptNumber,
+    outstandingOf, fineStatusFor,
 } = require('../services/libraryRules');
 
 // How a book can come back over the counter.
@@ -468,7 +469,15 @@ exports.markCopyStatus = async (req, res) => {
 
                 const policy = await getOrCreatePolicy(req.schoolId);
                 const days   = status === 'lost' ? (policy.lostBookFineDays ?? 30) : (policy.damagedBookFineDays ?? 10);
-                const amount = days * (policy.finePerDay || 0);
+
+                let amount = days * (policy.finePerDay || 0);
+                if (req.body.fineAmount !== undefined && req.body.fineAmount !== '' && req.body.fineAmount !== null) {
+                    const manual = Number(req.body.fineAmount);
+                    if (!Number.isFinite(manual) || manual < 0)
+                        return res.status(400).json({ success: false, message: 'Enter a charge of zero or more' });
+                    amount = Math.round(manual * 100) / 100;
+                }
+
                 if (amount > 0) {
                     fine = await LibraryFine.create({
                         school: req.schoolId, issuance: last._id, user: last.issuedTo,
@@ -808,7 +817,20 @@ exports.returnBook = async (req, res) => {
         const penaltyDays = condition === 'lost'    ? (policy.lostBookFineDays ?? 30)
                           : condition === 'damaged' ? (policy.damagedBookFineDays ?? 10)
                           : 0;
-        const fineAmt  = lateFine + penaltyDays * (policy.finePerDay || 0);
+
+        // The policy multiple is a default, not a rule. A librarian who knows
+        // the book cost ₹450 should be able to charge ₹450 — the multiple was
+        // only ever a stand-in for a price nobody had recorded.
+        let penalty = penaltyDays * (policy.finePerDay || 0);
+        if (condition !== 'good' && req.body.fineAmount !== undefined
+            && req.body.fineAmount !== '' && req.body.fineAmount !== null) {
+            const manual = Number(req.body.fineAmount);
+            if (!Number.isFinite(manual) || manual < 0)
+                return res.status(400).json({ success: false, message: 'Enter a charge of zero or more' });
+            penalty = Math.round(manual * 100) / 100;
+        }
+
+        const fineAmt  = lateFine + penalty;
         const fineType = condition === 'good' ? 'late_return' : condition;
 
         const priorStatus = issuance.status;
@@ -1060,6 +1082,14 @@ exports.getFines = async (req, res) => {
         if (userId)   filter.user   = userId;
         if (FINE_TYPES.includes(fineType)) filter.fineType = fineType;
 
+        // How the money came in. `paymentMode` defaults to 'cash' on every row,
+        // including ones nobody has paid — so filtering on it alone would sweep
+        // up every outstanding fine. Only rows where money actually moved count.
+        if (['cash', 'online'].includes(req.query.paymentMode)) {
+            filter.paymentMode = req.query.paymentMode;
+            filter.paidAmount  = { $gt: 0 };
+        }
+
         // A money report is usually asked for over a period — "what did we take
         // this term" — so the window is on when the fine was raised.
         const raised = {};
@@ -1101,7 +1131,17 @@ exports.getFines = async (req, res) => {
                 Member: f.user?.name || '',
                 Email: f.user?.email || '',
                 Type: f.fineType,
-                Amount: f.amount || 0,
+                // Blank rather than a misleading "Cash" when nothing was paid.
+                'Paid by': (f.paidAmount || 0) > 0
+                    ? (f.paymentMode === 'online' ? 'Online' : 'Cash') : '',
+                Receipt: f.receiptNumber || '',
+                Reference: f.gatewayPaymentId || '',
+                // Split the same way the fine ledger does — a single "amount"
+                // stopped meaning anything once part of a fine could be waived.
+                Charged: f.amount || 0,
+                Waived: f.waivedAmount || 0,
+                Collected: f.paidAmount || 0,
+                Outstanding: outstandingOf(f),
                 Status: f.status,
                 'Days late': f.daysOverdue || 0,
                 Raised: day(f.createdAt),
@@ -1117,15 +1157,18 @@ exports.getFines = async (req, res) => {
         const [fines, total, summaryRows] = await Promise.all([
             query().skip(skip).limit(limit).lean(),
             LibraryFine.countDocuments(filter),
-            LibraryFine.aggregate([
-                { $match: filter },
-                { $group: { _id: '$status', amount: { $sum: '$amount' }, count: { $sum: 1 } } },
-            ]),
+            LibraryFine.find(filter).select('status amount waivedAmount paidAmount').lean(),
         ]);
 
+        // Totalled from the arithmetic rather than by status, so a part-waived
+        // fine contributes its waiver to "written off" and its remainder to
+        // "outstanding" — summing `amount` by status would double-count it.
         const summary = emptyFineSummary();
         for (const row of summaryRows) {
-            if (summary[row._id]) summary[row._id] = { amount: row.amount || 0, count: row.count || 0 };
+            const owed = outstandingOf(row);
+            if (owed > 0)                    { summary.pending.amount += owed;                     summary.pending.count += 1; }
+            if ((row.paidAmount   || 0) > 0) { summary.paid.amount    += Number(row.paidAmount);    summary.paid.count    += 1; }
+            if ((row.waivedAmount || 0) > 0) { summary.waived.amount  += Number(row.waivedAmount);  summary.waived.count  += 1; }
         }
         for (const key of ['pending', 'paid', 'waived']) {
             summary.total.amount += summary[key].amount;
@@ -1141,18 +1184,32 @@ exports.collectFine = async (req, res) => {
         const fine = await LibraryFine.findOne({ _id: req.params.id, school: req.schoolId, status: 'pending' });
         if (!fine) return res.status(404).json({ success: false, message: 'Pending fine not found' });
 
-        fine.status      = 'paid';
-        fine.paidAt      = new Date();
-        fine.collectedBy = req.userId;
+        // Collects what is left after any waiver, not the amount originally
+        // charged — otherwise a part-waived fine would be over-collected.
+        const owed = outstandingOf(fine);
+        if (owed <= 0) return res.status(400).json({ success: false, message: 'Nothing is outstanding on this fine' });
+
+        // A counter payment gets a receipt too — a parent who pays cash should
+        // walk away with the same document as one who paid on their phone.
+        const receiptNumber = await nextFineReceiptNumber(req.schoolId);
+
+        fine.paidAmount    = (fine.paidAmount || 0) + owed;
+        fine.status        = fineStatusFor(fine);
+        fine.paidAt        = new Date();
+        fine.collectedBy   = req.userId;
+        fine.paymentMode   = 'cash';
+        fine.receiptNumber = receiptNumber;
         await fine.save();
-        audit(req.schoolId, req.userId, req.userRole, 'FINE_PAID', 'Fine', fine._id, null, { status: 'paid' });
+
+        audit(req.schoolId, req.userId, req.userRole, 'FINE_PAID', 'Fine', fine._id, null,
+            { status: fine.status, mode: 'cash', collected: owed, receiptNumber });
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '💳 Library fine paid',
-            body: `A library fine of ₹${fine.amount} has been recorded as paid. Thank you.`,
+            body: `A library fine payment of ₹${owed} has been recorded. Thank you.\nReceipt: ${receiptNumber}`,
             recipients: await audienceForUser(req.schoolId, fine.user),
         });
-        res.json({ success: true, data: fine });
+        res.json({ success: true, data: { ...fine.toObject?.() ?? fine, collected: owed } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -1167,18 +1224,42 @@ exports.waiveFine = async (req, res) => {
         const fine = await LibraryFine.findOne({ _id: req.params.id, school: req.schoolId, status: 'pending' });
         if (!fine) return res.status(404).json({ success: false, message: 'Pending fine not found' });
 
-        fine.status       = 'waived';
+        const owed = outstandingOf(fine);
+        if (owed <= 0) return res.status(400).json({ success: false, message: 'Nothing is outstanding on this fine' });
+
+        // Omitting the amount waives the lot, which is the common case. A
+        // number waives part of it and leaves the rest payable — a librarian
+        // forgiving ₹40 of ₹60 should not have to write the whole thing off.
+        let waive = owed;
+        if (req.body.amount !== undefined && req.body.amount !== '' && req.body.amount !== null) {
+            waive = Number(req.body.amount);
+            if (!Number.isFinite(waive) || waive <= 0)
+                return res.status(400).json({ success: false, message: 'Enter a waiver amount greater than zero' });
+            if (waive > owed)
+                return res.status(400).json({ success: false, message: `Only ₹${owed} is outstanding — you cannot waive more than that` });
+            waive = Math.round(waive * 100) / 100;
+        }
+
+        const before = { status: fine.status, waivedAmount: fine.waivedAmount || 0 };
+        fine.waivedAmount = (fine.waivedAmount || 0) + waive;
         fine.waivedBy     = req.userId;
-        fine.waiverReason = reason.trim();
+        // Reasons accumulate: a fine waived twice should show both.
+        fine.waiverReason = [fine.waiverReason, reason.trim()].filter(Boolean).join(' · ');
+        fine.status       = fineStatusFor(fine);
         await fine.save();
-        audit(req.schoolId, req.userId, req.userRole, 'FINE_WAIVED', 'Fine', fine._id, null, { status: 'waived', reason });
+
+        const stillOwed = outstandingOf(fine);
+        audit(req.schoolId, req.userId, req.userRole, 'FINE_WAIVED', 'Fine', fine._id, before,
+            { status: fine.status, waived: waive, outstanding: stillOwed, reason: reason.trim() });
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-            title: '💳 Library fine waived',
-            body: `A library fine of ₹${fine.amount} has been waived.${reason ? `\nReason: ${reason.trim()}` : ''}`,
+            title: stillOwed > 0 ? '💳 Part of a library fine waived' : '💳 Library fine waived',
+            body: stillOwed > 0
+                ? `₹${waive} of a ₹${fine.amount} library fine has been waived. ₹${stillOwed} is still to pay.\nReason: ${reason.trim()}`
+                : `A library fine of ₹${fine.amount} has been waived in full.\nReason: ${reason.trim()}`,
             recipients: await audienceForUser(req.schoolId, fine.user),
         });
-        res.json({ success: true, data: fine });
+        res.json({ success: true, data: { ...fine.toObject?.() ?? fine, outstanding: stillOwed } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

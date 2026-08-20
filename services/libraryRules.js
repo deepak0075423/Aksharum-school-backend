@@ -197,11 +197,11 @@ async function checkBorrowerEligibility({ schoolId, userId, bookId, policy }) {
     }
 
     if (policy.blockIssueOnPendingFine) {
-        const fines = await LibraryFine.find({ school: schoolId, user: userId, status: 'pending' }).select('amount').lean();
-        if (fines.length) {
-            const owed = fines.reduce((sum, f) => sum + (f.amount || 0), 0);
+        const fines = await LibraryFine.find({ school: schoolId, user: userId, status: 'pending' })
+            .select('amount waivedAmount paidAmount').lean();
+        const owed = fines.reduce((sum, f) => sum + outstandingOf(f), 0);
+        if (owed > 0)
             return { ok: false, status: 400, message: `${user.name} has ₹${owed} in unpaid library fines` };
-        }
     }
 
     return { ok: true, user };
@@ -341,6 +341,71 @@ async function commitReturn({ schoolId, issuance, condition, copyStatus, fineAmo
         }
         return { fineId };
     });
+}
+
+/**
+ * Next receipt number for a fine payment, e.g. LIB-REC-000042.
+ *
+ * One SQL statement for the same reason the copy counter is: the ORM's $inc is
+ * a read-modify-write, so two payments landing together would be handed the
+ * same receipt number.
+ */
+async function nextFineReceiptNumber(schoolId) {
+    const bump = () => pool.query(
+        `UPDATE "${LibraryPolicy.tableName}"
+            SET "lastReceiptNumber" = COALESCE("lastReceiptNumber", 0) + 1
+          WHERE "school" = $1
+      RETURNING "lastReceiptNumber", "receiptPrefix"`,
+        [String(schoolId)],
+    );
+
+    let { rows } = await bump();
+    if (!rows.length) {
+        await getOrCreatePolicy(schoolId);
+        ({ rows } = await bump());
+        if (!rows.length) throw new Error('Could not allocate a receipt number');
+    }
+    const prefix = (rows[0].receiptPrefix || 'LIB').trim() || 'LIB';
+    return `${prefix}-REC-${String(rows[0].lastReceiptNumber).padStart(6, '0')}`;
+}
+
+// ── Fine arithmetic ──────────────────────────────────────────────────────────
+
+/** What is still owed on a fine after any waiver and any part payment. */
+const outstandingOf = (fine) => Math.max(
+    0,
+    Number(fine?.amount || 0) - Number(fine?.waivedAmount || 0) - Number(fine?.paidAmount || 0),
+);
+
+/**
+ * The status a fine should carry given its arithmetic. Derived rather than set
+ * by hand so a part-waived fine cannot end up marked settled while money is
+ * still owed.
+ */
+function fineStatusFor(fine) {
+    if (outstandingOf(fine) > 0) return 'pending';
+    return Number(fine.paidAmount || 0) > 0 ? 'paid' : 'waived';
+}
+
+/**
+ * Fills in waivedAmount / paidAmount on fines settled before those columns
+ * existed. Without it every historical 'paid' row reads as fully outstanding,
+ * because its paidAmount defaults to zero. Self-healing: once every row is
+ * squared this matches nothing.
+ */
+async function backfillFineAmounts(schoolId) {
+    const T = `"${LibraryFine.tableName}"`;
+    const { rowCount } = await pool.query(
+        `UPDATE ${T}
+            SET "paidAmount"   = CASE WHEN "status" = 'paid'   THEN "amount" ELSE COALESCE("paidAmount", 0) END,
+                "waivedAmount" = CASE WHEN "status" = 'waived' THEN "amount" ELSE COALESCE("waivedAmount", 0) END
+          WHERE "school" = $1
+            AND "status" IN ('paid', 'waived')
+            AND COALESCE("paidAmount", 0) = 0
+            AND COALESCE("waivedAmount", 0) = 0`,
+        [String(schoolId)],
+    );
+    return rowCount;
 }
 
 // ── Lazy state sweeps ────────────────────────────────────────────────────────
@@ -540,6 +605,7 @@ async function sendDueSoonReminders(schoolId, { daysAhead = 2 } = {}) {
  */
 async function runLibrarySweep(schoolId) {
     await backfillIssuedToRole(schoolId);
+    await backfillFineAmounts(schoolId);
     const overdue = await sweepOverdue(schoolId);
     const lapsed  = await expireStaleHolds(schoolId);
     const nudged  = await sendDueSoonReminders(schoolId);
@@ -666,5 +732,6 @@ module.exports = {
     checkBorrowerEligibility, buildCopy, calcFine, reindexQueue, activeReservation,
     sweepOverdue, expireStaleHolds, promoteQueue, fineApplies, renewIssuance,
     commitIssue, commitReturn, sendDueSoonReminders, runLibrarySweep, pruneAuditLog,
-    borrowerAudience, backfillIssuedToRole,
+    borrowerAudience, backfillIssuedToRole, nextFineReceiptNumber,
+    outstandingOf, fineStatusFor, backfillFineAmounts,
 };

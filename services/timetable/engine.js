@@ -4,7 +4,7 @@
  * ────────────────────────────
  * Pure, database-free constraint solver. `generate(input)` takes plain objects
  * and returns assignments + conflicts + statistics, which is what makes the
- * whole thing unit-testable (see scripts/testTimetableEngine.js).
+ * whole thing unit-testable.
  *
  * Strategy — a constraint-satisfaction search, never a random shuffle:
  *

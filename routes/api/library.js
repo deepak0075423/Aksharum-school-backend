@@ -5,6 +5,7 @@ const libCtrl  = require('../../controllers/library.controller');
 const stuCtrl  = require('../../controllers/libraryStudent.controller');
 const parCtrl  = require('../../controllers/libraryParent.controller');
 const repCtrl  = require('../../controllers/libraryReports.controller');
+const payCtrl  = require('../../controllers/libraryPayment.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule  = require('../../middleware/requireModule');
 const { allowModuleAdmin } = require('../../middleware/moduleAccess');
@@ -102,6 +103,17 @@ router.post('/teacher/issuances/:id/renew',  teacherBrowseGuard, stuCtrl.request
 router.get('/teacher/my-books', teacherBrowseGuard, stuCtrl.getMyBooks);
 router.get('/teacher/my-fines', teacherBrowseGuard, stuCtrl.getMyFines);
 router.delete('/teacher/reservations/:id', teacherBrowseGuard, stuCtrl.cancelReservation);
+
+// ── Fine payment & receipts ───────────────────────────────────────────────────
+// Reachable by whoever owes the fine and by a parent paying for a child; the
+// controller decides whose fines the caller may act on.
+const payerGuard = [...baseGuard, requireRole('student', 'teacher', 'parent')];
+router.get('/my-fines/summary',            payerGuard, payCtrl.getMyFineSummary);
+router.post('/my-fines/order',             payerGuard, payCtrl.createFineOrder);
+router.post('/my-fines/confirm',           payerGuard, payCtrl.confirmFinePayment);
+router.get('/my-fines/receipts',           payerGuard, payCtrl.listMyReceipts);
+// Staff can reprint a counter receipt, so this one is open to librarians too.
+router.get('/receipts/:receiptNumber', [...baseGuard], payCtrl.getFineReceipt);
 
 // ── Parent ────────────────────────────────────────────────────────────────────
 router.get('/parent', parentGuard, parCtrl.getOverview);

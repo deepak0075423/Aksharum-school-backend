@@ -2,12 +2,9 @@ const db = require('../db/orm');
 
 const FeeSettingsSchema = new db.Schema({
     school: { type: db.Types.UUID, ref: 'School', required: true, unique: true },
-    onlinePaymentEnabled: { type: Boolean, default: false },
-    paymentGateway: { type: String, enum: ['razorpay', 'stripe', 'none'], default: 'none' },
-    razorpayKeyId: { type: String, default: '' },
-    razorpayKeySecret: { type: String, default: '' },
-    stripePublishableKey: { type: String, default: '' },
-    stripeSecretKey: { type: String, default: '' },
+    // Gateway credentials moved to School.paymentGateway — library fines are
+    // payable too, and a school has one merchant account, not one per module.
+    // Whether fees may charge through it is School.paymentGateway.modules.fees.
     currency: { type: String, default: 'INR' },
     currencySymbol: { type: String, default: '₹' },
     roundingRule: { type: String, enum: ['none', 'round', 'ceil', 'floor'], default: 'none' },

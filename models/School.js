@@ -174,6 +174,25 @@ const SchoolSchema = new db.Schema({
         fromName:  { type: String, trim: true, default: '' },
         fromEmail: { type: String, trim: true, lowercase: true, default: '' },
     },
+    // ── Payment gateway ──────────────────────────────────────────────────────
+    // School-level, like smtp above, because more than one module now takes
+    // money: fees and library fines both check out through the same account.
+    // `modules` decides which of them may use it, so a school can switch on
+    // online fee payment without also opening library fines to card payments.
+    paymentGateway: {
+        enabled:  { type: Boolean, default: false },
+        provider: { type: String, enum: ['razorpay', 'stripe', 'none'], default: 'none' },
+        razorpayKeyId:        { type: String, trim: true, default: '' },
+        razorpayKeySecret:    { type: String, default: '' },
+        stripePublishableKey: { type: String, trim: true, default: '' },
+        stripeSecretKey:      { type: String, default: '' },
+        currency:       { type: String, default: 'INR', trim: true },
+        currencySymbol: { type: String, default: '₹', trim: true },
+        modules: {
+            fees:    { type: Boolean, default: false },
+            library: { type: Boolean, default: false },
+        },
+    },
     createdAt: {
         type: Date,
         default: Date.now,
