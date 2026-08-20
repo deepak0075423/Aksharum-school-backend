@@ -64,6 +64,13 @@ const LibraryIssuanceSchema = new db.Schema({
         default: '',
         trim: true,
     },
+    // The due date a "due soon" reminder has already gone out for. Stamped
+    // rather than a boolean so a renewal re-arms the reminder for the new date,
+    // and so a restart mid-sweep cannot send the same nudge twice.
+    dueSoonNotifiedFor: {
+        type: Date,
+        default: null,
+    },
     createdAt: {
         type: Date,
         default: Date.now,

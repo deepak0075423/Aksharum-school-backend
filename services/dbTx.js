@@ -1,6 +1,7 @@
 'use strict';
 // ─────────────────────────────────────────────────────────────────────────────
-//  Transaction helpers for the hostel module.
+//  Transaction helpers. Written for hostel bed allocation, now also used by
+//  library circulation — hence the neutral name.
 //
 //  The ORM issues every statement as a standalone pool.query(), which is exactly
 //  what PgBouncer transaction pooling wants — but bed allocation has to move

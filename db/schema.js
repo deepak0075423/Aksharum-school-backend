@@ -56,7 +56,10 @@ Schema.Types = Types;
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 // meta: { kind, ref?, array?, elem?, children?, idFalse?, default?, enum?,
-//         required?, unique?, sparse?, lowercase?, trim?, singleIndex?, hasDates? }
+//         required?, unique?, sparse?, lowercase?, trim?, trgm?, singleIndex?, hasDates? }
+//
+// trgm: true asks for a GIN trigram index on this column — set it on any field
+// reached by a substring/ILIKE search, which a B-tree cannot accelerate.
 
 function parseType(t) {
     if (t === String) return { kind: 'string' };
@@ -88,7 +91,7 @@ function parseFieldDef(def) {
         const meta = parseType(def.type) || { kind: 'mixed' };
         if (def.ref) meta.ref = def.ref;
         if (meta.array && meta.elem && meta.elem.kind === 'id' && !meta.elem.ref && def.ref) meta.elem.ref = def.ref;
-        for (const k of ['default', 'enum', 'required', 'unique', 'sparse', 'lowercase', 'trim']) {
+        for (const k of ['default', 'enum', 'required', 'unique', 'sparse', 'lowercase', 'trim', 'trgm']) {
             if (def[k] !== undefined) meta[k] = def[k];
         }
         if (def.index === true) meta.singleIndex = true;

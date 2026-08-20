@@ -15,6 +15,7 @@ const TeacherProfileSchema = new db.Schema({
         type: String,
         default: '',
         trim: true,
+        trgm: true,   // searched by substring from the library issue counter
     },
     gender: {
         type: String,

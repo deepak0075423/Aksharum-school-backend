@@ -431,15 +431,18 @@ function createModel(name, schema) {
             }
         }
 
-        // Trigram GIN indexes on name/email — these are exactly the columns
-        // hit by the `{name: /search/i}` / `$or` substring search used across
-        // every admin list page. A plain B-tree can't accelerate `~*`/ILIKE
-        // substring matches; a trigram index can.
-        if (parsed.fields.name?.kind === 'string' || parsed.fields.email?.kind === 'string') {
+        // Trigram GIN indexes. `name` and `email` are covered by default because
+        // the `{name: /search/i}` / `$or` substring search on every admin list
+        // page hits them; any other column reached that way opts in with
+        // `trgm: true` on the field. A plain B-tree cannot accelerate `~*` or
+        // ILIKE substring matches — without one of these it is a seq scan.
+        const trgmFields = Object.entries(parsed.fields)
+            .filter(([fname, meta]) => meta?.kind === 'string' && (meta.trgm === true || fname === 'name' || fname === 'email'))
+            .map(([fname]) => fname);
+        if (trgmFields.length) {
             const trgmOk = await ensureTrgmExtension(run);
             if (trgmOk) {
-                for (const fname of ['name', 'email']) {
-                    if (parsed.fields[fname]?.kind !== 'string') continue;
+                for (const fname of trgmFields) {
                     try {
                         await run(`CREATE INDEX IF NOT EXISTS ${qi(`ix_${tableName}_${fname}_trgm`.slice(0, 60))} ON ${T} USING GIN (${qi(fname)} gin_trgm_ops)`);
                     } catch (e) {

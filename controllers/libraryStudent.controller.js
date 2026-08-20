@@ -3,23 +3,25 @@ const LibraryBook        = require('../models/LibraryBook');
 const LibraryIssuance    = require('../models/LibraryIssuance');
 const LibraryReservation = require('../models/LibraryReservation');
 const LibraryFine        = require('../models/LibraryFine');
-const LibraryPolicy      = require('../models/LibraryPolicy');
 const LibraryAuditLog    = require('../models/LibraryAuditLog');
-
-async function getOrCreatePolicy(schoolId) {
-    let p = await LibraryPolicy.findOne({ school: schoolId }).lean();
-    if (!p) p = (await LibraryPolicy.create({ school: schoolId })).toObject();
-    return p;
-}
+const {
+    ACTIVE_ISSUANCE, getOrCreatePolicy, reindexQueue, activeReservation,
+    sweepOverdue, expireStaleHolds, renewIssuance, fmtLibDate,
+} = require('../services/libraryRules');
+const { notify } = require('../services/notifyService');
 
 // ── Student / Teacher shared endpoints ────────────────────────────────────────
 
 exports.getDashboard = async (req, res) => {
     try {
         const policy = await getOrCreatePolicy(req.schoolId);
+        await Promise.all([
+            sweepOverdue(req.schoolId),
+            expireStaleHolds(req.schoolId, null, { actor: req.userId, actorRole: req.userRole }),
+        ]);
 
         const [myIssuances, myFines, myReservations] = await Promise.all([
-            LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, status: 'issued' })
+            LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, status: { $in: ACTIVE_ISSUANCE } })
                 .populate('book', 'title isbn')
                 .lean(),
             LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' }).lean(),
@@ -42,7 +44,9 @@ exports.getDashboard = async (req, res) => {
 
 exports.search = async (req, res) => {
     try {
-        const { q, category, page = 1, limit = 20 } = req.query;
+        const { q, category } = req.query;
+        const page  = Math.max(1, Math.floor(Number(req.query.page) || 1));
+        const limit = Math.min(100, Math.max(1, Math.floor(Number(req.query.limit) || 20)));
         const filter = { school: req.schoolId };
         if (category) filter.category = category;
         if (q) filter.$or = [
@@ -53,7 +57,7 @@ exports.search = async (req, res) => {
         ];
 
         const [books, total] = await Promise.all([
-            LibraryBook.find(filter).sort({ title: 1 }).skip((+page - 1) * +limit).limit(+limit).lean(),
+            LibraryBook.find(filter).sort({ title: 1 }).skip((page - 1) * limit).limit(limit).lean(),
             LibraryBook.countDocuments(filter),
         ]);
 
@@ -65,7 +69,7 @@ exports.search = async (req, res) => {
         const resMap = Object.fromEntries(reservations.map(r => [r.book.toString(), r]));
 
         const data = books.map(b => ({ ...b, myReservation: resMap[b._id.toString()] || null }));
-        res.json({ success: true, data, total, page: +page, pages: Math.ceil(total / +limit) });
+        res.json({ success: true, data, total, page, pages: Math.ceil(total / limit) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -75,22 +79,71 @@ exports.reserve = async (req, res) => {
         const book = await LibraryBook.findOne({ _id: bookId, school: req.schoolId }).lean();
         if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
 
-        // Duplicate active reservation guard
-        const existing = await LibraryReservation.findOne({ book: bookId, reservedBy: req.userId, status: { $in: ['pending','ready'] } });
-        if (existing) return res.status(400).json({ success: false, message: 'Already reserved' });
+        // A title with nothing behind it is a catalogue stub, not something a
+        // queue can ever be served from.
+        if ((book.totalCopies || 0) === 0)
+            return res.status(400).json({ success: false, message: 'This book has no copies in the library yet' });
 
-        // Queue position
-        const last = await LibraryReservation.findOne({ book: bookId, status: 'pending', school: req.schoolId }).sort({ queuePosition: -1 }).lean();
-        const queuePosition = (last?.queuePosition || 0) + 1;
+        const policy = await getOrCreatePolicy(req.schoolId);
+        await expireStaleHolds(req.schoolId, bookId, { actor: req.userId, actorRole: req.userRole });
 
-        const reservation = await LibraryReservation.create({
+        const existing = await activeReservation(req.schoolId, req.userId, bookId);
+        if (existing) return res.status(400).json({ success: false, message: 'You have already reserved this book' });
+
+        // Holding a copy and queueing for the same title means asking for two
+        // copies of one book — the same rule the issue counter enforces.
+        if (!policy.allowMultipleCopiesPerUser) {
+            const holding = await LibraryIssuance.findOne({
+                school: req.schoolId, issuedTo: req.userId, book: bookId, status: { $in: ACTIVE_ISSUANCE } }).lean();
+            if (holding) return res.status(400).json({ success: false, message: 'You already have this book — return it before reserving another copy' });
+        }
+
+        const activeReservations = await LibraryReservation.countDocuments({
+            school: req.schoolId, reservedBy: req.userId, status: { $in: ['pending', 'ready'] } });
+        const maxRes = policy.maxReservationsPerUser || 3;
+        if (activeReservations >= maxRes)
+            return res.status(400).json({ success: false, message: `You already have ${activeReservations} of a maximum ${maxRes} reservations` });
+
+        if (policy.blockIssueOnPendingFine) {
+            const fines = await LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' }).select('amount').lean();
+            if (fines.length) {
+                const owed = fines.reduce((sum, f) => sum + (f.amount || 0), 0);
+                return res.status(400).json({ success: false, message: `Clear your ₹${owed} in library fines before reserving` });
+            }
+        }
+
+        // Position is left at its default and assigned by reindexQueue below,
+        // ordered by reservedAt — reading "max + 1" here used to race.
+        const readyNow = (book.availableCopies || 0) > 0;
+        const created = await LibraryReservation.create({
             school: req.schoolId, book: bookId, reservedBy: req.userId,
-            queuePosition, status: book.availableCopies > 0 ? 'ready' : 'pending',
+            status: readyNow ? 'ready' : 'pending',
+            readyAt:   readyNow ? new Date() : null,
+            expiresAt: readyNow
+                ? new Date(Date.now() + (policy.reservationExpiryDays || 2) * 86400000)
+                : null,
         });
+        await reindexQueue(req.schoolId, bookId);
 
         await LibraryAuditLog.create({
             school: req.schoolId, user: req.userId, role: req.userRole,
-            actionType: 'RESERVATION_CREATED', entityType: 'Reservation', entityId: reservation._id,
+            actionType: 'RESERVATION_CREATED', entityType: 'Reservation', entityId: created._id,
+        });
+
+        // Re-read for the settled queue position, which is what the member
+        // actually wants to know.
+        const reservation = await LibraryReservation.findById(created._id).lean();
+
+        // A silent success reads as a failure — say what happened and where
+        // they stand.
+        notify({
+            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: readyNow ? '🔖 Reserved book ready' : '🔖 Reservation placed',
+            body: readyNow
+                ? `"${book.title}" is being held for you. Collect it before ${fmtLibDate(reservation.expiresAt)}.`
+                : `You are number ${reservation.queuePosition} in the queue for "${book.title}". We will let you know when it is ready.`,
+            recipients: [req.userId],
+            includeSender: true,
         });
 
         res.status(201).json({ success: true, data: reservation });
@@ -105,12 +158,38 @@ exports.cancelReservation = async (req, res) => {
             { new: true }
         ).lean();
         if (!reservation) return res.status(404).json({ success: false, message: 'Active reservation not found' });
+        await reindexQueue(req.schoolId, reservation.book);
+        await LibraryAuditLog.create({
+            school: req.schoolId, user: req.userId, role: req.userRole,
+            actionType: 'RESERVATION_CANCELLED', entityType: 'Reservation', entityId: reservation._id,
+        });
         res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+// A member asking to extend their own loan. Same rules as the counter — the
+// librarian only had to be involved because there was no route for this.
+exports.requestRenewal = async (req, res) => {
+    try {
+        await sweepOverdue(req.schoolId);
+        const result = await renewIssuance(req.schoolId, req.params.id, {
+            onlyForUser: req.userId, actor: req.userId, actorRole: req.userRole,
+        });
+        if (!result.ok) return res.status(result.status).json({ success: false, message: result.message });
+
+        await LibraryAuditLog.create({
+            school: req.schoolId, user: req.userId, role: req.userRole,
+            actionType: 'BOOK_RENEWED', entityType: 'Issuance', entityId: result.issuance._id,
+            newValue: { newDueDate: result.issuance.dueDate, renewalCount: result.issuance.renewalCount, self: true },
+        });
+        res.json({ success: true, data: result.issuance, message: `Renewed — now due ${fmtLibDate(result.issuance.dueDate)}` });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.getMyBooks = async (req, res) => {
     try {
+        await sweepOverdue(req.schoolId);
+
         const { status } = req.query;
         const filter = { school: req.schoolId, issuedTo: req.userId };
         if (status) filter.status = status;
@@ -124,7 +203,7 @@ exports.getMyBooks = async (req, res) => {
         const now = new Date();
         const data = issuances.map(i => ({
             ...i,
-            isOverdue: i.status === 'issued' && now > new Date(i.dueDate),
+            isOverdue: ACTIVE_ISSUANCE.includes(i.status) && now > new Date(i.dueDate),
         }));
         res.json({ success: true, data });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }

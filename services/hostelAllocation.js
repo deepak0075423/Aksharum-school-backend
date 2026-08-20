@@ -25,7 +25,7 @@ const HostelSettings          = require('../models/HostelSettings');
 const User                    = require('../models/User');
 const StudentProfile          = require('../models/StudentProfile');
 
-const { withTransaction, lock, insertRow, qi } = require('./hostelTx');
+const { withTransaction, lock, insertRow, qi } = require('./dbTx');
 const { getSettings, genderOf } = require('./hostelService');
 
 const BED   = qi(HostelBed.tableName);

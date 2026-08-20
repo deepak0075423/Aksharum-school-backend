@@ -34,7 +34,32 @@ const LibraryBookCopySchema = new db.Schema({
         default: '',
         trim: true,
     },
+    // ── Accession record ─────────────────────────────────────────────────────
+    // uniqueCode is the accession number; these are the rest of the register a
+    // school is expected to keep — where the book came from, against which bill,
+    // and what it cost. Without them the copy row cannot answer an audit.
     acquisitionDate: {
+        type: Date,
+        default: null,
+    },
+    vendor: {
+        type: String,
+        default: '',
+        trim: true,
+    },
+    billNumber: {
+        type: String,
+        default: '',
+        trim: true,
+    },
+    cost: {
+        type: Number,
+        default: 0,
+        min: 0,
+    },
+    // Set when a copy leaves the collection (lost, or withdrawn as damaged
+    // beyond use) — the register has to show what was written off and when.
+    writtenOffAt: {
         type: Date,
         default: null,
     },

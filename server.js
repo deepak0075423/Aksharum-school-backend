@@ -233,6 +233,46 @@ if (isPrimaryWorker) {
         setInterval(tick, 30 * 60 * 1000);     // then every 30 minutes
     }());
 
+    // ── Library clock ─────────────────────────────────────────────────────────
+    // Two things in the library happen because time passed, not because anyone
+    // clicked: a loan falls overdue and an uncollected hold lapses. Both used to
+    // wait for someone to open a library page, which made fines observer-
+    // dependent and left a no-show's hold blocking a copy indefinitely — and
+    // made due-date reminders impossible, since no library code ran before the
+    // due date. Every step is idempotent (an overdue loan is already overdue, a
+    // reminder carries the due date it was sent for), so a restart mid-sweep
+    // changes nothing. The read paths still run the same sweeps, so a stopped
+    // worker degrades rather than breaks.
+    (function scheduleLibrarySweep() {
+        const School = require('./models/School');
+        const library = require('./services/libraryRules');
+        let lastPrune = '';
+        const tick = async () => {
+            try {
+                const schools = await School.find({ 'modules.library': true }).select('_id').lean();
+                let overdue = 0, lapsed = 0, nudged = 0;
+                for (const s of schools) {
+                    const r = await library.runLibrarySweep(s._id);
+                    overdue += r.overdue; lapsed += r.lapsed; nudged += r.nudged;
+                }
+                if (overdue || lapsed || nudged) {
+                    console.log(`[Library] sweep: ${overdue} overdue, ${lapsed} hold(s) lapsed, ${nudged} reminder(s) across ${schools.length} school(s)`);
+                }
+
+                // Audit retention, once a day rather than every tick.
+                const today = new Date().toISOString().slice(0, 10);
+                if (lastPrune !== today) {
+                    lastPrune = today;
+                    let pruned = 0;
+                    for (const s of schools) pruned += await library.pruneAuditLog(s._id);
+                    if (pruned) console.log(`[Library] audit retention: ${pruned} row(s) pruned`);
+                }
+            } catch (err) { console.error('[Library] sweep error:', err.message); }
+        };
+        setTimeout(tick, 100 * 1000);          // once shortly after boot
+        setInterval(tick, 30 * 60 * 1000);     // then every 30 minutes
+    }());
+
     // ── Video scheduled-publish worker ────────────────────────────────────────
     // Flips master videos from 'scheduled' → 'published' once scheduledAt passes.
     (function scheduleVideoPublisher() {

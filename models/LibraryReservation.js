@@ -19,10 +19,13 @@ const LibraryReservationSchema = new db.Schema({
         required: true,
         index: true,
     },
-    // FIFO position in the queue (1 = next to be served)
+    // FIFO position in the queue (1 = next to be served).
+    // Never chosen by the caller: a new row goes in at 0 and reindexQueue
+    // assigns the real number by reservedAt. Reading "max + 1" and inserting
+    // raced — two people reserving in the same instant picked the same slot.
     queuePosition: {
         type: Number,
-        required: true,
+        default: 0,
     },
     status: {
         type: String,

@@ -3,6 +3,7 @@ const LibraryIssuance    = require('../models/LibraryIssuance');
 const LibraryFine        = require('../models/LibraryFine');
 const LibraryReservation = require('../models/LibraryReservation');
 const ParentProfile      = require('../models/ParentProfile');
+const { ACTIVE_ISSUANCE } = require('../services/libraryRules');
 
 exports.getOverview = async (req, res) => {
     try {
@@ -12,7 +13,7 @@ exports.getOverview = async (req, res) => {
 
         const result = await Promise.all(childIds.map(async childId => {
             const [issuances, fines, reservations] = await Promise.all([
-                LibraryIssuance.find({ school: req.schoolId, issuedTo: childId, status: 'issued' })
+                LibraryIssuance.find({ school: req.schoolId, issuedTo: childId, status: { $in: ACTIVE_ISSUANCE } })
                     .populate('book', 'title isbn')
                     .lean(),
                 LibraryFine.find({ school: req.schoolId, user: childId, status: 'pending' }).lean(),
