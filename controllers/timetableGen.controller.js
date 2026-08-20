@@ -91,6 +91,43 @@ async function claimEditLock(req, version) {
     await TimetableVersion.findByIdAndUpdate(version._id, { $set: { lockedBy: req.userId, lockedAt: new Date() } });
 }
 
+/**
+ * Version entry rows → the shape the engine's validator expects.
+ * `additionalSubjects` is carried through: merged subjects share one row, and a
+ * validator that could not see them would report every merge as a class clash.
+ */
+const shapeEntries = (rows) => rows.map((e) => ({
+    _id: sid(e._id),
+    sectionId: sid(e.section),
+    subjectId: sid(e.subject),
+    teacherId: sid(e.teacher),
+    roomId: sid(e.room),
+    dayOfWeek: e.dayOfWeek,
+    periodNumber: e.periodNumber,
+    mergeGroup: e.mergeGroup || '',
+    additionalSubjects: (e.additionalSubjects || []).map((m) => ({
+        subjectId: sid(m.subject ?? m.subjectId),
+        teacherId: sid(m.teacher ?? m.teacherId),
+        roomId: sid(m.room ?? m.roomId),
+    })),
+}));
+
+/**
+ * One row per subject actually taught. A merged slot yields several — which is
+ * what a teacher-wise or room-wise view has to iterate over.
+ */
+const explodeEntries = (rows) => rows.flatMap((e) => [
+    { ...e, mergedWith: (e.additionalSubjects || []).map((m) => sid(m.subject ?? m.subjectId)) },
+    ...(e.additionalSubjects || []).map((m) => ({
+        ...e,
+        subject: m.subject ?? m.subjectId,
+        teacher: m.teacher ?? m.teacherId ?? null,
+        room: m.room ?? m.roomId ?? null,
+        additionalSubjects: [],
+        isMergedPartner: true,
+    })),
+]);
+
 /** Compile an engine context for a version, reusing the shared bulk loader. */
 async function contextForVersion(version) {
     const { input, lookups } = await tt.loadGenerationInput({
@@ -168,6 +205,230 @@ exports.getMeta = async (req, res) => {
             subjectTypes: tt.SUBJECT_TYPES,
             periodTypes: tt.PERIOD_TYPES,
             days: tt.DAYS,
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/* ══════════════════════════════════════════════════════════════════════════
+   CLASS PLAN — the subjects, the week's capacity, and what each subject owes
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The teaching grid one section actually works, resolved exactly the way the
+ * generator resolves it: the section's own saved structure first, then the
+ * school-wide template, then its start/end/period timings.
+ */
+function sectionGrid({ section, timetable, config, satWorking }) {
+    const weekday = tt.normalisePeriods(timetable?.periodsStructure).length
+        ? tt.normalisePeriods(timetable.periodsStructure)
+        : (tt.normalisePeriods(config?.periodTemplate).length
+            ? tt.normalisePeriods(config.periodTemplate)
+            : tt.normalisePeriods(tt.derivePeriods(section)));
+    const saturday = tt.normalisePeriods(config?.saturdayTemplate);
+
+    const days = tt.workingDaysFor(config, { leaveSettings: { saturdayWorking: satWorking } })
+        .filter((d) => (d === 'Saturday' ? (satWorking && section.openOnSaturday !== false) : true));
+
+    const breakdown = days.map((day) => {
+        const periods = (day === 'Saturday' && saturday.length) ? saturday : weekday;
+        return { day, periods: periods.filter((x) => x.periodType === 'Teaching').length };
+    });
+    return { days, breakdown, periodsPerWeek: breakdown.reduce((n, d) => n + d.periods, 0) };
+}
+
+/**
+ * Which subjects each section teaches: its own teacher assignments plus the
+ * subjects carried by its class. The same two sources the generator falls back
+ * to, so the screen and the solver never disagree about what a section teaches.
+ */
+async function subjectsBySection(classId, sectionIds) {
+    const [sst, classSubjects] = await Promise.all([
+        SectionSubjectTeacher.find({ section: { $in: sectionIds } }).lean(),
+        ClassSubject.find({ class: classId }).lean(),
+    ]);
+    const classSubjectIds = classSubjects.map((x) => sid(x.subject));
+    const map = new Map(sectionIds.map((id) => [id, new Set(classSubjectIds)]));
+    for (const row of sst) map.get(sid(row.section))?.add(sid(row.subject));
+    return map;
+}
+
+/** How many days a week each of these sections actually teaches. */
+async function workingDaysBySection(schoolId, academicYearId, sectionIds) {
+    const [school, config, sections, timetables] = await Promise.all([
+        School.findById(schoolId).select('leaveSettings').lean(),
+        TimetableConfig.findOne({ school: schoolId, academicYear: academicYearId }).lean(),
+        ClassSection.find({ _id: { $in: sectionIds } }).lean(),
+        Timetable.find({ section: { $in: sectionIds }, academicYear: academicYearId }).lean(),
+    ]);
+    const satWorking = school?.leaveSettings?.saturdayWorking !== false;
+    const ttBySection = new Map(timetables.map((t) => [sid(t.section), t]));
+    return new Map(sections.map((section) => [
+        sid(section._id),
+        sectionGrid({ section, timetable: ttBySection.get(sid(section._id)), config, satWorking }).days.length,
+    ]));
+}
+
+/**
+ * Everything the Generate screen needs once a class is picked: which sections it
+ * has, how many teaching periods the week actually holds, every subject taught,
+ * and the weekly period count + merge grouping already saved for each.
+ *
+ * When several sections are in play their subject lists are compared here —
+ * generating one plan for sections that teach different subjects would silently
+ * apply the wrong requirements, so the mismatch is reported instead.
+ */
+exports.getClassPlan = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const { classId } = req.query;
+        if (!classId) return err(res, 'classId is required', 400);
+
+        const klass = await Class.findOne({ _id: classId, school: req.schoolId, academicYear: year._id }).lean();
+        if (!klass) return err(res, 'Class not found', 404);
+
+        const allSections = await ClassSection.find({
+            school: req.schoolId, academicYear: year._id, class: classId, status: 'active',
+        }).sort({ sectionName: 1 }).lean();
+        if (!allSections.length) return err(res, 'This class has no active sections', 400);
+
+        // Which sections the plan covers: the ones asked for, or all of them.
+        const asked = uniq(String(req.query.sectionIds || '').split(',').map((x) => x.trim()));
+        const scope = asked.length
+            ? allSections.filter((s) => asked.includes(sid(s._id)))
+            : allSections;
+        if (!scope.length) return err(res, 'None of those sections belong to this class', 400);
+        const scopeIds = scope.map((s) => sid(s._id));
+
+        const [school, config, timetables, sst, classSubjects, subjects, requirements, teachers] = await Promise.all([
+            School.findById(req.schoolId).select('leaveSettings').lean(),
+            TimetableConfig.findOne({ school: req.schoolId, academicYear: year._id }).lean(),
+            Timetable.find({ section: { $in: scopeIds }, academicYear: year._id }).lean(),
+            SectionSubjectTeacher.find({ section: { $in: scopeIds } }).lean(),
+            ClassSubject.find({ class: classId }).lean(),
+            Subject.find({ school: req.schoolId }).sort({ subjectName: 1 }).lean(),
+            SubjectRequirement.find({ school: req.schoolId, academicYear: year._id, section: { $in: scopeIds } }).lean(),
+            User.find({ school: req.schoolId, role: 'teacher', isActive: true }).select('name').sort({ name: 1 }).lean(),
+        ]);
+
+        const satWorking = school?.leaveSettings?.saturdayWorking !== false;
+        const ttBySection = new Map(timetables.map((t) => [sid(t.section), t]));
+        const subjectById = new Map(subjects.map((x) => [sid(x._id), x]));
+        const teacherName = new Map(teachers.map((t) => [sid(t._id), t.name]));
+
+        /* ── Capacity ────────────────────────────────────────────────────── */
+        const grids = scope.map((section) => ({
+            sectionId: sid(section._id),
+            sectionName: section.sectionName,
+            strength: section.currentCount || 0,
+            openOnSaturday: section.openOnSaturday !== false,
+            ...sectionGrid({ section, timetable: ttBySection.get(sid(section._id)), config, satWorking }),
+        }));
+        const weeks = grids.map((g) => g.periodsPerWeek);
+        const capacity = {
+            periodsPerWeek: Math.min(...weeks),
+            min: Math.min(...weeks),
+            max: Math.max(...weeks),
+            uniform: Math.min(...weeks) === Math.max(...weeks),
+            breakdown: grids[0].breakdown,
+            days: grids[0].days,
+            saturdayWorking: satWorking && grids.some((g) => g.days.includes('Saturday')),
+        };
+
+        /* ── Subjects, per section ───────────────────────────────────────── */
+        const subjectsOfSection = new Map(scopeIds.map((id) => [
+            id,
+            new Set([
+                ...classSubjects.map((x) => sid(x.subject)),
+                ...sst.filter((x) => sid(x.section) === id).map((x) => sid(x.subject)),
+            ]),
+        ]));
+
+        const reqBySection = new Map();
+        for (const r of requirements) reqBySection.set(`${sid(r.section)}#${sid(r.subject)}`, r);
+
+        const allSubjectIds = uniq([...subjectsOfSection.values()].flatMap((set) => [...set]));
+        const rows = allSubjectIds.map((subjectId) => {
+            const subject = subjectById.get(subjectId);
+            const presentIn = scopeIds.filter((id) => subjectsOfSection.get(id).has(subjectId));
+            const saved = scopeIds.map((id) => reqBySection.get(`${id}#${subjectId}`)).filter(Boolean);
+            const weeklyValues = uniq(saved.map((r) => String(Number(r.weeklyPeriods) || 0)));
+            const mergeValues = uniq(saved.map((r) => String(r.mergeGroup || '')).filter(Boolean));
+            const assignedTeachers = uniq(sst
+                .filter((x) => sid(x.subject) === subjectId && scopeIds.includes(sid(x.section)))
+                .map((x) => sid(x.teacher)));
+
+            // Every scheduling rule for this subject, so the Generate screen can
+            // edit them all in one place. Where sections were configured
+            // differently, the first section's row stands in and saving levels
+            // them — one plan describes one class.
+            const first = saved[0] || {};
+            const practical = subject?.type === 'practical';
+
+            return {
+                _id: subjectId,
+                subjectName: subject?.subjectName || 'Subject',
+                subjectCode: subject?.subjectCode || '',
+                type: subject?.type || 'theory',
+                subjectType: first.subjectType || (practical ? 'Practical' : 'Theory'),
+                // The saved figure when every section agrees; otherwise the
+                // largest, which the admin can then correct in one place.
+                weeklyPeriods: saved.length ? Math.max(...saved.map((r) => Number(r.weeklyPeriods) || 0)) : 0,
+                weeklyVaries: weeklyValues.length > 1,
+                consecutivePeriods: first.consecutivePeriods || (practical ? 2 : 1),
+                maxPerDay: first.maxPerDay || (practical ? 2 : 1),
+                hardMaxPerDay: first.hardMaxPerDay !== false,
+                difficulty: first.difficulty || 3,
+                priority: Number(first.priority) || 0,
+                minGapPeriods: Number(first.minGapPeriods) || 0,
+                requiresRoom: !!first.requiresRoom,
+                room: sid(first.room),
+                roomTypes: first.roomTypes || [],
+                preferredDays: first.preferredDays || [],
+                preferredPeriods: first.preferredPeriods || [],
+                teacher: sid(first.teacher) || assignedTeachers[0] || null,
+                altTeachers: (first.altTeachers || []).map(sid),
+                mergeGroup: mergeValues[0] || '',
+                mergeVaries: mergeValues.length > 1,
+                teachers: assignedTeachers.map((id) => ({ _id: id, name: teacherName.get(id) || 'Teacher' })),
+                hasRequirement: saved.length > 0,
+                presentIn,
+                missingIn: scopeIds.filter((id) => !presentIn.includes(id)),
+            };
+        }).sort((a, b) => a.subjectName.localeCompare(b.subjectName));
+
+        /* ── Do the sections actually teach the same thing? ──────────────── */
+        const labelOf = (id) => `${klass.className} ${grids.find((g) => g.sectionId === id)?.sectionName || ''}`.trim();
+        const differences = rows
+            .filter((r) => r.missingIn.length)
+            .map((r) => ({
+                subjectId: r._id,
+                subjectName: r.subjectName,
+                missingIn: r.missingIn.map(labelOf),
+                presentIn: r.presentIn.map(labelOf),
+            }));
+
+        ok(res, {
+            selectedYearId: year._id,
+            class: { _id: klass._id, className: klass.className, classNumber: klass.classNumber },
+            sections: allSections.map((x) => ({
+                _id: x._id, sectionName: x.sectionName, currentCount: x.currentCount, openOnSaturday: x.openOnSaturday,
+            })),
+            scopeSectionIds: scopeIds,
+            grids,
+            capacity,
+            subjects: rows,
+            totalWeekly: rows.reduce((n, r) => n + r.weeklyPeriods, 0),
+            structureMatches: {
+                ok: differences.length === 0 && capacity.uniform,
+                sameSubjects: differences.length === 0,
+                sameCapacity: capacity.uniform,
+                differences,
+                message: differences.length
+                    ? `These sections do not teach the same subjects: ${differences.map((d) => `${d.subjectName} is missing in ${d.missingIn.join(', ')}`).join('; ')}.`
+                    : (capacity.uniform ? '' : `These sections have different weekly period counts (${capacity.min}–${capacity.max}). The plan is validated against the smaller week.`),
+            },
         });
     } catch (e) { err(res, e, e.status); }
 };
@@ -442,231 +703,6 @@ exports.saveAvailability = async (req, res) => {
 };
 
 /* ══════════════════════════════════════════════════════════════════════════
-   SUBJECT REQUIREMENTS
-   ══════════════════════════════════════════════════════════════════════════ */
-
-exports.listRequirements = async (req, res) => {
-    try {
-        const year = await resolveYear(req.schoolId, req.query.yearId);
-        if (!year) return err(res, 'No academic year found', 404);
-        const { sectionId } = req.query;
-        if (!sectionId) return err(res, 'sectionId is required', 400);
-
-        const section = await ClassSection.findOne({ _id: sectionId, school: req.schoolId })
-            .populate('class', 'className').lean();
-        if (!section) return err(res, 'Section not found', 404);
-
-        const [rows, sst, classSubjects, subjects, teachers, rooms, timetable] = await Promise.all([
-            SubjectRequirement.find({ school: req.schoolId, academicYear: year._id, section: sectionId }).lean(),
-            SectionSubjectTeacher.find({ section: sectionId }).lean(),
-            ClassSubject.find({ class: section.class?._id || section.class }).lean(),
-            Subject.find({ school: req.schoolId }).sort({ subjectName: 1 }).lean(),
-            User.find({ school: req.schoolId, role: 'teacher', isActive: true }).select('name').sort({ name: 1 }).lean(),
-            Room.find({ school: req.schoolId, isActive: true }).select('roomName roomType capacity').sort({ roomName: 1 }).lean(),
-            Timetable.findOne({ section: sectionId, academicYear: year._id }).lean(),
-        ]);
-
-        const teachersBySubject = new Map();
-        for (const row of sst) {
-            const key = sid(row.subject);
-            if (!teachersBySubject.has(key)) teachersBySubject.set(key, []);
-            teachersBySubject.get(key).push(sid(row.teacher));
-        }
-
-        // Subjects the section teaches but has no requirement row for yet.
-        const covered = new Set(rows.map((r) => sid(r.subject)));
-        const available = uniq([
-            ...sst.map((x) => sid(x.subject)),
-            ...classSubjects.map((x) => sid(x.subject)),
-        ]).filter((s) => !covered.has(s));
-
-        const teachingSlots = (timetable?.periodsStructure || [])
-            .filter((p) => tt.periodTypeOf(p) === 'Teaching').length;
-
-        ok(res, {
-            selectedYearId: year._id,
-            section: {
-                _id: section._id,
-                sectionName: section.sectionName,
-                className: section.class?.className || '',
-                strength: section.currentCount || 0,
-                openOnSaturday: section.openOnSaturday,
-            },
-            requirements: rows,
-            missingSubjects: available.map((id) => ({
-                _id: id,
-                subjectName: subjects.find((s) => sid(s._id) === id)?.subjectName || 'Subject',
-                suggestedTeacher: (teachersBySubject.get(id) || [])[0] || null,
-            })),
-            subjects,
-            teachers,
-            rooms,
-            teachersBySubject: Object.fromEntries(teachersBySubject),
-            periodsPerDay: teachingSlots,
-            totalWeekly: rows.reduce((n, r) => n + (Number(r.weeklyPeriods) || 0), 0),
-        });
-    } catch (e) { err(res, e, e.status); }
-};
-
-exports.saveRequirements = async (req, res) => {
-    try {
-        const year = await resolveYear(req.schoolId, req.body.yearId);
-        if (!year) return err(res, 'No academic year found', 404);
-
-        const { sectionId } = req.params;
-        const section = await ClassSection.findOne({ _id: sectionId, school: req.schoolId }).lean();
-        if (!section) return err(res, 'Section not found', 404);
-
-        const rows = Array.isArray(req.body.requirements) ? req.body.requirements : [];
-        const seen = new Set();
-        for (const r of rows) {
-            const msg = validateBody(r, {
-                subject: { label: 'Subject', required: true },
-                weeklyPeriods: { label: 'Weekly periods', required: true, type: 'number', min: 0, max: 60 },
-                consecutivePeriods: { label: 'Consecutive periods', type: 'number', min: 1, max: 4 },
-                maxPerDay: { label: 'Max per day', type: 'number', min: 1, max: 12 },
-                difficulty: { label: 'Difficulty', type: 'number', min: 1, max: 5 },
-                subjectType: { label: 'Subject type', enum: tt.SUBJECT_TYPES },
-            });
-            if (msg) return err(res, msg, 400);
-            if (seen.has(sid(r.subject))) return err(res, 'The same subject appears twice', 400);
-            seen.add(sid(r.subject));
-            if (Number(r.consecutivePeriods) > Number(r.weeklyPeriods) && Number(r.weeklyPeriods) > 0) {
-                return err(res, 'Consecutive periods cannot exceed the weekly requirement', 400);
-            }
-        }
-
-        const existing = await SubjectRequirement.find({ school: req.schoolId, academicYear: year._id, section: sectionId }).lean();
-        const keep = new Set(rows.map((r) => sid(r.subject)));
-        for (const old of existing) {
-            if (!keep.has(sid(old.subject))) await SubjectRequirement.deleteOne({ _id: old._id });
-        }
-
-        const saved = [];
-        for (const r of rows) {
-            const doc = await SubjectRequirement.findOneAndUpdate(
-                { section: sectionId, subject: r.subject, academicYear: year._id },
-                {
-                    $set: {
-                        school: req.schoolId,
-                        weeklyPeriods: Number(r.weeklyPeriods) || 0,
-                        teacher: r.teacher || null,
-                        altTeachers: (r.altTeachers || []).filter(Boolean),
-                        subjectType: r.subjectType || 'Theory',
-                        room: r.room || null,
-                        roomTypes: (r.roomTypes || []).filter((t) => tt.ROOM_TYPES.includes(t)),
-                        requiresRoom: !!r.requiresRoom,
-                        consecutivePeriods: Math.max(1, Number(r.consecutivePeriods) || 1),
-                        maxPerDay: Math.max(1, Number(r.maxPerDay) || 1),
-                        hardMaxPerDay: r.hardMaxPerDay !== false,
-                        minGapPeriods: Math.max(0, Number(r.minGapPeriods) || 0),
-                        preferredPeriods: (r.preferredPeriods || []).map(Number).filter((n) => n > 0),
-                        preferredDays: (r.preferredDays || []).filter((d) => tt.DAYS.includes(d)),
-                        difficulty: Math.min(5, Math.max(1, Number(r.difficulty) || 3)),
-                        priority: Number(r.priority) || 0,
-                        isActive: r.isActive !== false,
-                    },
-                    $setOnInsert: { section: sectionId, subject: r.subject, academicYear: year._id, createdBy: req.userId },
-                },
-                { upsert: true, new: true },
-            );
-            saved.push(doc);
-        }
-
-        await logAudit(req, 'update', 'Requirement', sectionId,
-            `Saved ${saved.length} subject requirement(s)`, { sectionId, count: saved.length });
-        ok(res, { saved: saved.length, requirements: saved });
-    } catch (e) { err(res, e, e.status); }
-};
-
-/**
- * Seed requirements for one section (or every section in scope) from the
- * subject-teacher assignments that already exist, so an admin never starts from
- * a blank screen.
- */
-exports.seedRequirements = async (req, res) => {
-    try {
-        const year = await resolveYear(req.schoolId, req.body.yearId);
-        if (!year) return err(res, 'No academic year found', 404);
-
-        const sectionIds = req.body.sectionId
-            ? [req.body.sectionId]
-            : (await ClassSection.find({ school: req.schoolId, academicYear: year._id, status: 'active' }).select('_id').lean())
-                .map((s) => sid(s._id));
-        if (!sectionIds.length) return err(res, 'No sections found', 404);
-
-        const [sections, sst, classSubjects, subjects, timetables, existing] = await Promise.all([
-            ClassSection.find({ _id: { $in: sectionIds } }).lean(),
-            SectionSubjectTeacher.find({ section: { $in: sectionIds } }).lean(),
-            ClassSubject.find({}).lean(),
-            Subject.find({ school: req.schoolId }).lean(),
-            Timetable.find({ section: { $in: sectionIds }, academicYear: year._id }).lean(),
-            SubjectRequirement.find({ school: req.schoolId, academicYear: year._id, section: { $in: sectionIds } }).lean(),
-        ]);
-
-        const subjectById = new Map(subjects.map((s) => [sid(s._id), s]));
-        const ttBySection = new Map(timetables.map((t) => [sid(t.section), t]));
-        const have = new Set(existing.map((r) => `${sid(r.section)}#${sid(r.subject)}`));
-
-        const school = await School.findById(req.schoolId).select('leaveSettings').lean();
-        const satWorking = school?.leaveSettings?.saturdayWorking !== false;
-
-        let created = 0;
-        for (const section of sections) {
-            const secId = sid(section._id);
-            const subjectIds = uniq([
-                ...sst.filter((x) => sid(x.section) === secId).map((x) => sid(x.subject)),
-                ...classSubjects.filter((x) => sid(x.class) === sid(section.class)).map((x) => sid(x.subject)),
-            ]);
-            if (!subjectIds.length) continue;
-
-            const periods = ttBySection.get(secId)?.periodsStructure || tt.derivePeriods(section);
-            const perDay = periods.filter((p) => tt.periodTypeOf(p) === 'Teaching').length;
-            const days = (satWorking && section.openOnSaturday !== false) ? 6 : 5;
-            const weekly = Math.max(1, Math.floor((perDay * days) / subjectIds.length));
-
-            for (const subjectId of subjectIds) {
-                if (have.has(`${secId}#${subjectId}`)) continue;
-                const subject = subjectById.get(subjectId);
-                const teachers = sst.filter((x) => sid(x.section) === secId && sid(x.subject) === subjectId).map((x) => sid(x.teacher));
-                const practical = subject?.type === 'practical';
-                await SubjectRequirement.create({
-                    school: req.schoolId,
-                    academicYear: year._id,
-                    section: secId,
-                    subject: subjectId,
-                    weeklyPeriods: weekly,
-                    teacher: teachers[0] || null,
-                    altTeachers: teachers.slice(1),
-                    subjectType: practical ? 'Practical' : 'Theory',
-                    roomTypes: [],
-                    requiresRoom: false,
-                    consecutivePeriods: practical ? 2 : 1,
-                    maxPerDay: practical ? 2 : Math.max(1, Math.ceil(weekly / days)),
-                    hardMaxPerDay: true,
-                    difficulty: 3,
-                    createdBy: req.userId,
-                });
-                created++;
-            }
-        }
-
-        await logAudit(req, 'seed', 'Requirement', null, `Seeded ${created} subject requirement(s) from section assignments`, { sections: sectionIds.length });
-        ok(res, { created, sections: sectionIds.length });
-    } catch (e) { err(res, e, e.status); }
-};
-
-exports.deleteRequirement = async (req, res) => {
-    try {
-        const row = await SubjectRequirement.findOne({ _id: req.params.id, school: req.schoolId }).lean();
-        if (!row) return err(res, 'Requirement not found', 404);
-        await SubjectRequirement.deleteOne({ _id: row._id });
-        await logAudit(req, 'delete', 'Requirement', row._id, 'Deleted a subject requirement', { section: row.section });
-        ok(res, { deleted: true });
-    } catch (e) { err(res, e, e.status); }
-};
-
-/* ══════════════════════════════════════════════════════════════════════════
    GENERATION
    ══════════════════════════════════════════════════════════════════════════ */
 
@@ -789,25 +825,191 @@ function dedupeConflicts(conflicts) {
     return out;
 }
 
+/**
+ * Write the Generate screen's subject plan onto the sections it covers.
+ *
+ * The plan is the same SubjectRequirement rows the Requirements screen edits —
+ * generation has one source of truth, not a parallel copy. Only the fields the
+ * screen actually shows are written, so a per-section room, difficulty or
+ * alternate-teacher setup made earlier survives untouched.
+ */
+async function applySubjectPlan({ req, year, sectionIds, plan, daysBySection }) {
+    const subjectIds = uniq(plan.map((r) => sid(r.subject ?? r._id ?? r.subjectId)));
+    const [subjects, sst, existing] = await Promise.all([
+        Subject.find({ _id: { $in: subjectIds } }).lean(),
+        SectionSubjectTeacher.find({ section: { $in: sectionIds } }).lean(),
+        SubjectRequirement.find({ school: req.schoolId, academicYear: year._id, section: { $in: sectionIds } }).lean(),
+    ]);
+    const subjectById = new Map(subjects.map((x) => [sid(x._id), x]));
+    const have = new Map(existing.map((r) => [`${sid(r.section)}#${sid(r.subject)}`, r]));
+
+    let written = 0;
+    for (const sectionId of sectionIds) {
+        for (const row of plan) {
+            const subjectId = sid(row.subject ?? row._id ?? row.subjectId);
+            if (!subjectId) continue;
+            const weekly = Math.max(0, Number(row.weeklyPeriods) || 0);
+            const current = have.get(`${sectionId}#${subjectId}`);
+            const subject = subjectById.get(subjectId);
+            const practical = subject?.type === 'practical';
+            // Teachers the section itself has for this subject win over the plan's
+            // choice, which may have come from a different section of the class.
+            const sectionTeachers = sst
+                .filter((x) => sid(x.section) === sectionId && sid(x.subject) === subjectId)
+                .map((x) => sid(x.teacher));
+
+            // Zero periods means "not taught this week" — drop the row rather
+            // than leaving a 0-period requirement lying around.
+            if (weekly === 0) {
+                if (current) { await SubjectRequirement.deleteOne({ _id: current._id }); written++; }
+                continue;
+            }
+
+            const block = Math.max(1, Math.min(4, Number(row.consecutivePeriods) || (practical ? 2 : 1)));
+            // The per-day cap has to permit the weekly count the screen asked for:
+            // 8 periods across 6 working days is impossible at 1 a day, and the
+            // solver would silently place 6. Raise the cap to fit, never lower it.
+            const days = Math.max(1, daysBySection?.get(sectionId) || 5);
+            const askedPerDay = Math.max(1, Number(row.maxPerDay) || 1);
+            const maxPerDay = Math.max(askedPerDay, block, Math.ceil(weekly / days));
+
+            // Who teaches this subject here. One plan row cannot name a teacher
+            // for several sections at once, so across a whole class each section
+            // keeps its own assigned teacher and the plan's choice becomes an
+            // alternate; for a single section the plan is talking about that
+            // section, so its choice wins.
+            const planTeacher = sid(row.teacher);
+            const chosenTeacher = sectionIds.length > 1
+                ? (sectionTeachers[0] || planTeacher || null)
+                : (planTeacher || sectionTeachers[0] || null);
+
+            await SubjectRequirement.findOneAndUpdate(
+                { section: sectionId, subject: subjectId, academicYear: year._id },
+                {
+                    $set: {
+                        school: req.schoolId,
+                        weeklyPeriods: weekly,
+                        mergeGroup: String(row.mergeGroup || '').trim(),
+                        teacher: chosenTeacher,
+                        altTeachers: uniq([
+                            ...(row.altTeachers || []).map(sid),
+                            ...sectionTeachers,
+                            planTeacher,
+                        ]).filter((t) => t && t !== chosenTeacher),
+                        subjectType: tt.SUBJECT_TYPES.includes(row.subjectType)
+                            ? row.subjectType : (practical ? 'Practical' : 'Theory'),
+                        room: sid(row.room) || null,
+                        roomTypes: (row.roomTypes || []).filter((t) => tt.ROOM_TYPES.includes(t)),
+                        requiresRoom: !!row.requiresRoom,
+                        consecutivePeriods: block,
+                        maxPerDay,
+                        hardMaxPerDay: row.hardMaxPerDay !== false,
+                        minGapPeriods: Math.max(0, Number(row.minGapPeriods) || 0),
+                        preferredPeriods: (row.preferredPeriods || []).map(Number).filter((n) => n > 0),
+                        preferredDays: (row.preferredDays || []).filter((d) => tt.DAYS.includes(d)),
+                        difficulty: Math.min(5, Math.max(1, Number(row.difficulty) || 3)),
+                        priority: Number(row.priority) || 0,
+                        isActive: true,
+                    },
+                    $setOnInsert: { section: sectionId, subject: subjectId, academicYear: year._id, createdBy: req.userId },
+                },
+                { upsert: true, new: true },
+            );
+            written++;
+        }
+    }
+    return written;
+}
+
+/** Reject a plan that cannot fit the week, or that merges a subject with itself. */
+function validateSubjectPlan(plan, capacity) {
+    const seen = new Set();
+    for (const row of plan) {
+        const subjectId = sid(row.subject ?? row._id ?? row.subjectId);
+        if (!subjectId) return 'Every row of the subject plan needs a subject';
+        if (seen.has(subjectId)) return 'The same subject appears twice in the subject plan';
+        seen.add(subjectId);
+        const weekly = Number(row.weeklyPeriods);
+        if (!Number.isFinite(weekly) || weekly < 0 || weekly > 60) {
+            return `Weekly periods for ${row.subjectName || 'a subject'} must be between 0 and 60`;
+        }
+    }
+
+    // Merged subjects share their periods, so a group costs the week ONE run of
+    // slots — counting each member would reject plans that actually fit.
+    const groups = new Map();
+    let demand = 0;
+    for (const row of plan) {
+        const weekly = Number(row.weeklyPeriods) || 0;
+        const key = String(row.mergeGroup || '').trim();
+        if (!key) { demand += weekly; continue; }
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push({ ...row, weekly });
+    }
+    for (const [key, members] of groups) {
+        if (members.length < 2) {
+            return `"${members[0]?.subjectName || key}" is marked as merged but has no subject to merge with`;
+        }
+        const counts = uniq(members.map((m) => String(m.weekly)));
+        if (counts.length > 1) {
+            return `Merged subjects ${members.map((m) => m.subjectName || 'subject').join(' + ')} must have the same number of periods per week`;
+        }
+        demand += members[0].weekly;
+    }
+
+    if (demand <= 0) {
+        // Saving an all-zero plan would delete every requirement row, and the
+        // loader would then fall back to derived defaults — the opposite of
+        // what the admin asked for.
+        return 'Give at least one subject a weekly period count';
+    }
+    if (capacity > 0 && demand > capacity) {
+        return `The plan needs ${demand} periods a week but only ${capacity} are available. Reduce it by ${demand - capacity}.`;
+    }
+    return null;
+}
+
 exports.generate = async (req, res) => {
     try {
         const year = await resolveYear(req.schoolId, req.body.yearId);
         if (!year) return err(res, 'No academic year found', 404);
 
-        const scopeType = req.body.scopeType || 'single';
-        if (!['single', 'multiple', 'school'].includes(scopeType)) {
-            return err(res, 'Generation scope must be single, multiple or school', 400);
-        }
+        // Scope is a class plus either one of its sections or all of them. The
+        // stored scopeType stays for older versions and the version list's label.
+        const classId = req.body.classId || null;
+        const requested = uniq((req.body.sectionIds || []).map(String).filter(Boolean));
+        const allSections = req.body.allSections === true || req.body.allSections === 'true';
 
-        const sections = await tt.resolveScope(req.schoolId, year._id, scopeType, {
-            sectionIds: (req.body.sectionIds || []).filter(Boolean),
-            classIds: (req.body.classIds || []).filter(Boolean),
-        });
-        if (!sections.length) {
-            return err(res, scopeType === 'school'
-                ? 'This academic year has no active sections to generate for'
-                : 'Select at least one class or section', 400);
+        let sections;
+        if (classId) {
+            const inClass = await ClassSection.find({
+                school: req.schoolId, academicYear: year._id, class: classId, status: 'active',
+            }).select('_id').lean();
+            if (!inClass.length) return err(res, 'This class has no active sections to generate for', 400);
+            sections = (allSections || !requested.length)
+                ? inClass
+                : inClass.filter((s) => requested.includes(sid(s._id)));
+            if (!sections.length) return err(res, 'Select a section, or choose all sections of the class', 400);
+        } else {
+            // Legacy callers (and regenerate) still pass a scope type.
+            const scopeType = req.body.scopeType || 'single';
+            if (!['single', 'multiple', 'school'].includes(scopeType)) {
+                return err(res, 'Generation scope must be single, multiple or school', 400);
+            }
+            sections = await tt.resolveScope(req.schoolId, year._id, scopeType, {
+                sectionIds: requested,
+                classIds: (req.body.classIds || []).filter(Boolean),
+            });
+            if (!sections.length) {
+                return err(res, scopeType === 'school'
+                    ? 'This academic year has no active sections to generate for'
+                    : 'Select at least one class or section', 400);
+            }
         }
+        const sectionIds = sections.map((s) => sid(s._id));
+        const scopeType = classId
+            ? (sectionIds.length === 1 ? 'single' : 'multiple')
+            : (req.body.scopeType || 'single');
 
         // Duplicate-submit guard: one run at a time per school+year.
         const running = await TimetableVersion.findOne({
@@ -821,6 +1023,32 @@ exports.generate = async (req, res) => {
             });
         }
 
+        // The subject plan from the Generate screen — weekly periods per subject
+        // and which of them are merged — is saved before the solver reads them.
+        const plan = Array.isArray(req.body.subjectPlan) ? req.body.subjectPlan : null;
+        if (plan) {
+            const capacity = Number(req.body.periodsPerWeek) || 0;
+            const msg = validateSubjectPlan(plan, capacity);
+            if (msg) return err(res, msg, 400);
+
+            // One plan cannot describe sections that teach different subjects —
+            // it would quietly write the wrong requirements onto some of them.
+            if (classId && sectionIds.length > 1) {
+                const bySection = await subjectsBySection(classId, sectionIds);
+                const planned = plan
+                    .filter((r) => (Number(r.weeklyPeriods) || 0) > 0)
+                    .map((r) => ({ id: sid(r.subject ?? r._id ?? r.subjectId), name: r.subjectName || 'A subject' }));
+                const gaps = planned.filter((x) => [...bySection.values()].some((set) => !set.has(x.id)));
+                if (gaps.length) {
+                    return err(res, `These sections do not teach the same subjects (${gaps.map((x) => x.name).join(', ')} is not taught in every section). Generate them one section at a time, or give every section the same subjects.`, 400);
+                }
+            }
+            await applySubjectPlan({
+                req, year, sectionIds, plan,
+                daysBySection: await workingDaysBySection(req.schoolId, year._id, sectionIds),
+            });
+        }
+
         const versionNumber = await persistence.nextVersionNumber(req.schoolId, year._id);
         const version = await TimetableVersion.create({
             school: req.schoolId,
@@ -830,8 +1058,8 @@ exports.generate = async (req, res) => {
             description: req.body.description || '',
             status: 'generating',
             scopeType,
-            scopeClasses: (req.body.classIds || []).filter(Boolean),
-            sections: sections.map((s) => sid(s._id)),
+            scopeClasses: classId ? [classId] : (req.body.classIds || []).filter(Boolean),
+            sections: sectionIds,
             options: { ...tt.DEFAULT_OPTIONS, ...(req.body.options || {}) },
             seed: Number(req.body.seed) || newSeed(),
             basedOn: req.body.basedOn || null,
@@ -841,8 +1069,8 @@ exports.generate = async (req, res) => {
         });
 
         await logAudit(req, 'generate', 'Version', version._id,
-            `Started generation of ${version.label} (${scopeType}, ${sections.length} section(s))`,
-            { scopeType, sections: sections.length, seed: version.seed }, version._id);
+            `Started generation of ${version.label} (${sections.length} section(s))`,
+            { scopeType, classId, sections: sections.length, seed: version.seed, planRows: plan?.length || 0 }, version._id);
 
         // Fire and forget — the client polls /progress.
         setImmediate(() => runGeneration(version._id, req.schoolId));
@@ -1109,8 +1337,15 @@ exports.compareVersions = async (req, res) => {
         const index = (rows) => new Map(rows.map((r) => [`${sid(r.section)}#${r.dayOfWeek}#${r.periodNumber}`, r]));
         const ia = index(ea);
         const ib = index(eb);
+        const mergedIds = (r) => (r.additionalSubjects || []).map((m) => sid(m.subject ?? m.subjectId)).sort().join(',');
         const describe = (r) => (r
-            ? { subject: subjectName.get(sid(r.subject)) || '—', teacher: teacherName.get(sid(r.teacher)) || '', room: sid(r.room) }
+            ? {
+                subject: [sid(r.subject), ...(r.additionalSubjects || []).map((m) => sid(m.subject ?? m.subjectId))]
+                    .map((id) => subjectName.get(id) || '—').join(' + '),
+                teacher: uniq([sid(r.teacher), ...(r.additionalSubjects || []).map((m) => sid(m.teacher ?? m.teacherId))])
+                    .map((id) => teacherName.get(id) || '').filter(Boolean).join(' · '),
+                room: sid(r.room),
+            }
             : null);
 
         const changes = [];
@@ -1121,7 +1356,8 @@ exports.compareVersions = async (req, res) => {
             const same = from && to
                 && sid(from.subject) === sid(to.subject)
                 && sid(from.teacher) === sid(to.teacher)
-                && sid(from.room) === sid(to.room);
+                && sid(from.room) === sid(to.room)
+                && mergedIds(from) === mergedIds(to);
             if (same) continue;
             changes.push({
                 sectionId, section: label.get(sectionId) || 'Section', dayOfWeek: day, periodNumber: Number(period),
@@ -1168,10 +1404,7 @@ async function assertEditable(req, version) {
 async function revalidate(version, extraEntries) {
     const { ctx } = await contextForVersion(version);
     const entries = extraEntries || await TimetableVersionEntry.find({ version: version._id }).lean();
-    const report = tt.validate(ctx, entries.map((e) => ({
-        sectionId: sid(e.section), subjectId: sid(e.subject), teacherId: sid(e.teacher),
-        roomId: sid(e.room), dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
-    })));
+    const report = tt.validate(ctx, shapeEntries(entries));
     const counts = await persistence.replaceConflicts(version._id, version.school, dedupeConflicts(report.conflicts));
     return { report, counts, ctx, entries };
 }
@@ -1193,10 +1426,7 @@ exports.moveEntry = async (req, res) => {
 
         const { ctx } = await contextForVersion(version);
         const entries = await TimetableVersionEntry.find({ version: version._id }).lean();
-        const shaped = entries.map((e) => ({
-            _id: sid(e._id), sectionId: sid(e.section), subjectId: sid(e.subject),
-            teacherId: sid(e.teacher), roomId: sid(e.room), dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
-        }));
+        const shaped = shapeEntries(entries);
 
         const check = tt.validateMove(ctx, shaped, {
             entryId: sid(entry._id),
@@ -1266,14 +1496,12 @@ exports.createEntry = async (req, res) => {
             return err(res, 'That section is not part of this timetable version', 400);
         }
 
-        const shaped = (await TimetableVersionEntry.find({ version: version._id }).lean()).map((e) => ({
-            _id: sid(e._id), sectionId: sid(e.section), subjectId: sid(e.subject),
-            teacherId: sid(e.teacher), roomId: sid(e.room), dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
-        }));
+        const shaped = shapeEntries(await TimetableVersionEntry.find({ version: version._id }).lean());
         const candidate = {
             _id: 'new', sectionId: String(req.body.section), subjectId: String(req.body.subject),
             teacherId: req.body.teacher || null, roomId: req.body.room || null,
             dayOfWeek: req.body.dayOfWeek, periodNumber: Number(req.body.periodNumber),
+            additionalSubjects: [],
         };
 
         const { ctx } = await contextForVersion(version);
@@ -1411,10 +1639,7 @@ exports.publishVersion = async (req, res) => {
         const { report, counts, input } = await (async () => {
             const { ctx, input: loaded } = await contextForVersion(version);
             const entries = await TimetableVersionEntry.find({ version: version._id }).lean();
-            const r = tt.validate(ctx, entries.map((e) => ({
-                sectionId: sid(e.section), subjectId: sid(e.subject), teacherId: sid(e.teacher),
-                roomId: sid(e.room), dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
-            })));
+            const r = tt.validate(ctx, shapeEntries(entries));
             const c = await persistence.replaceConflicts(version._id, version.school, dedupeConflicts(r.conflicts));
             return { report: r, counts: c, input: loaded };
         })();
@@ -1568,7 +1793,23 @@ async function buildExportModel(req, version, view) {
     const days = config?.workingDays?.length ? config.workingDays : tt.DAYS.slice(0, 6);
     const usedDays = days.filter((d) => entries.some((e) => e.dayOfWeek === d));
 
-    return { entries, sections, sectionById, subjectName, teacherName, roomName, structureFor, year, days: usedDays.length ? usedDays : days.slice(0, 5), view };
+    // A merged slot is ONE row in a class grid ("Maths + Computer") but a
+    // separate line in every teacher-wise and room-wise view.
+    const occupants = explodeEntries(entries);
+    const slotSubjects = (e) => [sid(e.subject), ...(e.additionalSubjects || []).map((m) => sid(m.subject ?? m.subjectId))];
+    const slotLabel = (e) => slotSubjects(e).map((id) => subjectName.get(id) || '—').join(' + ');
+    const slotStaff = (e) => uniq([
+        sid(e.teacher), ...(e.additionalSubjects || []).map((m) => sid(m.teacher ?? m.teacherId)),
+    ]).map((id) => teacherName.get(id) || '').filter(Boolean).join(' · ');
+    const slotRooms = (e) => uniq([
+        sid(e.room), ...(e.additionalSubjects || []).map((m) => sid(m.room ?? m.roomId)),
+    ]).map((id) => roomName.get(id) || '').filter(Boolean).join(' · ');
+
+    return {
+        entries, occupants, sections, sectionById, subjectName, teacherName, roomName,
+        slotLabel, slotStaff, slotRooms, structureFor, year,
+        days: usedDays.length ? usedDays : days.slice(0, 5), view,
+    };
 }
 
 exports.exportVersion = async (req, res) => {
@@ -1590,7 +1831,8 @@ async function exportPdf(req, res, version, model) {
     const School = require('../models/School');
     const { generateTimetablePDF, generateMessagePDF } = require('../utils/timetablePdf');
     const school = await School.findById(req.schoolId).lean();
-    const { entries, sections, subjectName, teacherName, roomName, structureFor, year, days, view } = model;
+    const { entries, occupants, sections, subjectName, teacherName, roomName, structureFor, year, days, view } = model;
+    const { slotLabel, slotStaff, slotRooms } = model;
 
     const pages = [];
 
@@ -1609,15 +1851,15 @@ async function exportPdf(req, res, version, model) {
                 entries: rows.map((e) => ({
                     dayOfWeek: e.dayOfWeek,
                     periodNumber: e.periodNumber,
-                    subject: { subjectName: subjectName.get(sid(e.subject)) || '—' },
-                    teacher: { name: [teacherName.get(sid(e.teacher)), roomName.get(sid(e.room))].filter(Boolean).join(' · ') },
+                    subject: { subjectName: slotLabel(e) },
+                    teacher: { name: [slotStaff(e), slotRooms(e)].filter(Boolean).join(' · ') },
                 })),
                 days: days.filter((d) => rows.some((r) => r.dayOfWeek === d)),
             });
         }
     } else if (view === 'teacher') {
         const byTeacher = new Map();
-        for (const e of entries) {
+        for (const e of occupants) {
             const t = sid(e.teacher);
             if (!t) continue;
             if (!byTeacher.has(t)) byTeacher.set(t, []);
@@ -1644,7 +1886,7 @@ async function exportPdf(req, res, version, model) {
         }
     } else {
         const byRoom = new Map();
-        for (const e of entries) {
+        for (const e of occupants) {
             const r = sid(e.room);
             if (!r) continue;
             if (!byRoom.has(r)) byRoom.set(r, []);
@@ -1675,11 +1917,13 @@ async function exportPdf(req, res, version, model) {
 
 function exportExcel(res, version, model) {
     const XLSX = require('xlsx');
-    const { entries, sections, sectionById, subjectName, teacherName, roomName, days, view } = model;
+    const { entries, occupants, sectionById, subjectName, teacherName, roomName, days, view } = model;
+    const { slotLabel, slotStaff, slotRooms } = model;
     const wb = XLSX.utils.book_new();
 
-    // A flat sheet first — the shape people actually pivot and filter on.
-    const flat = entries.map((e) => ({
+    // A flat sheet first — the shape people actually pivot and filter on. One
+    // line per subject taught, so a merged period contributes a line each.
+    const flat = occupants.map((e) => ({
         Class: sectionById.get(sid(e.section))?.class?.className || '',
         Section: sectionById.get(sid(e.section))?.sectionName || '',
         Day: e.dayOfWeek,
@@ -1687,6 +1931,7 @@ function exportExcel(res, version, model) {
         Subject: subjectName.get(sid(e.subject)) || '',
         Teacher: teacherName.get(sid(e.teacher)) || '',
         Room: roomName.get(sid(e.room)) || '',
+        Merged: e.isMergedPartner || (e.mergedWith || []).length ? 'Yes' : '',
         Edited: e.isManual ? 'Manual' : 'Generated',
     })).sort((a, b) => String(a.Class).localeCompare(String(b.Class))
         || days.indexOf(a.Day) - days.indexOf(b.Day) || a.Period - b.Period);
@@ -1694,7 +1939,7 @@ function exportExcel(res, version, model) {
 
     // Then one grid per class / teacher / room, matching the chosen view.
     const groups = new Map();
-    for (const e of entries) {
+    for (const e of (view === 'class' ? entries : occupants)) {
         let key = null;
         let title = null;
         if (view === 'class') {
@@ -1720,8 +1965,7 @@ function exportExcel(res, version, model) {
             for (const day of days) {
                 const hit = rows.find((r) => r.dayOfWeek === day && r.periodNumber === p);
                 row[day] = hit
-                    ? [subjectName.get(sid(hit.subject)), teacherName.get(sid(hit.teacher)), roomName.get(sid(hit.room))]
-                        .filter(Boolean).join('\n')
+                    ? [slotLabel(hit), slotStaff(hit), slotRooms(hit)].filter(Boolean).join('\n')
                     : '';
             }
             return row;

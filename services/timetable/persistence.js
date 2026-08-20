@@ -62,8 +62,18 @@ const run = (sql, params) => pool.query(sql, params);
 
 const VERSION_ENTRY_COLUMNS = [
     '_id', 'version', 'school', 'section', 'dayOfWeek', 'periodNumber',
-    'subject', 'teacher', 'room', 'isManual', 'isLocked', 'note', 'createdAt', 'updatedAt',
+    'subject', 'teacher', 'room', 'additionalSubjects', 'mergeGroup',
+    'isManual', 'isLocked', 'note', 'createdAt', 'updatedAt',
 ];
+
+/** Merged partners, normalised to the {subject, teacher, room} shape stored in the column. */
+function mergedPartners(a) {
+    return (a.additionalSubjects || []).map((m) => ({
+        subject: sid(m.subjectId ?? m.subject),
+        teacher: sid(m.teacherId ?? m.teacher) || null,
+        room: sid(m.roomId ?? m.room) || null,
+    })).filter((m) => m.subject);
+}
 
 async function replaceVersionEntries(versionId, schoolId, assignments) {
     await run(`DELETE FROM ${VE} WHERE "version" = $1::uuid`, [String(versionId)]);
@@ -72,6 +82,7 @@ async function replaceVersionEntries(versionId, schoolId, assignments) {
         newId(), String(versionId), String(schoolId), sid(a.sectionId ?? a.section),
         a.dayOfWeek, Number(a.periodNumber),
         sid(a.subjectId ?? a.subject), sid(a.teacherId ?? a.teacher) || null, sid(a.roomId ?? a.room) || null,
+        JSON.stringify(mergedPartners(a)), a.mergeGroup || '',
         !!a.isManual, !!a.isLocked, a.note || '', now, now,
     ]));
     return chunkedInsert(run, VE, VERSION_ENTRY_COLUMNS, rows);
@@ -175,7 +186,8 @@ async function publishVersion({ version, entries, userId, structureBySection }) 
             e.teacher ? String(e.teacher) : null,
             e.room ? String(e.room) : null,
             String(version._id),
-            JSON.stringify([]),
+            // Merged subjects travel with the slot they share.
+            JSON.stringify(mergedPartners(e)),
             JSON.stringify([]),
         ])).filter((r) => r[1]);
         const inserted = await chunkedInsert(q, TE, LIVE_ENTRY_COLUMNS, liveRows);
@@ -210,6 +222,7 @@ async function copyEntries(fromVersionId, toVersionId, schoolId) {
     return replaceVersionEntries(toVersionId, schoolId, rows.map((r) => ({
         sectionId: r.section, dayOfWeek: r.dayOfWeek, periodNumber: r.periodNumber,
         subjectId: r.subject, teacherId: r.teacher, roomId: r.room,
+        additionalSubjects: r.additionalSubjects || [], mergeGroup: r.mergeGroup || '',
         isManual: r.isManual, isLocked: r.isLocked, note: r.note,
     })));
 }

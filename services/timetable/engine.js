@@ -181,8 +181,10 @@ function compile(input) {
         warnings: [],
     };
 
-    /* ── Blocks (the CSP variables) ───────────────────────────────────────── */
-    let blockSeq = 0;
+    /* ── Demands (one subject's worth of scheduling need) ─────────────────── */
+    // Built first, merged into units second: a merged group has to know every
+    // member's teacher/room needs before it can be turned into a block.
+    const demands = [];
     for (const req of input.requirements || []) {
         const sectionId = sid(req.sectionId);
         const section = sections.get(sectionId);
@@ -198,7 +200,7 @@ function compile(input) {
         const explicitRoom = !!req.requiresRoom || !!req.roomId;
         const inferredRoom = PRACTICAL_TYPES.has(subjectType);
 
-        // Rooms that could physically host this block, cheapest-fitting first so
+        // Rooms that could physically host this subject, cheapest-fitting first so
         // the auditorium is not consumed by a 30-student theory class.
         let candidateRooms = [];
         if (req.roomId && rooms.has(sid(req.roomId))) {
@@ -255,8 +257,7 @@ function compile(input) {
             });
         }
 
-        const maxPerDay = Math.max(Number(req.maxPerDay) || 1, size);
-        const common = {
+        demands.push({
             reqId: sid(req.id ?? req._id) || `${sectionId}:${sid(req.subjectId)}`,
             sectionId,
             subjectId: sid(req.subjectId),
@@ -265,7 +266,7 @@ function compile(input) {
             strength: section.strength,
             teacherOptions,
             difficulty: Number(req.difficulty) || 3,
-            maxPerDay,
+            maxPerDay: Math.max(Number(req.maxPerDay) || 1, size),
             hardMaxPerDay: req.hardMaxPerDay !== false,
             minGapPeriods: Number(req.minGapPeriods) || 0,
             preferredPeriods: new Set((req.preferredPeriods || []).map(Number)),
@@ -275,9 +276,106 @@ function compile(input) {
             roomTypes: wantedTypes,
             candidateRooms,
             priority: Number(req.priority) || 0,
-        };
+            weeklyPeriods: weekly,
+            consecutivePeriods: size,
+            mergeGroup: String(req.mergeGroup || '').trim(),
+        });
+    }
 
-        ctx.requirements.push({ ...common, weeklyPeriods: weekly, consecutivePeriods: size });
+    /* ── Merge groups ─────────────────────────────────────────────────────── */
+    // Subjects of one section sharing a mergeGroup key are taught in the SAME
+    // period — Maths and Computer merged means P1 Monday is both. They become a
+    // single CSP variable carrying the partners in `parallel`, so the solver can
+    // never place them apart, and each partner keeps its own teacher and room.
+    const units = [];
+    const groups = new Map();
+    for (const d of demands) {
+        if (!d.mergeGroup) { units.push({ lead: d, parallel: [], mergeGroup: '' }); continue; }
+        const key = `${d.sectionId}#${d.mergeGroup}`;
+        if (!groups.has(key)) {
+            const unit = { lead: null, members: [], mergeGroup: d.mergeGroup };
+            groups.set(key, unit);
+            units.push(unit);
+        }
+        groups.get(key).members.push(d);
+    }
+    for (const unit of groups.values()) {
+        // Deterministic lead so (input, seed) still reproduces a run whatever
+        // order the requirement rows came back from the database in.
+        unit.members.sort((a, b) => (b.priority - a.priority)
+            || a.subjectName.localeCompare(b.subjectName)
+            || String(a.subjectId).localeCompare(String(b.subjectId)));
+        unit.lead = unit.members[0];
+        unit.parallel = unit.members.slice(1);
+
+        // The group is one unit, so it runs one number of periods a week. The
+        // largest member's figures win and the rest are pulled up to match.
+        const weekly = Math.max(...unit.members.map((m) => m.weeklyPeriods));
+        const size = Math.max(...unit.members.map((m) => m.consecutivePeriods));
+        const maxPerDay = Math.max(...unit.members.map((m) => m.maxPerDay), size);
+        const differing = unit.members.filter((m) => m.weeklyPeriods !== weekly);
+        if (differing.length) {
+            const section = sections.get(unit.lead.sectionId);
+            ctx.warnings.push({
+                type: CONFLICT_TYPES.MERGE_GROUP_MISMATCH,
+                severity: SEVERITY.WARNING,
+                sectionId: unit.lead.sectionId,
+                subjectId: differing[0].subjectId,
+                description: `Merged subjects ${unit.members.map((m) => m.subjectName).join(' + ')} for ${section?.label || 'section'} asked for different weekly periods — all of them have been scheduled ${weekly} time(s) a week.`,
+                suggestion: 'Give every subject in a merged group the same weekly period count.',
+            });
+        }
+        for (const m of unit.members) {
+            m.weeklyPeriods = weekly;
+            m.consecutivePeriods = size;
+            m.maxPerDay = maxPerDay;
+        }
+    }
+
+    /* ── Blocks (the CSP variables) ───────────────────────────────────────── */
+    let blockSeq = 0;
+    for (const unit of units) {
+        const lead = unit.lead;
+        const weekly = lead.weeklyPeriods;
+        const size = lead.consecutivePeriods;
+        const mergeLabel = unit.parallel.length
+            ? [lead, ...unit.parallel].map((m) => m.subjectName).join(' + ')
+            : '';
+
+        const common = {
+            ...lead,
+            parallel: unit.parallel.map((m) => ({
+                reqId: m.reqId,
+                subjectId: m.subjectId,
+                subjectName: m.subjectName,
+                subjectType: m.subjectType,
+                teacherOptions: m.teacherOptions,
+                requiresRoom: m.requiresRoom,
+                pinnedRoomId: m.pinnedRoomId,
+                roomTypes: m.roomTypes,
+                candidateRooms: m.candidateRooms,
+                strength: m.strength,
+            })),
+            mergeGroup: unit.mergeGroup || '',
+            mergeLabel,
+        };
+        delete common.weeklyPeriods;
+        delete common.consecutivePeriods;
+
+        // Every member is a requirement in its own right — that is what makes the
+        // validator hold each merged subject to the same weekly count. Only the
+        // lead counts towards the section's slot demand (they share the slots).
+        for (const member of [lead, ...unit.parallel]) {
+            ctx.requirements.push({
+                ...member,
+                parallel: member === lead ? common.parallel : [],
+                mergeGroup: unit.mergeGroup || '',
+                mergeLabel,
+                mergeLead: member === lead,
+                weeklyPeriods: weekly,
+                consecutivePeriods: size,
+            });
+        }
 
         // Split the weekly quota into indivisible blocks.
         const full = Math.floor(weekly / size);
@@ -292,13 +390,17 @@ function compile(input) {
         }
     }
 
-    // Static domains + reverse indexes used for forward checking.
+    // Static domains + reverse indexes used for forward checking. A merged
+    // block is indexed under its partners' teachers and rooms as well —
+    // otherwise placing one of them would not invalidate this block's domain.
     for (const block of ctx.blocks) {
         block.domain = staticDomain(ctx, block);
         index(ctx.bySection, block.sectionId, block);
-        for (const t of block.teacherOptions) index(ctx.byTeacher, t, block);
-        for (const r of block.candidateRooms) index(ctx.byRoom, r, block);
-        if (block.pinnedRoomId) index(ctx.byRoom, block.pinnedRoomId, block);
+        for (const member of [block, ...(block.parallel || [])]) {
+            for (const t of member.teacherOptions) index(ctx.byTeacher, t, block);
+            for (const r of member.candidateRooms) index(ctx.byRoom, r, block);
+            if (member.pinnedRoomId) index(ctx.byRoom, member.pinnedRoomId, block);
+        }
     }
 
     return ctx;
@@ -347,12 +449,16 @@ function staticDomain(ctx, block) {
             }
             if (!contiguous) continue;
 
-            // Prune slots no candidate teacher could ever take.
-            const anyTeacher = block.teacherOptions.some((tid) => {
-                const t = ctx.teachers.get(tid);
-                return t && !periods.some((p) => t.blocked.has(slotKey(day, p)));
+            // Prune slots no candidate teacher could ever take. Every merged
+            // member must have someone free, not just the primary subject.
+            const everyMemberCovered = [block, ...(block.parallel || [])].every((member) => {
+                if (!member.teacherOptions.length) return true;
+                return member.teacherOptions.some((tid) => {
+                    const t = ctx.teachers.get(tid);
+                    return t && !periods.some((p) => t.blocked.has(slotKey(day, p)));
+                });
             });
-            if (block.teacherOptions.length && !anyTeacher) continue;
+            if (!everyMemberCovered) continue;
 
             out.push({ day, startIdx: i, periods });
         }
@@ -367,9 +473,11 @@ function staticDomain(ctx, block) {
 function preflight(ctx) {
     const conflicts = [];
 
-    // Per-section: weekly demand vs teaching slots available.
+    // Per-section: weekly demand vs teaching slots available. A merged group
+    // occupies one slot however many subjects share it, so only its lead counts.
     const demandBySection = new Map();
     for (const req of ctx.requirements) {
+        if (req.mergeGroup && !req.mergeLead) continue;
         demandBySection.set(req.sectionId, (demandBySection.get(req.sectionId) || 0) + req.weeklyPeriods);
     }
     for (const [sectionId, demand] of demandBySection) {
@@ -495,6 +603,7 @@ function candidates(ctx, state, block, rng, limit = Infinity) {
             periods: res.periods,
             teacherId: res.teacherId,
             roomId: res.roomId,
+            parallel: res.parallel,
             cost: placementCost(ctx, state, block, d.day, res.periods, res.teacherId) + rng.next() * 0.01,
         });
         if (out.length >= limit) break;
@@ -517,9 +626,15 @@ function feasibleCount(ctx, state, block) {
 /** Forward checking: only blocks sharing a section, teacher or room are affected. */
 function markDirty(ctx, block, placement) {
     for (const b of ctx.bySection.get(block.sectionId) || []) b.dirty = true;
-    if (placement?.teacherId) for (const b of ctx.byTeacher.get(placement.teacherId) || []) b.dirty = true;
-    if (placement?.roomId) for (const b of ctx.byRoom.get(placement.roomId) || []) b.dirty = true;
-    for (const t of block.teacherOptions) for (const b of ctx.byTeacher.get(t) || []) b.dirty = true;
+    // A merged placement books a teacher and a room per member — all of them
+    // change what the other blocks can still do.
+    for (const used of [placement, ...(placement?.parallel || [])]) {
+        if (used?.teacherId) for (const b of ctx.byTeacher.get(used.teacherId) || []) b.dirty = true;
+        if (used?.roomId) for (const b of ctx.byRoom.get(used.roomId) || []) b.dirty = true;
+    }
+    for (const member of [block, ...(block.parallel || [])]) {
+        for (const t of member.teacherOptions) for (const b of ctx.byTeacher.get(t) || []) b.dirty = true;
+    }
 }
 
 /** MRV with a degree tie-break — hardest-to-place block first. */
@@ -559,16 +674,23 @@ function ejectAndPlace(ctx, state, block, pool, rng, protectedIds) {
             if (holder) blockers.add(holder);
         }
         // Teacher clashes — only the teachers this block could actually use.
-        for (const tid of block.teacherOptions) {
-            const t = ctx.teachers.get(tid);
-            if (!t || d.periods.some((p) => t.blocked.has(slotKey(d.day, p)))) continue;
-            const busy = new Set();
-            for (const p of d.periods) {
-                const holder = state.teacherSlots.get(`${tid}#${slotKey(d.day, p)}`);
-                if (holder) busy.add(holder);
+        // For a merged block every member needs someone free, so a member whose
+        // whole teacher list is busy contributes its blockers to the set.
+        for (const member of [block, ...(block.parallel || [])]) {
+            const memberBlockers = new Set();
+            let someoneFree = false;
+            for (const tid of member.teacherOptions) {
+                const t = ctx.teachers.get(tid);
+                if (!t || d.periods.some((p) => t.blocked.has(slotKey(d.day, p)))) continue;
+                const busy = new Set();
+                for (const p of d.periods) {
+                    const holder = state.teacherSlots.get(`${tid}#${slotKey(d.day, p)}`);
+                    if (holder) busy.add(holder);
+                }
+                if (!busy.size) { someoneFree = true; break; }
+                for (const b of busy) memberBlockers.add(b);
             }
-            if (!busy.size) { blockers.clear(); break; } // this teacher is free — only class clashes matter
-            for (const b of busy) blockers.add(b);
+            if (!someoneFree) for (const b of memberBlockers) blockers.add(b);
         }
         if (!blockers.size) continue; // would already be feasible; nothing to eject
         // Pinned / manually-locked entries are immovable — an option that would
@@ -596,7 +718,7 @@ function ejectAndPlace(ctx, state, block, pool, rng, protectedIds) {
         // re-placed by the main loop, so nothing is lost.
         return false;
     }
-    const placement = { day: res.day, startIdx: bestOption.d.startIdx, periods: res.periods, teacherId: res.teacherId, roomId: res.roomId };
+    const placement = { day: res.day, startIdx: bestOption.d.startIdx, periods: res.periods, teacherId: res.teacherId, roomId: res.roomId, parallel: res.parallel };
     applyPlacement(state, block, placement);
     markDirty(ctx, block, placement);
     pool.delete(block);
@@ -626,6 +748,7 @@ function runSearch(ctx, seed, pinned) {
             day: pin.dayOfWeek, startIdx, periods: res.periods,
             teacherId: pin.teacherId || res.teacherId,
             roomId: pin.roomId !== undefined ? pin.roomId : res.roomId,
+            parallel: res.parallel,
             manual: true,
         };
         applyPlacement(state, block, placement);
@@ -657,7 +780,7 @@ function runSearch(ctx, seed, pinned) {
         const opts = candidates(ctx, state, block, rng, 12);
         if (!opts.length) { block.dirty = true; continue; }
         const best = opts[0];
-        const placement = { day: best.day, startIdx: best.startIdx, periods: best.periods, teacherId: best.teacherId, roomId: best.roomId };
+        const placement = { day: best.day, startIdx: best.startIdx, periods: best.periods, teacherId: best.teacherId, roomId: best.roomId, parallel: best.parallel };
         applyPlacement(state, block, placement);
         markDirty(ctx, block, placement);
         pool.delete(block);
@@ -704,7 +827,7 @@ function optimise(ctx, state, seed, pinnedIds) {
             if (d.day === current.day && d.startIdx === current.startIdx) continue;
             const res = checkPlacement(ctx, state, block, d.day, d.startIdx);
             if (!res.ok) continue;
-            const trial = { day: res.day, startIdx: d.startIdx, periods: res.periods, teacherId: res.teacherId, roomId: res.roomId };
+            const trial = { day: res.day, startIdx: d.startIdx, periods: res.periods, teacherId: res.teacherId, roomId: res.roomId, parallel: res.parallel };
             applyPlacement(state, block, trial);
             scorer.invalidate([block.sectionId], [res.teacherId, current.teacherId]);
             const after = scorer.partial([block.sectionId], [res.teacherId, current.teacherId]);
@@ -780,6 +903,13 @@ function generate(input, hooks = {}) {
                 periodNumber,
                 isManual: !!placement.manual,
                 blockId,
+                // Merged partners share this exact slot — one row, several subjects.
+                mergeGroup: block.mergeGroup || '',
+                additionalSubjects: (placement.parallel || []).map((m) => ({
+                    subjectId: m.subjectId,
+                    teacherId: m.teacherId || null,
+                    roomId: m.roomId || null,
+                })),
             });
         }
     }
@@ -803,7 +933,7 @@ function generate(input, hooks = {}) {
             sectionId: block.sectionId,
             subjectId: block.subjectId,
             teacherId: block.teacherOptions[0] || null,
-            description: `${block.subjectName} for ${section?.label || 'section'}: ${periods} period(s) of the weekly requirement could not be placed.`,
+            description: `${block.mergeLabel || block.subjectName} for ${section?.label || 'section'}: ${periods} period(s) of the weekly requirement could not be placed.`,
             suggestion: 'Free up teacher availability, add an alternate teacher, or lower the weekly period requirement.',
             meta: { missingPeriods: periods },
         };
@@ -831,12 +961,20 @@ function buildStats(ctx, state, assignments, startedAt, moves, score) {
         if (a.teacherId) teachersUsed.add(a.teacherId);
         subjectsUsed.add(`${a.sectionId}#${a.subjectId}`);
         if (a.roomId) roomsUsed.add(a.roomId);
+        for (const m of a.additionalSubjects || []) {
+            if (m.teacherId) teachersUsed.add(m.teacherId);
+            subjectsUsed.add(`${a.sectionId}#${m.subjectId}`);
+            if (m.roomId) roomsUsed.add(m.roomId);
+        }
     }
     let totalSlots = 0;
     for (const s of ctx.sections.values()) {
         for (const day of s.days) totalSlots += (s.teachingByDay.get(day) || []).length;
     }
-    const required = ctx.requirements.reduce((sum, r) => sum + r.weeklyPeriods, 0);
+    // Slots the week must supply — a merged group needs one run of slots, not
+    // one per subject, so its followers are not counted twice.
+    const required = ctx.requirements.reduce(
+        (sum, r) => sum + ((r.mergeGroup && !r.mergeLead) ? 0 : r.weeklyPeriods), 0);
     return {
         classesProcessed: ctx.sections.size,
         teachersProcessed: ctx.teachers.size,

@@ -38,9 +38,12 @@ const TimetableEntrySchema = new db.Schema({
         ref: 'TimetableVersion',
         default: null,
     },
+    // Subjects taught alongside `subject` in this very period (merged subjects).
+    // Written by publish from TimetableVersionEntry.additionalSubjects.
     additionalSubjects: [{
         subject: { type: db.Types.UUID, ref: 'Subject' },
         teacher: { type: db.Types.UUID, ref: 'User', default: null },
+        room:    { type: db.Types.UUID, ref: 'Room', default: null },
     }],
     mergedSections: [{
         type: db.Types.UUID,

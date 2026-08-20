@@ -240,6 +240,8 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
                     preferredDays: r.preferredDays || [],
                     difficulty: Number(r.difficulty) || 3,
                     priority: Number(r.priority) || 0,
+                    // Shared key ⇒ scheduled in the same period as its partners.
+                    mergeGroup: String(r.mergeGroup || '').trim(),
                 });
             }
             continue;
@@ -280,6 +282,7 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
                 preferredDays: [],
                 difficulty: 3,
                 priority: 0,
+                mergeGroup: '',
                 derived: true,
             });
         }

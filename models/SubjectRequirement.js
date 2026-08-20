@@ -92,6 +92,14 @@ const SubjectRequirementSchema = new db.Schema({
         type: Number,
         default: 0,
     },
+    // Non-empty ⇒ this subject is MERGED with every other requirement in the
+    // same section carrying the same key: they are scheduled as one unit, in
+    // the same period, each with its own teacher and room. Empty ⇒ standalone.
+    mergeGroup: {
+        type: String,
+        default: '',
+        trim: true,
+    },
     isActive: {
         type: Boolean,
         default: true,

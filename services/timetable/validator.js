@@ -23,6 +23,7 @@ function validate(ctx, entries) {
     const push = (c) => conflicts.push(c);
 
     const sectionSlot = new Map();   // section#day#period -> entry
+    const slotSubjects = new Map();  // section#day#period -> Set(subjectId)
     const teacherSlot = new Map();
     const roomSlot = new Map();
     const teacherDay = new Map();
@@ -34,15 +35,39 @@ function validate(ctx, entries) {
     const subjName = (sectionId, subjectId) =>
         ctx.requirements.find((r) => r.sectionId === sectionId && r.subjectId === subjectId)?.subjectName || 'Subject';
 
-    for (const raw of entries) {
-        const e = {
+    // MERGED subjects sit inside one row as `additionalSubjects`. Flatten them
+    // into an occupant each — every one still needs its own free teacher and
+    // room — but tag them with the row they came from, so sharing the section's
+    // slot is recognised as a merge and not reported as a class clash.
+    const occupants = [];
+    entries.forEach((raw, rowIndex) => {
+        const rowId = String(raw._id ?? raw.id ?? `row${rowIndex}`);
+        const base = {
+            rowId,
             sectionId: sid(raw.sectionId ?? raw.section),
-            subjectId: sid(raw.subjectId ?? raw.subject),
-            teacherId: sid(raw.teacherId ?? raw.teacher),
-            roomId: sid(raw.roomId ?? raw.room),
             dayOfWeek: raw.dayOfWeek,
             periodNumber: Number(raw.periodNumber),
         };
+        occupants.push({
+            ...base,
+            subjectId: sid(raw.subjectId ?? raw.subject),
+            teacherId: sid(raw.teacherId ?? raw.teacher),
+            roomId: sid(raw.roomId ?? raw.room),
+            merged: false,
+        });
+        for (const m of raw.additionalSubjects || []) {
+            occupants.push({
+                ...base,
+                subjectId: sid(m.subjectId ?? m.subject),
+                teacherId: sid(m.teacherId ?? m.teacher),
+                roomId: sid(m.roomId ?? m.room),
+                merged: true,
+            });
+        }
+    });
+
+    for (const e of occupants) {
+        if (!e.subjectId) continue;
         const section = ctx.sections.get(e.sectionId);
         if (!section) {
             push({
@@ -80,18 +105,22 @@ function validate(ctx, entries) {
             });
         }
 
-        // HARD #1: class clash.
+        // HARD #1: class clash. Merged subjects share their slot by design, so
+        // only occupants from DIFFERENT rows collide.
         const cKey = `${e.sectionId}#${slotKey(e.dayOfWeek, e.periodNumber)}`;
-        if (sectionSlot.has(cKey)) {
+        const held = sectionSlot.get(cKey);
+        if (held && held.rowId !== e.rowId) {
             push({
                 type: CONFLICT_TYPES.CLASS_CLASH, severity: SEVERITY.ERROR,
                 sectionId: e.sectionId, subjectId: e.subjectId, dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
                 description: `${label(e.sectionId)} has two subjects at ${e.dayOfWeek} P${e.periodNumber}.`,
-                suggestion: 'Delete one of the two entries.',
+                suggestion: 'Delete one of the two entries, or merge the two subjects if they are meant to run together.',
             });
-        } else {
+        } else if (!held) {
             sectionSlot.set(cKey, e);
         }
+        if (!slotSubjects.has(cKey)) slotSubjects.set(cKey, new Set());
+        slotSubjects.get(cKey).add(e.subjectId);
 
         // HARD #2 / #4 / #9 / #10: teacher rules.
         if (!e.teacherId) {
@@ -225,8 +254,8 @@ function validate(ctx, entries) {
                 let run = 0;
                 const runs = [];
                 for (const slot of teaching) {
-                    const hit = sectionSlot.get(`${req.sectionId}#${slotKey(day, slot.periodNumber)}`);
-                    if (hit && hit.subjectId === req.subjectId) run++;
+                    const inSlot = slotSubjects.get(`${req.sectionId}#${slotKey(day, slot.periodNumber)}`);
+                    if (inSlot && inSlot.has(req.subjectId)) run++;
                     else { if (run) runs.push(run); run = 0; }
                 }
                 if (run) runs.push(run);
@@ -274,7 +303,7 @@ function validate(ctx, entries) {
         conflicts,
         valid: errorCount === 0,
         stats: {
-            entries: entries.length,
+            entries: occupants.length,
             errorCount,
             warningCount,
             infoCount: conflicts.length - errorCount - warningCount,

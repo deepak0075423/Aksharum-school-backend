@@ -29,18 +29,40 @@ function createState() {
 
 const bump = (map, key, by) => map.set(key, (map.get(key) || 0) + by);
 
+/**
+ * Every (subject, teacher, room) triple a placement books.
+ *
+ * A plain block books one. A MERGED block books one per subject in the group —
+ * they share the section's slot but each needs its own free teacher and room,
+ * which is exactly what makes the group a single scheduling unit.
+ */
+function occupantsOf(block, placement) {
+    const out = [{ subjectId: block.subjectId, teacherId: placement.teacherId || null, roomId: placement.roomId || null }];
+    for (const m of placement.parallel || []) {
+        out.push({ subjectId: m.subjectId, teacherId: m.teacherId || null, roomId: m.roomId || null });
+    }
+    return out;
+}
+
 function applyPlacement(state, block, placement) {
-    const { day, periods, teacherId, roomId } = placement;
+    const { day, periods } = placement;
+    const occupants = occupantsOf(block, placement);
     for (const p of periods) {
+        // One section slot for the whole unit — merged partners share it.
         state.sectionSlots.set(`${block.sectionId}#${slotKey(day, p)}`, block.id);
-        if (teacherId) state.teacherSlots.set(`${teacherId}#${slotKey(day, p)}`, block.id);
-        if (roomId)    state.roomSlots.set(`${roomId}#${slotKey(day, p)}`, block.id);
+        for (const o of occupants) {
+            if (o.teacherId) state.teacherSlots.set(`${o.teacherId}#${slotKey(day, p)}`, block.id);
+            if (o.roomId)    state.roomSlots.set(`${o.roomId}#${slotKey(day, p)}`, block.id);
+        }
     }
-    if (teacherId) {
-        bump(state.teacherDay, `${teacherId}#${day}`, periods.length);
-        bump(state.teacherWeek, teacherId, periods.length);
+    for (const o of occupants) {
+        if (o.teacherId) {
+            bump(state.teacherDay, `${o.teacherId}#${day}`, periods.length);
+            bump(state.teacherWeek, o.teacherId, periods.length);
+        }
+        bump(state.subjectDay, `${block.sectionId}#${o.subjectId}#${day}`, periods.length);
     }
-    bump(state.subjectDay, `${block.sectionId}#${block.subjectId}#${day}`, periods.length);
+    // The section only loses `periods.length` slots however many subjects share them.
     bump(state.sectionDay, `${block.sectionId}#${day}`, periods.length);
     state.placements.set(block.id, placement);
 }
@@ -48,17 +70,22 @@ function applyPlacement(state, block, placement) {
 function removePlacement(state, block) {
     const placement = state.placements.get(block.id);
     if (!placement) return null;
-    const { day, periods, teacherId, roomId } = placement;
+    const { day, periods } = placement;
+    const occupants = occupantsOf(block, placement);
     for (const p of periods) {
         state.sectionSlots.delete(`${block.sectionId}#${slotKey(day, p)}`);
-        if (teacherId) state.teacherSlots.delete(`${teacherId}#${slotKey(day, p)}`);
-        if (roomId)    state.roomSlots.delete(`${roomId}#${slotKey(day, p)}`);
+        for (const o of occupants) {
+            if (o.teacherId) state.teacherSlots.delete(`${o.teacherId}#${slotKey(day, p)}`);
+            if (o.roomId)    state.roomSlots.delete(`${o.roomId}#${slotKey(day, p)}`);
+        }
     }
-    if (teacherId) {
-        bump(state.teacherDay, `${teacherId}#${day}`, -periods.length);
-        bump(state.teacherWeek, teacherId, -periods.length);
+    for (const o of occupants) {
+        if (o.teacherId) {
+            bump(state.teacherDay, `${o.teacherId}#${day}`, -periods.length);
+            bump(state.teacherWeek, o.teacherId, -periods.length);
+        }
+        bump(state.subjectDay, `${block.sectionId}#${o.subjectId}#${day}`, -periods.length);
     }
-    bump(state.subjectDay, `${block.sectionId}#${block.subjectId}#${day}`, -periods.length);
     bump(state.sectionDay, `${block.sectionId}#${day}`, -periods.length);
     state.placements.delete(block.id);
     return placement;
@@ -69,47 +96,54 @@ function removePlacement(state, block) {
    ══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * HARD #7/#8: pick a room for this block, or explain why none fits.
+ * HARD #7/#8: pick a room for one subject demand, or explain why none fits.
  * Order of preference: pinned room → compatible special room → section home room.
+ *
+ * `demand` is the block itself for a plain subject, or one merged partner —
+ * partners are resolved one after another, so `taken` carries the rooms the
+ * earlier partners of the SAME placement already claimed.
+ *
  * Returns { ok, roomId, code, reason }.
  */
-function resolveRoom(ctx, state, block, day, periods, ignoreBlockId = null) {
-    const free = (roomId) => periods.every((p) => {
+function resolveRoom(ctx, state, sectionId, demand, day, periods, ignoreBlockId = null, taken = null) {
+    const free = (roomId) => !(taken && taken.has(roomId)) && periods.every((p) => {
         const holder = state.roomSlots.get(`${roomId}#${slotKey(day, p)}`);
         return holder === undefined || holder === ignoreBlockId;
     });
     const notBlocked = (room) => periods.every((p) => !room.blocked.has(slotKey(day, p)));
 
     // 1. Admin pinned one specific room — it is that room or nothing.
-    if (block.pinnedRoomId) {
-        const room = ctx.rooms.get(block.pinnedRoomId);
+    if (demand.pinnedRoomId) {
+        const room = ctx.rooms.get(demand.pinnedRoomId);
         if (!room) return { ok: false, code: CONFLICT_TYPES.PRACTICAL_ROOM_MISSING, reason: 'Pinned room no longer exists' };
         if (!notBlocked(room)) return { ok: false, code: CONFLICT_TYPES.ROOM_UNAVAILABLE, reason: `${room.name} is unavailable at this time` };
         if (!free(room.id))    return { ok: false, code: CONFLICT_TYPES.ROOM_CLASH, reason: `${room.name} is already booked at this time` };
-        if (ctx.enforceRoomCapacity && room.capacity > 0 && room.capacity < block.strength) {
-            return { ok: false, code: CONFLICT_TYPES.ROOM_CAPACITY, reason: `${room.name} seats ${room.capacity}, section needs ${block.strength}` };
+        if (ctx.enforceRoomCapacity && room.capacity > 0 && room.capacity < demand.strength) {
+            return { ok: false, code: CONFLICT_TYPES.ROOM_CAPACITY, reason: `${room.name} seats ${room.capacity}, section needs ${demand.strength}` };
         }
         return { ok: true, roomId: room.id };
     }
 
     // 2. A special room is required (lab / activity / sports …).
-    if (block.requiresRoom) {
-        if (!block.candidateRooms.length) {
+    if (demand.requiresRoom) {
+        if (!demand.candidateRooms.length) {
             return {
                 ok: false,
                 code: CONFLICT_TYPES.PRACTICAL_ROOM_MISSING,
-                reason: `No room of type ${block.roomTypes.join(' / ') || 'required'} exists with enough capacity`,
+                reason: `No room of type ${demand.roomTypes.join(' / ') || 'required'} exists with enough capacity`,
             };
         }
-        for (const roomId of block.candidateRooms) {
+        for (const roomId of demand.candidateRooms) {
             const room = ctx.rooms.get(roomId);
             if (room && notBlocked(room) && free(roomId)) return { ok: true, roomId };
         }
         return { ok: false, code: CONFLICT_TYPES.ROOM_CLASH, reason: 'All compatible rooms are booked at this time' };
     }
 
-    // 3. Plain theory — use the section's home classroom when it is free.
-    const home = ctx.sections.get(block.sectionId)?.homeRoomId;
+    // 3. Plain theory — use the section's home classroom when it is free. A
+    //    merged partner finds it already taken and is simply scheduled without
+    //    a room, which is correct: the class is in one place either way.
+    const home = ctx.sections.get(sectionId)?.homeRoomId;
     if (home) {
         const room = ctx.rooms.get(home);
         if (room && notBlocked(room) && free(home)) return { ok: true, roomId: home };
@@ -119,11 +153,96 @@ function resolveRoom(ctx, state, block, day, periods, ignoreBlockId = null) {
 }
 
 /**
+ * How many periods of `teacherId`'s load on `day` come from the block we are
+ * allowed to ignore (the one being moved). Merge-aware: the ignored block may
+ * hold this teacher as a merged partner rather than as its primary.
+ */
+function selfLoad(state, ignoreBlockId, teacherId, day) {
+    if (!ignoreBlockId) return { day: 0, week: 0 };
+    const pl = state.placements.get(ignoreBlockId);
+    if (!pl) return { day: 0, week: 0 };
+    const holds = pl.teacherId === teacherId || (pl.parallel || []).some((m) => m.teacherId === teacherId);
+    if (!holds) return { day: 0, week: 0 };
+    return { day: pl.day === day ? pl.periods.length : 0, week: pl.periods.length };
+}
+
+/**
+ * HARD #2/#4/#9/#10: the first teacher of `demand` who is qualified, available,
+ * free and under their ceilings. `taken` holds the teachers already claimed by
+ * earlier merged partners of the same placement — nobody teaches two subjects
+ * at once, merged or not.
+ *
+ * Returns { ok, teacherId, code, reason }.
+ */
+function resolveTeacher(ctx, state, demand, day, periods, size, ignore = null, taken = null) {
+    let reason = null;
+    let code = CONFLICT_TYPES.TEACHER_CLASH;
+
+    for (const teacherId of demand.teacherOptions) {
+        const t = ctx.teachers.get(teacherId);
+        if (!t) continue;
+        if (taken && taken.has(teacherId)) {
+            reason = `${t.name} is already teaching another subject of this merged period`;
+            code = CONFLICT_TYPES.TEACHER_CLASH;
+            continue;
+        }
+
+        // HARD #9: must be qualified for / assigned to this subject.
+        if (ctx.enforceTeacherQualified && t.subjects.size && !t.subjects.has(demand.subjectId)) {
+            reason = `${t.name} is not assigned to teach ${demand.subjectName}`;
+            code = CONFLICT_TYPES.SUBJECT_TEACHER_MISMATCH;
+            continue;
+        }
+        // HARD #4: declared unavailable.
+        if (periods.some((p) => t.blocked.has(slotKey(day, p)))) {
+            reason = `${t.name} is unavailable on ${day}`;
+            code = CONFLICT_TYPES.TEACHER_UNAVAILABLE;
+            continue;
+        }
+        // HARD #2: already teaching elsewhere.
+        let busy = false;
+        for (const p of periods) {
+            const holder = state.teacherSlots.get(`${teacherId}#${slotKey(day, p)}`);
+            if (holder !== undefined && holder !== ignore) { busy = true; break; }
+        }
+        if (busy) {
+            reason = `${t.name} is already teaching another class at ${day} P${periods[0]}`;
+            code = CONFLICT_TYPES.TEACHER_CLASH;
+            continue;
+        }
+        // HARD #10: daily / weekly workload ceilings.
+        const self = selfLoad(state, ignore, teacherId, day);
+        if (t.hardDailyLimit && t.maxPerDay > 0 &&
+            (state.teacherDay.get(`${teacherId}#${day}`) || 0) - self.day + size > t.maxPerDay) {
+            reason = `${t.name} is at their ${t.maxPerDay}-period daily limit on ${day}`;
+            code = CONFLICT_TYPES.DAILY_LIMIT_EXCEEDED;
+            continue;
+        }
+        if (t.maxPerWeek > 0 &&
+            (state.teacherWeek.get(teacherId) || 0) - self.week + size > t.maxPerWeek) {
+            reason = `${t.name} is at their ${t.maxPerWeek}-period weekly limit`;
+            code = CONFLICT_TYPES.WEEKLY_LIMIT_EXCEEDED;
+            continue;
+        }
+        return { ok: true, teacherId };
+    }
+
+    if (!demand.teacherOptions.length) {
+        return { ok: false, code: CONFLICT_TYPES.NO_TEACHER_ASSIGNED, reason: `No teacher is assigned to ${demand.subjectName}` };
+    }
+    return { ok: false, code, reason: reason || 'No teacher free at this time' };
+}
+
+/**
  * Can `block` sit at `day` starting at teaching-slot index `startIdx`?
  * Runs every hard constraint in cost order (cheapest rejections first) and
  * returns the teacher + room it would use.
  *
- * @returns {{ok:boolean, teacherId?:string, roomId?:string|null, code?:string, reason?:string}}
+ * For a MERGED block every subject in the group is resolved here, against the
+ * same periods: the placement is legal only when ALL of them find a teacher and
+ * a room. That is what makes the group one indivisible scheduling unit.
+ *
+ * @returns {{ok:boolean, teacherId?:string, roomId?:string|null, parallel?:Array, code?:string, reason?:string}}
  */
 function checkPlacement(ctx, state, block, day, startIdx, opts = {}) {
     const ignore = opts.ignoreBlockId || null;
@@ -145,7 +264,7 @@ function checkPlacement(ctx, state, block, day, startIdx, opts = {}) {
         periods.push(cur.periodNumber);
     }
 
-    // HARD #1: one subject per section per slot.
+    // HARD #1: one subject per section per slot (a merged group counts as one).
     for (const p of periods) {
         const holder = state.sectionSlots.get(`${block.sectionId}#${slotKey(day, p)}`);
         if (holder !== undefined && holder !== ignore) {
@@ -178,70 +297,43 @@ function checkPlacement(ctx, state, block, day, startIdx, opts = {}) {
         }
     }
 
-    // HARD #2/#4/#9/#10: teacher clash, availability, qualification, workload.
-    let chosenTeacher = null;
-    let teacherReason = null;
-    let teacherCode = CONFLICT_TYPES.TEACHER_CLASH;
-    for (const teacherId of block.teacherOptions) {
-        const t = ctx.teachers.get(teacherId);
-        if (!t) continue;
+    // HARD #2/#4/#9/#10 then #3/#7/#8, for the primary subject and then for each
+    // merged partner. Teachers and rooms already claimed by an earlier member of
+    // this same placement are off the table for the next one.
+    const takenTeachers = new Set();
+    const takenRooms = new Set();
 
-        // HARD #9: must be qualified for / assigned to this subject.
-        if (ctx.enforceTeacherQualified && t.subjects.size && !t.subjects.has(block.subjectId)) {
-            teacherReason = `${t.name} is not assigned to teach ${block.subjectName}`;
-            teacherCode = CONFLICT_TYPES.SUBJECT_TEACHER_MISMATCH;
-            continue;
-        }
-        // HARD #4: declared unavailable.
-        if (periods.some((p) => t.blocked.has(slotKey(day, p)))) {
-            teacherReason = `${t.name} is unavailable on ${day}`;
-            teacherCode = CONFLICT_TYPES.TEACHER_UNAVAILABLE;
-            continue;
-        }
-        // HARD #2: already teaching elsewhere.
-        let busy = false;
-        for (const p of periods) {
-            const holder = state.teacherSlots.get(`${teacherId}#${slotKey(day, p)}`);
-            if (holder !== undefined && holder !== ignore) { busy = true; break; }
-        }
-        if (busy) {
-            teacherReason = `${t.name} is already teaching another class at ${day} P${periods[0]}`;
-            teacherCode = CONFLICT_TYPES.TEACHER_CLASH;
-            continue;
-        }
-        // HARD #10: daily / weekly workload ceilings.
-        const selfDay = ignore && state.placements.get(ignore)?.teacherId === teacherId && state.placements.get(ignore)?.day === day
-            ? state.placements.get(ignore).periods.length : 0;
-        const selfWeek = ignore && state.placements.get(ignore)?.teacherId === teacherId
-            ? state.placements.get(ignore).periods.length : 0;
-        if (t.hardDailyLimit && t.maxPerDay > 0 &&
-            (state.teacherDay.get(`${teacherId}#${day}`) || 0) - selfDay + block.size > t.maxPerDay) {
-            teacherReason = `${t.name} is at their ${t.maxPerDay}-period daily limit on ${day}`;
-            teacherCode = CONFLICT_TYPES.DAILY_LIMIT_EXCEEDED;
-            continue;
-        }
-        if (t.maxPerWeek > 0 &&
-            (state.teacherWeek.get(teacherId) || 0) - selfWeek + block.size > t.maxPerWeek) {
-            teacherReason = `${t.name} is at their ${t.maxPerWeek}-period weekly limit`;
-            teacherCode = CONFLICT_TYPES.WEEKLY_LIMIT_EXCEEDED;
-            continue;
-        }
-        chosenTeacher = teacherId;
-        break;
-    }
+    const teacher = resolveTeacher(ctx, state, block, day, periods, block.size, ignore, takenTeachers);
+    if (!teacher.ok) return { ok: false, code: teacher.code, reason: teacher.reason };
+    takenTeachers.add(teacher.teacherId);
 
-    if (!chosenTeacher) {
-        if (!block.teacherOptions.length) {
-            return { ok: false, code: CONFLICT_TYPES.NO_TEACHER_ASSIGNED, reason: `No teacher is assigned to ${block.subjectName} for ${section.label}` };
-        }
-        return { ok: false, code: teacherCode, reason: teacherReason || 'No teacher free at this time' };
-    }
-
-    // HARD #3/#7/#8: rooms.
-    const room = resolveRoom(ctx, state, block, day, periods, ignore);
+    const room = resolveRoom(ctx, state, block.sectionId, block, day, periods, ignore, takenRooms);
     if (!room.ok) return { ok: false, code: room.code, reason: room.reason };
+    if (room.roomId) takenRooms.add(room.roomId);
 
-    return { ok: true, teacherId: chosenTeacher, roomId: room.roomId, periods, day };
+    const parallel = [];
+    for (const member of block.parallel || []) {
+        const mTeacher = resolveTeacher(ctx, state, member, day, periods, block.size, ignore, takenTeachers);
+        if (!mTeacher.ok) {
+            return { ok: false, code: mTeacher.code, reason: `${member.subjectName} (merged with ${block.subjectName}): ${mTeacher.reason}` };
+        }
+        takenTeachers.add(mTeacher.teacherId);
+
+        const mRoom = resolveRoom(ctx, state, block.sectionId, member, day, periods, ignore, takenRooms);
+        if (!mRoom.ok) {
+            return { ok: false, code: mRoom.code, reason: `${member.subjectName} (merged with ${block.subjectName}): ${mRoom.reason}` };
+        }
+        if (mRoom.roomId) takenRooms.add(mRoom.roomId);
+
+        parallel.push({
+            subjectId: member.subjectId,
+            subjectName: member.subjectName,
+            teacherId: mTeacher.teacherId,
+            roomId: mRoom.roomId,
+        });
+    }
+
+    return { ok: true, teacherId: teacher.teacherId, roomId: room.roomId, parallel, periods, day };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

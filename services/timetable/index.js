@@ -22,5 +22,6 @@ module.exports = {
     resolveScope: dataLoader.resolveScope,
     derivePeriods: dataLoader.derivePeriods,
     normalisePeriods: dataLoader.normalisePeriods,
+    workingDaysFor: dataLoader.workingDaysFor,
     constraints,
 };

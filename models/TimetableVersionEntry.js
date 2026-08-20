@@ -44,6 +44,22 @@ const TimetableVersionEntrySchema = new db.Schema({
         ref: 'Room',
         default: null,
     },
+    // MERGED subjects. `subject` above stays the slot's primary subject; the
+    // partners it is taught alongside sit here, each with its own teacher and
+    // room. They occupy the SAME period, which is why they are inline columns
+    // rather than extra rows — the unique index below is a real hard rule.
+    // Mirrors TimetableEntry.additionalSubjects so publish is a direct copy.
+    additionalSubjects: [{
+        subject: { type: db.Types.UUID, ref: 'Subject' },
+        teacher: { type: db.Types.UUID, ref: 'User', default: null },
+        room:    { type: db.Types.UUID, ref: 'Room', default: null },
+    }],
+    // The SubjectRequirement.mergeGroup key this slot came from, so the grid can
+    // label it and a regeneration can pin it back.
+    mergeGroup: {
+        type: String,
+        default: '',
+    },
     // Set when an admin moved/created this entry by hand — regeneration with
     // `preserveManualEdits` pins these before solving.
     isManual: {

@@ -210,6 +210,7 @@ router.get('/timetable/teachers',     timetableGuard, timetableCtrl.getTeachersB
 // Static segments are declared before '/timetable/versions/:id' so a literal
 // path like '/timetable/versions' is never captured as an id.
 router.get('/timetable/meta',            timetableGuard, ttGenCtrl.getMeta);
+router.get('/timetable/class-plan',      timetableGuard, ttGenCtrl.getClassPlan);
 router.get('/timetable/config',          timetableGuard, ttGenCtrl.getConfig);
 router.put('/timetable/config',          timetableGuard, ttGenCtrl.saveConfig);
 
@@ -220,11 +221,6 @@ router.delete('/timetable/rooms/:id',    timetableGuard, ttGenCtrl.deleteRoom);
 
 router.get('/timetable/availability',              timetableGuard, ttGenCtrl.listAvailability);
 router.put('/timetable/availability/:teacherId',   timetableGuard, ttGenCtrl.saveAvailability);
-
-router.get('/timetable/requirements',                    timetableGuard, ttGenCtrl.listRequirements);
-router.put('/timetable/requirements/:sectionId',         timetableGuard, ttGenCtrl.saveRequirements);
-router.post('/timetable/requirements/seed',              timetableGuard, ttGenCtrl.seedRequirements);
-router.delete('/timetable/requirements/item/:id',        timetableGuard, ttGenCtrl.deleteRequirement);
 
 router.post('/timetable/generate',       timetableGuard, ttGenCtrl.generate);
 router.get('/timetable/versions',        timetableGuard, ttGenCtrl.listVersions);
