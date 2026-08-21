@@ -273,6 +273,45 @@ if (isPrimaryWorker) {
         setInterval(tick, 30 * 60 * 1000);     // then every 30 minutes
     }());
 
+    // ── Substitute subject teacher sweep ──────────────────────────────────────
+    // Cover happens because the school day started, not because anyone opened a
+    // page: a teacher marked absent at 08:50 needs their 09:10 period covered
+    // before it begins. Each tick re-detects today's absences, opens one
+    // requirement per affected period and fills the uncovered ones with the
+    // fairest eligible teacher.
+    //
+    // Every step is idempotent — requirements are keyed on
+    // (period, day, absent teacher) behind a partial unique index, and only
+    // rows still 'uncovered' are filled — so a restart mid-sweep, or two ticks
+    // landing close together, changes nothing. Rows an admin has touched are
+    // never re-decided; the sweep only ever fills blanks. It also retires rows
+    // whose absence was withdrawn (attendance corrected to Present, leave
+    // cancelled), notifying whoever was standing by.
+    //
+    // The board runs the same detection on read, so a stopped worker degrades
+    // to "covered when an admin looks" rather than breaking.
+    (function scheduleSubstitutionSweep() {
+        const substitutes = require('./services/substituteService');
+        const tick = async () => {
+            try {
+                const schools = await substitutes.schoolsToSweep();
+                let assigned = 0, created = 0, uncovered = 0;
+                for (const s of schools) {
+                    const r = await substitutes.runAutoAssign(s._id, new Date());
+                    created   += r.created;
+                    assigned  += r.assigned;
+                    uncovered += r.uncovered;
+                }
+                if (created || assigned || uncovered) {
+                    console.log(`[Substitution] sweep: ${created} period(s) needing cover, `
+                        + `${assigned} assigned, ${uncovered} left uncovered across ${schools.length} school(s)`);
+                }
+            } catch (err) { console.error('[Substitution] sweep error:', err.message); }
+        };
+        setTimeout(tick, 45 * 1000);           // once shortly after boot
+        setInterval(tick, 10 * 60 * 1000);     // then every 10 minutes
+    }());
+
     // ── Video scheduled-publish worker ────────────────────────────────────────
     // Flips master videos from 'scheduled' → 'published' once scheduledAt passes.
     (function scheduleVideoPublisher() {

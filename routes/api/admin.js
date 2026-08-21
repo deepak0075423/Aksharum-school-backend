@@ -8,6 +8,7 @@ const reportCtrl    = require('../../controllers/report.controller');
 const attendanceCtrl = require('../../controllers/attendance.controller');
 const timetableCtrl  = require('../../controllers/timetable.controller');
 const ttGenCtrl      = require('../../controllers/timetableGen.controller');
+const substituteCtrl = require('../../controllers/substitute.controller');
 const notifCtrl      = require('../../controllers/notification.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
@@ -205,6 +206,26 @@ router.delete('/subjects/:id',   guard, subjectCtrl.deleteSubject);
 // Timetable
 router.get('/timetable/download-all', timetableGuard, timetableCtrl.adminDownloadAllTimetables);
 router.get('/timetable/teachers',     timetableGuard, timetableCtrl.getTeachersBySubject);
+
+// ── Substitute subject teachers ──────────────────────────────────────────────
+// Part of the timetable module: a substitution is a period of the published
+// timetable being covered by someone else, so it rides the same flag and the
+// same designation permission.
+// Static segments precede '/:id' so 'settings' / 'workload' are never read as ids.
+router.get('/substitutions',                    timetableGuard, substituteCtrl.getBoard);
+router.post('/substitutions/run',               timetableGuard, substituteCtrl.runAutoAssign);
+router.get('/substitutions/settings',           timetableGuard, substituteCtrl.getSettings);
+router.put('/substitutions/settings',           timetableGuard, substituteCtrl.saveSettings);
+router.get('/substitutions/workload',           timetableGuard, substituteCtrl.getWorkload);
+router.get('/substitutions/report',             timetableGuard, substituteCtrl.getReport);
+router.get('/substitutions/history',            timetableGuard, substituteCtrl.getHistory);
+router.get('/substitutions/teacher-periods',    timetableGuard, substituteCtrl.getTeacherPeriods);
+router.get('/substitutions/schedulable-teachers', timetableGuard, substituteCtrl.getSchedulableTeachers);
+router.post('/substitutions/manual',            timetableGuard, substituteCtrl.createManual);
+router.get('/substitutions/:id/candidates',     timetableGuard, substituteCtrl.getCandidates);
+router.post('/substitutions/:id/assign',        timetableGuard, substituteCtrl.assign);
+router.put('/substitutions/:id/remarks',        timetableGuard, substituteCtrl.updateRemarks);
+router.delete('/substitutions/:id',             timetableGuard, substituteCtrl.cancel);
 
 // ── Timetable generation, versioning & publishing ────────────────────────────
 // Static segments are declared before '/timetable/versions/:id' so a literal

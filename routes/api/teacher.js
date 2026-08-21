@@ -5,6 +5,7 @@ const teacherCtrl    = require('../../controllers/teacher.controller');
 const sectionCtrl    = require('../../controllers/section.controller');
 const attendanceCtrl = require('../../controllers/attendance.controller');
 const timetableCtrl  = require('../../controllers/timetable.controller');
+const substituteCtrl = require('../../controllers/substitute.controller');
 const notifCtrl      = require('../../controllers/notification.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
@@ -69,6 +70,9 @@ router.post('/correction-requests/review', attendanceGuard, attendanceCtrl.revie
 router.get('/timetable',              timetableGuard, timetableCtrl.teacherViewTimetable);
 router.get('/timetable/download',     timetableGuard, timetableCtrl.teacherDownloadTimetable);
 router.get('/timetable/my-class',     timetableGuard, timetableCtrl.teacherClassTimetable);
+
+// Substitute duties I have been given, and my own periods someone else covers.
+router.get('/substitutions',          timetableGuard, substituteCtrl.teacherMySubstitutions);
 
 // ── Notifications ─────────────────────────────────────────────────────────────
 router.get('/notifications',        notifGuard, notifCtrl.getList);
