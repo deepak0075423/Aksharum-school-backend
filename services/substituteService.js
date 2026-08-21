@@ -334,13 +334,21 @@ async function detectAbsences(ctx) {
             status:   'approved',
             fromDate: { $lte: ctx.date },
             toDate:   { $gte: ctx.date },
-        }).select('teacher leaveMode _id').lean();
+        }).select('teacher leaveMode halfDaySession _id').lean();
         for (const a of apps) {
+            const half = a.leaveMode === 'half_day';
+            // Which half matters: cover for a morning absence is a different set
+            // of periods from an afternoon one. Before the session was recorded
+            // this could only be flagged for review.
+            const session = half ? (a.halfDaySession === 'second' ? 'second' : 'first') : null;
             out.set(sid(a.teacher), {
                 reason: 'leave',
                 sourceRef: a._id,
-                needsReview: a.leaveMode === 'half_day',
-                label: a.leaveMode === 'half_day' ? 'Approved leave (half day)' : 'Approved leave',
+                needsReview: half,
+                halfDaySession: session,
+                label: half
+                    ? `Approved leave (${session === 'second' ? 'second' : 'first'} half)`
+                    : 'Approved leave',
             });
         }
     }

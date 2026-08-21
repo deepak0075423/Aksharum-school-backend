@@ -331,6 +331,11 @@ router.get('/leave/allocations/template',          leaveGuard, leaveCtrl.adminGe
 router.post('/leave/allocations/excel',            leaveGuard, uploadExcel.single('excelFile'), leaveCtrl.adminBulkAllocateExcel);
 router.post('/leave/allocations/clear',            leaveGuard, leaveCtrl.adminClearAllocations);
 router.post('/leave/allocations/carry-forward',    leaveGuard, leaveCtrl.adminRunCarryForward);
+// Year-end: lapse whatever carry-forward did not move, then close the year
+router.get('/leave/year-close/preview',            leaveGuard, leaveCtrl.adminGetYearClosePreview);
+router.post('/leave/year-close',                   leaveGuard, leaveCtrl.adminCloseAcademicYear);
+// Final settlement for someone leaving
+router.post('/leave/settle',                       leaveGuard, leaveCtrl.adminSettleEmployeeLeave);
 router.post('/leave/accrual/run',                  leaveGuard, leaveCtrl.adminRunMonthlyAccrual);
 router.get('/leave/requests/export',               leaveGuard, leaveCtrl.adminExportRequests);
 router.get('/leave/allocations/export',            leaveGuard, leaveCtrl.adminExportAllocations);

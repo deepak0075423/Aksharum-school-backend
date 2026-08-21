@@ -10,6 +10,11 @@ const path             = require('path');
 const { notify, schoolAdminIds } = require('../services/notifyService');
 const compOff          = require('../services/compOffService');
 const leavePolicy      = require('../services/leavePolicyService');
+// Status change + balance move + ledger row, as one transaction under one lock.
+const { commitTransition, recordAdjustments } = require('../services/leaveBalanceTx');
+// Cross-module effects. Each one is gated on the target module's own flag, so a
+// school without Attendance or Timetable sees leave behave exactly as before.
+const leaveIntegrations = require('../services/leaveIntegrations');
 // Working-day / weekly-off arithmetic is shared with the Comp Off engine so the
 // two can never disagree about whether a given Saturday is a working day.
 const {
@@ -20,6 +25,24 @@ const {
 const fmtDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Reports and exports used to run unbounded — every application the school had
+// ever filed, populated, with no limit. These keep them to a window.
+const REPORT_ROW_CAP = 5000;
+
+/**
+ * Restrict a report filter to a date window. Defaults to the academic year the
+ * report is about, so the common case reads one year rather than all history.
+ */
+function withReportWindow(filter, { fromDate, toDate }, academicYearRange) {
+    const from = fromDate ? new Date(fromDate) : academicYearRange?.startDate;
+    const to   = toDate   ? new Date(toDate)   : academicYearRange?.endDate;
+    if (!from && !to) return filter;
+    const range = {};
+    if (from && !isNaN(new Date(from))) range.$gte = new Date(from);
+    if (to   && !isNaN(new Date(to)))   range.$lte = new Date(to);
+    return Object.keys(range).length ? { ...filter, fromDate: range } : filter;
+}
 
 const isCompOffType = lt => lt?.category === 'compoff' || String(lt?.code || '').toUpperCase() === 'COMPOFF';
 
@@ -61,6 +84,24 @@ async function computeLeaveDays({ schoolId, from, to, leaveMode, policy, leaveSe
     if (totalDays <= 0)
         return { error: 'No working days in the selected date range (all are weekends or holidays)' };
     return { totalDays };
+}
+
+/**
+ * The days of an application that actually draw on the balance. Loss-of-pay
+ * days are part of the leave but not of the entitlement, so only this portion
+ * is ever held, spent or restored.
+ */
+const paidOf = (app) => Math.max(0, (app.totalDays || 0) - (app.lopDays || 0));
+
+/**
+ * The academic year an application's days belong to.
+ *
+ * Always the year stamped when it was filed. Applications created before that
+ * column existed carry none, so they fall back to the active year — exactly
+ * what every handler used to do unconditionally.
+ */
+async function yearOf(app, schoolId) {
+    return app.academicYear || await getActiveAcademicYearLabel(schoolId);
 }
 
 // Returns an existing pending/approved/modification_requested leave that overlaps [from, to]
@@ -383,11 +424,18 @@ exports.teacherGetPolicies = async (req, res) => {
 exports.teacherGetApprovals = async (req, res) => {
     try {
         const { status = 'pending' } = req.query;
-        const policies = await leavePolicy.getAllPolicies(req.schoolId);
+        const [policies, designation] = await Promise.all([
+            leavePolicy.getAllPolicies(req.schoolId),
+            // Resolved once and reused — canApprove would otherwise reload the
+            // same profile for every leave type in the school.
+            leavePolicy.designationOf(req.userId, req.schoolId),
+        ]);
 
         const mine = [];
         for (const p of policies) {
-            if (await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, p)) mine.push(p.leaveType._id);
+            if (await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, p, designation)) {
+                mine.push(p.leaveType._id);
+            }
         }
         if (!mine.length) return res.json({ success: true, data: { isApprover: false, items: [] } });
 
@@ -439,7 +487,10 @@ exports.adminGetRequests = async (req, res) => {
                 .populate('teacher',  'name email employeeId')
                 .populate('leaveType','name code category')
                 .populate('approvedBy','name')
-                .sort({ appliedAt: -1 })
+                // fromDate is indexed alongside (school, status); appliedAt is
+                // not, so sorting on it made every page of the queue sort in
+                // memory. Newest leave first reads the same to a user.
+                .sort({ fromDate: -1 })
                 .skip((+page - 1) * +limit)
                 .limit(+limit)
                 .lean(),
@@ -451,7 +502,7 @@ exports.adminGetRequests = async (req, res) => {
 
 exports.adminApplyLeave = async (req, res) => {
     try {
-        const { teacherId, leaveTypeId, fromDate, toDate, leaveMode, reason } = req.body;
+        const { teacherId, leaveTypeId, fromDate, toDate, leaveMode, halfDaySession, reason } = req.body;
         if (!teacherId || !leaveTypeId || !fromDate || !toDate || !reason)
             return res.status(400).json({ success: false, message: 'teacherId, leaveTypeId, fromDate, toDate and reason are required' });
 
@@ -499,21 +550,30 @@ exports.adminApplyLeave = async (req, res) => {
 
         const bal = await ensureBalance(teacherId, req.schoolId, leaveTypeId, ay);
         const remaining = remainingOf(bal);
-        if (totalDays > leavePolicy.spendableFrom(policy, remaining))
-            return res.status(400).json({ success: false, message: `Insufficient balance. Available: ${remaining}` });
+        // Days past the balance are refused exactly as before, unless the type
+        // is unpaid or the policy allows the overrun as loss of pay.
+        const split = leavePolicy.splitPaidAndLop(
+            policy, ltDoc, totalDays, leavePolicy.spendableFrom(policy, remaining));
+        if (!split.ok) return res.status(400).json({ success: false, message: split.message });
 
         const app = await LeaveApplication.create({
             teacher: teacherId, school: req.schoolId, leaveType: leaveTypeId,
-            fromDate: from, toDate: to, totalDays,
-            leaveMode: leaveMode || 'full_day', reason, document: documentPath, appliedAt: new Date(),
+            fromDate: from, toDate: to, totalDays, academicYear: ay, lopDays: split.lopDays,
+            leaveMode: leaveMode || 'full_day',
+            halfDaySession: leaveMode === 'half_day' ? (halfDaySession === 'second' ? 'second' : 'first') : 'first',
+            reason, document: documentPath, appliedAt: new Date(),
             // Leave takes one sign-off — the two-level policy option was removed.
             approvalsRequired: 1,
             approvalLevel: 0, approvals: [],
         });
-        await LeaveBalance.updateOne(
-            { teacher: teacherId, school: req.schoolId, leaveType: leaveTypeId, academicYear: ay },
-            { $inc: { pending: totalDays } }
-        );
+        // Only the paid portion is held. LOP days draw on no entitlement, so
+        // holding them would understate the balance for no reason.
+        if (split.paidDays > 0) {
+            await LeaveBalance.updateOne(
+                { teacher: teacherId, school: req.schoolId, leaveType: leaveTypeId, academicYear: ay },
+                { $inc: { pending: split.paidDays } }
+            );
+        }
         res.status(201).json({ success: true, data: app });
     } catch (e) {
         if (e.code === 11000) return res.status(400).json({ success: false, message: 'Teacher already has a leave application for these dates' });
@@ -605,8 +665,14 @@ async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, t
                 const holidayDays  = holidayModule
                     ? await countHolidayWorkingDays(from, to, schoolId, leaveSettings)
                     : 0;
+                // Split the preview the same way the submit will, so "3 of
+                // these 5 days are unpaid" is visible before filing.
+                const previewSplit = counted.error ? null : leavePolicy.splitPaidAndLop(
+                    policy, ltDoc, counted.totalDays, leavePolicy.spendableFrom(policy, remaining));
                 days = {
-                    error:        counted.error || null,
+                    error:        counted.error || (previewSplit && !previewSplit.ok ? previewSplit.message : null),
+                    lopDays:      previewSplit?.ok ? previewSplit.lopDays : 0,
+                    paidDays:     previewSplit?.ok ? previewSplit.paidDays : 0,
                     // What the balance will be charged. Equals workingDays minus
                     // holidays normally, calendarDays under the sandwich rule,
                     // and 0.5 for a half day.
@@ -654,8 +720,10 @@ async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, t
                 requiresDocument:    policy.requiresDocument,
                 documentRequiredAfterDays: policy.documentRequiredAfterDays,
             },
-            // The one hard stop the form can know about before submitting.
-            sufficient: !days || !!days.error || days.totalDays <= balance.spendable,
+            // With loss of pay available an over-balance request is no longer a
+            // hard stop — the excess is simply unpaid, and days.error carries
+            // the refusal when it genuinely cannot go through.
+            sufficient: !days || !!days.error || (days.paidDays ?? days.totalDays) <= balance.spendable,
         }}};
 }
 
@@ -723,16 +791,37 @@ exports.adminApproveRequest = async (req, res) => {
             return res.json({ success: true, data: app, pendingLevels: required - app.approvalLevel });
         }
 
+        // The year the application was filed against, not whichever is active
+        // now — a rollover between applying and approving used to release the
+        // held days into a row that did not exist.
+        const ay = await yearOf(app, req.schoolId);
+
+        // Status and balance move together. Previously the save landed first and
+        // a crash before the balance write left leave approved but not deducted.
+        const approvedAt = new Date();
+        const paid = paidOf(app);
+        const moved = await commitTransition({
+            schoolId: req.schoolId, appId: app._id, teacherId: app.teacher,
+            leaveTypeId: app.leaveType, academicYear: ay,
+            // Lost-race guard: this handler read the application before taking
+            // the lock, so the status is confirmed again inside it.
+            expectStatus: ['pending', 'modification_requested'],
+            statusPatch: { status: 'approved', approvedBy: String(req.userId), approvedAt },
+            inc: { used: paid, pending: -paid },
+            // A wholly unpaid leave moves no entitlement, so it gets no ledger
+            // row — the ledger tracks days, and none were spent.
+            ledger: paid > 0 ? {
+                entryType: 'USED', days: paid, delta: -paid,
+                createdBy: req.userId,
+                description: `Leave ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)} approved`
+                    + (app.lopDays > 0 ? ` (${app.lopDays} day(s) loss of pay)` : ''),
+            } : null,
+        });
+        if (!moved.applied)
+            return res.status(400).json({ success: false, message: `Already ${moved.currentStatus || 'processed'} by someone else` });
         app.status     = 'approved';
         app.approvedBy = req.userId;
-        app.approvedAt = new Date();
-        await app.save();
-
-        const ay = await getActiveAcademicYearLabel(req.schoolId);
-        await LeaveBalance.updateOne(
-            { teacher: app.teacher, school: req.schoolId, leaveType: app.leaveType, academicYear: ay },
-            { $inc: { used: app.totalDays, pending: -app.totalDays } }
-        );
+        app.approvedAt = approvedAt;
 
         // Comp Off leave draws down the FIFO ledger lots (oldest expiry first)
         // and records a USED entry alongside the balance move.
@@ -741,6 +830,13 @@ exports.adminApproveRequest = async (req, res) => {
             await compOff.consumeForLeave(app, { actorId: req.userId, academicYear: ay })
                 .catch(e => console.error('[compOff] consume failed:', e.message));
         }
+
+        // Downstream effects, each gated on its own module flag and each
+        // best-effort — neither may undo an approval that has already committed.
+        leaveIntegrations.markAttendanceForLeave(app, req.schoolId)
+            .catch(e => console.error('[leave→attendance]', e.message));
+        leaveIntegrations.requestSubstituteCover(app, req.schoolId)
+            .catch(e => console.error('[leave→substitute]', e.message));
 
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
@@ -771,13 +867,16 @@ exports.adminRejectRequest = async (req, res) => {
         app.adminComment = adminComment || '';
         await app.save();
 
-        // If it was pending or modification_requested, the pending count was set on apply — decrement it
+        // If it was pending or modification_requested, the pending count was set
+        // on apply — release it. No ledger row: a hold that is released was
+        // never consumed, and SUM(delta) must stay a true position.
         if (['pending', 'modification_requested'].includes(oldStatus)) {
-            const ay = await getActiveAcademicYearLabel(req.schoolId);
-            await LeaveBalance.updateOne(
-                { teacher: app.teacher, school: req.schoolId, leaveType: app.leaveType, academicYear: ay },
-                { $inc: { pending: -app.totalDays } }
-            );
+            const ay = await yearOf(app, req.schoolId);
+            await commitTransition({
+                schoolId: req.schoolId, appId: app._id, teacherId: app.teacher,
+                leaveTypeId: app.leaveType, academicYear: ay,
+                inc: { pending: -paidOf(app) },
+            });
         }
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
@@ -829,11 +928,20 @@ exports.adminReverseApproved = async (req, res) => {
         if (app.status !== 'approved')
             return res.status(400).json({ success: false, message: 'Only approved leave can be reversed' });
 
-        const ay = await getActiveAcademicYearLabel(req.schoolId);
-        await LeaveBalance.updateOne(
-            { teacher: app.teacher, school: req.schoolId, leaveType: app.leaveType, academicYear: ay },
-            { $inc: { used: -app.totalDays } }
-        );
+        const ay = await yearOf(app, req.schoolId);
+        const reversed = await commitTransition({
+            schoolId: req.schoolId, appId: app._id, teacherId: app.teacher,
+            leaveTypeId: app.leaveType, academicYear: ay,
+            expectStatus: ['approved'],
+            inc: { used: -paidOf(app) },
+            ledger: paidOf(app) > 0 ? {
+                entryType: 'REVERSED', days: paidOf(app), delta: paidOf(app),
+                createdBy: req.userId,
+                description: `Approval reversed for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)}`,
+            } : null,
+        });
+        if (!reversed.applied)
+            return res.status(400).json({ success: false, message: `Already ${reversed.currentStatus || 'processed'} by someone else` });
 
         const ltDoc = await LeaveType.findById(app.leaveType).lean();
         if (isCompOffType(ltDoc)) {
@@ -846,6 +954,10 @@ exports.adminReverseApproved = async (req, res) => {
         app.cancelledAt  = new Date();
         app.adminComment = adminComment || '';
         await app.save();
+
+        // The leave no longer stands, so the register rows it created go too.
+        leaveIntegrations.clearAttendanceForLeave(app, req.schoolId)
+            .catch(e => console.error('[leave→attendance]', e.message));
 
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
@@ -973,6 +1085,17 @@ exports.adminAllocate = async (req, res) => {
         }));
         await LeaveBalance.bulkWrite(ops);
 
+        // The allocation is a balance change like any other, so it goes on the
+        // ledger too — previously only comp off left any trace.
+        await recordAdjustments(teachers.map(t => ({
+            school: req.schoolId, teacher: t._id, leaveType: leaveTypeId, academicYear: ay,
+            entryType: 'ADJUSTMENT', days: totalAllocated, delta: totalAllocated,
+            balanceAfter: totalAllocated, createdBy: req.userId, source: 'manual',
+            description: prorated
+                ? `Allocated ${totalAllocated} day(s), prorated from ${lt.annualAllocation}`
+                : `Allocated ${totalAllocated} day(s)`,
+        })));
+
         const suffix = prorated
             ? ` (prorated from ${lt.annualAllocation})`
             : accrues && totalAllocated === 0
@@ -1034,6 +1157,16 @@ exports.adminClearAllocations = async (req, res) => {
 
         await LeaveBalance.updateMany(filter, { $set: set });
 
+        await recordAdjustments(affected.map(b => {
+            const removed = (b.totalAllocated || 0) + (b.carriedForward || 0);
+            return {
+                school: req.schoolId, teacher: b.teacher, leaveType: leaveTypeId, academicYear: ay,
+                entryType: 'ADJUSTMENT', days: removed, delta: -removed,
+                balanceAfter: 0, createdBy: req.userId, source: 'manual',
+                description: `Allocation cleared — ${removed} day(s) removed`,
+            };
+        }));
+
         const daysRemoved = affected.reduce((n, b) => n + (b.totalAllocated || 0) + (b.carriedForward || 0), 0);
         const stillPending = affected.reduce((n, b) => n + (b.pending || 0), 0);
         res.json({
@@ -1042,6 +1175,175 @@ exports.adminClearAllocations = async (req, res) => {
             daysRemoved,
             stillPending,
             message: `Cleared ${lt.name} for ${affected.length} teacher(s) — ${daysRemoved} day(s) removed`,
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+// ── Year-end closure & exit settlement ───────────────────────────────────────
+
+/**
+ * What closing a year would do, without doing it.
+ *
+ * Carry-forward moved days between years but nothing ever *closed* one, so
+ * un-carried days never lapsed and a finished year's balances stayed editable
+ * indefinitely. This is the preview the confirm screen shows.
+ */
+exports.adminGetYearClosePreview = async (req, res) => {
+    try {
+        const { academicYear } = req.query;
+        if (!academicYear) return res.status(400).json({ success: false, message: 'academicYear is required' });
+
+        const [balances, openApps, activeAY] = await Promise.all([
+            LeaveBalance.find({ school: req.schoolId, academicYear }).lean(),
+            LeaveApplication.countDocuments({
+                school: req.schoolId, academicYear,
+                status: { $in: ['pending', 'modification_requested'] },
+            }),
+            getActiveAcademicYearLabel(req.schoolId),
+        ]);
+
+        const types = await LeaveType.find({ school: req.schoolId }).lean();
+        const byType = Object.fromEntries(types.map(t => [String(t._id), t]));
+        const teacherIds = [...new Set(balances.map(b => String(b.teacher)))];
+        const teachers = teacherIds.length
+            ? await User.find({ _id: { $in: teacherIds }, school: req.schoolId }).select('name employeeId').lean()
+            : [];
+        const byTeacher = Object.fromEntries(teachers.map(t => [String(t._id), t]));
+
+        const rows = balances
+            .map(b => ({
+                _id: b._id,
+                teacher: { _id: b.teacher, name: byTeacher[String(b.teacher)]?.name || null },
+                leaveType: { _id: b.leaveType, code: byType[String(b.leaveType)]?.code || null },
+                remaining: remainingOf(b),
+            }))
+            .filter(r => r.remaining > 0);
+
+        res.json({ success: true, data: {
+            academicYear,
+            isActiveYear: academicYear === activeAY,
+            // Closing the year an employee is still applying against would strand
+            // their request, so this has to be cleared first.
+            openApplications: openApps,
+            canClose: openApps === 0 && academicYear !== activeAY,
+            balanceRows: balances.length,
+            lapsing: rows,
+            daysLapsing: Math.round(rows.reduce((n, r) => n + r.remaining, 0) * 100) / 100,
+        }});
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Close an academic year: lapse whatever is left and stop the year accruing.
+ *
+ * Run carry-forward FIRST — this deliberately does not carry anything, because
+ * a close that silently moved days would make the two operations impossible to
+ * reason about. Whatever is still standing here is what the school intends to
+ * expire.
+ */
+exports.adminCloseAcademicYear = async (req, res) => {
+    try {
+        const { academicYear } = req.body;
+        if (!academicYear) return res.status(400).json({ success: false, message: 'academicYear is required' });
+
+        const activeAY = await getActiveAcademicYearLabel(req.schoolId);
+        if (academicYear === activeAY)
+            return res.status(400).json({ success: false, message: 'Cannot close the active academic year — activate the next year first' });
+
+        const openApps = await LeaveApplication.countDocuments({
+            school: req.schoolId, academicYear,
+            status: { $in: ['pending', 'modification_requested'] },
+        });
+        if (openApps)
+            return res.status(400).json({ success: false, message: `${openApps} application(s) are still awaiting a decision for ${academicYear} — settle them first` });
+
+        const balances = await LeaveBalance.find({ school: req.schoolId, academicYear }).lean();
+        const ops = [];
+        const ledger = [];
+        for (const b of balances) {
+            const left = remainingOf(b);
+            if (left <= 0) continue;
+            // `expired` is the existing lapse counter — remainingOf already
+            // subtracts it, so the row lands at zero without rewriting history.
+            ops.push({ updateOne: { filter: { _id: b._id }, update: { $inc: { expired: left } } } });
+            ledger.push({
+                school: req.schoolId, teacher: b.teacher, leaveType: b.leaveType, academicYear,
+                entryType: 'EXPIRED', days: left, delta: -left, balanceAfter: 0,
+                createdBy: req.userId, source: 'system',
+                description: `${academicYear} closed — ${left} unused day(s) lapsed`,
+            });
+        }
+        if (ops.length) await LeaveBalance.bulkWrite(ops);
+        await recordAdjustments(ledger);
+
+        res.json({
+            success: true,
+            academicYear,
+            balancesClosed: ops.length,
+            daysLapsed: Math.round(ledger.reduce((n, l) => n + l.days, 0) * 100) / 100,
+            message: ops.length
+                ? `${academicYear} closed — ${ops.length} balance(s) lapsed`
+                : `${academicYear} closed — nothing was left to lapse`,
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Final settlement for someone leaving. Stops accrual, lapses or reports the
+ * remainder, and leaves the row closed rather than quietly still accruing.
+ */
+exports.adminSettleEmployeeLeave = async (req, res) => {
+    try {
+        const { teacherId, academicYear, action = 'lapse' } = req.body;
+        if (!teacherId) return res.status(400).json({ success: false, message: 'teacherId is required' });
+        if (!['lapse', 'report'].includes(action))
+            return res.status(400).json({ success: false, message: "action must be 'lapse' or 'report'" });
+
+        const ay = academicYear || await getActiveAcademicYearLabel(req.schoolId);
+        if (!ay) return res.status(400).json({ success: false, message: 'No active academic year' });
+
+        const [balances, types] = await Promise.all([
+            LeaveBalance.find({ teacher: teacherId, school: req.schoolId, academicYear: ay }).lean(),
+            LeaveType.find({ school: req.schoolId }).lean(),
+        ]);
+        const byType = Object.fromEntries(types.map(t => [String(t._id), t]));
+
+        const lines = balances.map(b => {
+            const t = byType[String(b.leaveType)];
+            return {
+                leaveType: { _id: b.leaveType, name: t?.name || null, code: t?.code || null },
+                remaining: remainingOf(b),
+                // Encashable is a policy figure; the payout itself is a payroll
+                // decision, so this reports rather than pays.
+                encashable: !!t?.encashable,
+                maxEncashableDays: t?.maxEncashableDays || 0,
+            };
+        }).filter(l => l.remaining > 0);
+
+        if (action === 'report') {
+            return res.json({ success: true, data: { academicYear: ay, settled: false, lines } });
+        }
+
+        const ops = [];
+        const ledger = [];
+        for (const b of balances) {
+            const left = remainingOf(b);
+            if (left <= 0) continue;
+            ops.push({ updateOne: { filter: { _id: b._id }, update: { $inc: { expired: left } } } });
+            ledger.push({
+                school: req.schoolId, teacher: teacherId, leaveType: b.leaveType, academicYear: ay,
+                entryType: 'EXPIRED', days: left, delta: -left, balanceAfter: 0,
+                createdBy: req.userId, source: 'system',
+                description: 'Final settlement on exit',
+            });
+        }
+        if (ops.length) await LeaveBalance.bulkWrite(ops);
+        await recordAdjustments(ledger);
+
+        res.json({
+            success: true,
+            data: { academicYear: ay, settled: true, lines },
+            message: ops.length ? `Settled ${ops.length} balance(s)` : 'Nothing left to settle',
         });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -1238,6 +1540,7 @@ exports.adminRunCarryForward = async (req, res) => {
 
         let processed = 0;
         let compOffProcessed = 0;
+        const carried = [];
         for (const policy of policies) {
             const lt = policy.leaveType;
 
@@ -1261,9 +1564,17 @@ exports.adminRunCarryForward = async (req, res) => {
                     { $inc: { carriedForward: carryAmt }, $setOnInsert: { totalAllocated: lt.annualAllocation, used: 0, pending: 0, expired: 0 } },
                     { upsert: true }
                 );
+                carried.push({
+                    school: req.schoolId, teacher: bal.teacher, leaveType: lt._id, academicYear: toYear,
+                    entryType: 'ADJUSTMENT', days: carryAmt, delta: carryAmt,
+                    balanceAfter: carryAmt, createdBy: req.userId, source: 'system',
+                    description: `Carried forward ${carryAmt} day(s) from ${fromYear}`,
+                });
                 processed++;
             }
         }
+
+        await recordAdjustments(carried);
 
         if (!processed) return res.json({ success: true, message: 'Nothing to carry forward', processed: 0 });
         res.json({ success: true, processed, compOffProcessed });
@@ -1274,19 +1585,25 @@ exports.adminRunCarryForward = async (req, res) => {
 
 exports.adminGetReports = async (req, res) => {
     try {
-        const { academicYear, teacherId, leaveType, status } = req.query;
+        const { academicYear, teacherId, leaveType, status, fromDate, toDate } = req.query;
         const ay = academicYear || await getActiveAcademicYearLabel(req.schoolId);
 
-        const filter = { school: req.schoolId };
+        let filter = { school: req.schoolId };
         if (teacherId) filter.teacher   = teacherId;
         if (leaveType) filter.leaveType = leaveType;
         if (status)    filter.status    = status;
+
+        // Bounded to the reported year unless an explicit range is given. This
+        // used to read every application the school had ever filed.
+        const ayRow = await AcademicYear.findOne({ school: req.schoolId, yearName: ay }).lean();
+        filter = withReportWindow(filter, { fromDate, toDate }, ayRow);
 
         const [apps, balances] = await Promise.all([
             LeaveApplication.find(filter)
                 .populate('teacher',   'name email employeeId')
                 .populate('leaveType', 'name code')
                 .sort({ appliedAt: -1 })
+                .limit(REPORT_ROW_CAP)
                 .lean(),
             LeaveBalance.find({ school: req.schoolId, academicYear: ay, ...(teacherId ? { teacher: teacherId } : {}) })
                 .populate('teacher',   'name email employeeId')
@@ -1306,7 +1623,14 @@ exports.adminGetReports = async (req, res) => {
             remaining:      remainingOf(b),
         }));
 
-        res.json({ success: true, data: { applications: apps, summary } });
+        res.json({
+            success: true,
+            data: { applications: apps, summary },
+            academicYear: ay,
+            // Tells the caller the list was cut rather than letting a truncated
+            // report look complete.
+            truncated: apps.length >= REPORT_ROW_CAP,
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -1321,6 +1645,10 @@ exports.adminExportRequests = async (req, res) => {
             filter.fromDate = {};
             if (fromDate) filter.fromDate.$gte = new Date(fromDate);
             if (toDate)   filter.fromDate.$lte = new Date(toDate);
+        } else {
+            // No range asked for: the active academic year, not all history.
+            const ayRow = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
+            if (ayRow?.startDate) filter.fromDate = { $gte: new Date(ayRow.startDate), $lte: new Date(ayRow.endDate) };
         }
 
         const apps = await LeaveApplication.find(filter)
@@ -1328,6 +1656,7 @@ exports.adminExportRequests = async (req, res) => {
             .populate('leaveType', 'name code')
             .populate('approvedBy','name')
             .sort({ appliedAt: -1 })
+            .limit(REPORT_ROW_CAP)
             .lean();
 
         const rows = apps.map(a => ({
@@ -1395,16 +1724,19 @@ exports.adminExportAllocations = async (req, res) => {
 
 exports.adminExportReports = async (req, res) => {
     try {
-        const { academicYear, status } = req.query;
+        const { academicYear, status, fromDate, toDate } = req.query;
         const ay = academicYear || await getActiveAcademicYearLabel(req.schoolId);
 
-        const filter = { school: req.schoolId };
+        let filter = { school: req.schoolId };
         if (status) filter.status = status;
+        const ayRow = await AcademicYear.findOne({ school: req.schoolId, yearName: ay }).lean();
+        filter = withReportWindow(filter, { fromDate, toDate }, ayRow);
 
         const apps = await LeaveApplication.find(filter)
             .populate('teacher',   'name email employeeId')
             .populate('leaveType', 'name code')
             .sort({ appliedAt: -1 })
+            .limit(REPORT_ROW_CAP)
             .lean();
 
         const rows = apps.map(a => ({
@@ -1494,7 +1826,7 @@ exports.teacherGetLeaveBalance = async (req, res) => {
 
 exports.teacherApplyLeave = async (req, res) => {
     try {
-        const { leaveTypeId, fromDate, toDate, leaveMode, reason } = req.body;
+        const { leaveTypeId, fromDate, toDate, leaveMode, halfDaySession, reason } = req.body;
         if (!leaveTypeId || !fromDate || !toDate || !reason)
             return res.status(400).json({ success: false, message: 'leaveTypeId, fromDate, toDate and reason are required' });
 
@@ -1541,21 +1873,29 @@ exports.teacherApplyLeave = async (req, res) => {
         const bal = await ensureBalance(req.userId, req.schoolId, leaveTypeId, ay);
         const remaining = remainingOf(bal);
         const spendable = leavePolicy.spendableFrom(policy, remaining);
-        if (totalDays > spendable)
-            return res.status(400).json({ success: false, message: `Insufficient leave balance. Available: ${remaining} day(s)` });
+        // Same rule as the admin path: refused as before, unless the type is
+        // unpaid or the policy allows the overrun as loss of pay.
+        const split = leavePolicy.splitPaidAndLop(policy, lt, totalDays, spendable);
+        if (!split.ok)
+            return res.status(400).json({ success: false, message: split.message.replace('Insufficient balance', 'Insufficient leave balance') });
 
         const app = await LeaveApplication.create({
             teacher: req.userId, school: req.schoolId, leaveType: leaveTypeId,
-            fromDate: from, toDate: to, totalDays,
-            leaveMode: leaveMode || 'full_day', reason, document: documentPath, appliedAt: new Date(),
+            fromDate: from, toDate: to, totalDays, academicYear: ay, lopDays: split.lopDays,
+            leaveMode: leaveMode || 'full_day',
+            halfDaySession: leaveMode === 'half_day' ? (halfDaySession === 'second' ? 'second' : 'first') : 'first',
+            reason, document: documentPath, appliedAt: new Date(),
             // Leave takes one sign-off — the two-level policy option was removed.
             approvalsRequired: 1,
             approvalLevel: 0, approvals: [],
         });
-        await LeaveBalance.updateOne(
-            { teacher: req.userId, school: req.schoolId, leaveType: leaveTypeId, academicYear: ay },
-            { $inc: { pending: totalDays } }
-        );
+        // Only the paid portion is held — LOP days draw on no entitlement.
+        if (split.paidDays > 0) {
+            await LeaveBalance.updateOne(
+                { teacher: req.userId, school: req.schoolId, leaveType: leaveTypeId, academicYear: ay },
+                { $inc: { pending: split.paidDays } }
+            );
+        }
         // Routed by the type's own policy — admins, named designations, or both
         leavePolicy.approverIds(req.schoolId, policy).then(recipients => notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
@@ -1582,13 +1922,15 @@ exports.teacherCancelLeave = async (req, res) => {
         app.cancelledAt = new Date();
         await app.save();
 
-        // pending was set on apply and never cleared for modification_requested, so decrement for both
+        // pending was set on apply and never cleared for modification_requested,
+        // so release it for both. A released hold writes no ledger row.
         if (['pending', 'modification_requested'].includes(oldStatus)) {
-            const ay = await getActiveAcademicYearLabel(req.schoolId);
-            await LeaveBalance.updateOne(
-                { teacher: req.userId, school: req.schoolId, leaveType: app.leaveType, academicYear: ay },
-                { $inc: { pending: -app.totalDays } }
-            );
+            const ay = await yearOf(app, req.schoolId);
+            await commitTransition({
+                schoolId: req.schoolId, appId: app._id, teacherId: req.userId,
+                leaveTypeId: app.leaveType, academicYear: ay,
+                inc: { pending: -paidOf(app) },
+            });
         }
         schoolAdminIds(req.schoolId).then(admins => notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,

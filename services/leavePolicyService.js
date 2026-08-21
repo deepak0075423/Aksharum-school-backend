@@ -55,6 +55,9 @@ function defaults(leaveType = {}) {
         allowNegativeBalance: false,
         maxNegativeDays:      0,
 
+        allowLopBeyondBalance:    false,
+        maxLopDaysPerApplication: 0,
+
         monthlyAccrual: {
             enabled:      !!leaveType.monthlyAccrual?.enabled,
             daysPerMonth: Number(leaveType.monthlyAccrual?.daysPerMonth) || 0,
@@ -146,6 +149,9 @@ async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
 
         allowNegativeBalance: bool(patch.allowNegativeBalance, current.allowNegativeBalance),
         maxNegativeDays:      num(patch.maxNegativeDays,       current.maxNegativeDays),
+
+        allowLopBeyondBalance:    bool(patch.allowLopBeyondBalance,    current.allowLopBeyondBalance),
+        maxLopDaysPerApplication: num(patch.maxLopDaysPerApplication,  current.maxLopDaysPerApplication),
 
         monthlyAccrual: {
             enabled:      bool(patch.monthlyAccrual?.enabled,      current.monthlyAccrual.enabled),
@@ -367,9 +373,48 @@ function spendableFrom(policy, remaining) {
         : remaining;
 }
 
+/**
+ * Split an application into paid days and loss-of-pay days.
+ *
+ * Three ways days become unpaid:
+ *   · the leave type itself is unpaid — every day is LOP;
+ *   · the request runs past what the balance can cover, and the policy permits
+ *     the overrun as LOP rather than refusing it;
+ *   · neither, in which case nothing is LOP and the caller enforces the balance
+ *     exactly as it always did.
+ *
+ * Returns { paidDays, lopDays, ok, message }. `ok:false` means the application
+ * must still be refused — the shortfall is not coverable as LOP.
+ */
+function splitPaidAndLop(policy, leaveType, totalDays, spendable) {
+    if (leaveType && leaveType.isPaid === false) {
+        return { paidDays: 0, lopDays: totalDays, ok: true };
+    }
+    const shortfall = Math.max(0, totalDays - Math.max(0, spendable));
+    if (shortfall === 0) return { paidDays: totalDays, lopDays: 0, ok: true };
+
+    if (!policy.allowLopBeyondBalance) {
+        return { paidDays: 0, lopDays: 0, ok: false, message: `Insufficient balance. Available: ${spendable}` };
+    }
+    const cap = policy.maxLopDaysPerApplication || 0;
+    if (cap > 0 && shortfall > cap) {
+        return {
+            paidDays: 0, lopDays: 0, ok: false,
+            message: `Only ${cap} day(s) may be taken as loss of pay on one application — this needs ${shortfall}`,
+        };
+    }
+    return { paidDays: totalDays - shortfall, lopDays: shortfall, ok: true };
+}
+
 // ── Approver RBAC (mirrors compOffService, driven by this policy) ─────────────
 
-async function canApprove(userId, userRole, schoolId, policy) {
+/**
+ * @param designation optional pre-resolved designation. Callers that ask about
+ *        many leave types in a row should pass it — without it this reloads the
+ *        same profile once per type, which is how the approver queue managed
+ *        ten identical lookups on every open.
+ */
+async function canApprove(userId, userRole, schoolId, policy, designation) {
     const mode = policy.approval.mode;
     const isAdmin = userRole === 'school_admin';
     if (mode === 'admin') return isAdmin;
@@ -377,8 +422,16 @@ async function canApprove(userId, userRole, schoolId, policy) {
 
     const designations = policy.approval.approverDesignations || [];
     if (!designations.length) return isAdmin;   // misconfigured → admins keep the keys
+    const mine = designation !== undefined
+        ? designation
+        : (await TeacherProfile.findOne({ user: userId, school: schoolId }).select('designation').lean())?.designation;
+    return designations.includes(mine || '');
+}
+
+/** The designation canApprove needs, resolved once. */
+async function designationOf(userId, schoolId) {
     const profile = await TeacherProfile.findOne({ user: userId, school: schoolId }).select('designation').lean();
-    return designations.includes(profile?.designation || '');
+    return profile?.designation || '';
 }
 
 /** Everyone who should be told a new application needs their attention. */
@@ -429,7 +482,9 @@ module.exports = {
     savePolicy,
     validateApplication,
     spendableFrom,
+    splitPaidAndLop,
     canApprove,
+    designationOf,
     approverIds,
     eligibleTypesFor,
 };

@@ -17,6 +17,9 @@ const LeaveTypeSchema = new db.Schema({
         default: 'general',
     },
     annualAllocation: { type: Number, required: true, default: 0 },
+    // Whether days of this type are paid. An unpaid type (leave without pay,
+    // sabbatical) sends every one of its days to payroll as loss of pay.
+    isPaid: { type: Boolean, default: true },
     monthlyAccrual: {
         enabled: { type: Boolean, default: false },
         daysPerMonth: { type: Number, default: 0 },

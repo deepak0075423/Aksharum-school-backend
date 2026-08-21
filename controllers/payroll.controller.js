@@ -14,6 +14,49 @@ const MONTHS = ['January','February','March','April','May','June','July','August
 
 // ── Salary calculation ────────────────────────────────────────────────────────
 
+/**
+ * Unpaid leave days per employee for a pay month, keyed by employee id.
+ *
+ * Returns an EMPTY object when the Leave module is off for the school, so every
+ * caller falls straight back to the hand-entered figure and payroll behaves
+ * exactly as it did before this link existed. Any failure does the same — a
+ * leave lookup must never be the reason a payroll run cannot be processed.
+ */
+async function leaveLopDaysFor(schoolId, year, month) {
+    try {
+        const School = require('../models/School');
+        const { schoolModuleFlags } = require('../config/modules');
+        const school = await School.findById(schoolId).select('modules').lean();
+        if (!schoolModuleFlags(school).leave) return {};
+
+        const LeaveApplication = require('../models/LeaveApplication');
+        const monthStart = new Date(Date.UTC(year, month - 1, 1));
+        const monthEnd   = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+
+        const apps = await LeaveApplication.find({
+            school: schoolId, status: 'approved',
+            lopDays: { $gt: 0 },
+            fromDate: { $lte: monthEnd }, toDate: { $gte: monthStart },
+        }).select('teacher lopDays fromDate toDate totalDays').lean();
+
+        const out = {};
+        for (const a of apps) {
+            // A leave spanning a month boundary is charged pro-rata to the part
+            // that falls inside this pay month, so no day is deducted twice.
+            const from = new Date(Math.max(new Date(a.fromDate), monthStart));
+            const to   = new Date(Math.min(new Date(a.toDate), monthEnd));
+            const inMonth = Math.max(0, Math.round((to - from) / 86400000) + 1);
+            const span    = Math.max(1, Math.round((new Date(a.toDate) - new Date(a.fromDate)) / 86400000) + 1);
+            const share   = span > 0 ? (a.lopDays * inMonth) / span : a.lopDays;
+            out[String(a.teacher)] = Math.round(((out[String(a.teacher)] || 0) + share) * 100) / 100;
+        }
+        return out;
+    } catch (err) {
+        console.error('[payroll←leave] LOP lookup failed:', err.message);
+        return {};
+    }
+}
+
 function computeSalaryBreakdown(structure, monthlyCtc, overrides = [], lopDays = 0) {
     const workingDays = 26;
     const resolved    = { CTC: monthlyCtc };
@@ -300,11 +343,18 @@ exports.createRun = async (req, res) => {
         let totalGross = 0, totalDeductions = 0, totalNet = 0;
         const entryDocs = [];
 
+        // Loss-of-pay days come from approved leave when the Leave module is on
+        // for this school. Without it — or for an employee with no unpaid leave
+        // — the figure falls back to whatever the payroll form supplied, which
+        // is exactly how this worked before leave was wired in.
+        const lopFromLeave = await leaveLopDaysFor(req.schoolId, +year, +month);
+
         for (const asgn of assignments) {
             if (!asgn.structure) continue;
             const annualCtc  = asgn.getActiveCTC ? asgn.getActiveCTC(+year, +month) : (asgn.ctc || 0);
             const monthlyCtc = annualCtc / 12;
-            const breakdown  = computeSalaryBreakdown(asgn.structure, monthlyCtc, asgn.componentOverrides || [], req.body[`lop_${asgn.employee}`] || 0);
+            const lopDays    = lopFromLeave[String(asgn.employee)] ?? (req.body[`lop_${asgn.employee}`] || 0);
+            const breakdown  = computeSalaryBreakdown(asgn.structure, monthlyCtc, asgn.componentOverrides || [], lopDays);
 
             totalGross      += breakdown.grossSalary;
             totalDeductions += breakdown.totalDeductions;
@@ -315,7 +365,7 @@ exports.createRun = async (req, res) => {
                 month: +month, year: +year, salaryAssignment: asgn._id,
                 earnings: breakdown.earnings, deductions: breakdown.deductions,
                 grossSalary: breakdown.grossSalary, totalDeductions: breakdown.totalDeductions,
-                netSalary: breakdown.netSalary, lopAmount: breakdown.lopAmount,
+                netSalary: breakdown.netSalary, lopAmount: breakdown.lopAmount, lopDays,
             });
         }
 

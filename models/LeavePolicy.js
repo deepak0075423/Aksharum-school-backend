@@ -51,6 +51,14 @@ const LeavePolicySchema = new db.Schema({
     allowNegativeBalance: { type: Boolean, default: false },
     maxNegativeDays:      { type: Number,  default: 0 },
 
+    // ── Loss of pay ─────────────────────────────────────────────────────────
+    // Without this the only answer to "I have no balance left but I must take
+    // the day" was to refuse the application outright, which left the employee
+    // no route through the system at all. With it on, the days beyond the
+    // balance are accepted and marked unpaid instead of blocking.
+    allowLopBeyondBalance: { type: Boolean, default: false },
+    maxLopDaysPerApplication: { type: Number, default: 0 },   // 0 = no cap
+
     // ── Entitlement mechanics (migrated off LeaveType) ──────────────────────
     // How the allocation reaches the balance and what happens to what is left.
     // LeaveType still carries the headline annualAllocation figure; these rules
