@@ -69,6 +69,7 @@ function defaults(leaveType = {}) {
         allowCombineWithOtherLeaves: true,
         blockedLeaveTypes: [],
 
+        // twoLevel stays for the column's sake; leave approval is single sign-off.
         approval: { mode: 'admin', approverDesignations: [], twoLevel: false },
         isActive: true,
     };
@@ -115,7 +116,7 @@ async function getAllPolicies(schoolId, { activeOnly = false } = {}) {
  */
 async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
     const current = await getPolicy(schoolId, leaveTypeId);
-    if (!current) return { ok: false, message: 'Leave type not found' };
+    if (!current) return { ok: false, notFound: true, message: 'Leave type not found' };
 
     const num  = (v, fallback) => (v === '' || v == null || isNaN(Number(v)) ? fallback : Math.max(0, Number(v)));
     const bool = (v, fallback) => (v === undefined ? fallback : !!v);
@@ -164,7 +165,11 @@ async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
             mode: ['admin', 'designation', 'both'].includes(patch.approval?.mode)
                 ? patch.approval.mode : current.approval.mode,
             approverDesignations: list(patch.approval?.approverDesignations, current.approval.approverDesignations),
-            twoLevel: bool(patch.approval?.twoLevel, current.approval.twoLevel),
+            // Leave is single sign-off. The two-level option was removed, so the
+            // column is pinned rather than read from the request — an old client
+            // still sending twoLevel cannot switch it back on. Comp Off keeps its
+            // own two-level approval; this only governs leave.
+            twoLevel: false,
         },
         isActive: bool(patch.isActive, current.isActive),
     };
@@ -173,6 +178,13 @@ async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
     // than store a rule that rejects every application.
     if (next.maxConsecutiveDays > 0 && next.minDaysPerApplication > next.maxConsecutiveDays) {
         next.minDaysPerApplication = next.maxConsecutiveDays;
+    }
+
+    // Accrual switched on but crediting 0 days a month is a rule that does
+    // nothing, and from the admin's side it is indistinguishable from a broken
+    // accrual engine. Refuse it rather than store a silent no-op.
+    if (next.monthlyAccrual.enabled && next.monthlyAccrual.daysPerMonth <= 0) {
+        return { ok: false, message: 'Monthly accrual needs a days-per-month figure greater than 0' };
     }
 
     await LeavePolicy.findOneAndUpdate(
@@ -230,22 +242,29 @@ async function validateApplication({
     }
 
     // ── When ───────────────────────────────────────────────────────────────
-    if (!onBehalf) {
-        if (from < today) {
-            if (!policy.allowBackdated) {
-                return { ok: false, message: 'Cannot apply for past dates' };
+    // A range that ends before it starts is nonsense whoever files it.
+    if (to < from) {
+        return { ok: false, message: 'To date must be on or after From date' };
+    }
+
+    // Back-dating binds everyone. It is a statement about which dates the
+    // school will accept leave for at all, so an admin filing on someone's
+    // behalf is bound by it too — unlike the notice period below, which is an
+    // obligation on the employee and is waived for `onBehalf`.
+    if (from < today) {
+        if (!policy.allowBackdated) {
+            return { ok: false, message: 'Cannot apply for past dates' };
+        }
+        if (policy.backdatedWithinDays > 0) {
+            const age = Math.floor((today - from) / DAY_MS);
+            if (age > policy.backdatedWithinDays) {
+                return { ok: false, message: `Back-dated applications are allowed only within ${policy.backdatedWithinDays} day(s)` };
             }
-            if (policy.backdatedWithinDays > 0) {
-                const age = Math.floor((today - from) / DAY_MS);
-                if (age > policy.backdatedWithinDays) {
-                    return { ok: false, message: `Back-dated applications are allowed only within ${policy.backdatedWithinDays} day(s)` };
-                }
-            }
-        } else if (policy.advanceNoticeDays > 0) {
-            const notice = Math.floor((from - today) / DAY_MS);
-            if (notice < policy.advanceNoticeDays) {
-                return { ok: false, message: `This leave type needs ${policy.advanceNoticeDays} day(s) advance notice` };
-            }
+        }
+    } else if (!onBehalf && policy.advanceNoticeDays > 0) {
+        const notice = Math.floor((from - today) / DAY_MS);
+        if (notice < policy.advanceNoticeDays) {
+            return { ok: false, message: `This leave type needs ${policy.advanceNoticeDays} day(s) advance notice` };
         }
     }
 

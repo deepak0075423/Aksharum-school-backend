@@ -144,25 +144,33 @@ if (isPrimaryWorker) {
     require('./services/chatBrokerService').init();
 
     // ── Monthly Leave Accrual Scheduler ──────────────────────────────────────
+    // Every balance row carries its own `lastAccrualAt`, and the sweep credits
+    // only the whole months a row is actually owed — so running it hourly is
+    // idempotent and there is no process-level "already ran this month" flag.
+    // There used to be one, and it was a liability: it was set before the work,
+    // so a failure part-way through the school list skipped every remaining
+    // school for the rest of the month. Now a transient failure just heals on
+    // the next tick.
     (function scheduleMonthlyAccrual() {
     const School     = require('./models/School');
     const { runMonthlyAccrualForSchool } = require('./controllers/leave.controller');
-    let lastRunMonth = '';
 
-    setInterval(async () => {
-        const now        = new Date();
-        const thisMonth  = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-        if (lastRunMonth === thisMonth) return;
-        lastRunMonth = thisMonth;
+    const sweep = async () => {
         try {
             const schools = await School.find({ 'modules.leave': true }).select('_id').lean();
             let total = 0;
-            for (const s of schools) total += await runMonthlyAccrualForSchool(s._id);
-            if (total > 0) console.log(`[Leave] Monthly accrual: ${total} balance(s) updated across ${schools.length} school(s)`);
+            for (const s of schools) {
+                try { total += await runMonthlyAccrualForSchool(s._id); }
+                catch (err) { console.error(`[Leave] Accrual failed for school ${s._id}:`, err.message); }
+            }
+            if (total > 0) console.log(`[Leave] Monthly accrual: ${total} balance(s) credited across ${schools.length} school(s)`);
         } catch (err) {
             console.error('[Leave] Monthly accrual error:', err.message);
         }
-    }, 60 * 60 * 1000); // check every hour; fires for real on 1st of each month
+    };
+
+    setInterval(sweep, 60 * 60 * 1000); // hourly; each row is credited only when a whole month is due
+    sweep();                            // and once at boot, so a month missed while down is caught up
     }());
 
     // ── Comp Off expiry clock ────────────────────────────────────────────────

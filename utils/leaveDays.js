@@ -94,12 +94,19 @@ function countCalendarDays(from, to) {
     return Math.round((end - start) / (24 * 60 * 60 * 1000)) + 1;
 }
 
-async function getActiveAcademicYearLabel(schoolId) {
-    const ay = await AcademicYear.findOne({ school: schoolId, status: 'active' }).lean();
+// The label a LeaveBalance row stores in `academicYear`. Everything that has to
+// match one of those rows — carry forward, allocation, accrual — must derive the
+// string the same way, so it lives in one function.
+function academicYearLabel(ay) {
     if (!ay) return null;
     if (ay.yearName) return ay.yearName;
     const y = new Date(ay.startDate || ay.createdAt).getFullYear();
     return `${y}-${String(y + 1).slice(-2)}`;
+}
+
+async function getActiveAcademicYearLabel(schoolId) {
+    const ay = await AcademicYear.findOne({ school: schoolId, status: 'active' }).lean();
+    return academicYearLabel(ay);
 }
 
 // Single definition of "days this employee can still spend". `expired` is the
@@ -119,6 +126,7 @@ const utcMidnight = (d) => {
 };
 
 module.exports = {
+    academicYearLabel,
     normalizeLeaveSettings,
     isSaturdayWorking,
     countWorkingDays,

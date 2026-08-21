@@ -308,6 +308,9 @@ router.get('/results/sections/:sectionId/subjects',   resultGuard, formalExamCtr
 router.get('/leave/types',                         leaveGuard, leaveCtrl.adminGetLeaveTypes);
 router.post('/leave/types',                        leaveGuard, leaveCtrl.adminCreateLeaveType);
 router.put('/leave/types/:id',                     leaveGuard, leaveCtrl.adminUpdateLeaveType);
+// Impact preview must be registered before the bare ':id' delete so the
+// confirm popup can ask what a delete would wipe out.
+router.get('/leave/types/:id/impact',              leaveGuard, leaveCtrl.adminGetLeaveTypeImpact);
 router.delete('/leave/types/:id',                  leaveGuard, leaveCtrl.adminDeleteLeaveType);
 router.put('/leave/settings',                      leaveGuard, leaveCtrl.adminUpdateLeaveSettings);
 // Per-leave-type policies — every type gets its own configurable rule set
@@ -317,6 +320,8 @@ router.put('/leave/policies/:leaveTypeId',         leaveGuard, leaveCtrl.adminUp
 router.get('/leave/requests',                      leaveGuard, leaveCtrl.adminGetRequests);
 router.post('/leave/requests',                     leaveGuard, uploadLeaveDoc.single('document'), leaveCtrl.adminApplyLeave);
 router.get('/leave/balance',                       leaveGuard, leaveCtrl.adminGetTeacherBalance);
+// Live balance + working-day count for the apply-on-behalf form
+router.get('/leave/apply-preview',                 leaveGuard, leaveCtrl.adminApplyPreview);
 router.post('/leave/requests/:id/approve',         leaveGuard, leaveCtrl.adminApproveRequest);
 router.post('/leave/requests/:id/reject',          leaveGuard, leaveCtrl.adminRejectRequest);
 router.post('/leave/requests/:id/modification',    leaveGuard, leaveCtrl.adminRequestModification);
@@ -324,6 +329,7 @@ router.get('/leave/allocations',                   leaveGuard, leaveCtrl.adminGe
 router.post('/leave/allocations',                  leaveGuard, leaveCtrl.adminAllocate);
 router.get('/leave/allocations/template',          leaveGuard, leaveCtrl.adminGetAllocationTemplate);
 router.post('/leave/allocations/excel',            leaveGuard, uploadExcel.single('excelFile'), leaveCtrl.adminBulkAllocateExcel);
+router.post('/leave/allocations/clear',            leaveGuard, leaveCtrl.adminClearAllocations);
 router.post('/leave/allocations/carry-forward',    leaveGuard, leaveCtrl.adminRunCarryForward);
 router.post('/leave/accrual/run',                  leaveGuard, leaveCtrl.adminRunMonthlyAccrual);
 router.get('/leave/requests/export',               leaveGuard, leaveCtrl.adminExportRequests);

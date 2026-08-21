@@ -13,8 +13,8 @@ const leavePolicy      = require('../services/leavePolicyService');
 // Working-day / weekly-off arithmetic is shared with the Comp Off engine so the
 // two can never disagree about whether a given Saturday is a working day.
 const {
-    getActiveAcademicYearLabel, isSaturdayWorking, countWorkingDays, countCalendarDays,
-    countHolidayWorkingDays, normalizeLeaveSettings, remainingOf,
+    getActiveAcademicYearLabel, academicYearLabel, isSaturdayWorking, countWorkingDays,
+    countCalendarDays, countHolidayWorkingDays, normalizeLeaveSettings, remainingOf,
 } = require('../utils/leaveDays');
 
 const fmtDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
@@ -92,7 +92,26 @@ async function ensureBalance(teacherId, schoolId, leaveTypeId, academicYear) {
 
 exports.adminGetLeaveTypes = async (req, res) => {
     try {
-        const types = await LeaveType.find({ school: req.schoolId }).sort({ name: 1 }).lean();
+        // Accrual, carry forward and encashment live in LeavePolicy — the
+        // matching LeaveType columns are only the seed for a type that has no
+        // policy row yet, and savePolicy never writes back to them. Serving the
+        // raw columns is what made the allocation screen believe a type set to
+        // accrue monthly was a plain up-front allocation, so it is merged here
+        // and every reader of this endpoint sees the effective rules.
+        const policies = await leavePolicy.getAllPolicies(req.schoolId);
+        const types = policies.map(p => ({
+            ...p.leaveType,
+            monthlyAccrual:    p.monthlyAccrual,
+            carryForward:      p.carryForward,
+            encashable:        p.encashable,
+            maxEncashableDays: p.maxEncashableDays,
+            // Date rules ride along so the apply form can bound its calendar
+            // the moment a type is picked, without waiting on a preview call.
+            allowBackdated:      p.allowBackdated,
+            backdatedWithinDays: p.backdatedWithinDays,
+            advanceNoticeDays:   p.advanceNoticeDays,
+            maxConsecutiveDays:  p.maxConsecutiveDays,
+        }));
         res.json({ success: true, data: types });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -199,6 +218,8 @@ exports.adminUpdateLeaveType = async (req, res) => {
 exports.adminDeleteLeaveType = async (req, res) => {
     try {
         const CompOffRequest = require('../models/CompOffRequest');
+        const LeaveLedger    = require('../models/LeaveLedger');
+        const LeavePolicyRow = require('../models/LeavePolicy');
         const [inUse, compOffInUse] = await Promise.all([
             LeaveApplication.exists({ leaveType: req.params.id, school: req.schoolId }),
             CompOffRequest.exists({ leaveType: req.params.id, school: req.schoolId }),
@@ -207,10 +228,108 @@ exports.adminDeleteLeaveType = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Cannot delete — leave type is in use' });
         const lt = await LeaveType.findOneAndDelete({ _id: req.params.id, school: req.schoolId });
         if (!lt) return res.status(404).json({ success: false, message: 'Leave type not found' });
-        res.json({ success: true });
+
+        // An allocation without its leave type is dead weight: the days can
+        // never be spent, and the allocation screen renders a row with a blank
+        // type. Everything hanging off the type goes with it — the balances
+        // (the allocation), the ledger rows behind them, and the rule set.
+        // Applications and comp off requests are the two things that block the
+        // delete above, so nothing here can orphan a record with history.
+        const [balances, ledger, policy] = await Promise.all([
+            LeaveBalance.deleteMany({ school: req.schoolId, leaveType: req.params.id }),
+            LeaveLedger.deleteMany({ school: req.schoolId, leaveType: req.params.id }),
+            LeavePolicyRow.deleteMany({ school: req.schoolId, leaveType: req.params.id }),
+        ]);
+        res.json({
+            success: true,
+            deleted: {
+                allocations:   balances.deletedCount || 0,
+                ledgerEntries: ledger.deletedCount   || 0,
+                policies:      policy.deletedCount   || 0,
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * What a delete would take with it. The confirm popup needs to name every
+ * teacher who still holds days of this type — deleting it silently wipes those
+ * allocations, so the admin sees them first and can back out.
+ *
+ * Also reports the two things that block a delete outright (applications and
+ * comp off requests) so the popup can say why rather than only refusing.
+ */
+exports.adminGetLeaveTypeImpact = async (req, res) => {
+    try {
+        const CompOffRequest = require('../models/CompOffRequest');
+        const LeaveLedger    = require('../models/LeaveLedger');
+        const LeavePolicyRow = require('../models/LeavePolicy');
+
+        const lt = await LeaveType.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!lt) return res.status(404).json({ success: false, message: 'Leave type not found' });
+
+        const [rawBalances, applications, compOffRequests, ledgerEntries, policyRow, activeAY] = await Promise.all([
+            // Deliberately unpopulated: populate() replaces a dangling teacher
+            // ref with null, and the raw id is what the distinct-teacher count
+            // needs. Names are attached below in one extra query.
+            LeaveBalance.find({ school: req.schoolId, leaveType: req.params.id }).lean(),
+            LeaveApplication.countDocuments({ school: req.schoolId, leaveType: req.params.id }),
+            CompOffRequest.countDocuments({ school: req.schoolId, leaveType: req.params.id }),
+            LeaveLedger.countDocuments({ school: req.schoolId, leaveType: req.params.id }),
+            LeavePolicyRow.findOne({ school: req.schoolId, leaveType: req.params.id }).lean(),
+            getActiveAcademicYearLabel(req.schoolId),
+        ]);
+
+        const teacherIds = [...new Set(rawBalances.map(b => String(b.teacher)).filter(Boolean))];
+        const teachers = teacherIds.length
+            ? await User.find({ _id: { $in: teacherIds }, school: req.schoolId }).select('name employeeId').lean()
+            : [];
+        const teacherById = Object.fromEntries(teachers.map(t => [String(t._id), t]));
+
+        // Every academic year, not just the active one — the delete removes the
+        // lot, so the popup must not under-report by showing only this year.
+        const allocations = rawBalances
+            .map(b => ({
+                _id:            b._id,
+                teacher:        {
+                    _id:        b.teacher,
+                    // A row whose employee has since been removed still holds
+                    // days, so it is listed rather than hidden.
+                    name:       teacherById[String(b.teacher)]?.name || null,
+                    employeeId: teacherById[String(b.teacher)]?.employeeId || null,
+                },
+                academicYear:   b.academicYear,
+                totalAllocated: b.totalAllocated || 0,
+                carriedForward: b.carriedForward || 0,
+                used:           b.used    || 0,
+                pending:        b.pending || 0,
+                expired:        b.expired || 0,
+                remaining:      remainingOf(b),
+            }))
+            .sort((a, b) =>
+                (a.teacher?.name || '').localeCompare(b.teacher?.name || '')
+                || String(b.academicYear).localeCompare(String(a.academicYear)));
+
+        const totals = allocations.reduce((acc, a) => ({
+            allocated: acc.allocated + a.totalAllocated + a.carriedForward,
+            used:      acc.used      + a.used,
+            pending:   acc.pending   + a.pending,
+            remaining: acc.remaining + a.remaining,
+        }), { allocated: 0, used: 0, pending: 0, remaining: 0 });
+
+        res.json({ success: true, data: {
+            leaveType: { _id: lt._id, name: lt.name, code: lt.code, category: lt.category || 'general' },
+            academicYear: activeAY,
+            canDelete: !applications && !compOffRequests,
+            blockers: { applications, compOffRequests },
+            allocations,
+            teacherCount: teacherIds.length,
+            totals,
+            ledgerEntries,
+            hasPolicy: !!policyRow,
+        }});
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
 // ── Admin: Leave Policies (one configurable policy per leave type) ───────────
 
 exports.adminGetPolicies = async (req, res) => {
@@ -242,7 +361,8 @@ exports.adminGetPolicy = async (req, res) => {
 exports.adminUpdatePolicy = async (req, res) => {
     try {
         const result = await leavePolicy.savePolicy(req.schoolId, req.params.leaveTypeId, req.body || {}, req.userId);
-        if (!result.ok) return res.status(404).json({ success: false, message: result.message });
+        // A rejected rule is a bad request, not a missing leave type.
+        if (!result.ok) return res.status(result.notFound ? 404 : 400).json({ success: false, message: result.message });
         res.json({ success: true, data: result.policy });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -386,7 +506,8 @@ exports.adminApplyLeave = async (req, res) => {
             teacher: teacherId, school: req.schoolId, leaveType: leaveTypeId,
             fromDate: from, toDate: to, totalDays,
             leaveMode: leaveMode || 'full_day', reason, document: documentPath, appliedAt: new Date(),
-            approvalsRequired: policy.approval.twoLevel ? 2 : 1,
+            // Leave takes one sign-off — the two-level policy option was removed.
+            approvalsRequired: 1,
             approvalLevel: 0, approvals: [],
         });
         await LeaveBalance.updateOne(
@@ -410,6 +531,123 @@ exports.adminGetTeacherBalance = async (req, res) => {
             .lean();
         const data = balances.map(b => ({ ...b, remaining: remainingOf(b) }));
         res.json({ success: true, data, academicYear: ay });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Live preview for the "apply on behalf of a teacher" form.
+ *
+ * Two questions the admin cannot answer by looking at the form: how many days
+ * this teacher still has of the chosen type, and how many days the chosen date
+ * range will actually cost once weekends, school holidays and the type's own
+ * sandwich rule are applied. Both are answered here, by the same helpers the
+ * real submit uses, so the number shown is the number that will be charged.
+ *
+ * Everything is optional except teacherId + leaveTypeId. Date problems come
+ * back as `days.error` inside a 200 rather than a 400: this is a preview the
+ * form paints while the user is still typing, not a failed submission.
+ */
+exports.adminApplyPreview = async (req, res) => {
+    try {
+        const { teacherId, leaveTypeId, fromDate, toDate, leaveMode = 'full_day' } = req.query;
+        if (!teacherId || !leaveTypeId)
+            return res.status(400).json({ success: false, message: 'teacherId and leaveTypeId are required' });
+
+        const ltDoc = await LeaveType.findOne({ _id: leaveTypeId, school: req.schoolId }).lean();
+        if (!ltDoc) return res.status(404).json({ success: false, message: 'Leave type not found' });
+
+        const [school, ay, policy] = await Promise.all([
+            School.findById(req.schoolId).select('leaveSettings modules').lean(),
+            getActiveAcademicYearLabel(req.schoolId),
+            leavePolicy.getPolicy(req.schoolId, ltDoc),
+        ]);
+        const leaveSettings = normalizeLeaveSettings(school?.leaveSettings);
+        const holidayModule = !!school?.modules?.holiday;
+
+        // Read-only: an unallocated teacher must not get a balance row just for
+        // opening the form, so this looks the row up instead of upserting it.
+        const balRow = ay
+            ? await LeaveBalance.findOne({ teacher: teacherId, school: req.schoolId, leaveType: leaveTypeId, academicYear: ay }).lean()
+            : null;
+        const remaining = remainingOf(balRow);
+        const balance = {
+            allocated:      !!balRow,
+            academicYear:   ay,
+            totalAllocated: balRow?.totalAllocated || 0,
+            carriedForward: balRow?.carriedForward || 0,
+            used:           balRow?.used    || 0,
+            pending:        balRow?.pending || 0,
+            expired:        balRow?.expired || 0,
+            remaining,
+            // What an application may actually draw — larger than `remaining`
+            // when the policy permits an overdraft.
+            spendable:      leavePolicy.spendableFrom(policy, remaining),
+            // Comp off is earned per approved request, so its annual figure is
+            // deliberately 0 and must not be shown as an entitlement.
+            annualAllocation: isCompOffType(ltDoc) ? null : (ltDoc.annualAllocation || 0),
+        };
+
+        let days = null;
+        if (fromDate && toDate) {
+            const from = new Date(fromDate);
+            const to   = new Date(toDate);
+            from.setUTCHours(0, 0, 0, 0);
+            to.setUTCHours(0, 0, 0, 0);
+
+            if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+                days = { error: 'Invalid date format' };
+            } else if (to < from) {
+                days = { error: 'To date must be on or after From date' };
+            } else {
+                const counted = await computeLeaveDays({
+                    schoolId: req.schoolId, from, to, leaveMode, policy, leaveSettings, holidayModule,
+                });
+                const calendarDays = countCalendarDays(from, to);
+                const workingDays  = countWorkingDays(from, to, leaveSettings);
+                const holidayDays  = holidayModule
+                    ? await countHolidayWorkingDays(from, to, req.schoolId, leaveSettings)
+                    : 0;
+                days = {
+                    error:        counted.error || null,
+                    // What the balance will be charged. Equals workingDays minus
+                    // holidays normally, calendarDays under the sandwich rule,
+                    // and 0.5 for a half day.
+                    totalDays:    counted.totalDays ?? 0,
+                    calendarDays,
+                    workingDays,
+                    holidayDays,
+                    weeklyOffDays: Math.max(0, calendarDays - workingDays),
+                    sandwiched:   !!counted.sandwiched,
+                    leaveMode:    leaveMode === 'half_day' ? 'half_day' : 'full_day',
+                };
+            }
+        }
+
+        // Soft check only — the form still submits, and the real validation runs
+        // again on POST. `onBehalf` mirrors adminApplyLeave: notice-period and
+        // back-dating rules bind the employee, not the admin filing for them.
+        let warning = null;
+        if (days && !days.error) {
+            const [overlap, check] = await Promise.all([
+                getOverlappingLeave(teacherId, req.schoolId, new Date(fromDate), new Date(toDate)),
+                leavePolicy.validateApplication({
+                    schoolId: req.schoolId, policy, teacherId,
+                    from: new Date(fromDate), to: new Date(toDate),
+                    totalDays: days.totalDays, leaveMode, hasDocument: true, onBehalf: true,
+                }),
+            ]);
+            if (overlap) warning = 'This teacher already has a leave application overlapping these dates';
+            else if (!check.ok) warning = check.message;
+        }
+
+        res.json({ success: true, data: {
+            leaveType: { _id: ltDoc._id, name: ltDoc.name, code: ltDoc.code, category: ltDoc.category || 'general' },
+            balance,
+            days,
+            warning,
+            // The one hard stop the form can know about before submitting.
+            sufficient: !days || !!days.error || days.totalDays <= balance.spendable,
+        }});
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -614,7 +852,16 @@ exports.adminGetAllocations = async (req, res) => {
             monthlyAccrual: byType[String(lt._id)]?.monthlyAccrual || lt.monthlyAccrual,
             carryForward:   byType[String(lt._id)]?.carryForward   || lt.carryForward,
         }));
-        res.json({ success: true, data: balances, leaveTypes: withPolicy, academicYear: ay });
+        // Served here rather than left to /admin/academic-years, which sits behind
+        // the general admin guard — a designation-based leave admin cannot reach
+        // that one, and the carry-forward and proration UI both need this list.
+        const years = await AcademicYear.find({ school: req.schoolId }).lean();
+        const academicYears = years
+            .map(y => ({ label: academicYearLabel(y), startDate: y.startDate, endDate: y.endDate, status: y.status }))
+            .filter(y => y.label)
+            .sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+
+        res.json({ success: true, data: balances, leaveTypes: withPolicy, academicYear: ay, academicYears });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -652,13 +899,18 @@ exports.adminAllocate = async (req, res) => {
         const ltPolicy = await leavePolicy.getPolicy(req.schoolId, lt);
         const accrues  = !!ltPolicy?.monthlyAccrual?.enabled;
 
+        // Precedence, most explicit first. Proration is deliberately NOT gated on
+        // `accrues`: an accruing type that is being handed its days up front can
+        // still be prorated for a mid-year start, and silently ignoring the
+        // admin's choice here is what used to hand out the full annual figure.
         let totalAllocated;
+        let prorated = false;
         if (overrideDays !== undefined && overrideDays !== null && overrideDays !== '') {
             totalAllocated = Number(overrideDays);
         } else if (accrues && !giveFullAllocation) {
-            // Monthly accrual: start at 0, cron will credit each month
+            // Monthly accrual: start at 0, the accrual sweep credits each month
             totalAllocated = 0;
-        } else if (useProration && !accrues) {
+        } else if (useProration) {
             const activeAY = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
             if (activeAY?.startDate && activeAY?.endDate) {
                 const now = new Date();
@@ -666,27 +918,126 @@ exports.adminAllocate = async (req, res) => {
                 const remainMs = Math.max(0, end - now);
                 const totalMs  = Math.max(1, end - new Date(activeAY.startDate));
                 totalAllocated = Math.max(1, Math.ceil(lt.annualAllocation * remainMs / totalMs));
+                prorated = true;
             } else {
-                totalAllocated = lt.annualAllocation;
+                // Nothing to prorate against — say so rather than quietly hand
+                // out the full year, which is indistinguishable from a bug.
+                return res.status(400).json({ success: false, message: 'Cannot prorate — the active academic year has no start and end date' });
             }
         } else {
             totalAllocated = lt.annualAllocation;
         }
 
+        const set = { totalAllocated };
+        // Re-baselining an accruing type restarts its monthly clock from today,
+        // so the sweep credits from the next month boundary rather than
+        // immediately paying out every month since the row was first created.
+        if (accrues) set.lastAccrualAt = new Date();
+
         const ops = teachers.map(t => ({
             updateOne: {
                 filter: { teacher: t._id, school: req.schoolId, leaveType: leaveTypeId, academicYear: ay },
-                update: { $set: { totalAllocated } },
+                update: { $set: set },
                 upsert: true,
             },
         }));
         await LeaveBalance.bulkWrite(ops);
-        res.json({ success: true, allocated: teachers.length, message: `Allocated ${totalAllocated} day(s) to ${teachers.length} teacher(s)` });
+
+        const suffix = prorated
+            ? ` (prorated from ${lt.annualAllocation})`
+            : accrues && totalAllocated === 0
+                ? ` — ${ltPolicy.monthlyAccrual.daysPerMonth} day(s)/month will be credited automatically`
+                : '';
+        res.json({
+            success: true, allocated: teachers.length, totalAllocated, prorated, accrues,
+            message: `Allocated ${totalAllocated} day(s) to ${teachers.length} teacher(s)${suffix}`,
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Zeroes an allocation without erasing the teacher's history.
+ *
+ * `totalAllocated` and `carriedForward` go to 0; `used` and `pending` are left
+ * alone, so leave already taken still reconciles against the ledger and an
+ * approved application never points at a balance that forgot it was spent.
+ *
+ * Only existing rows are touched — clearing must never enrol somebody, so there
+ * is no upsert here.
+ */
+exports.adminClearAllocations = async (req, res) => {
+    try {
+        const { teacherIds, excludeIds = [], leaveTypeId, academicYear } = req.body;
+        if (!leaveTypeId) return res.status(400).json({ success: false, message: 'leaveTypeId is required' });
+        if (!teacherIds)  return res.status(400).json({ success: false, message: 'teacherIds is required' });
+
+        const ay = academicYear || await getActiveAcademicYearLabel(req.schoolId);
+        if (!ay) return res.status(400).json({ success: false, message: 'No active academic year' });
+
+        const lt = await LeaveType.findOne({ _id: leaveTypeId, school: req.schoolId }).lean();
+        if (!lt) return res.status(404).json({ success: false, message: 'Leave type not found' });
+
+        // Same resolution as adminAllocate, so "all except these two" means the
+        // same set on both screens.
+        const isAll = teacherIds === 'all' || (Array.isArray(teacherIds) && teacherIds[0] === 'all');
+        let ids;
+        if (isAll) {
+            const excludeFilter = excludeIds.length ? { _id: { $nin: excludeIds } } : {};
+            const teachers = await User.find({ school: req.schoolId, role: 'teacher', isActive: true, ...excludeFilter })
+                .select('_id').lean();
+            ids = teachers.map(t => t._id);
+        } else {
+            ids = Array.isArray(teacherIds) ? teacherIds : [teacherIds];
+        }
+        if (!ids.length) return res.json({ success: true, cleared: 0, message: 'No teachers matched' });
+
+        const filter = { school: req.schoolId, leaveType: leaveTypeId, academicYear: ay, teacher: { $in: ids } };
+        const affected = await LeaveBalance.find(filter).lean();
+        if (!affected.length)
+            return res.json({ success: true, cleared: 0, message: 'No allocations to clear for the selected teachers' });
+
+        const set = { totalAllocated: 0, carriedForward: 0 };
+        // A cleared accruing type starts earning again from today rather than
+        // immediately paying out every month since it was first allocated.
+        const ltPolicy = await leavePolicy.getPolicy(req.schoolId, lt);
+        if (ltPolicy?.monthlyAccrual?.enabled) set.lastAccrualAt = new Date();
+
+        await LeaveBalance.updateMany(filter, { $set: set });
+
+        const daysRemoved = affected.reduce((n, b) => n + (b.totalAllocated || 0) + (b.carriedForward || 0), 0);
+        const stillPending = affected.reduce((n, b) => n + (b.pending || 0), 0);
+        res.json({
+            success: true,
+            cleared: affected.length,
+            daysRemoved,
+            stillPending,
+            message: `Cleared ${lt.name} for ${affected.length} teacher(s) — ${daysRemoved} day(s) removed`,
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 // ── Monthly Accrual ───────────────────────────────────────────────────────────
 
+// Whole calendar months from `a` to `b`. Local time, matching the scheduler's
+// clock in server.js.
+const monthsBetween = (a, b) =>
+    (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
+
+/**
+ * Credits every accruing balance the months it is owed.
+ *
+ * The admin allocates a monthly-accrual type once — the row is created at 0 (or
+ * at a prorated opening figure) — and from then on this is the only thing that
+ * touches it. Each row carries its own clock (`lastAccrualAt`), so:
+ *
+ *   · a month the server was down is caught up on the next run rather than lost;
+ *   · running twice in the same month credits nothing the second time;
+ *   · a teacher allocated mid-year starts accruing from their allocation date,
+ *     not from the start of the academic year.
+ *
+ * Balances are capped at the type's annual allocation and scoped to the active
+ * academic year — a closed year's rows are history and must not keep growing.
+ */
 async function runMonthlyAccrualForSchool(schoolId) {
     // Accrual is a policy rule now, so the set of accruing types comes from the
     // policies rather than the leave type columns.
@@ -695,34 +1046,53 @@ async function runMonthlyAccrualForSchool(schoolId) {
         .filter(p => p.monthlyAccrual.enabled && !isCompOffType(p.leaveType));
     if (!policies.length) return 0;
 
-    const now       = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const ay = await getActiveAcademicYearLabel(schoolId);
+    if (!ay) return 0;
 
+    const now = new Date();
     let credited = 0;
+
     for (const policy of policies) {
-        const lt = policy.leaveType;
+        const lt        = policy.leaveType;
+        const perMonth  = Number(policy.monthlyAccrual.daysPerMonth) || 0;
+        const annualCap = Number(lt.annualAllocation) || 0;
+        if (perMonth <= 0 || annualCap <= 0) continue;
+
         const balances = await LeaveBalance.find({
-            school:    schoolId,
-            leaveType: lt._id,
-            $or: [{ lastAccrualAt: null }, { lastAccrualAt: { $exists: false } }, { lastAccrualAt: { $lt: monthStart } }],
+            school: schoolId, leaveType: lt._id, academicYear: ay,
         }).lean();
 
-        const ops = balances
-            .filter(b => b.totalAllocated < lt.annualAllocation)
-            .map(b => ({
-                updateOne: {
-                    filter: { _id: b._id },
-                    update: { $set: {
-                        totalAllocated: Math.min(b.totalAllocated + (policy.monthlyAccrual.daysPerMonth || 0), lt.annualAllocation),
-                        lastAccrualAt:  now,
-                    }},
-                },
-            }));
+        const ops = [];
+        for (const b of balances) {
+            const already = Number(b.totalAllocated) || 0;
+            if (already >= annualCap) continue;
 
-        if (ops.length) { await LeaveBalance.bulkWrite(ops); credited += ops.length; }
+            const anchorRaw = b.lastAccrualAt || b.createdAt;
+            if (!anchorRaw) {
+                // No clock to measure from. Start one instead of treating the
+                // epoch as the anchor, which would credit a full year at once.
+                ops.push({ updateOne: { filter: { _id: b._id }, update: { $set: { lastAccrualAt: now } } } });
+                continue;
+            }
+
+            const months = monthsBetween(new Date(anchorRaw), now);
+            if (months < 1) continue;
+
+            ops.push({ updateOne: {
+                filter: { _id: b._id },
+                update: { $set: {
+                    totalAllocated: Math.min(already + months * perMonth, annualCap),
+                    lastAccrualAt:  now,
+                }},
+            }});
+            credited += 1;
+        }
+
+        if (ops.length) await LeaveBalance.bulkWrite(ops);
     }
     return credited;
 }
+
 exports.runMonthlyAccrualForSchool = runMonthlyAccrualForSchool;
 
 exports.adminRunMonthlyAccrual = async (req, res) => {
@@ -815,6 +1185,21 @@ exports.adminRunCarryForward = async (req, res) => {
         const { fromYear, toYear } = req.body;
         if (!fromYear || !toYear)
             return res.status(400).json({ success: false, message: 'fromYear and toYear are required (e.g. "2024-25", "2025-26")' });
+
+        // Both ends must be real academic years of this school, and the balances
+        // must move forwards. Ordering is decided by startDate rather than by
+        // comparing the labels as text — a label is free-form, and "2025-26" only
+        // happens to sort correctly.
+        const years = await AcademicYear.find({ school: req.schoolId }).lean();
+        const byLabel = new Map(years.map(y => [academicYearLabel(y), y]));
+        const fromAY = byLabel.get(fromYear);
+        const toAY   = byLabel.get(toYear);
+        if (!fromAY) return res.status(400).json({ success: false, message: `"${fromYear}" is not an academic year of this school` });
+        if (!toAY)   return res.status(400).json({ success: false, message: `"${toYear}" is not an academic year of this school` });
+        if (fromYear === toYear)
+            return res.status(400).json({ success: false, message: 'From year and To year must be different' });
+        if (new Date(fromAY.startDate) >= new Date(toAY.startDate))
+            return res.status(400).json({ success: false, message: `From year must be earlier than To year — ${fromYear} does not start before ${toYear}` });
 
         // Carry forward is a policy rule, so the types that roll over come from
         // the policies rather than the leave type columns.
@@ -1133,7 +1518,8 @@ exports.teacherApplyLeave = async (req, res) => {
             teacher: req.userId, school: req.schoolId, leaveType: leaveTypeId,
             fromDate: from, toDate: to, totalDays,
             leaveMode: leaveMode || 'full_day', reason, document: documentPath, appliedAt: new Date(),
-            approvalsRequired: policy.approval.twoLevel ? 2 : 1,
+            // Leave takes one sign-off — the two-level policy option was removed.
+            approvalsRequired: 1,
             approvalLevel: 0, approvals: [],
         });
         await LeaveBalance.updateOne(
