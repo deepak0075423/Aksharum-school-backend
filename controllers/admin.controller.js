@@ -739,10 +739,18 @@ const createUserHelper = async (body, role, school) => {
 
 // ── Teacher intake ────────────────────────────────────────────────────────────
 
-/** Validate the teacher payload; returns the first problem, or null. */
-function validateTeacherIntake(b, files = {}) {
+/**
+ * Validate the teacher payload; returns the first problem, or null.
+ *
+ * `requireDocuments: false` keeps every other rule but drops the upload checks.
+ * That is what the Excel importer needs: a spreadsheet cannot carry the Aadhaar,
+ * PAN or experience scans, and those are the ONLY rules it is excused from.
+ */
+function validateTeacherIntake(b, files = {}, { requireDocuments = true } = {}) {
     const req = (value, label) => (!String(value ?? '').trim() ? `${label} is required` : null);
-    const file = (key) => files[key]?.[0]?.filename || '';
+    // A sentinel keeps every `if (!file(...))` check below satisfied when the
+    // caller has no uploads to offer.
+    const file = (key) => (requireDocuments ? files[key]?.[0]?.filename || '' : 'not-required');
 
     // 1. Personal
     let e = req(b.name, 'Full name')
@@ -919,6 +927,21 @@ const TEACHER_FILE_BY_INPUT = {
     experienceCertificate: 'experienceCertificateFile', resignationLetter: 'resignationLetterFile',
     joiningLetter: 'joiningLetterFile',
 };
+/**
+ * Drop every key the payload did not actually feed. buildTeacherProfile fills
+ * each field with a default, so writing it wholesale on a partial update would
+ * blank whatever the caller left out — an edit that only corrects a phone
+ * number, or an import sheet that only carries some of the columns.
+ */
+function pruneUnsuppliedTeacherFields(built, b) {
+    for (const key of Object.keys(built)) {
+        if (TEACHER_FILE_FIELDS.includes(key)) continue;
+        const feeds = TEACHER_FIELD_SOURCES[key] || [key];
+        if (!feeds.some((f) => b[f] !== undefined)) delete built[key];
+    }
+    return built;
+}
+
 /** Files already on the profile, shaped like multer's req.files. */
 function fileStubsFor(profile) {
     const out = {};
@@ -1023,14 +1046,8 @@ exports.updateTeacherFull = async (req, res) => {
         for (const key of TEACHER_FILE_FIELDS) {
             if (!built[key] && existing?.[key]) built[key] = existing[key];
         }
-        // ...and neither must an omitted field. buildTeacherProfile fills every
-        // key with a default, so writing it wholesale would blank anything the
-        // caller did not send. Keep only what this request actually supplied.
-        for (const key of Object.keys(built)) {
-            if (TEACHER_FILE_FIELDS.includes(key)) continue;
-            const feeds = TEACHER_FIELD_SOURCES[key] || [key];
-            if (!feeds.some((f) => b[f] !== undefined)) delete built[key];
-        }
+        // ...and neither must an omitted field.
+        pruneUnsuppliedTeacherFields(built, b);
         if (typedId) built.employeeId = typedId;
 
         await TeacherProfile.findOneAndUpdate(
@@ -1222,6 +1239,28 @@ exports.bulkDeleteUsers = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bulk import.
+//
+//  Both sheets mirror the admin's own add-teacher and add-student wizards column
+//  for column, so an imported account is as complete as a typed one. A row is
+//  turned into exactly the payload that form posts and then run through the SAME
+//  validators and profile builders — there is no second, looser rule set for
+//  spreadsheets. The one thing a sheet cannot carry is an upload (ID scans,
+//  certificates), so those checks are all that is switched off; the reference
+//  sheet in each template says which paperwork still has to be attached by hand.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The intake forms' own dropdown lists. Kept here so the templates offer, and
+// the importer accepts, precisely what an admin can pick in the wizard.
+const BLOOD_GROUPS   = ['A+', 'A−', 'B+', 'B−', 'AB+', 'AB−', 'O+', 'O−'];
+const CATEGORIES     = ['General', 'OBC', 'SC', 'ST', 'EWS'];
+const QUALIFICATIONS = ['B.A.', 'B.Sc.', 'B.Com.', 'M.A.', 'M.Sc.', 'M.Com.', 'B.Tech.', 'M.Tech.', 'Ph.D.'];
+const TEACHING_DEGREES = ['B.Ed.', 'D.El.Ed.', 'M.Ed.', 'NTT'];
+const SCHOOL_BOARDS  = ['CBSE', 'ICSE', 'State Board', 'IB', 'Cambridge (IGCSE)', 'NIOS', 'Other'];
+const SCHOOL_MEDIUMS = ['English', 'Hindi', 'Marathi', 'Gujarati', 'Bengali', 'Tamil', 'Telugu', 'Kannada', 'Malayalam', 'Urdu', 'Other'];
+const GENDERS        = ['Male', 'Female', 'Other'];
+
 // Sheet dates arrive as dd/mm/yyyy text (the templates force the column to
 // text so Excel cannot silently reformat them). Returns null on anything else,
 // which the callers turn into a row error rather than a wrong date.
@@ -1235,6 +1274,56 @@ function parseSheetDate(raw) {
     const dt = new Date(`${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`);
     return Number.isNaN(dt.getTime()) ? null : dt;
 }
+
+/**
+ * A dropdown value typed by hand. Matching is case-insensitive but what gets
+ * stored is the form's own spelling, so "male" and "Male" do not become two
+ * different genders. An unlisted value is kept as typed — that is how the
+ * wizard's "Other → type it in" fields behave.
+ */
+const matchOption = (raw, options) => {
+    const typed = String(raw ?? '').trim();
+    return options.find((o) => o.toLowerCase() === typed.toLowerCase()) || typed;
+};
+
+// Excel users type an ASCII hyphen ("B-"); the dropdowns emit a Unicode minus
+// ("B−"). Both have to land on the same value or one blood group is stored two
+// different ways depending on how the record was created.
+const normalizeBloodGroup = (raw) => {
+    const typed = String(raw ?? '').trim();
+    const ascii = typed.replace(/[−–—]/g, '-').toLowerCase();
+    return BLOOD_GROUPS.find((g) => g.replace(/−/g, '-').toLowerCase() === ascii) || typed;
+};
+
+// A spreadsheet has no checkbox, so the yes/no columns are read as text.
+const sheetBool = (raw) => ['yes', 'y', 'true', '1'].includes(String(raw ?? '').trim().toLowerCase());
+
+/**
+ * Column reader for one sheet row. Headers are matched case- and
+ * space-insensitively, and every field also accepts the shorter headers of the
+ * earlier templates, so a sheet a school has already filled in still imports.
+ * Returns '' for a column that is blank or absent.
+ */
+function sheetRow(raw) {
+    const cells = {};
+    Object.keys(raw).forEach((k) => { cells[k.trim().toLowerCase()] = String(raw[k] ?? '').trim(); });
+    return (...aliases) => {
+        for (const alias of aliases) {
+            if (cells[alias]) return cells[alias];
+        }
+        return '';
+    };
+}
+
+/**
+ * Keep only the columns the row actually filled in. A blank optional cell then
+ * means "leave whatever is on file alone" rather than "erase it", which is what
+ * makes a corrected sheet safe to re-upload. Blank REQUIRED cells still fail,
+ * because the shared validators run on the pruned object.
+ */
+const suppliedOnly = (obj) => Object.fromEntries(
+    Object.entries(obj).filter(([, v]) => v !== '' && v !== null && v !== undefined),
+);
 
 exports.bulkTeachers = async (req, res) => {
     try {
@@ -1250,48 +1339,85 @@ exports.bulkTeachers = async (req, res) => {
         const errors = [];
         for (let i = 0; i < rows.length; i++) {
             const rowNum = i + 2;
-            const r = {};
-            Object.keys(rows[i]).forEach(k => { r[k.trim().toLowerCase()] = String(rows[i][k]).trim(); });
+            const cell   = sheetRow(rows[i]);
 
-            const name        = r['full name']     || r['name']  || '';
-            const email       = (r['email address'] || r['email'] || '').toLowerCase();
-            const phone       = r['phone number']   || r['phone'] || '';
-            const designation = r['designation']    || '';
-            const employeeId  = r['employee id']    || r['employeeid'] || '';
-            const department  = r['department']     || '';
-            const gender      = r['gender']         || '';
-            const bloodGroup  = r['blood group']    || r['bloodgroup'] || '';
-            const qualification  = r['qualification']    || '';
-            const teachingDegree = r['teaching degree']  || r['teachingdegree'] || '';
-            const experience     = r['experience']       || '';
-            const dob         = parseSheetDate(r['date of birth']   || r['dob'] || '');
-            const joiningDate = parseSheetDate(r['date of joining'] || r['joining date'] || r['joiningdate'] || '');
+            const name  = cell('full name', 'name');
+            const email = cell('email address', 'email').toLowerCase();
+            const fail  = (reason) => errors.push({ row: rowNum, name: name || '?', reason });
 
-            if (!name || !email) { errors.push({ row: rowNum, name: name || '?', reason: 'Full Name and Email Address are required' }); continue; }
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errors.push({ row: rowNum, name, reason: `Invalid email "${email}"` }); continue; }
-            if (phone && !/^[+\d\s\-]{7,15}$/.test(phone)) { errors.push({ row: rowNum, name, reason: `Invalid phone "${phone}"` }); continue; }
-            if (gender && !['Male', 'Female', 'Other'].includes(gender)) {
-                errors.push({ row: rowNum, name, reason: `Gender must be Male, Female or Other — got "${gender}"` }); continue;
-            }
-            if ((r['date of birth'] || r['dob']) && !dob) {
-                errors.push({ row: rowNum, name, reason: 'Invalid Date of Birth (use dd/mm/yyyy)' }); continue;
-            }
-            if ((r['date of joining'] || r['joining date']) && !joiningDate) {
-                errors.push({ row: rowNum, name, reason: 'Invalid Date of Joining (use dd/mm/yyyy)' }); continue;
-            }
-            // Only the fields this row actually supplied are written, so
-            // re-uploading a partial sheet never blanks what is already on file.
-            const profileFields = {
-                ...(designation    ? { designation } : {}),
-                ...(department     ? { department } : {}),
-                ...(gender         ? { gender } : {}),
-                ...(bloodGroup     ? { bloodGroup } : {}),
-                ...(qualification  ? { qualification } : {}),
-                ...(teachingDegree ? { teachingDegree } : {}),
-                ...(experience     ? { experience, totalExperience: experience } : {}),
-                ...(dob            ? { dob } : {}),
-                ...(joiningDate    ? { joiningDate } : {}),
+            // Dates are dd/mm/yyyy. They are parsed here rather than left to the
+            // shared validator, which would hand the string to `new Date` and
+            // read 04/12/1990 as the fourth of December.
+            const dobRaw  = cell('date of birth', 'dob');
+            const joinRaw = cell('date of joining', 'joining date', 'joiningdate');
+            const dob     = parseSheetDate(dobRaw);
+            const joining = parseSheetDate(joinRaw);
+            if (dobRaw  && !dob)     { fail('Invalid Date of Birth (use dd/mm/yyyy)'); continue; }
+            if (joinRaw && !joining) { fail('Invalid Date of Joining (use dd/mm/yyyy)'); continue; }
+
+            const employeeId = cell('employee id', 'employeeid');
+            // The row, shaped exactly like the seven-step wizard's POST body.
+            const b = {
+                ...suppliedOnly({
+                    name,
+                    email,
+                    dob,
+                    gender:     matchOption(cell('gender'), GENDERS),
+                    bloodGroup: normalizeBloodGroup(cell('blood group', 'bloodgroup')),
+                    fatherOrHusbandName:   cell("father's / husband's name", 'father / husband name', "father's name", 'father name'),
+                    emergencyContactName:  cell('emergency contact name'),
+                    emergencyContactPhone: cell('emergency contact phone'),
+
+                    phone:          cell('phone number', 'mobile number', 'phone'),
+                    alternatePhone: cell('alternate phone', 'secondary phone'),
+                    currentAddress: cell('current address', 'address'),
+                    currentCity:    cell('current city', 'city'),
+                    currentState:   matchOption(cell('current state', 'state'), STATES_AND_UTS),
+                    currentPincode: cell('current pincode', 'current pin code', 'pincode'),
+                    currentCountry: cell('current country', 'country') || 'India',
+                    permanentAddress: cell('permanent address'),
+                    permanentCity:    cell('permanent city'),
+                    permanentState:   matchOption(cell('permanent state'), STATES_AND_UTS),
+                    permanentPincode: cell('permanent pincode', 'permanent pin code'),
+                    permanentCountry: cell('permanent country') || 'India',
+
+                    aadhaarNumber: cell('aadhaar number', 'aadhar number'),
+                    panNumber:     cell('pan number'),
+                    uanNumber:     cell('uan number'),
+
+                    qualification:  matchOption(cell('qualification'), QUALIFICATIONS),
+                    teachingDegree: matchOption(cell('teaching degree', 'teachingdegree'), TEACHING_DEGREES),
+
+                    totalExperience: cell('total experience', 'experience'),
+                    previousSchool:  cell('previous school'),
+                    lastDesignation: cell('last designation'),
+
+                    bankAccountHolder: cell('bank account holder', 'bank account holder name'),
+                    bankAccountNumber: cell('bank account number'),
+                    bankIfsc:          cell('ifsc code', 'bank ifsc'),
+                    bankBranch:        cell('bank branch', 'bank branch name'),
+
+                    joiningDate: joining,
+                    designation: cell('designation'),
+                    department:  cell('department'),
+                }),
+                // These two decide what other fields mean, so they are always
+                // present: blank reads as "no" / "unanswered", never as
+                // "leave the stored value alone".
+                sameAsCurrent:  sheetBool(cell('permanent same as current', 'same as current')),
+                employmentType: matchOption(cell('employment type'), ['fresher', 'experienced']).toLowerCase(),
             };
+
+            // Every rule the add-teacher form enforces, minus the uploads.
+            const problem = validateTeacherIntake(b, {}, { requireDocuments: false });
+            if (problem) { fail(problem); continue; }
+
+            // Only the columns this row filled in are written, so re-uploading a
+            // partial sheet never blanks what is already on file — and the ID
+            // scans, which no sheet can carry, are never touched at all.
+            const profileFields = buildTeacherProfile(b, {});
+            for (const key of TEACHER_FILE_FIELDS) delete profileFields[key];
+            pruneUnsuppliedTeacherFields(profileFields, b);
 
             try {
                 const exists = await User.findOne({ email }).lean();
@@ -1299,17 +1425,29 @@ exports.bulkTeachers = async (req, res) => {
                     // Re-uploading a sheet updates the existing teacher rather
                     // than failing the row. Other roles are never overwritten.
                     if (exists.role !== 'teacher' || String(exists.school) !== String(req.schoolId)) {
-                        errors.push({ row: rowNum, name, reason: `Email "${email}" belongs to another account` });
+                        fail(`Email "${email}" belongs to another account`);
                         continue;
                     }
-                    await User.updateOne({ _id: exists._id }, { $set: { name, ...(phone ? { phone } : {}) } });
+                    const current = await TeacherProfile.findOne({ user: exists._id }).lean();
+                    // A typed employee ID may be a correction, but it must not
+                    // collide with one another teacher already holds.
+                    if (employeeId && employeeId !== (current?.employeeId || '')) {
+                        const taken = await TeacherProfile.findOne({ school: req.schoolId, employeeId }).lean();
+                        if (taken) { fail(`Employee ID "${employeeId}" is already in use`); continue; }
+                        profileFields.employeeId = employeeId;
+                    }
+                    await User.updateOne({ _id: exists._id }, { $set: { name, ...(b.phone ? { phone: b.phone } : {}) } });
                     await authCache.invalidate(exists._id);
                     await TeacherProfile.findOneAndUpdate(
                         { user: exists._id },
                         { $set: profileFields, $setOnInsert: { school: req.schoolId } },
                         { upsert: true },
                     );
-                    if (designation) await designationSvc.invalidateUser(exists._id);
+                    // The designation decides which modules this teacher reaches.
+                    if (profileFields.designation !== undefined
+                        && profileFields.designation !== (current?.designation || '')) {
+                        await designationSvc.invalidateUser(exists._id);
+                    }
                     updated++;
                     continue;
                 }
@@ -1319,19 +1457,22 @@ exports.bulkTeachers = async (req, res) => {
                 let resolvedId = employeeId;
                 if (resolvedId) {
                     const taken = await TeacherProfile.findOne({ school: req.schoolId, employeeId: resolvedId }).lean();
-                    if (taken) { errors.push({ row: rowNum, name, reason: `Employee ID "${resolvedId}" is already in use` }); continue; }
+                    if (taken) { fail(`Employee ID "${resolvedId}" is already in use`); continue; }
                 } else {
                     resolvedId = await employeeIdUtil.nextEmployeeId(bulkSchoolDoc || { _id: req.schoolId });
                 }
                 const otp  = generateOTP();
-                const user = await createUserHelper({ name, email, phone, password: otp }, 'teacher', req.schoolId);
+                const user = await createUserHelper(
+                    { name, email, phone: b.phone, designation: b.designation, password: otp },
+                    'teacher', req.schoolId,
+                );
                 await TeacherProfile.create({
                     user: user._id, school: req.schoolId, employeeId: resolvedId, ...profileFields,
                 });
                 sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
                 created++;
             } catch (e) {
-                errors.push({ row: rowNum, name, reason: e.code === 11000 ? 'Duplicate entry' : e.message });
+                fail(e.code === 11000 ? 'Duplicate entry' : e.message);
             }
         }
         res.json({ success: true, created, updated, errors });
@@ -1372,84 +1513,144 @@ exports.bulkStudents = async (req, res) => {
         const rosterBySection = new Map();
 
         for (let i = 0; i < rows.length; i++) {
-            const row = rows[i];
             const rowNum = i + 2;
-            const r = {};
-            Object.keys(row).forEach(k => { r[k.trim().toLowerCase()] = String(row[k]).trim(); });
+            const cell   = sheetRow(rows[i]);
 
-            const name        = r['full name']          || r['name']        || '';
-            const email       = (r['email address']     || r['email']       || '').toLowerCase();
-            const phone       = r['phone number']        || r['phone']       || '';
-            const admNo       = r['admission number']    || r['admissionnumber'] || '';
-            const dobRaw      = r['date of birth']       || r['dob']         || '';
-            const gender      = r['gender']              || '';
-            const bloodGroup  = r['blood group']         || r['bloodgroup']  || '';
-            const category    = r['category']            || '';
-            const className   = r['class']               || '';
-            const sectionName = r['section']             || '';
-            const address     = r['address']             || '';
-            const city        = r['city']                || '';
-            const stateName   = r['state']               || '';
-            const pincode     = String(r['pincode'] || r['pin code'] || r['postal code'] || '').trim();
-            const rollNumber  = r['roll number']         || r['rollnumber']  || '';
-            const parentName  = r['parent full name']    || r['parent name'] || '';
-            const parentEmail = (r['parent email']       || '').toLowerCase();
-            const parentPhone = r['parent phone number'] || r['parent phone'] || '';
+            const name        = cell('full name', 'name');
+            const email       = cell('email address', 'email').toLowerCase();
+            const phone       = cell('phone number', 'mobile number', 'phone');
+            const className   = cell('class');
+            const sectionName = cell('section');
+            const admNo       = cell('admission number', 'admissionnumber');
+            const rollNumber  = cell('roll number', 'rollnumber');
 
             push({ type: 'processing', current: i + 1, total: rows.length, name: name || `Row ${rowNum}` });
 
+            const fail = (reason) => {
+                errors.push({ row: rowNum, name, reason });
+                push({ type: 'row_done', row: rowNum, name, success: false, reason });
+            };
+
+            // ── Account + enrolment: the columns the profile validator does not
+            //    own, because they carry their own uniqueness and seat checks.
             const missing = [];
             if (!name)        missing.push('Full Name');
             if (!email)       missing.push('Email Address');
             if (!phone)       missing.push('Phone Number');
-            if (!dobRaw)      missing.push('Date of Birth');
-            if (!gender)      missing.push('Gender');
-            if (!bloodGroup)  missing.push('Blood Group');
-            if (!category)    missing.push('Category');
             if (!className)   missing.push('Class');
             if (!sectionName) missing.push('Section');
-            if (!address)     missing.push('Address');
-            if (!parentName)  missing.push('Parent Full Name');
-            if (!parentEmail) missing.push('Parent Email');
-            if (!parentPhone) missing.push('Parent Phone Number');
-            if (missing.length) {
-                errors.push({ row: rowNum, name, reason: `Missing: ${missing.join(', ')}` });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason: `Missing: ${missing.join(', ')}` });
-                continue;
-            }
+            if (missing.length) { fail(`Missing: ${missing.join(', ')}`); continue; }
+            if (!isEmail(email)) { fail('Invalid student email'); continue; }
+            if (!isPhone(phone)) { fail(`Invalid phone "${phone}"`); continue; }
 
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-                errors.push({ row: rowNum, name, reason: 'Invalid student email' });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason: 'Invalid student email' });
-                continue;
+            // Dates are dd/mm/yyyy; `new Date` would read them as mm/dd/yyyy.
+            const dates   = {};
+            let   dateErr = null;
+            for (const [key, label, ...aliases] of [
+                ['dob', 'Date of Birth', 'date of birth', 'dob'],
+                ['previousSchoolLeavingDate', 'Previous School Leaving Date', 'previous school leaving date', 'leaving date'],
+                ['tcDate', 'TC Date', 'tc date'],
+            ]) {
+                const raw = cell(...aliases);
+                if (!raw) continue;
+                const parsed = parseSheetDate(raw);
+                if (!parsed) { dateErr = `Invalid ${label} (use dd/mm/yyyy)`; break; }
+                dates[key] = parsed;
             }
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parentEmail)) {
-                errors.push({ row: rowNum, name, reason: 'Invalid parent email' });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason: 'Invalid parent email' });
-                continue;
-            }
+            if (dateErr) { fail(dateErr); continue; }
 
-            const dob = parseSheetDate(dobRaw);
-            if (!dob) {
-                errors.push({ row: rowNum, name, reason: 'Invalid Date of Birth (use dd/mm/yyyy)' });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason: 'Invalid Date of Birth (use dd/mm/yyyy)' });
-                continue;
+            // ── The profile, shaped exactly like the add-student wizard's POST
+            const pincode = cell('pincode', 'pin code', 'postal code');
+            const profile = {
+                ...suppliedOnly({
+                    dob:         dates.dob,
+                    gender:      matchOption(cell('gender'), GENDERS),
+                    bloodGroup:  normalizeBloodGroup(cell('blood group', 'bloodgroup')),
+                    category:    matchOption(cell('category'), CATEGORIES),
+                    religion:    cell('religion'),
+                    nationality: cell('nationality') || 'Indian',
+                    emergencyContactName:     cell('emergency contact name'),
+                    emergencyContactPhone:    cell('emergency contact phone'),
+                    emergencyContactRelation: cell('emergency contact relation', 'emergency contact relation to the student'),
+
+                    address: cell('address', 'current address'),
+                    city:    cell('city', 'current city'),
+                    // A blank state is derived from the PIN code, as the form does
+                    state:   matchOption(cell('state', 'current state') || stateFromPincode(pincode), STATES_AND_UTS),
+                    pincode,
+                    country: cell('country', 'current country') || 'India',
+                    permanentAddress: cell('permanent address'),
+                    permanentCity:    cell('permanent city'),
+                    permanentState:   matchOption(cell('permanent state'), STATES_AND_UTS),
+                    permanentPincode: cell('permanent pincode', 'permanent pin code'),
+                    permanentCountry: cell('permanent country') || 'India',
+
+                    aadhaarNumber: cell('aadhaar number', 'aadhar number'),
+
+                    previousSchoolName:    cell('previous school name'),
+                    previousSchoolAddress: cell('previous school address'),
+                    previousSchoolCity:    cell('previous school city'),
+                    previousSchoolState:   matchOption(cell('previous school state'), STATES_AND_UTS),
+                    previousSchoolPincode: cell('previous school pincode', 'previous school pin code'),
+                    previousSchoolCountry: cell('previous school country') || 'India',
+                    previousSchoolMedium:  matchOption(cell('previous school medium'), SCHOOL_MEDIUMS),
+                    previousSchoolBoard:   matchOption(cell('previous school board'), SCHOOL_BOARDS),
+                    previousSchoolStateBoardName: cell('state board name', 'previous school state board name'),
+                    previousClass:         cell('previous class'),
+                    previousAcademicYear:  cell('previous academic year'),
+                    previousSchoolLeavingDate: dates.previousSchoolLeavingDate,
+                    previousSchoolContact: cell('previous school contact'),
+                    tcNumber:              cell('tc number'),
+                    tcDate:                dates.tcDate,
+                }),
+                // Both gate whole blocks, so they are always present: blank reads
+                // as "no", never as "leave the stored value alone".
+                sameAsCurrent:     sheetBool(cell('permanent same as current', 'same as current')),
+                isTransferStudent: sheetBool(cell('transfer student', 'is transfer student')),
+            };
+
+            // The same validator the wizard runs. Only the document checks are
+            // skipped — the certificates are attached later by editing the
+            // student, which the template's reference sheet spells out.
+            const profileErr = validateStudentProfile(profile);
+            if (profileErr) { fail(profileErr); continue; }
+
+            // ── Father / mother / guardian, one column group each ─────────────
+            const parentBlock = (role) => suppliedOnly({
+                name:          cell(`${role} name`, `${role} full name`),
+                email:         cell(`${role} email`).toLowerCase(),
+                phone:         cell(`${role} phone`, `${role} phone number`),
+                occupation:    cell(`${role} occupation`),
+                organization:  cell(`${role} organization`),
+                designation:   cell(`${role} designation`),
+                qualification: cell(`${role} qualification`),
+                annualIncome:  cell(`${role} annual income`),
+                aadhaarNumber: cell(`${role} aadhaar number`, `${role} aadhar number`),
+                panNumber:     cell(`${role} pan number`),
+                ...(role === 'guardian' ? { relation: cell('guardian relation') } : {}),
+            });
+            const newParent = {
+                // Whoever holds the login. The wizard defaults to the father.
+                accountFor: matchOption(cell('account for'), ['Father', 'Mother', 'Guardian']) || 'Father',
+                father:   parentBlock('father'),
+                mother:   parentBlock('mother'),
+                guardian: parentBlock('guardian'),
+            };
+            if (!PARENT_ROLES.some(role => newParent[role].name || newParent[role].email)) {
+                // A sheet from the older three-column template names one parent
+                // only; resolveNewParent still accepts that flat shape.
+                const legacyName  = cell('parent full name', 'parent name');
+                const legacyEmail = cell('parent email').toLowerCase();
+                if (!legacyName || !legacyEmail) { fail('Parent / guardian details are required'); continue; }
+                newParent.name  = legacyName;
+                newParent.email = legacyEmail;
+                newParent.phone = cell('parent phone number', 'parent phone');
             }
 
             const clasDoc = classMap[className.toLowerCase()];
-            if (!clasDoc) {
-                const reason = `Class "${className}" not found in active year`;
-                errors.push({ row: rowNum, name, reason });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason });
-                continue;
-            }
+            if (!clasDoc) { fail(`Class "${className}" not found in active year`); continue; }
             const section = sectionMap[`${clasDoc._id.toString()}_${sectionName.toLowerCase()}`];
-            if (!section) {
-                const reason = `Section "${sectionName}" not found in class "${className}"`;
-                errors.push({ row: rowNum, name, reason });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason });
-                continue;
-            }
+            if (!section) { fail(`Section "${sectionName}" not found in class "${className}"`); continue; }
 
             // Seats filled earlier in THIS import must count, so the roster is
             // tracked across rows rather than re-read from the pre-run snapshot.
@@ -1464,9 +1665,7 @@ exports.bulkStudents = async (req, res) => {
             // failing, so a corrected sheet can simply be re-uploaded.
             const studentExists = await User.findOne({ email }).lean();
             if (studentExists && (studentExists.role !== 'student' || String(studentExists.school) !== String(req.schoolId))) {
-                const reason = `Email "${email}" belongs to another account`;
-                errors.push({ row: rowNum, name, reason });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason });
+                fail(`Email "${email}" belongs to another account`);
                 continue;
             }
 
@@ -1475,36 +1674,50 @@ exports.bulkStudents = async (req, res) => {
             // than overfilling the section.
             const alreadySeated = studentExists && sectionRoster.has(String(studentExists._id));
             if (sectionSeats > 0 && !alreadySeated && sectionRoster.size >= sectionSeats) {
-                const reason = `Section "${section.sectionName}" of ${className} is full `
-                             + `(${sectionRoster.size} of ${sectionSeats} seats taken)`;
-                errors.push({ row: rowNum, name, reason });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason });
+                fail(`Section "${section.sectionName}" of ${className} is full `
+                   + `(${sectionRoster.size} of ${sectionSeats} seats taken)`);
                 continue;
             }
 
             try {
-                let parentUserId = null;
-                const existingParent = await User.findOne({ email: parentEmail }).lean();
-                if (existingParent) {
-                    parentUserId = existingParent._id;
-                    const pp = await ParentProfile.findOne({ user: existingParent._id }).lean();
-                    if (!pp) await ParentProfile.create({ user: existingParent._id, school: req.schoolId });
-                } else {
-                    const parentOtp = generateOTP();
-                    const parentUser = await createUserHelper({ name: parentName, email: parentEmail, phone: parentPhone, password: parentOtp }, 'parent', req.schoolId);
-                    await ParentProfile.create({ user: parentUser._id, school: req.schoolId });
-                    parentUserId = parentUser._id;
-                    sendWelcomeEmail(parentEmail, parentName, parentEmail, parentOtp, schoolName, req.schoolId);
+                const existingProfile = studentExists
+                    ? await StudentProfile.findOne({ user: studentExists._id }).lean()
+                    : null;
+
+                // Admission and roll numbers carry the form's uniqueness rules.
+                if (admNo) {
+                    const admTaken = await StudentProfile.findOne({
+                        school: req.schoolId, admissionNumber: admNo,
+                        ...(studentExists ? { user: { $ne: studentExists._id } } : {}),
+                    }).lean();
+                    if (admTaken) { fail(`Admission number ${admNo} is already in use`); continue; }
                 }
+                if (rollNumber) {
+                    const takenBy = await rollNumberTaken(section._id, rollNumber, studentExists?._id);
+                    if (takenBy) { fail(`Roll number ${rollNumber} is already used by ${takenBy} in this section`); continue; }
+                }
+
+                // Same helper the wizard uses, so the guardian blocks, the login
+                // holder and the welcome email all behave identically. Documents
+                // already on the parent record survive a re-import.
+                const existingParent = existingProfile?.parent
+                    ? await ParentProfile.findOne({ user: existingProfile.parent }).lean()
+                    : null;
+                const { parentId, error: parentErr } = await resolveNewParent(newParent, {
+                    schoolId: req.schoolId, schoolName, uploads: {}, existingBlocks: existingParent,
+                });
+                if (parentErr) { fail(parentErr); continue; }
+                if (!parentId) { fail('Parent / guardian details are required'); continue; }
 
                 // Blank in the sheet → generated from the school's format
                 const admissionNumber = admNo || await admissionNo.nextAdmissionNumber(bulkSchool, clasDoc);
                 const profileData = {
-                    school: req.schoolId, admissionNumber,
-                    dob, gender, bloodGroup, category,
-                    address, city, state: stateName || stateFromPincode(pincode), pincode,
-                    country: 'India',
-                    currentClass: clasDoc._id, currentSection: section._id, parent: parentUserId,
+                    school: req.schoolId,
+                    ...buildStudentProfile(profile, {}),
+                    admissionNumber,
+                    currentClass: clasDoc._id,
+                    currentSection: section._id,
+                    parent: parentId,
                     // Optional in the sheet: sections assign roll numbers in bulk later.
                     ...(rollNumber ? { rollNumber } : {}),
                 };
@@ -1533,13 +1746,11 @@ exports.bulkStudents = async (req, res) => {
                     { _id: section._id },
                     { $addToSet: { enrolledStudents: studentUser._id } },
                 );
-                await ParentProfile.findOneAndUpdate({ user: parentUserId }, { $addToSet: { children: studentUser._id } });
+                await ParentProfile.findOneAndUpdate({ user: parentId }, { $addToSet: { children: studentUser._id } });
 
                 push({ type: 'row_done', row: rowNum, name, success: true });
             } catch (e) {
-                const reason = e.code === 11000 ? 'Duplicate entry' : e.message;
-                errors.push({ row: rowNum, name, reason });
-                push({ type: 'row_done', row: rowNum, name, success: false, reason });
+                fail(e.code === 11000 ? 'Duplicate entry' : e.message);
             }
         }
 
@@ -1561,11 +1772,14 @@ exports.bulkStudents = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Bulk-import templates.
 //
-//  A template is only useful if the sheet it produces actually imports. Both of
-//  these are therefore built from the school's OWN data: the sample row uses a
-//  class and section that exist, and a second "Reference" sheet lists the exact
-//  values the importer will accept. The previous fixed sample ("Class 10") did
-//  not exist in most schools, so the template's own example row was rejected.
+//  Each template carries one column per field of the matching intake wizard, in
+//  the wizard's own step order, so importing a sheet and filling in the form
+//  produce the same record. Two things keep a template honest:
+//
+//    * the sample row is built from the school's OWN data, so the example
+//      imports as-is instead of failing on a class that never existed; and
+//    * a "Reference" sheet lists the exact values the importer accepts, which
+//      are the intake dropdowns' own lists.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Marks the columns Excel would otherwise mangle (leading zeros, dd/mm/yyyy)
@@ -1578,6 +1792,15 @@ function forceTextColumns(ws, cols, lastRow) {
         }
     }
 }
+
+// Column indices by header name. Naming them beats counting them: these sheets
+// are dozens of columns wide and an off-by-one silently reformats a phone
+// number or a date.
+const colsFor = (headers, names) => names.map((n) => headers.indexOf(n)).filter((i) => i >= 0);
+
+// The sample row, written against the header names rather than by position, for
+// the same reason. Anything not named is left blank.
+const sampleFor = (headers, values) => headers.map((h) => values[h] ?? '');
 
 const widthsFor = (headers) => headers.map((h) => ({ wch: Math.max(12, Math.min(30, h.length + 4)) }));
 
@@ -1599,18 +1822,45 @@ function referenceSheet(wb, sections) {
         rows.push([]);
     }
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{ wch: 26 }, { wch: 40 }];
+    ws['!cols'] = [{ wch: 30 }, { wch: 52 }];
     XLSX.utils.book_append_sheet(wb, ws, 'Reference');
 }
 
+// The seven steps of the add-student wizard, flattened into columns.
+const STUDENT_TEMPLATE_HEADERS = [
+    // 1. Basic
+    'Full Name', 'Email Address', 'Phone Number',
+    // 2. Personal
+    'Date of Birth', 'Gender', 'Blood Group', 'Category', 'Religion', 'Nationality',
+    'Emergency Contact Name', 'Emergency Contact Phone', 'Emergency Contact Relation',
+    // 3. Address
+    'Address', 'City', 'State', 'Pincode', 'Country',
+    'Permanent Same As Current',
+    'Permanent Address', 'Permanent City', 'Permanent State', 'Permanent Pincode', 'Permanent Country',
+    // 4. Documents — only the number travels in a sheet; the scans are uploaded later
+    'Aadhaar Number',
+    // 5. Previous school
+    'Transfer Student', 'Previous School Name', 'Previous School Address', 'Previous School City',
+    'Previous School State', 'Previous School Pincode', 'Previous School Country',
+    'Previous School Medium', 'Previous School Board', 'State Board Name',
+    'Previous Class', 'Previous Academic Year', 'Previous School Leaving Date',
+    'Previous School Contact', 'TC Number', 'TC Date',
+    // 6. Enrolment
+    'Class', 'Section', 'Admission Number', 'Roll Number',
+    // 7. Parents / guardian
+    'Account For',
+    'Father Name', 'Father Email', 'Father Phone', 'Father Occupation', 'Father Organization',
+    'Father Designation', 'Father Qualification', 'Father Annual Income', 'Father Aadhaar Number', 'Father PAN Number',
+    'Mother Name', 'Mother Email', 'Mother Phone', 'Mother Occupation', 'Mother Organization',
+    'Mother Designation', 'Mother Qualification', 'Mother Annual Income', 'Mother Aadhaar Number', 'Mother PAN Number',
+    'Guardian Name', 'Guardian Relation', 'Guardian Email', 'Guardian Phone', 'Guardian Occupation',
+    'Guardian Organization', 'Guardian Designation', 'Guardian Qualification', 'Guardian Annual Income',
+    'Guardian Aadhaar Number', 'Guardian PAN Number',
+];
+
 exports.downloadStudentTemplate = async (req, res) => {
     try {
-        const headers = [
-            'Full Name', 'Email Address', 'Phone Number', 'Admission Number', 'Roll Number',
-            'Date of Birth', 'Gender', 'Blood Group', 'Category',
-            'Class', 'Section', 'Address', 'City', 'State', 'Pincode',
-            'Parent Full Name', 'Parent Email', 'Parent Phone Number',
-        ];
+        const headers = STUDENT_TEMPLATE_HEADERS;
 
         // Sample row built from this school's real classes and sections, so the
         // example imports as-is instead of failing on a class that never existed.
@@ -1624,19 +1874,51 @@ exports.downloadStudentTemplate = async (req, res) => {
             ? sections.find((s) => String(s.class) === String(firstClass._id))
             : null;
         const school = await School.findById(req.schoolId).select('city state').lean();
+        const city   = school?.city  || 'Pune';
+        const state  = STATES_AND_UTS.includes(school?.state) ? school.state : 'Maharashtra';
 
-        const sample = [
-            'Ravi Kumar', 'ravi.kumar@example.com', '9876543210', '', '',
-            '15/08/2010', 'Male', 'B+', 'General',
-            firstClass?.className || 'Class 1', firstSection?.sectionName || 'A',
-            '123 Main Street', school?.city || 'Pune', school?.state || 'Maharashtra', '411001',
-            'Suresh Kumar', 'suresh.kumar@example.com', '9876543200',
-        ];
+        const sample = sampleFor(headers, {
+            'Full Name': 'Ravi Kumar', 'Email Address': 'ravi.kumar@example.com', 'Phone Number': '9876543210',
+
+            'Date of Birth': '15/08/2010', Gender: 'Male', 'Blood Group': 'B+',
+            Category: 'General', Religion: 'Hindu', Nationality: 'Indian',
+            'Emergency Contact Name': 'Suresh Kumar', 'Emergency Contact Phone': '9876543200',
+            'Emergency Contact Relation': 'Father',
+
+            Address: '123 Main Street', City: city, State: state, Pincode: '411001', Country: 'India',
+            'Permanent Same As Current': 'Yes',
+
+            'Aadhaar Number': '123456789012',
+
+            'Transfer Student': 'No',
+            'Previous School Country': 'India',
+
+            Class: firstClass?.className || 'Class 1',
+            Section: firstSection?.sectionName || 'A',
+
+            'Account For': 'Father',
+            'Father Name': 'Suresh Kumar', 'Father Email': 'suresh.kumar@example.com',
+            'Father Phone': '9876543200', 'Father Occupation': 'Engineer',
+            'Father Organization': 'Tata Motors', 'Father Designation': 'Senior Engineer',
+            'Father Qualification': 'B.Tech.', 'Father Annual Income': '850000',
+            'Father Aadhaar Number': '123456789013', 'Father PAN Number': 'ABCDE1234F',
+
+            'Mother Name': 'Sunita Kumar', 'Mother Phone': '9876543201',
+            'Mother Occupation': 'Teacher', 'Mother Qualification': 'M.A.',
+            'Mother Aadhaar Number': '123456789014',
+        });
 
         const wb = XLSX.utils.book_new();
         const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
-        // Phone, Admission No, Roll No, DOB, Pincode, Parent Phone
-        forceTextColumns(ws, [2, 3, 4, 5, 14, 17], 1);
+        forceTextColumns(ws, colsFor(headers, [
+            'Phone Number', 'Date of Birth', 'Emergency Contact Phone',
+            'Pincode', 'Permanent Pincode', 'Aadhaar Number',
+            'Previous School Pincode', 'Previous School Leaving Date', 'Previous School Contact',
+            'Previous Academic Year', 'TC Date', 'Admission Number', 'Roll Number',
+            'Father Phone', 'Father Aadhaar Number', 'Father PAN Number',
+            'Mother Phone', 'Mother Aadhaar Number', 'Mother PAN Number',
+            'Guardian Phone', 'Guardian Aadhaar Number', 'Guardian PAN Number',
+        ]), 1);
         ws['!cols'] = widthsFor(headers);
         XLSX.utils.book_append_sheet(wb, ws, 'Students');
 
@@ -1647,14 +1929,50 @@ exports.downloadStudentTemplate = async (req, res) => {
         referenceSheet(wb, [
             ['Classes (use exactly this text)', classes.map((c) => c.className)],
             ['Class → Section pairs', sectionLabels],
-            ['Gender', ['Male', 'Female', 'Other']],
-            ['Blood Group', ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']],
-            ['Date of Birth format', ['dd/mm/yyyy  (e.g. 15/08/2010)']],
+            ['Gender', GENDERS],
+            ['Blood Group', BLOOD_GROUPS],
+            ['Category', CATEGORIES],
+            ['Previous School Board', SCHOOL_BOARDS],
+            ['Previous School Medium', SCHOOL_MEDIUMS],
+            ['Account For (who holds the login)', ['Father', 'Mother', 'Guardian']],
+            ['Yes / No columns', [
+                'Permanent Same As Current — Yes copies the current address into the permanent one',
+                'Transfer Student — Yes turns on the whole Previous School block below',
+            ]],
+            ['Date format (all date columns)', ['dd/mm/yyyy  (e.g. 15/08/2010)']],
+            ['State / UT (use exactly this text)', STATES_AND_UTS],
             ['Leave blank to auto-generate', ['Admission Number', 'Roll Number']],
             ['Required in every row', [
-                'Full Name', 'Email Address', 'Phone Number', 'Date of Birth', 'Gender',
-                'Blood Group', 'Category', 'Class', 'Section', 'Address',
-                'Parent Full Name', 'Parent Email', 'Parent Phone Number',
+                'Full Name', 'Email Address', 'Phone Number',
+                'Date of Birth', 'Gender', 'Blood Group', 'Category', 'Nationality',
+                'Emergency Contact Name', 'Emergency Contact Phone', 'Emergency Contact Relation',
+                'Address', 'City', 'State', 'Pincode',
+                'Aadhaar Number', 'Class', 'Section',
+            ]],
+            ['Required unless Permanent Same As Current = Yes', [
+                'Permanent Address', 'Permanent City', 'Permanent State', 'Permanent Pincode',
+            ]],
+            ['Required only when Transfer Student = Yes', [
+                'Previous School Name', 'Previous School Address', 'Previous School City',
+                'Previous School State', 'Previous School Pincode',
+                'Previous School Medium', 'Previous School Board',
+                'Previous Class', 'Previous Academic Year', 'Previous School Leaving Date',
+                'Previous School Contact', 'TC Number', 'TC Date',
+                'State Board Name — only when the board is "State Board"',
+            ]],
+            ['Parents — required in every row', [
+                'Father Name, Father Phone, Father Occupation, Father Aadhaar Number',
+                'Mother Name, Mother Phone, Mother Occupation, Mother Aadhaar Number',
+                'The email of whoever "Account For" names — that is the login',
+                'Guardian Name / Phone / Occupation / Aadhaar Number / Relation',
+                '   ...only when Account For = Guardian',
+            ]],
+            ['Cannot be imported — upload by editing the student', [
+                'Passport size photo',
+                'Aadhaar card front and back scans',
+                'Birth certificate, caste / disability / medical certificates',
+                'Transfer Certificate and migration certificate',
+                'Father / mother / guardian Aadhaar, PAN and photo scans',
             ]],
         ]);
 
@@ -1662,43 +1980,124 @@ exports.downloadStudentTemplate = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+// The seven steps of the add-teacher wizard, flattened into columns.
+const TEACHER_TEMPLATE_HEADERS = [
+    // 1. Personal
+    'Full Name', 'Date of Birth', 'Gender', 'Blood Group', "Father's / Husband's Name",
+    'Emergency Contact Name', 'Emergency Contact Phone',
+    // 2. Contact
+    'Phone Number', 'Alternate Phone', 'Email Address',
+    'Current Address', 'Current City', 'Current State', 'Current Pincode', 'Current Country',
+    'Permanent Same As Current',
+    'Permanent Address', 'Permanent City', 'Permanent State', 'Permanent Pincode', 'Permanent Country',
+    // 3. Government ID — numbers only; the scans are uploaded later
+    'Aadhaar Number', 'PAN Number', 'UAN Number',
+    // 4. Education
+    'Qualification', 'Teaching Degree',
+    // 5. Work experience
+    'Employment Type', 'Total Experience', 'Previous School', 'Last Designation',
+    // 6. Bank
+    'Bank Account Holder', 'Bank Account Number', 'IFSC Code', 'Bank Branch',
+    // 7. School internal
+    'Date of Joining', 'Designation', 'Department', 'Employee ID',
+];
+
 exports.downloadTeacherTemplate = async (req, res) => {
     try {
-        // The four-column template produced teachers with no employee ID, no
-        // joining date and no personal details — every one of them showing as an
-        // incomplete profile. These are the fields the importer now reads.
-        const headers = [
-            'Full Name', 'Email Address', 'Phone Number',
-            'Employee ID', 'Designation', 'Department',
-            'Gender', 'Date of Birth', 'Blood Group', 'Date of Joining',
-            'Qualification', 'Teaching Degree', 'Experience',
-        ];
-        const sample = [
-            'Anita Sharma', 'anita.sharma@example.com', '9876543210',
-            '', 'Teacher', 'Mathematics',
-            'Female', '12/04/1990', 'B+', '01/06/2021',
-            'M.Sc.', 'B.Ed.', '5 years',
-        ];
+        const headers = TEACHER_TEMPLATE_HEADERS;
 
-        const school = await School.findById(req.schoolId).select('designations').lean();
+        // The designation list the add-teacher form itself offers, so the sample
+        // row and the reference sheet cannot suggest one that does not exist.
+        await designationSvc.ensureSeeded(req.schoolId, req.userId);
+        const rows   = await Designation.find({ school: req.schoolId, isActive: true }).sort('name').select('name').lean();
+        const school = await School.findById(req.schoolId).select('designations city state').lean();
+        const designations = rows.length
+            ? rows.map((r) => r.name)
+            : (school?.designations?.length ? school.designations : DEFAULT_DESIGNATIONS);
+        const city  = school?.city  || 'Pune';
+        const state = STATES_AND_UTS.includes(school?.state) ? school.state : 'Maharashtra';
+
+        const sample = sampleFor(headers, {
+            'Full Name': 'Anita Sharma', 'Date of Birth': '12/04/1990', Gender: 'Female', 'Blood Group': 'B+',
+            "Father's / Husband's Name": 'Ramesh Sharma',
+            'Emergency Contact Name': 'Ramesh Sharma', 'Emergency Contact Phone': '9876543200',
+
+            'Phone Number': '9876543210', 'Email Address': 'anita.sharma@example.com',
+            'Current Address': '12 Rose Villa, MG Road', 'Current City': city,
+            'Current State': state, 'Current Pincode': '411001', 'Current Country': 'India',
+            'Permanent Same As Current': 'Yes',
+
+            'Aadhaar Number': '123456789012', 'PAN Number': 'ABCDE1234F',
+
+            Qualification: 'M.Sc.', 'Teaching Degree': 'B.Ed.',
+
+            'Employment Type': 'Experienced', 'Total Experience': '5 years',
+            'Previous School': 'Sunrise Public School', 'Last Designation': 'PGT Mathematics',
+
+            'Bank Account Holder': 'Anita Sharma', 'Bank Account Number': '12345678901234',
+            'IFSC Code': 'HDFC0001234', 'Bank Branch': 'MG Road',
+
+            'Date of Joining': '01/06/2021',
+            Designation: designations[0] || 'Teacher',
+            Department: 'Mathematics',
+        });
 
         const wb = XLSX.utils.book_new();
         const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
-        // Phone, Employee ID, Date of Birth, Date of Joining
-        forceTextColumns(ws, [2, 3, 7, 9], 1);
+        forceTextColumns(ws, colsFor(headers, [
+            'Date of Birth', 'Emergency Contact Phone', 'Phone Number', 'Alternate Phone',
+            'Current Pincode', 'Permanent Pincode',
+            'Aadhaar Number', 'PAN Number', 'UAN Number',
+            'Bank Account Number', 'IFSC Code', 'Date of Joining', 'Employee ID',
+        ]), 1);
         ws['!cols'] = widthsFor(headers);
         XLSX.utils.book_append_sheet(wb, ws, 'Teachers');
 
         referenceSheet(wb, [
-            ['Designations (this school)', school?.designations || []],
-            ['Gender', ['Male', 'Female', 'Other']],
-            ['Blood Group', ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']],
-            ['Date format', ['dd/mm/yyyy  (e.g. 01/06/2021)']],
+            ['Designations (this school)', designations],
+            ['Gender', GENDERS],
+            ['Blood Group', BLOOD_GROUPS],
+            ['Qualification', [
+                ...QUALIFICATIONS,
+                'Any other — type the qualification itself, not the word "Other"',
+            ]],
+            ['Teaching Degree', [
+                ...TEACHING_DEGREES,
+                'Any other — type the degree itself, not the word "Other"',
+            ]],
+            ['Employment Type', ['Fresher', 'Experienced']],
+            ['Yes / No columns', [
+                'Permanent Same As Current — Yes copies the current address into the permanent one',
+            ]],
+            ['Date format (all date columns)', ['dd/mm/yyyy  (e.g. 01/06/2021)']],
+            ['State / UT (use exactly this text)', STATES_AND_UTS],
             ['Leave blank to auto-generate', ['Employee ID']],
-            ['Required in every row', ['Full Name', 'Email Address']],
-            ['Note', [
-                'Government ID, bank and document details cannot be imported.',
-                'Add them by editing the teacher after import.',
+            ['Required in every row', [
+                'Full Name', 'Date of Birth', 'Gender', 'Blood Group',
+                "Father's / Husband's Name", 'Emergency Contact Name', 'Emergency Contact Phone',
+                'Phone Number', 'Email Address',
+                'Current Address', 'Current City', 'Current State', 'Current Pincode',
+                'Aadhaar Number', 'PAN Number', 'Qualification', 'Employment Type',
+                'Bank Account Holder', 'Bank Account Number', 'IFSC Code', 'Bank Branch',
+                'Date of Joining',
+            ]],
+            ['Required unless Permanent Same As Current = Yes', [
+                'Permanent Address', 'Permanent City', 'Permanent State', 'Permanent Pincode',
+            ]],
+            ['Required only when Employment Type = Experienced', [
+                'Total Experience', 'Previous School', 'Last Designation',
+            ]],
+            ['Format', [
+                'Aadhaar Number — 12 digits',
+                'PAN Number — ABCDE1234F',
+                'IFSC Code — HDFC0001234',
+                'Bank Account Number — 6 to 20 digits',
+            ]],
+            ['Cannot be imported — upload by editing the teacher', [
+                'Aadhaar card front and back scans',
+                'PAN card scan',
+                'Resignation letter of the last company (required for experienced staff)',
+                'Experience certificate and joining letter',
             ]],
         ]);
 
