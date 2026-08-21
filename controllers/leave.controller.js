@@ -547,19 +547,17 @@ exports.adminGetTeacherBalance = async (req, res) => {
  * back as `days.error` inside a 200 rather than a 400: this is a preview the
  * form paints while the user is still typing, not a failed submission.
  */
-exports.adminApplyPreview = async (req, res) => {
-    try {
-        const { teacherId, leaveTypeId, fromDate, toDate, leaveMode = 'full_day' } = req.query;
+async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, toDate, leaveMode = 'full_day', onBehalf }) {
         if (!teacherId || !leaveTypeId)
-            return res.status(400).json({ success: false, message: 'teacherId and leaveTypeId are required' });
+            return { status: 400, body: { success: false, message: 'teacherId and leaveTypeId are required' } };
 
-        const ltDoc = await LeaveType.findOne({ _id: leaveTypeId, school: req.schoolId }).lean();
-        if (!ltDoc) return res.status(404).json({ success: false, message: 'Leave type not found' });
+        const ltDoc = await LeaveType.findOne({ _id: leaveTypeId, school: schoolId }).lean();
+        if (!ltDoc) return { status: 404, body: { success: false, message: 'Leave type not found' } };
 
         const [school, ay, policy] = await Promise.all([
-            School.findById(req.schoolId).select('leaveSettings modules').lean(),
-            getActiveAcademicYearLabel(req.schoolId),
-            leavePolicy.getPolicy(req.schoolId, ltDoc),
+            School.findById(schoolId).select('leaveSettings modules').lean(),
+            getActiveAcademicYearLabel(schoolId),
+            leavePolicy.getPolicy(schoolId, ltDoc),
         ]);
         const leaveSettings = normalizeLeaveSettings(school?.leaveSettings);
         const holidayModule = !!school?.modules?.holiday;
@@ -567,7 +565,7 @@ exports.adminApplyPreview = async (req, res) => {
         // Read-only: an unallocated teacher must not get a balance row just for
         // opening the form, so this looks the row up instead of upserting it.
         const balRow = ay
-            ? await LeaveBalance.findOne({ teacher: teacherId, school: req.schoolId, leaveType: leaveTypeId, academicYear: ay }).lean()
+            ? await LeaveBalance.findOne({ teacher: teacherId, school: schoolId, leaveType: leaveTypeId, academicYear: ay }).lean()
             : null;
         const remaining = remainingOf(balRow);
         const balance = {
@@ -600,12 +598,12 @@ exports.adminApplyPreview = async (req, res) => {
                 days = { error: 'To date must be on or after From date' };
             } else {
                 const counted = await computeLeaveDays({
-                    schoolId: req.schoolId, from, to, leaveMode, policy, leaveSettings, holidayModule,
+                    schoolId: schoolId, from, to, leaveMode, policy, leaveSettings, holidayModule,
                 });
                 const calendarDays = countCalendarDays(from, to);
                 const workingDays  = countWorkingDays(from, to, leaveSettings);
                 const holidayDays  = holidayModule
-                    ? await countHolidayWorkingDays(from, to, req.schoolId, leaveSettings)
+                    ? await countHolidayWorkingDays(from, to, schoolId, leaveSettings)
                     : 0;
                 days = {
                     error:        counted.error || null,
@@ -629,25 +627,57 @@ exports.adminApplyPreview = async (req, res) => {
         let warning = null;
         if (days && !days.error) {
             const [overlap, check] = await Promise.all([
-                getOverlappingLeave(teacherId, req.schoolId, new Date(fromDate), new Date(toDate)),
+                getOverlappingLeave(teacherId, schoolId, new Date(fromDate), new Date(toDate)),
                 leavePolicy.validateApplication({
-                    schoolId: req.schoolId, policy, teacherId,
+                    schoolId: schoolId, policy, teacherId,
                     from: new Date(fromDate), to: new Date(toDate),
-                    totalDays: days.totalDays, leaveMode, hasDocument: true, onBehalf: true,
+                    totalDays: days.totalDays, leaveMode, hasDocument: true, onBehalf,
                 }),
             ]);
             if (overlap) warning = 'This teacher already has a leave application overlapping these dates';
             else if (!check.ok) warning = check.message;
         }
 
-        res.json({ success: true, data: {
+        return { status: 200, body: { success: true, data: {
             leaveType: { _id: ltDoc._id, name: ltDoc.name, code: ltDoc.code, category: ltDoc.category || 'general' },
             balance,
             days,
             warning,
+            // What the calendar may offer. Back-dating binds everyone; the notice
+            // period is the employee's obligation, so it is waived for onBehalf.
+            dateRules: {
+                allowBackdated:      policy.allowBackdated,
+                backdatedWithinDays: policy.backdatedWithinDays,
+                advanceNoticeDays:   onBehalf ? 0 : policy.advanceNoticeDays,
+                maxConsecutiveDays:  policy.maxConsecutiveDays,
+                halfDayAllowed:      policy.halfDayAllowed,
+                requiresDocument:    policy.requiresDocument,
+                documentRequiredAfterDays: policy.documentRequiredAfterDays,
+            },
             // The one hard stop the form can know about before submitting.
             sufficient: !days || !!days.error || days.totalDays <= balance.spendable,
-        }});
+        }}};
+}
+
+/** Preview for an admin filing on someone else's behalf. */
+exports.adminApplyPreview = async (req, res) => {
+    try {
+        const { teacherId, leaveTypeId, fromDate, toDate, leaveMode } = req.query;
+        const r = await buildApplyPreview({
+            schoolId: req.schoolId, teacherId, leaveTypeId, fromDate, toDate, leaveMode, onBehalf: true,
+        });
+        res.status(r.status).json(r.body);
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/** The same preview for the employee's own application. */
+exports.teacherApplyPreview = async (req, res) => {
+    try {
+        const { leaveTypeId, fromDate, toDate, leaveMode } = req.query;
+        const r = await buildApplyPreview({
+            schoolId: req.schoolId, teacherId: req.userId, leaveTypeId, fromDate, toDate, leaveMode, onBehalf: false,
+        });
+        res.status(r.status).json(r.body);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

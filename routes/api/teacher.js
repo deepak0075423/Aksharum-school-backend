@@ -102,6 +102,8 @@ router.get('/leave',           leaveGuard, leaveCtrl.teacherGetMyLeaves);
 router.get('/leave/balance',   leaveGuard, leaveCtrl.teacherGetLeaveBalance);
 // The rules behind each leave type, and whether this employee qualifies
 router.get('/leave/policies',  leaveGuard, leaveCtrl.teacherGetPolicies);
+// Live balance + working-day count for my own application
+router.get('/leave/apply-preview', leaveGuard, leaveCtrl.teacherApplyPreview);
 // Designation-based approvers are teachers — this is their sign-off queue
 router.get('/leave/approvals',              leaveGuard, leaveCtrl.teacherGetApprovals);
 router.post('/leave/approvals/:id/approve', leaveGuard, leaveCtrl.adminApproveRequest);
