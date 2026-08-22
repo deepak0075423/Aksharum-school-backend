@@ -44,6 +44,7 @@ const { rollNumberTaken } = require('../utils/rollNumbers');
 const admissionNo = require('../utils/admissionNumber');
 const employeeIdUtil = require('../utils/employeeId');
 const { capacityErrorById } = require('../utils/sectionCapacity');
+const { syncSectionsToSchoolSaturday } = require('../utils/timetableDays');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -2489,11 +2490,17 @@ exports.updateSchoolSettings = async (req, res) => {
             previousLogo = current?.logo || null;
         }
 
+        const saturdayChanged = update['leaveSettings.saturdayWorking'] !== undefined;
         const school = await School.findByIdAndUpdate(
             req.schoolId, update, { new: true, select: 'name code email phone website logo leaveSettings admissionNumberFormat employeeIdFormat' }
         ).lean();
 
         if (previousLogo && previousLogo !== school?.logo) deleteSchoolLogo(previousLogo);
+
+        // Turning Saturday on or off here has to reach the sections, or the
+        // timetable keeps using the old week: the generator, the student and
+        // teacher views and the PDFs all resolve Saturday per section.
+        if (saturdayChanged) await syncSectionsToSchoolSaturday(req.schoolId, school);
 
         res.json({ success: true, data: school });
     } catch (e) { jsonErr(res, e); }

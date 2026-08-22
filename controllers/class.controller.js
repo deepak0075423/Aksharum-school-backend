@@ -10,6 +10,8 @@ const { isDate }     = require('../utils/validators');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
 const { capacityError }   = require('../utils/sectionCapacity');
+const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
+const Subject               = require('../models/Subject');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const err = (res, e, status = 500)    => res.status(status).json({ success: false, message: e.message || e });
@@ -551,6 +553,51 @@ exports.createSection = async (req, res) => {
 };
 // Teacher picker for a section: flags who already holds a class-teacher post in
 // the same academic year so the form can grey them out before submitting.
+/**
+ * What each teacher already carries this academic year: how many sections they
+ * teach each subject in, and the total across all of them.
+ *
+ * The subject-teacher dropdown used to show bare names, so an admin adding one
+ * more class to someone had no way of knowing they already had eight. Keyed by
+ * teacher id: { total, bySubject: [{ subject, subjectName, sections }] },
+ * heaviest subject first.
+ */
+async function teachingLoadByTeacher(schoolId, academicYearId) {
+    const sections = await ClassSection.find(
+        { school: schoolId, ...(academicYearId ? { academicYear: academicYearId } : {}) }, '_id',
+    ).lean();
+    if (!sections.length) return {};
+
+    const rows = await SectionSubjectTeacher.find({ section: { $in: sections.map(s => s._id) } })
+        .select('teacher subject section').lean();
+    if (!rows.length) return {};
+
+    const subjectIds = [...new Set(rows.map(r => String(r.subject)))];
+    const subjects   = await Subject.find({ _id: { $in: subjectIds } }, 'subjectName').lean();
+    const nameOf     = Object.fromEntries(subjects.map(s => [String(s._id), s.subjectName]));
+
+    // teacher -> subject -> set of sections. A teacher can hold the same
+    // subject in several sections, and that is exactly the count wanted.
+    const perTeacher = new Map();
+    for (const r of rows) {
+        const t = String(r.teacher);
+        if (!perTeacher.has(t)) perTeacher.set(t, new Map());
+        const bySubject = perTeacher.get(t);
+        const sub = String(r.subject);
+        if (!bySubject.has(sub)) bySubject.set(sub, new Set());
+        bySubject.get(sub).add(String(r.section));
+    }
+
+    const out = {};
+    for (const [teacherId, bySubject] of perTeacher) {
+        const list = [...bySubject.entries()]
+            .map(([subject, secs]) => ({ subject, subjectName: nameOf[subject] || 'Subject', sections: secs.size }))
+            .sort((a, b) => b.sections - a.sections || a.subjectName.localeCompare(b.subjectName));
+        out[teacherId] = { total: list.reduce((n, x) => n + x.sections, 0), bySubject: list };
+    }
+    return out;
+}
+
 exports.getSectionTeacherOptions = async (req, res) => {
     try {
         const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
@@ -582,6 +629,7 @@ exports.getSectionTeacherOptions = async (req, res) => {
                     classTeacherOf: held && held.sectionId !== String(section._id) ? held.label : null,
                 };
             }),
+            load: await teachingLoadByTeacher(req.schoolId, section.academicYear),
         });
     } catch (e) { err(res, e); }
 };

@@ -3,6 +3,10 @@ const Timetable            = require('../models/Timetable');
 const TimetableEntry       = require('../models/TimetableEntry');
 const ClassSection         = require('../models/ClassSection');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
+const School               = require('../models/School');
+// One resolver for "does this section teach on Saturday" — utils/timetableDays.js
+// explains why the school flag and the section flag used to disagree.
+const { daysForSection, syncSectionsToSchoolSaturday } = require('../utils/timetableDays');
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true,  data: d });
 const err = (res, e, s = 500) => res.status(s).json({ success: false, message: e.message || e });
@@ -89,12 +93,12 @@ exports.adminSaveTimetableStructure = async (req, res) => {
             }
         }
 
-        // Sync openOnSaturday from school's leaveSettings (source of truth)
+        // Bring EVERY section back in step with the school setting, not just this
+        // one: per-section drift is exactly what hid Saturday before.
         {
             const School = require('../models/School');
             const school = await School.findById(req.schoolId).select('leaveSettings').lean();
-            const satWorking = school?.leaveSettings?.saturdayWorking !== false;
-            await ClassSection.findByIdAndUpdate(req.params.sectionId, { openOnSaturday: satWorking });
+            await syncSectionsToSchoolSaturday(req.schoolId, school);
         }
 
         const year = await resolveYear(req.schoolId, req.body.yearId);
@@ -305,10 +309,9 @@ exports.adminDownloadSectionTimetable = async (req, res) => {
             .populate('additionalSubjects.teacher', 'name')
             .lean();
 
-        const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
-        if (section.openOnSaturday) days.push('Saturday');
-
         const school = await School.findById(req.schoolId).lean();
+        const days   = daysForSection(section, school);
+
         const { generateTimetablePDF } = require('../utils/timetablePdf');
 
         generateTimetablePDF(res, [{
@@ -355,6 +358,7 @@ exports.adminDownloadAllTimetables = async (req, res) => {
             return cmp !== 0 ? cmp : (a.section?.sectionName || '').localeCompare(b.section?.sectionName || '');
         });
 
+        const school = await School.findById(req.schoolId).lean();
         const pages = await Promise.all(timetables.map(async tt => {
             const section = tt.section;
             if (!section) return null;
@@ -363,8 +367,7 @@ exports.adminDownloadAllTimetables = async (req, res) => {
                 .populate('additionalSubjects.subject', 'subjectName')
                 .populate('additionalSubjects.teacher', 'name')
                 .lean();
-            const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
-            if (section.openOnSaturday) days.push('Saturday');
+            const days = daysForSection(section, school);
             return {
                 className:   section.class?.className || 'Class',
                 sectionName: section.sectionName,
@@ -381,7 +384,6 @@ exports.adminDownloadAllTimetables = async (req, res) => {
                 `all-timetables-${selectedYear.yearName}.pdf`);
         }
 
-        const school = await School.findById(req.schoolId).lean();
         generateTimetablePDF(res, validPages, school,
             `all-timetables-${selectedYear.yearName}.pdf`);
     } catch (e) {
@@ -447,8 +449,11 @@ exports.teacherViewTimetable = async (req, res) => {
             if (refTT?.periodsStructure?.length) periodsStructure = refTT.periodsStructure;
         }
 
-        const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
-        if (entries.some(e => e.dayOfWeek === 'Saturday')) days.push('Saturday');
+        // Driven by the school's week, not by whether this teacher happens to
+        // have a Saturday class — the old test hid the column for everyone
+        // whenever generation had skipped Saturday in the first place.
+        const school = await School.findById(req.schoolId).select('leaveSettings').lean();
+        const days   = daysForSection(null, school);
 
         ok(res, {
             teacher,
@@ -525,9 +530,6 @@ exports.teacherDownloadTimetable = async (req, res) => {
             };
         });
 
-        const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
-        if (entries.some(e => e.dayOfWeek === 'Saturday')) days.push('Saturday');
-
         const firstTTId  = String(entries[0].timetable?._id);
         const refTT      = timetables.find(t => String(t._id) === firstTTId) || timetables[0];
         const teacherTT  = {
@@ -537,6 +539,9 @@ exports.teacherDownloadTimetable = async (req, res) => {
         };
 
         const school = await School.findById(req.schoolId).lean();
+        // The week comes from the school's settings, not from whether this
+        // teacher happens to have a Saturday class.
+        const days   = daysForSection(null, school);
         const { generateTimetablePDF } = require('../utils/timetablePdf');
 
         generateTimetablePDF(res, [{
@@ -603,8 +608,8 @@ exports.teacherClassTimetable = async (req, res) => {
                 .lean();
         }
 
-        const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
-        if (section.openOnSaturday) days.push('Saturday');
+        const school = await School.findById(req.schoolId).select('leaveSettings').lean();
+        const days   = daysForSection(section, school);
 
         const role = String(section.classTeacher || '') === String(req.userId)
             ? 'Class Teacher'
@@ -671,8 +676,8 @@ exports.studentViewTimetable = async (req, res) => {
                 .lean();
         }
 
-        const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
-        if (effectiveSection?.openOnSaturday) days.push('Saturday');
+        const school = await School.findById(req.schoolId).select('leaveSettings').lean();
+        const days   = daysForSection(effectiveSection, school);
 
         ok(res, {
             timetable: tt,
@@ -722,10 +727,9 @@ exports.studentDownloadTimetable = async (req, res) => {
             .populate('additionalSubjects.teacher', 'name')
             .lean();
 
-        const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
-        if (section?.openOnSaturday) days.push('Saturday');
-
         const school = await School.findById(req.schoolId).lean();
+        const days   = daysForSection(section, school);
+
         const { generateTimetablePDF } = require('../utils/timetablePdf');
 
         generateTimetablePDF(res, [{

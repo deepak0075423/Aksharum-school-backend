@@ -28,6 +28,7 @@ const TimetableConflict     = require('../models/TimetableConflict');
 const TimetableAuditLog     = require('../models/TimetableAuditLog');
 
 const tt = require('../services/timetable');
+const { daysForSection } = require('../utils/timetableDays');
 const persistence = require('../services/timetable/persistence');
 const { validate: validateBody } = require('../utils/validators');
 const { newSeed } = require('../services/timetable/rng');
@@ -226,8 +227,9 @@ function sectionGrid({ section, timetable, config, satWorking }) {
             : tt.normalisePeriods(tt.derivePeriods(section)));
     const saturday = tt.normalisePeriods(config?.saturdayTemplate);
 
-    const days = tt.workingDaysFor(config, { leaveSettings: { saturdayWorking: satWorking } })
-        .filter((d) => (d === 'Saturday' ? (satWorking && section.openOnSaturday !== false) : true));
+    // Same resolver the published views use, so the solver and the screens can
+    // never disagree about whether a section teaches on Saturday.
+    const days = daysForSection(section, { leaveSettings: { saturdayWorking: satWorking } }, config?.workingDays);
 
     const breakdown = days.map((day) => {
         const periods = (day === 'Saturday' && saturday.length) ? saturday : weekday;
