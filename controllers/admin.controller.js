@@ -1315,6 +1315,82 @@ function sheetRow(raw) {
     };
 }
 
+// A whole sheet can fail on one missing column, and the report rides back inside
+// the JSON/SSE response rather than costing a second round trip. That only stays
+// cheap if it is bounded: a student row is 76 columns, so ~200 of them is already
+// around half a megabyte of base64. Past that the sheet itself is the thing to
+// fix, and the "How to fix" page says so.
+const MAX_ERROR_ROWS = 200;
+
+/**
+ * The rows that did NOT import, handed back as a workbook to correct.
+ *
+ * It is the admin's own sheet, filtered to the failed rows, with the row number
+ * and the reason added in front. Because the importers look columns up by name
+ * and ignore the ones they do not recognise, this file is itself a valid import
+ * sheet: fix what the Error column names, upload this same file, done. Rows that
+ * imported are absent from it, so a re-upload cannot duplicate them.
+ *
+ * @param {String[]} headers  the header row of the uploaded sheet, in order
+ * @param {Array}    failures [{ row, reason, raw }] — `raw` is the original row
+ * @returns {{ filename, base64, rows, total }|null}
+ */
+function buildErrorReport(headers, failures, filename) {
+    if (!failures.length) return null;
+    const shown = failures.slice(0, MAX_ERROR_ROWS);
+    const cols  = ['Row', 'Error', ...headers];
+    const body  = shown.map((f) => [
+        f.row,
+        f.reason,
+        ...headers.map((h) => {
+            const v = f.raw?.[h];
+            return v === undefined || v === null ? '' : String(v);
+        }),
+    ]);
+
+    const ws = XLSX.utils.aoa_to_sheet([cols, ...body]);
+    // Every column but the row number goes back as text: these cells are the
+    // admin's own, and Excel must not "helpfully" re-read a PIN code or a
+    // dd/mm/yyyy date on the way out and back in again.
+    forceTextColumns(ws, cols.map((_, i) => i).slice(1), body.length);
+    ws['!cols'] = [
+        { wch: 6 }, { wch: 58 },
+        ...headers.map((h) => ({ wch: Math.max(12, Math.min(30, String(h).length + 4)) })),
+    ];
+
+    const guide = [
+        ['How to fix these rows'],
+        [],
+        ['1.', 'The Error column says what stopped each row.'],
+        ['2.', 'Correct the cells it names — everything else is exactly as you uploaded it.'],
+        ['3.', 'Upload this same file again. Row and Error are ignored by the importer.'],
+        [],
+        ['Only the rows that failed are in this file, so re-uploading cannot'],
+        ['duplicate the ones that already imported.'],
+    ];
+    if (failures.length > shown.length) {
+        guide.push(
+            [],
+            [`${failures.length} rows failed — the first ${shown.length} are listed here.`],
+            ['That many failures usually means one thing is wrong across the whole sheet.'],
+            ['Fix it in your original file and upload that again, rather than working from this one.'],
+        );
+    }
+    const guideWs = XLSX.utils.aoa_to_sheet(guide);
+    guideWs['!cols'] = [{ wch: 4 }, { wch: 78 }];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Errors');
+    XLSX.utils.book_append_sheet(wb, guideWs, 'How to fix');
+
+    return {
+        filename,
+        base64: XLSX.write(wb, { type: 'base64', bookType: 'xlsx' }),
+        rows:   shown.length,
+        total:  failures.length,
+    };
+}
+
 /**
  * Keep only the columns the row actually filled in. A blank optional cell then
  * means "leave whatever is on file alone" rather than "erase it", which is what
@@ -1330,20 +1406,31 @@ exports.bulkTeachers = async (req, res) => {
         if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
         const schoolName = req.user?.school?.name || 'School';
         const wb   = XLSX.read(req.file.buffer, { type: 'buffer' });
-        const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows  = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        // The header row verbatim, so a failed row can be handed back in the
+        // admin's own column order rather than a guessed one.
+        const headerRow = (XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })[0] || [])
+            .map((h) => String(h).trim());
         // Needed once for the employee-ID format, not per row.
         const bulkSchoolDoc = await School.findById(req.schoolId).select('name code employeeIdFormat').lean();
 
         let created = 0;
         let updated = 0;
         const errors = [];
+        // The same failures, each still carrying the row it came from, so they
+        // can be written back out as a sheet to correct.
+        const failures = [];
         for (let i = 0; i < rows.length; i++) {
             const rowNum = i + 2;
             const cell   = sheetRow(rows[i]);
 
             const name  = cell('full name', 'name');
             const email = cell('email address', 'email').toLowerCase();
-            const fail  = (reason) => errors.push({ row: rowNum, name: name || '?', reason });
+            const fail  = (reason) => {
+                errors.push({ row: rowNum, name: name || '?', reason });
+                failures.push({ row: rowNum, reason, raw: rows[i] });
+            };
 
             // Dates are dd/mm/yyyy. They are parsed here rather than left to the
             // shared validator, which would hand the string to `new Date` and
@@ -1475,7 +1562,10 @@ exports.bulkTeachers = async (req, res) => {
                 fail(e.code === 11000 ? 'Duplicate entry' : e.message);
             }
         }
-        res.json({ success: true, created, updated, errors });
+        res.json({
+            success: true, created, updated, errors,
+            errorFile: buildErrorReport(headerRow, failures, 'teacher-import-errors.xlsx'),
+        });
     } catch (err) { jsonErr(res, err); }
 };
 
@@ -1493,7 +1583,10 @@ exports.bulkStudents = async (req, res) => {
     try {
         const schoolName = req.user?.school?.name || 'School';
         const wb   = XLSX.read(req.file.buffer, { type: 'buffer' });
-        const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows  = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        const headerRow = (XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })[0] || [])
+            .map((h) => String(h).trim());
 
         push({ type: 'total', total: rows.length });
 
@@ -1509,6 +1602,9 @@ exports.bulkStudents = async (req, res) => {
         let created = 0;
         let updated = 0;
         const errors = [];
+        // The same failures, each still carrying the row it came from, so they
+        // can be written back out as a sheet to correct.
+        const failures = [];
         // sectionId -> live set of student ids seated there during this import.
         const rosterBySection = new Map();
 
@@ -1528,6 +1624,7 @@ exports.bulkStudents = async (req, res) => {
 
             const fail = (reason) => {
                 errors.push({ row: rowNum, name, reason });
+                failures.push({ row: rowNum, reason, raw: rows[i] });
                 push({ type: 'row_done', row: rowNum, name, success: false, reason });
             };
 
@@ -1761,7 +1858,10 @@ exports.bulkStudents = async (req, res) => {
         }));
         if (countOps.length) await ClassSection.bulkWrite(countOps);
 
-        push({ type: 'done', created, updated, errors });
+        push({
+            type: 'done', created, updated, errors,
+            errorFile: buildErrorReport(headerRow, failures, 'student-import-errors.xlsx'),
+        });
         res.end();
     } catch (e) {
         push({ type: 'error', message: e.message });
