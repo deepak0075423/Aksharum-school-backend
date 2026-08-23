@@ -49,6 +49,17 @@ const TimetableEntrySchema = new db.Schema({
         type: db.Types.UUID,
         ref: 'ClassSection',
     }],
+    // Written by hand in the live grid after publishing. Publish reprojects the
+    // whole section from its draft, so this is what tells it — and the admin —
+    // which live corrections are about to be overwritten.
+    isManual: {
+        type: Boolean,
+        default: false,
+    },
+    updatedAt: {
+        type: Date,
+        default: Date.now,
+    },
 });
 
 // Unique period per day per timetable

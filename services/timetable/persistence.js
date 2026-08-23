@@ -63,8 +63,15 @@ const run = (sql, params) => pool.query(sql, params);
 const VERSION_ENTRY_COLUMNS = [
     '_id', 'version', 'school', 'section', 'dayOfWeek', 'periodNumber',
     'subject', 'teacher', 'room', 'additionalSubjects', 'mergeGroup',
-    'isManual', 'isLocked', 'note', 'createdAt', 'updatedAt',
+    'mergedSections', 'isManual', 'isLocked', 'note', 'createdAt', 'updatedAt',
 ];
+
+/** The other sections sharing this lesson, however the caller spelled it. */
+const mergedSectionIds = (a) => uniqIds([
+    ...(a.mergedSectionIds || []), ...(a.mergedSections || []),
+].map(sid).filter(Boolean));
+
+const uniqIds = (list) => [...new Set(list)];
 
 /** Merged partners, normalised to the {subject, teacher, room} shape stored in the column. */
 function mergedPartners(a) {
@@ -83,6 +90,7 @@ async function replaceVersionEntries(versionId, schoolId, assignments) {
         a.dayOfWeek, Number(a.periodNumber),
         sid(a.subjectId ?? a.subject), sid(a.teacherId ?? a.teacher) || null, sid(a.roomId ?? a.room) || null,
         JSON.stringify(mergedPartners(a)), a.mergeGroup || '',
+        JSON.stringify(mergedSectionIds(a)),
         !!a.isManual, !!a.isLocked, a.note || '', now, now,
     ]));
     return chunkedInsert(run, VE, VERSION_ENTRY_COLUMNS, rows);
@@ -122,7 +130,7 @@ async function replaceConflicts(versionId, schoolId, conflicts) {
 
 const LIVE_ENTRY_COLUMNS = [
     '_id', 'timetable', 'dayOfWeek', 'periodNumber', 'subject', 'teacher',
-    'room', 'sourceVersion', 'additionalSubjects', 'mergedSections',
+    'room', 'sourceVersion', 'additionalSubjects', 'mergedSections', 'isManual',
 ];
 
 /**
@@ -186,9 +194,12 @@ async function publishVersion({ version, entries, userId, structureBySection }) 
             e.teacher ? String(e.teacher) : null,
             e.room ? String(e.room) : null,
             String(version._id),
-            // Merged subjects travel with the slot they share.
+            // Merged subjects travel with the slot they share…
             JSON.stringify(mergedPartners(e)),
-            JSON.stringify([]),
+            // …and so do the sections sitting in it.
+            JSON.stringify(mergedSectionIds(e)),
+            // A freshly published slot is the generator's, not a hand edit.
+            false,
         ])).filter((r) => r[1]);
         const inserted = await chunkedInsert(q, TE, LIVE_ENTRY_COLUMNS, liveRows);
 

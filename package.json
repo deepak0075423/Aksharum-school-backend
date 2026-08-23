@@ -1,7 +1,7 @@
 {
   "name": "school-backend",
   "version": "1.0.0",
-  "description": "School Management System — REST API Backend",
+  "description": "School Management System \u2014 REST API Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -18,6 +18,8 @@ const ClassSubject          = require('../models/ClassSubject');
 const User                  = require('../models/User');
 const School                = require('../models/School');
 const Timetable             = require('../models/Timetable');
+const TimetableMergeGroup   = require('../models/TimetableMergeGroup');
+const TimetableEntry        = require('../models/TimetableEntry');
 const Room                  = require('../models/Room');
 const TeacherAvailability   = require('../models/TeacherAvailability');
 const SubjectRequirement    = require('../models/SubjectRequirement');
@@ -30,6 +32,7 @@ const TimetableAuditLog     = require('../models/TimetableAuditLog');
 const tt = require('../services/timetable');
 const { daysForSection } = require('../utils/timetableDays');
 const persistence = require('../services/timetable/persistence');
+const { solve } = require('../services/timetable/solveRunner');
 const { validate: validateBody } = require('../utils/validators');
 const { newSeed } = require('../services/timetable/rng');
 
@@ -460,7 +463,7 @@ exports.getConfig = async (req, res) => {
             allowSubjectsInActivity: false,
             defaults: {
                 maxTeacherPeriodsPerDay: 6, maxTeacherPeriodsPerWeek: 30,
-                enforceRoomCapacity: true, enforceTeacherQualified: true, hardTeacherDailyLimit: true,
+                enforceTeacherQualified: true, hardTeacherDailyLimit: true,
             },
             softWeights: tt.DEFAULT_SOFT_WEIGHTS,
             solver: tt.DEFAULT_SOLVER,
@@ -521,6 +524,473 @@ exports.saveConfig = async (req, res) => {
 /* ══════════════════════════════════════════════════════════════════════════
    ROOMS
    ══════════════════════════════════════════════════════════════════════════ */
+
+/* ══════════════════════════════════════════════════════════════════════════
+   MERGE GROUPS — sections taught a subject together
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/** A group with its sections, subject and pins resolved for display. */
+async function hydrateGroups(schoolId, groups) {
+    if (!groups.length) return [];
+    const sectionIds = uniq(groups.flatMap((g) => (g.sections || []).map(sid)));
+    const [sections, subjects, teachers, rooms] = await Promise.all([
+        ClassSection.find({ _id: { $in: sectionIds } }).select('sectionName class').lean(),
+        Subject.find({ _id: { $in: uniq(groups.map((g) => sid(g.subject))) } }).select('subjectName').lean(),
+        User.find({ _id: { $in: uniq(groups.map((g) => sid(g.teacher))) } }).select('name').lean(),
+        Room.find({ _id: { $in: uniq(groups.map((g) => sid(g.room))) } }).select('roomName').lean(),
+    ]);
+    const classes = await Class.find({ _id: { $in: uniq(sections.map((x) => sid(x.class))) } }).select('className').lean();
+    const className = new Map(classes.map((c) => [sid(c._id), c.className]));
+    const sectionById = new Map(sections.map((x) => [sid(x._id), {
+        _id: sid(x._id),
+        label: `${className.get(sid(x.class)) || 'Class'} – ${x.sectionName}`,
+    }]));
+    const subjectName = new Map(subjects.map((x) => [sid(x._id), x.subjectName]));
+    const teacherName = new Map(teachers.map((x) => [sid(x._id), x.name]));
+    const roomName    = new Map(rooms.map((x) => [sid(x._id), x.roomName]));
+
+    return groups.map((g) => ({
+        _id: sid(g._id),
+        subject: sid(g.subject),
+        subjectName: subjectName.get(sid(g.subject)) || 'Subject',
+        sections: (g.sections || []).map(sid).map((id) => sectionById.get(id) || { _id: id, label: 'Section' }),
+        teacher: sid(g.teacher),
+        teacherName: teacherName.get(sid(g.teacher)) || '',
+        room: sid(g.room),
+        roomName: roomName.get(sid(g.room)) || '',
+        source: g.source || 'plan',
+        isActive: g.isActive !== false,
+        label: `${subjectName.get(sid(g.subject)) || 'Subject'} — ${(g.sections || []).map(sid).map((id) => sectionById.get(id)?.label || '?').join(' + ')}`,
+    }));
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   CARRY FORWARD — last year's timetable as this year's starting point
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Copy a year's timetable settings into another year.
+ *
+ * Rebuilding a timetable from nothing every July is the single biggest chore in
+ * this module. Sections are matched by class name + section name, because the
+ * rows themselves are new every year — 9-A of 2025 and 9-A of 2026 are different
+ * records describing the same room of children.
+ *
+ * Requirements, merges and the period grid carry; the placements do not. What
+ * comes across is the PLAN, so the solver still produces a schedule that fits
+ * this year's staff.
+ */
+exports.carryForward = async (req, res) => {
+    try {
+        const from = await AcademicYear.findOne({ _id: req.body.fromYearId, school: req.schoolId }).lean();
+        const to   = await AcademicYear.findOne({ _id: req.body.toYearId,   school: req.schoolId }).lean();
+        if (!from) return err(res, 'Pick the year to copy from', 400);
+        if (!to)   return err(res, 'Pick the year to copy into', 400);
+        if (String(from._id) === String(to._id)) return err(res, 'Those are the same year', 400);
+
+        const dryRun = req.body.apply !== true && req.body.apply !== 'true';
+
+        const [fromSections, toSections] = await Promise.all([
+            ClassSection.find({ school: req.schoolId, academicYear: from._id }).select('sectionName class').lean(),
+            ClassSection.find({ school: req.schoolId, academicYear: to._id }).select('sectionName class').lean(),
+        ]);
+        if (!toSections.length) return err(res, `${to.yearName || 'That year'} has no sections yet`, 400);
+
+        const classes = await Class.find({
+            _id: { $in: uniq([...fromSections, ...toSections].map((x) => sid(x.class))) },
+        }).select('className').lean();
+        const className = new Map(classes.map((c) => [sid(c._id), c.className]));
+        const keyOf = (x) => `${className.get(sid(x.class)) || '?'}#${x.sectionName}`;
+
+        const toByKey = new Map(toSections.map((x) => [keyOf(x), x]));
+        const pairs = [];
+        const unmatched = [];
+        for (const f of fromSections) {
+            const match = toByKey.get(keyOf(f));
+            if (match) pairs.push({ from: sid(f._id), to: sid(match._id), label: keyOf(f).replace('#', ' – ') });
+            else unmatched.push(keyOf(f).replace('#', ' – '));
+        }
+        if (!pairs.length) return err(res, 'No sections in the two years share a class and section name', 400);
+
+        const map = new Map(pairs.map((p) => [p.from, p.to]));
+
+        const [reqs, merges, config, timetables] = await Promise.all([
+            SubjectRequirement.find({ school: req.schoolId, academicYear: from._id, isActive: true }).lean(),
+            TimetableMergeGroup.find({ school: req.schoolId, academicYear: from._id, isActive: true }).lean(),
+            TimetableConfig.findOne({ school: req.schoolId, academicYear: from._id }).lean(),
+            Timetable.find({ section: { $in: pairs.map((p) => p.from) }, academicYear: from._id })
+                .select('section periodsStructure schoolStartTime schoolEndTime').lean(),
+        ]);
+
+        const carriedReqs = reqs.filter((r) => map.has(sid(r.section)));
+        const carriedMerges = merges.filter((g) => (g.sections || []).every((x) => map.has(sid(x))));
+        const droppedMerges = merges.length - carriedMerges.length;
+
+        const plan = {
+            fromYear: from.yearName || String(from._id),
+            toYear: to.yearName || String(to._id),
+            sections: pairs.map((p) => p.label),
+            unmatchedSections: unmatched,
+            requirements: carriedReqs.length,
+            merges: carriedMerges.length,
+            mergesDropped: droppedMerges,
+            periodStructures: timetables.length,
+            config: !!config,
+        };
+        if (dryRun) return ok(res, { ...plan, applied: false });
+
+        /* ── Write ────────────────────────────────────────────────────────── */
+        // Replaced, not merged: carrying forward twice must not double the plan.
+        await SubjectRequirement.deleteMany({
+            school: req.schoolId, academicYear: to._id, section: { $in: [...map.values()] },
+        });
+        if (carriedReqs.length) {
+            await SubjectRequirement.insertMany(carriedReqs.map((r) => {
+                const { _id, createdAt, updatedAt, ...rest } = r;
+                return { ...rest, academicYear: to._id, section: map.get(sid(r.section)), createdBy: req.userId };
+            }));
+        }
+
+        await TimetableMergeGroup.deleteMany({ school: req.schoolId, academicYear: to._id });
+        if (carriedMerges.length) {
+            await TimetableMergeGroup.insertMany(carriedMerges.map((g) => {
+                const { _id, createdAt, updatedAt, ...rest } = g;
+                return {
+                    ...rest,
+                    academicYear: to._id,
+                    sections: (g.sections || []).map((x) => map.get(sid(x))),
+                    createdBy: req.userId,
+                };
+            }));
+        }
+
+        if (config) {
+            const { _id, createdAt, updatedAt, ...rest } = config;
+            await TimetableConfig.findOneAndUpdate(
+                { school: req.schoolId, academicYear: to._id },
+                { $set: { ...rest, academicYear: to._id, updatedBy: req.userId } },
+                { upsert: true },
+            );
+        }
+
+        // The period grid too — a section with no structure falls back to the
+        // school template, which is rarely what last year actually ran.
+        let grids = 0;
+        for (const t of timetables) {
+            const target = map.get(sid(t.section));
+            if (!target) continue;
+            await Timetable.findOneAndUpdate(
+                { section: target, academicYear: to._id },
+                {
+                    $set: {
+                        periodsStructure: t.periodsStructure || [],
+                        schoolStartTime: t.schoolStartTime || '08:00',
+                        schoolEndTime: t.schoolEndTime || '15:00',
+                    },
+                    $setOnInsert: { section: target, academicYear: to._id, createdBy: req.userId },
+                },
+                { upsert: true },
+            );
+            grids += 1;
+        }
+
+        await logAudit(req, 'create', 'carry_forward', to._id,
+            `Carried the timetable plan from ${plan.fromYear} into ${plan.toYear}`, plan);
+
+        ok(res, { ...plan, periodStructures: grids, applied: true });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/* ══════════════════════════════════════════════════════════════════════════
+   REPORTS — who is carrying what, and what the rooms are doing
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The published week, as rows one report can group any way it likes.
+ *
+ * Reads the LIVE timetable rather than a draft: these answer "what is actually
+ * happening", not "what would happen if we published this".
+ */
+async function publishedWeek(schoolId, academicYearId) {
+    const sections = await ClassSection.find({ school: schoolId, academicYear: academicYearId })
+        .select('sectionName class').lean();
+    if (!sections.length) return { rows: [], sections: [], days: [] };
+
+    const [timetables, classes, school, config] = await Promise.all([
+        Timetable.find({ section: { $in: sections.map((x) => x._id) }, academicYear: academicYearId })
+            .select('_id section periodsStructure').lean(),
+        Class.find({ _id: { $in: uniq(sections.map((x) => sid(x.class))) } }).select('className').lean(),
+        School.findById(schoolId).select('leaveSettings').lean(),
+        TimetableConfig.findOne({ school: schoolId, academicYear: academicYearId }).lean(),
+    ]);
+    if (!timetables.length) return { rows: [], sections: [], days: [] };
+
+    const className = new Map(classes.map((c) => [sid(c._id), c.className]));
+    const label = new Map(sections.map((x) => [
+        sid(x._id), `${className.get(sid(x.class)) || 'Class'} – ${x.sectionName}`,
+    ]));
+    const sectionOf = new Map(timetables.map((t) => [sid(t._id), sid(t.section)]));
+
+    const entries = await TimetableEntry.find({ timetable: { $in: timetables.map((t) => t._id) } })
+        .select('timetable dayOfWeek periodNumber subject teacher room mergedSections').lean();
+
+    const days = daysForSection(null, school, config?.workingDays);
+    // One teaching slot per section per day, for the "free periods" arithmetic.
+    const slotsPerSection = new Map(timetables.map((t) => [
+        sid(t.section),
+        (t.periodsStructure || []).filter((x) => !x.isRecess && (x.periodType || 'Teaching') === 'Teaching').length,
+    ]));
+
+    return {
+        rows: entries.map((e) => ({
+            section: sectionOf.get(sid(e.timetable)),
+            sectionLabel: label.get(sectionOf.get(sid(e.timetable))) || 'Section',
+            dayOfWeek: e.dayOfWeek,
+            periodNumber: e.periodNumber,
+            subject: sid(e.subject),
+            teacher: sid(e.teacher),
+            room: sid(e.room),
+            mergedSections: (e.mergedSections || []).map(sid),
+        })),
+        sections: [...label.entries()].map(([id, l]) => ({ _id: id, label: l })),
+        days,
+        slotsPerSection,
+    };
+}
+
+/**
+ * GET — what every teacher is carrying, and when they are free.
+ *
+ * A merged lesson is one lesson however many sections sit in it, so it counts
+ * once against the teacher who takes it.
+ */
+exports.teacherWorkload = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const { rows, days } = await publishedWeek(req.schoolId, year._id);
+        const [teachers, subjects, availability] = await Promise.all([
+            User.find({ school: req.schoolId, role: 'teacher', isActive: true }).select('name').sort('name').lean(),
+            Subject.find({ school: req.schoolId }).select('subjectName').lean(),
+            TeacherAvailability.find({ school: req.schoolId, academicYear: year._id }).lean(),
+        ]);
+        const subjectName = new Map(subjects.map((x) => [sid(x._id), x.subjectName]));
+        const capOf = new Map(availability.map((a) => [sid(a.teacher), a.maxPeriodsPerWeek || 0]));
+
+        // Merged lessons are written once per section — count the lesson, not the rows.
+        const counted = new Set();
+        const byTeacher = new Map();
+        for (const r of rows) {
+            if (!r.teacher) continue;
+            const mergeKey = r.mergedSections.length
+                ? `${[r.section, ...r.mergedSections].sort().join('|')}#${r.dayOfWeek}#${r.periodNumber}#${r.subject}`
+                : null;
+            if (mergeKey) {
+                if (counted.has(mergeKey)) continue;
+                counted.add(mergeKey);
+            }
+            if (!byTeacher.has(r.teacher)) {
+                byTeacher.set(r.teacher, { periods: 0, byDay: {}, bySubject: {}, sections: new Set(), busy: new Set() });
+            }
+            const t = byTeacher.get(r.teacher);
+            t.periods += 1;
+            t.byDay[r.dayOfWeek] = (t.byDay[r.dayOfWeek] || 0) + 1;
+            const sn = subjectName.get(r.subject) || 'Subject';
+            t.bySubject[sn] = (t.bySubject[sn] || 0) + 1;
+            t.sections.add(r.section);
+            for (const secId of [r.section, ...r.mergedSections]) t.sections.add(secId);
+            t.busy.add(`${r.dayOfWeek}#${r.periodNumber}`);
+        }
+
+        const periodsInWeek = Math.max(0, ...rows.map((r) => Number(r.periodNumber) || 0));
+        const weekSlots = periodsInWeek * days.length;
+
+        const report = teachers.map((t) => {
+            const load = byTeacher.get(sid(t._id));
+            const periods = load?.periods || 0;
+            const cap = capOf.get(sid(t._id)) || 0;
+            return {
+                _id: sid(t._id),
+                name: t.name,
+                periods,
+                freePeriods: Math.max(0, weekSlots - periods),
+                sections: load ? load.sections.size : 0,
+                busiestDay: load
+                    ? Object.entries(load.byDay).sort((a, b) => b[1] - a[1])[0]?.[0] || ''
+                    : '',
+                byDay: load?.byDay || {},
+                bySubject: load
+                    ? Object.entries(load.bySubject).map(([name, n]) => ({ subjectName: name, periods: n }))
+                        .sort((a, b) => b.periods - a.periods)
+                    : [],
+                cap,
+                overCap: cap > 0 && periods > cap,
+            };
+        }).sort((a, b) => b.periods - a.periods);
+
+        const busy = report.filter((r) => r.periods > 0);
+        ok(res, {
+            days,
+            weekSlots,
+            teachers: report,
+            summary: {
+                teaching: busy.length,
+                idle: report.length - busy.length,
+                overCap: report.filter((r) => r.overCap).length,
+                busiest: busy[0]?.periods || 0,
+                lightest: busy.length ? busy[busy.length - 1].periods : 0,
+                average: busy.length ? Math.round((busy.reduce((n, r) => n + r.periods, 0) / busy.length) * 10) / 10 : 0,
+            },
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/** GET — how hard each room is worked, and when it sits empty. */
+exports.roomUtilisation = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const { rows, days } = await publishedWeek(req.schoolId, year._id);
+        const rooms = await Room.find({ school: req.schoolId, isActive: true })
+            .select('roomName roomType').sort('roomName').lean();
+
+        const periodsInWeek = Math.max(0, ...rows.map((r) => Number(r.periodNumber) || 0));
+        const weekSlots = periodsInWeek * days.length;
+
+        const counted = new Set();
+        const byRoom = new Map();
+        for (const r of rows) {
+            if (!r.room) continue;
+            // One merged lesson occupies the room once.
+            const key = `${r.room}#${r.dayOfWeek}#${r.periodNumber}`;
+            if (counted.has(key)) continue;
+            counted.add(key);
+            if (!byRoom.has(r.room)) byRoom.set(r.room, { periods: 0, byDay: {}, sections: new Set() });
+            const b = byRoom.get(r.room);
+            b.periods += 1;
+            b.byDay[r.dayOfWeek] = (b.byDay[r.dayOfWeek] || 0) + 1;
+            b.sections.add(r.section);
+        }
+
+        const report = rooms.map((room) => {
+            const b = byRoom.get(sid(room._id));
+            const periods = b?.periods || 0;
+            return {
+                _id: sid(room._id),
+                roomName: room.roomName,
+                roomType: room.roomType,
+                periods,
+                freeSlots: Math.max(0, weekSlots - periods),
+                utilisation: weekSlots ? Math.round((periods / weekSlots) * 100) : 0,
+                sections: b ? b.sections.size : 0,
+                byDay: b?.byDay || {},
+            };
+        }).sort((a, b) => b.periods - a.periods);
+
+        const unroomed = rows.filter((r) => !r.room).length;
+        ok(res, {
+            days,
+            weekSlots,
+            rooms: report,
+            summary: {
+                total: report.length,
+                used: report.filter((r) => r.periods > 0).length,
+                idle: report.filter((r) => r.periods === 0).length,
+                busiest: report[0]?.roomName || '',
+                periodsWithoutARoom: unroomed,
+            },
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+exports.listMergeGroups = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+        const filter = { school: req.schoolId, academicYear: year._id };
+        if (req.query.subjectId) filter.subject = req.query.subjectId;
+        const groups = await hydrateGroups(req.schoolId, await TimetableMergeGroup.find(filter).lean());
+        // A group is only relevant to a class if the class owns one of its sections.
+        if (req.query.sectionIds) {
+            const want = new Set(String(req.query.sectionIds).split(',').map((x) => x.trim()).filter(Boolean));
+            return ok(res, groups.filter((g) => g.sections.some((sec) => want.has(sec._id))));
+        }
+        ok(res, groups);
+    } catch (e) { err(res, e, e.status); }
+};
+
+/**
+ * Create or replace a merge. One subject may only be merged one way per year —
+ * a section cannot be sitting in two different combined classes for the same
+ * subject — so overlapping groups are replaced rather than stacked.
+ */
+exports.saveMergeGroup = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.body.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const subject = sid(req.body.subject);
+        const sections = uniq((req.body.sections || []).map(sid));
+        if (!subject) return err(res, 'A subject is required', 400);
+        if (sections.length < 2) return err(res, 'Pick at least two sections to merge', 400);
+
+        const known = await ClassSection.find({
+            _id: { $in: sections }, school: req.schoolId, academicYear: year._id,
+        }).select('_id').lean();
+        if (known.length !== sections.length) return err(res, 'One of those sections is not in this academic year', 400);
+
+        const payload = {
+            school: req.schoolId,
+            academicYear: year._id,
+            subject,
+            sections,
+            teacher: sid(req.body.teacher) || null,
+            room: sid(req.body.room) || null,
+            source: req.body.source === 'manual' ? 'manual' : 'plan',
+            isActive: req.body.isActive !== false,
+            createdBy: req.userId,
+        };
+
+        const id = req.params.id || sid(req.body._id);
+        let saved;
+        if (id) {
+            saved = await TimetableMergeGroup.findOneAndUpdate(
+                { _id: id, school: req.schoolId }, { $set: payload }, { new: true },
+            );
+            if (!saved) return err(res, 'Merge not found', 404);
+        } else {
+            saved = await TimetableMergeGroup.create(payload);
+        }
+
+        // Drop any other group for this subject that shares a section with it.
+        const siblings = await TimetableMergeGroup.find({
+            school: req.schoolId, academicYear: year._id, subject,
+            _id: { $ne: saved._id },
+        }).lean();
+        const overlapping = siblings
+            .filter((g) => (g.sections || []).map(sid).some((x) => sections.includes(x)))
+            .map((g) => g._id);
+        if (overlapping.length) await TimetableMergeGroup.deleteMany({ _id: { $in: overlapping } });
+
+        await logAudit(req, 'update', 'merge_group', saved._id,
+            `Merged ${sections.length} sections for one subject`, { subject, sections });
+
+        const [hydrated] = await hydrateGroups(req.schoolId, [saved.toObject ? saved.toObject() : saved]);
+        ok(res, { ...hydrated, replaced: overlapping.length }, id ? 200 : 201);
+    } catch (e) { err(res, e, e.status); }
+};
+
+exports.deleteMergeGroup = async (req, res) => {
+    try {
+        const group = await TimetableMergeGroup.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!group) return err(res, 'Merge not found', 404);
+        await TimetableMergeGroup.deleteOne({ _id: group._id });
+        await logAudit(req, 'delete', 'merge_group', group._id, 'Removed a section merge');
+        ok(res, { _id: sid(group._id) });
+    } catch (e) { err(res, e, e.status); }
+};
 
 exports.listRooms = async (req, res) => {
     try {
@@ -731,6 +1201,70 @@ function advanceProgress(progress, stepKey, percent) {
  * client and risk a proxy timeout. Progress is written to the version row, so
  * ANY cluster worker can answer the poll — not just the one solving.
  */
+/**
+ * Slots a merge is already committed to, for sections this run is not touching.
+ *
+ * When a school generates section by section, the second run has to place the
+ * merged lesson exactly where the first one put it — otherwise 9-A and 9-B end
+ * up in the same room at different times, or in different rooms at the same one.
+ * The published timetable is the record of what was already decided.
+ */
+async function mergePinsOutsideScope(schoolId, version, input) {
+    const scope = new Set((version.sections || []).map(String));
+    const groups = await TimetableMergeGroup.find({
+        school: schoolId, academicYear: version.academicYear, isActive: true,
+    }).lean();
+    if (!groups.length) return [];
+
+    // Only groups that straddle the scope boundary matter: if every member is
+    // being regenerated, the solver is free to place them wherever it likes.
+    const outside = [];
+    for (const g of groups) {
+        const members = (g.sections || []).map(String);
+        if (members.length < 2) continue;
+        const inScope = members.filter((m) => scope.has(m));
+        const settled = members.filter((m) => !scope.has(m));
+        if (!inScope.length || !settled.length) continue;
+        outside.push({ subject: String(g.subject), inScope, settled });
+    }
+    if (!outside.length) return [];
+
+    const settledIds = [...new Set(outside.flatMap((g) => g.settled))];
+    const timetables = await Timetable.find({
+        section: { $in: settledIds }, academicYear: version.academicYear,
+    }).select('_id section').lean();
+    if (!timetables.length) return [];
+    const sectionOf = new Map(timetables.map((t) => [String(t._id), String(t.section)]));
+
+    const entries = await TimetableEntry.find({
+        timetable: { $in: timetables.map((t) => t._id) },
+    }).select('timetable dayOfWeek periodNumber subject teacher room').lean();
+
+    const pins = [];
+    for (const e of entries) {
+        const secId = sectionOf.get(String(e.timetable));
+        const group = outside.find((g) => g.subject === String(e.subject) && g.settled.includes(secId));
+        if (!group) continue;
+        // Pin against a section this run IS generating — that is the one the
+        // solver has a block for.
+        for (const target of group.inScope) {
+            pins.push({
+                sectionId: target,
+                subjectId: String(e.subject),
+                teacherId: e.teacher ? String(e.teacher) : null,
+                roomId: e.room ? String(e.room) : null,
+                dayOfWeek: e.dayOfWeek,
+                periodNumber: e.periodNumber,
+                size: 1,
+            });
+        }
+    }
+    return pins;
+}
+
+// Exported for tests: the one-section-at-a-time path is the whole point of it.
+exports._mergePinsOutsideScope = mergePinsOutsideScope;
+
 async function runGeneration(versionId, schoolId) {
     let progress = initialProgress();
     try {
@@ -756,18 +1290,30 @@ async function runGeneration(versionId, schoolId) {
         input.seed = version.seed || newSeed();
 
         // Carry hand-made edits over from the version this run is based on.
+        const pins = [];
         if (version.options?.preserveManualEdits && version.basedOn) {
             const manual = await TimetableVersionEntry.find({ version: version.basedOn, isManual: true }).lean();
-            input.pinned = manual.map((m) => ({
+            pins.push(...manual.map((m) => ({
                 sectionId: sid(m.section), subjectId: sid(m.subject), teacherId: sid(m.teacher),
                 roomId: sid(m.room), dayOfWeek: m.dayOfWeek, periodNumber: m.periodNumber, size: 1,
-            }));
+            })));
         }
+        // Merges already fixed by an earlier run. Generating one section at a
+        // time must not move a lesson its partner is already sitting in, so any
+        // published slot belonging to a merge partner OUTSIDE this scope is
+        // pinned before the solver starts.
+        pins.push(...await mergePinsOutsideScope(schoolId, version, input));
+        if (pins.length) input.pinned = pins;
 
-        const result = tt.generate(input, { onProgress });
+        // Off the request thread: the solve is pure CPU and would otherwise pin
+        // this worker for its whole run, serving nothing else meanwhile.
+        const result = await solve(input, onProgress);
 
-        // Re-validate the finished grid independently of the solver.
-        const report = tt.validate(result.ctx, result.assignments);
+        // Re-validate the finished grid independently of the solver. The worker
+        // cannot ship its context back (it holds Maps and back-references), so
+        // it is recompiled here from the same input — which is a stronger check
+        // than reusing the solver's own, not a weaker one.
+        const report = tt.validate(tt.compile(input), result.assignments);
         const conflicts = dedupeConflicts([...result.conflicts, ...report.conflicts]);
 
         await persistence.replaceVersionEntries(versionId, schoolId, result.assignments);
@@ -1630,6 +2176,146 @@ exports.validateVersion = async (req, res) => {
     } catch (e) { err(res, e, e.status); }
 };
 
+/**
+ * Live corrections that publishing is about to reproject over.
+ *
+ * Publish replaces every entry of every section in the version, so anything
+ * typed into the live grid since the last publish disappears. The draft side has
+ * `preserveManualEdits` for exactly this; the live side had nothing, so the loss
+ * was silent. Now it is counted, listed, and has to be acknowledged.
+ */
+/**
+ * Teachers and rooms this draft would collide with in sections it does not own.
+ *
+ * The solver only ever sees the sections in its own scope, so a version is
+ * internally perfect and can still put a teacher in two places once it lands
+ * beside a timetable published from a different run. That is how five genuine
+ * double-bookings reached the live grid unnoticed. Publish is the last moment
+ * anyone can catch it, so it is checked here against what is already live.
+ */
+async function clashesOutsideVersion(version, entries) {
+    const scope = new Set((version.sections || []).map(String));
+    const teacherIds = uniq(entries.map((e) => sid(e.teacher)).filter(Boolean));
+    const roomIds    = uniq(entries.map((e) => sid(e.room)).filter(Boolean));
+    if (!teacherIds.length && !roomIds.length) return [];
+
+    // Every OTHER section's live timetable for this year.
+    const timetables = await Timetable.find({ academicYear: version.academicYear })
+        .select('_id section').lean();
+    const outside = timetables.filter((t) => !scope.has(sid(t.section)));
+    if (!outside.length) return [];
+
+    const live = await TimetableEntry.find({
+        timetable: { $in: outside.map((t) => t._id) },
+        $or: [
+            ...(teacherIds.length ? [{ teacher: { $in: teacherIds } }] : []),
+            ...(roomIds.length    ? [{ room:    { $in: roomIds } }]    : []),
+        ],
+    }).select('timetable dayOfWeek periodNumber teacher room mergedSections').lean();
+    if (!live.length) return [];
+
+    const sectionOf = new Map(outside.map((t) => [sid(t._id), sid(t.section)]));
+    const [sections, teachers, rooms] = await Promise.all([
+        ClassSection.find({ _id: { $in: uniq([...sectionOf.values()]) } }).select('sectionName').lean(),
+        User.find({ _id: { $in: teacherIds } }).select('name').lean(),
+        Room.find({ _id: { $in: roomIds } }).select('roomName').lean(),
+    ]);
+    const sectionName = new Map(sections.map((x) => [sid(x._id), x.sectionName]));
+    const teacherName = new Map(teachers.map((x) => [sid(x._id), x.name]));
+    const roomName    = new Map(rooms.map((x) => [sid(x._id), x.roomName]));
+
+    // Index the live side once — entries × live is otherwise quadratic.
+    const bySlot = new Map();
+    for (const l of live) {
+        const key = `${l.dayOfWeek}#${l.periodNumber}`;
+        if (!bySlot.has(key)) bySlot.set(key, []);
+        bySlot.get(key).push(l);
+    }
+
+    const out = [];
+    for (const e of entries) {
+        for (const l of bySlot.get(`${e.dayOfWeek}#${e.periodNumber}`) || []) {
+            const otherSection = sectionOf.get(sid(l.timetable));
+            // A merged lesson is the same lesson in both places, not a collision.
+            const shared = (l.mergedSections || []).map(sid).includes(sid(e.section))
+                || (e.mergedSections || []).map(sid).includes(otherSection);
+            if (shared) continue;
+            const where = `${sectionName.get(otherSection) || 'another section'} at ${e.dayOfWeek} P${e.periodNumber}`;
+            if (e.teacher && sid(l.teacher) === sid(e.teacher)) {
+                out.push({
+                    kind: 'teacher',
+                    name: teacherName.get(sid(e.teacher)) || 'A teacher',
+                    dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
+                    message: `${teacherName.get(sid(e.teacher)) || 'A teacher'} is already teaching ${where}`,
+                });
+            }
+            if (e.room && sid(l.room) === sid(e.room)) {
+                out.push({
+                    kind: 'room',
+                    name: roomName.get(sid(e.room)) || 'A room',
+                    dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
+                    message: `${roomName.get(sid(e.room)) || 'A room'} is already booked by ${where}`,
+                });
+            }
+        }
+    }
+    // The same teacher clashing across six periods is one problem, listed six
+    // times, so collapse to one line per person or room per slot.
+    const seen = new Set();
+    return out.filter((c) => {
+        const k = `${c.kind}#${c.name}#${c.dayOfWeek}#${c.periodNumber}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+    });
+}
+
+async function liveEditsAtRisk(version) {
+    const timetables = await Timetable.find({
+        section: { $in: version.sections || [] }, academicYear: version.academicYear,
+    }).select('_id section').lean();
+    if (!timetables.length) return [];
+
+    const sectionOf = new Map(timetables.map((t) => [sid(t._id), sid(t.section)]));
+    const edits = await TimetableEntry.find({
+        timetable: { $in: timetables.map((t) => t._id) }, isManual: true,
+    }).select('timetable dayOfWeek periodNumber subject teacher').lean();
+    if (!edits.length) return [];
+
+    const [sections, subjects] = await Promise.all([
+        ClassSection.find({ _id: { $in: [...new Set(sectionOf.values())] } }).select('sectionName').lean(),
+        Subject.find({ _id: { $in: uniq(edits.map((e) => sid(e.subject))) } }).select('subjectName').lean(),
+    ]);
+    const sectionName = new Map(sections.map((x) => [sid(x._id), x.sectionName]));
+    const subjectName = new Map(subjects.map((x) => [sid(x._id), x.subjectName]));
+
+    return edits.map((e) => ({
+        section: sectionOf.get(sid(e.timetable)),
+        sectionName: sectionName.get(sectionOf.get(sid(e.timetable))) || 'Section',
+        dayOfWeek: e.dayOfWeek,
+        periodNumber: e.periodNumber,
+        subjectName: subjectName.get(sid(e.subject)) || 'Subject',
+    }));
+}
+
+/** GET — what publishing this version would overwrite, before committing to it. */
+exports.publishPreview = async (req, res) => {
+    try {
+        const version = await getOwnedVersion(req, req.params.id);
+        const entries = await TimetableVersionEntry.find({ version: version._id }).lean();
+        const [atRisk, outside] = await Promise.all([
+            liveEditsAtRisk(version),
+            clashesOutsideVersion(version, entries),
+        ]);
+        ok(res, {
+            liveEdits: atRisk,
+            count: atRisk.length,
+            sections: uniq(atRisk.map((x) => x.section)).length,
+            outsideClashes: outside,
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
 exports.publishVersion = async (req, res) => {
     try {
         const version = await getOwnedVersion(req, req.params.id);
@@ -1657,6 +2343,28 @@ exports.publishVersion = async (req, res) => {
 
         const entries = await TimetableVersionEntry.find({ version: version._id }).lean();
         if (!entries.length) return err(res, 'This version has no periods to publish', 400);
+
+        // Hand edits made in the live grid are about to be replaced. Say so, and
+        // make the admin agree to it rather than discovering it afterwards.
+        // …and so is a clash with a section this version does not own.
+        const overwrite = req.body?.overwriteLiveEdits === true || req.body?.overwriteLiveEdits === 'true';
+        const outside = await clashesOutsideVersion(version, entries);
+        if (outside.length && !overwrite) {
+            return res.status(409).json({
+                success: false,
+                message: `This timetable clashes with ${outside.length} already-published period(s) in other sections.`,
+                data: { outsideClashes: outside, blocked: true },
+            });
+        }
+
+        const atRisk = await liveEditsAtRisk(version);
+        if (atRisk.length && !overwrite) {
+            return res.status(409).json({
+                success: false,
+                message: `Publishing replaces ${atRisk.length} hand-edited period(s) in the live timetable.`,
+                data: { liveEdits: atRisk, blocked: true },
+            });
+        }
 
         const result = await persistence.publishVersion({
             version,

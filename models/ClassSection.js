@@ -78,9 +78,17 @@ const ClassSectionSchema = new db.Schema({
         type: Number,
         default: 4,
     },
+    // Whether this section teaches on Saturday. The SCHOOL decides — see
+    // utils/timetableDays.js — and this is the per-section override, so the
+    // default has to mean "follow the school", not "closed".
+    //
+    // It used to default to false while School.leaveSettings.saturdayWorking
+    // defaulted to true. Two defaults contradicting each other meant every new
+    // section was born closed on Saturday, and stayed that way until somebody
+    // happened to re-save School Settings.
     openOnSaturday: {
         type: Boolean,
-        default: false,
+        default: true,
     },
     createdAt: {
         type: Date,

@@ -7,6 +7,8 @@ const School               = require('../models/School');
 // One resolver for "does this section teach on Saturday" — utils/timetableDays.js
 // explains why the school flag and the section flag used to disagree.
 const { daysForSection, syncSectionsToSchoolSaturday } = require('../utils/timetableDays');
+// The same rules the solver enforces, applied to hand edits.
+const { validateManualEntries } = require('../services/manualTimetableRules');
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true,  data: d });
 const err = (res, e, s = 500) => res.status(s).json({ success: false, message: e.message || e });
@@ -141,6 +143,53 @@ exports.adminAssignPeriods = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
+/**
+ * Turn the merges drawn in the grid into merge groups the generator honours.
+ *
+ * Scoped to this section: a group is created or refreshed for every subject this
+ * section merges, and groups it has walked away from are dropped. Other
+ * sections' merges are left alone — this save speaks only for this section.
+ */
+async function syncManualMerges({ schoolId, academicYear, sectionId, rows, userId }) {
+    const TimetableMergeGroup = require('../models/TimetableMergeGroup');
+    if (!academicYear) return;
+
+    // subject -> the full set of sections sitting together for it
+    const wanted = new Map();
+    for (const r of rows) {
+        const partners = (r.mergedSections || []).map(String).filter(Boolean);
+        if (!partners.length) continue;
+        const key = String(r.subject);
+        const members = new Set([...(wanted.get(key) || []), String(sectionId), ...partners]);
+        wanted.set(key, members);
+    }
+
+    const existing = await TimetableMergeGroup.find({
+        school: schoolId, academicYear, source: 'manual',
+    }).lean();
+
+    for (const [subject, members] of wanted) {
+        const sections = [...members];
+        const match = existing.find((g) => String(g.subject) === subject
+            && (g.sections || []).map(String).includes(String(sectionId)));
+        if (match) {
+            await TimetableMergeGroup.updateOne({ _id: match._id }, { $set: { sections, isActive: true } });
+        } else {
+            await TimetableMergeGroup.create({
+                school: schoolId, academicYear, subject, sections,
+                source: 'manual', isActive: true, createdBy: userId,
+            });
+        }
+    }
+
+    // Merges this section no longer draws are no longer merges.
+    const stale = existing.filter((g) => (g.sections || []).map(String).includes(String(sectionId))
+        && !wanted.has(String(g.subject)));
+    if (stale.length) {
+        await TimetableMergeGroup.deleteMany({ _id: { $in: stale.map((g) => g._id) } });
+    }
+}
+
 exports.adminSaveEntries = async (req, res) => {
     try {
         const { sectionId } = req.params;
@@ -165,50 +214,70 @@ exports.adminSaveEntries = async (req, res) => {
         }
 
         const entries = Array.isArray(req.body) ? req.body : req.body.entries || [];
+        const force   = req.body.force === true || req.body.force === 'true';
+
+        // What is on record now. The grid posts subject + teacher only, so the
+        // room and the version this slot was published from have to be carried
+        // across or a hand edit silently strips the generator's work from the
+        // whole section.
+        const current = await TimetableEntry.find({ timetable: tt._id }).lean();
+        const carryBySlot = new Map(current.map(e => [`${e.dayOfWeek}#${e.periodNumber}`, e]));
+
         const toInsert = entries
             .filter(e => e.subject)
-            .map(e => ({
-                timetable:          tt._id,
-                dayOfWeek:          e.dayOfWeek,
-                periodNumber:       e.periodNumber,
-                subject:            e.subject,
-                teacher:            e.teacher    || null,
-                additionalSubjects: (e.additionalSubjects || []).filter(a => a.subject),
-                mergedSections:     (e.mergedSections     || []).filter(Boolean),
-            }));
+            .map(e => {
+                const prior = carryBySlot.get(`${e.dayOfWeek}#${e.periodNumber}`);
+                // The room follows the slot, but only while the slot still holds
+                // the same subject — reassign the period and its old room is not
+                // automatically the right one.
+                const keepRoom = prior && String(prior.subject) === String(e.subject);
+                return {
+                    timetable:          tt._id,
+                    dayOfWeek:          e.dayOfWeek,
+                    periodNumber:       e.periodNumber,
+                    subject:            e.subject,
+                    teacher:            e.teacher    || null,
+                    room:               e.room !== undefined ? (e.room || null) : (keepRoom ? prior.room || null : null),
+                    sourceVersion:      prior?.sourceVersion || null,
+                    isManual:           true,
+                    additionalSubjects: (e.additionalSubjects || []).filter(a => a.subject),
+                    mergedSections:     (e.mergedSections     || []).filter(Boolean),
+                };
+            });
 
-        // Teacher conflict check across other sections in same academic year
-        const conflicts = [];
-        const teacherEntries = toInsert.filter(e => e.teacher);
-        if (teacherEntries.length > 0) {
-            const sibling    = await Timetable.find({ _id: { $ne: tt._id }, academicYear: tt.academicYear }).select('_id section').lean();
-            const siblingIds = sibling.map(s => s._id);
-            if (siblingIds.length > 0) {
-                const existing = await TimetableEntry.find({
-                    timetable: { $in: siblingIds },
-                    teacher:   { $in: teacherEntries.map(e => e.teacher) },
-                }).populate('timetable', 'section').populate('teacher', 'name').lean();
-
-                teacherEntries.forEach(e => {
-                    const clash = existing.find(x =>
-                        String(x.teacher?._id || x.teacher) === String(e.teacher) &&
-                        x.dayOfWeek   === e.dayOfWeek &&
-                        x.periodNumber === e.periodNumber
-                    );
-                    if (clash) {
-                        conflicts.push({
-                            teacher:         clash.teacher?.name,
-                            dayOfWeek:       e.dayOfWeek,
-                            periodNumber:    e.periodNumber,
-                            conflictSection: clash.timetable?.section,
-                        });
-                    }
-                });
-            }
+        const problems = await validateManualEntries({
+            schoolId: req.schoolId, timetable: tt, sectionId, rows: toInsert,
+        });
+        // `fatal` is never overridable — the grid could not hold it and the unique
+        // index would reject the write regardless of what the admin insists on.
+        const fatal    = problems.filter(p => p.severity === 'fatal');
+        const blocking = problems.filter(p => p.severity === 'error');
+        if (fatal.length) {
+            return res.status(409).json({
+                success: false,
+                message: fatal.length === 1 ? fatal[0].message : `${fatal.length} periods cannot be placed as laid out`,
+                data: { conflicts: problems, blocked: true, overridable: false },
+            });
+        }
+        if (blocking.length && !force) {
+            return res.status(409).json({
+                success: false,
+                message: `${blocking.length} conflict(s) would break this timetable`,
+                data: { conflicts: problems, blocked: true, overridable: true },
+            });
         }
 
         await TimetableEntry.deleteMany({ timetable: tt._id });
         if (toInsert.length) await TimetableEntry.insertMany(toInsert);
+        const conflicts = problems;
+
+        // A period merged by hand used to live only in this row, so the next
+        // generation run knew nothing about it and pulled the sections apart
+        // again. Recording it as a merge group is what makes it stick.
+        await syncManualMerges({
+            schoolId: req.schoolId, academicYear: tt.academicYear,
+            sectionId, rows: toInsert, userId: req.userId,
+        });
 
         // Notify the section's students + assigned teachers about the update
         setImmediate(async () => {
@@ -229,7 +298,7 @@ exports.adminSaveEntries = async (req, res) => {
             } catch (e) { console.error('[timetable-notif]', e.message); }
         });
 
-        ok(res, { saved: toInsert.length, conflicts, timetableId: tt._id });
+        ok(res, { saved: toInsert.length, conflicts, forced: force && blocking.length > 0, timetableId: tt._id });
     } catch (e) { err(res, e); }
 };
 
@@ -307,6 +376,7 @@ exports.adminDownloadSectionTimetable = async (req, res) => {
             .populate('subject', 'subjectName').populate('teacher', 'name')
             .populate('additionalSubjects.subject', 'subjectName')
             .populate('additionalSubjects.teacher', 'name')
+            .populate('mergedSections', 'sectionName')
             .lean();
 
         const school = await School.findById(req.schoolId).lean();
@@ -366,6 +436,8 @@ exports.adminDownloadAllTimetables = async (req, res) => {
                 .populate('subject', 'subjectName').populate('teacher', 'name')
                 .populate('additionalSubjects.subject', 'subjectName')
                 .populate('additionalSubjects.teacher', 'name')
+                // Sections sharing this lesson, so every view can say who is in the room.
+                .populate('mergedSections', 'sectionName')
                 .lean();
             const days = daysForSection(section, school);
             return {
@@ -605,6 +677,8 @@ exports.teacherClassTimetable = async (req, res) => {
                 .populate('teacher', 'name')
                 .populate('additionalSubjects.subject', 'subjectName')
                 .populate('additionalSubjects.teacher', 'name')
+                // Sections sharing this lesson, so every view can say who is in the room.
+                .populate('mergedSections', 'sectionName')
                 .lean();
         }
 
@@ -673,6 +747,8 @@ exports.studentViewTimetable = async (req, res) => {
                 .populate('subject', 'subjectName').populate('teacher', 'name')
                 .populate('additionalSubjects.subject', 'subjectName')
                 .populate('additionalSubjects.teacher', 'name')
+                // Sections sharing this lesson, so every view can say who is in the room.
+                .populate('mergedSections', 'sectionName')
                 .lean();
         }
 
@@ -725,6 +801,7 @@ exports.studentDownloadTimetable = async (req, res) => {
             .populate('subject', 'subjectName').populate('teacher', 'name')
             .populate('additionalSubjects.subject', 'subjectName')
             .populate('additionalSubjects.teacher', 'name')
+            .populate('mergedSections', 'sectionName')
             .lean();
 
         const school = await School.findById(req.schoolId).lean();

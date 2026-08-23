@@ -194,14 +194,6 @@ function validate(ctx, entries) {
                         suggestion: 'Pick another room or clear the room\'s blocked slot.',
                     });
                 }
-                if (ctx.enforceRoomCapacity && room.capacity > 0 && section.strength > room.capacity) {
-                    push({
-                        type: CONFLICT_TYPES.ROOM_CAPACITY, severity: SEVERITY.WARNING,
-                        sectionId: e.sectionId, roomId: e.roomId, dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
-                        description: `${room.name} seats ${room.capacity} but ${label(e.sectionId)} has ${section.strength} students.`,
-                        suggestion: 'Move the class to a larger room.',
-                    });
-                }
             }
         }
 

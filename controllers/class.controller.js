@@ -12,6 +12,8 @@ const { rollNumberTaken } = require('../utils/rollNumbers');
 const { capacityError }   = require('../utils/sectionCapacity');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const Subject               = require('../models/Subject');
+const School                = require('../models/School');
+const { schoolWorksSaturday } = require('../utils/timetableDays');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const err = (res, e, status = 500)    => res.status(status).json({ success: false, message: e.message || e });
@@ -538,12 +540,17 @@ exports.createSection = async (req, res) => {
         const dup = await ClassSection.findOne({ class: req.params.classId, sectionName: label }).lean();
         if (dup) return err(res, { message: `Section "${label}" already exists in ${cls?.className || 'this class'}.` }, 400);
 
+        // Born in step with the school's week, so a new section is usable
+        // immediately instead of waiting on a School Settings save.
+        const school = await School.findById(req.schoolId).select('leaveSettings').lean();
+
         const section = await ClassSection.create({
             sectionName: label,
             maxStudents: maxStudents || capacity || 40,
             class: req.params.classId,
             academicYear: cls?.academicYear,
             school: req.schoolId,
+            openOnSaturday: schoolWorksSaturday(school),
         });
         ok(res, section, 201);
     } catch (e) {

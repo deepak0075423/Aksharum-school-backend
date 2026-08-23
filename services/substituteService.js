@@ -143,12 +143,15 @@ async function saveSettings(schoolId, patch, userId) {
  */
 function slotsOf(entry) {
     const out = [];
+    // `mergedWith` travels on the slot so the cover, and the notice sent about
+    // it, can name every section sitting in the room.
+    const mergedWith = (entry.mergedSections || []).map(sid);
     if (entry.teacher) {
-        out.push({ entry, teacher: sid(entry.teacher), subject: sid(entry.subject), isPrimary: true });
+        out.push({ entry, teacher: sid(entry.teacher), subject: sid(entry.subject), isPrimary: true, mergedWith });
     }
     for (const a of entry.additionalSubjects || []) {
         if (a && a.teacher) {
-            out.push({ entry, teacher: sid(a.teacher), subject: sid(a.subject), isPrimary: false });
+            out.push({ entry, teacher: sid(a.teacher), subject: sid(a.subject), isPrimary: false, mergedWith });
         }
     }
     return out;
@@ -219,10 +222,25 @@ async function buildContext(schoolId, dateLike) {
     const ttIds = timetables.map((t) => t._id);
     const entries = ttIds.length
         ? await TimetableEntry.find({ timetable: { $in: ttIds } })
-            .select('timetable dayOfWeek periodNumber subject teacher additionalSubjects').lean()
+            .select('timetable dayOfWeek periodNumber subject teacher additionalSubjects mergedSections').lean()
         : [];
 
-    for (const e of entries) {
+    // A lesson merged across sections is written once per section, but it is ONE
+    // class in one room needing ONE cover. Keep the first row of each merged
+    // group and let it carry the others, so an absent teacher raises a single
+    // substitution instead of one per section.
+    const mergedSeen = new Set();
+    const coverable = entries.filter((e) => {
+        const partners = (e.mergedSections || []).map(sid);
+        if (!partners.length) return true;
+        const key = [sid(e.timetable), ...partners].sort().join('|')
+            + `#${e.dayOfWeek}#${e.periodNumber}#${sid(e.subject)}`;
+        if (mergedSeen.has(key)) return false;
+        mergedSeen.add(key);
+        return true;
+    });
+
+    for (const e of coverable) {
         for (const slot of slotsOf(e)) {
             ctx.slots.push(slot);
             const k1 = `${slot.teacher}|${e.dayOfWeek}`;

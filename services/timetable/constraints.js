@@ -44,12 +44,21 @@ function occupantsOf(block, placement) {
     return out;
 }
 
+/**
+ * The sections a block occupies. Normally one; a cross-section merge books the
+ * same slot in every member section, since one lesson is being taught to all of
+ * them at once.
+ */
+const sectionsOf = (block) => (block.sectionIds && block.sectionIds.length
+    ? block.sectionIds : [block.sectionId]);
+
 function applyPlacement(state, block, placement) {
     const { day, periods } = placement;
     const occupants = occupantsOf(block, placement);
+    const inSections = sectionsOf(block);
     for (const p of periods) {
         // One section slot for the whole unit — merged partners share it.
-        state.sectionSlots.set(`${block.sectionId}#${slotKey(day, p)}`, block.id);
+        for (const secId of inSections) state.sectionSlots.set(`${secId}#${slotKey(day, p)}`, block.id);
         for (const o of occupants) {
             if (o.teacherId) state.teacherSlots.set(`${o.teacherId}#${slotKey(day, p)}`, block.id);
             if (o.roomId)    state.roomSlots.set(`${o.roomId}#${slotKey(day, p)}`, block.id);
@@ -60,10 +69,10 @@ function applyPlacement(state, block, placement) {
             bump(state.teacherDay, `${o.teacherId}#${day}`, periods.length);
             bump(state.teacherWeek, o.teacherId, periods.length);
         }
-        bump(state.subjectDay, `${block.sectionId}#${o.subjectId}#${day}`, periods.length);
+        for (const secId of inSections) bump(state.subjectDay, `${secId}#${o.subjectId}#${day}`, periods.length);
     }
     // The section only loses `periods.length` slots however many subjects share them.
-    bump(state.sectionDay, `${block.sectionId}#${day}`, periods.length);
+    for (const secId of inSections) bump(state.sectionDay, `${secId}#${day}`, periods.length);
     state.placements.set(block.id, placement);
 }
 
@@ -72,8 +81,9 @@ function removePlacement(state, block) {
     if (!placement) return null;
     const { day, periods } = placement;
     const occupants = occupantsOf(block, placement);
+    const inSections = sectionsOf(block);
     for (const p of periods) {
-        state.sectionSlots.delete(`${block.sectionId}#${slotKey(day, p)}`);
+        for (const secId of inSections) state.sectionSlots.delete(`${secId}#${slotKey(day, p)}`);
         for (const o of occupants) {
             if (o.teacherId) state.teacherSlots.delete(`${o.teacherId}#${slotKey(day, p)}`);
             if (o.roomId)    state.roomSlots.delete(`${o.roomId}#${slotKey(day, p)}`);
@@ -84,9 +94,9 @@ function removePlacement(state, block) {
             bump(state.teacherDay, `${o.teacherId}#${day}`, -periods.length);
             bump(state.teacherWeek, o.teacherId, -periods.length);
         }
-        bump(state.subjectDay, `${block.sectionId}#${o.subjectId}#${day}`, -periods.length);
+        for (const secId of inSections) bump(state.subjectDay, `${secId}#${o.subjectId}#${day}`, -periods.length);
     }
-    bump(state.sectionDay, `${block.sectionId}#${day}`, -periods.length);
+    for (const secId of inSections) bump(state.sectionDay, `${secId}#${day}`, -periods.length);
     state.placements.delete(block.id);
     return placement;
 }
@@ -118,9 +128,9 @@ function resolveRoom(ctx, state, sectionId, demand, day, periods, ignoreBlockId 
         if (!room) return { ok: false, code: CONFLICT_TYPES.PRACTICAL_ROOM_MISSING, reason: 'Pinned room no longer exists' };
         if (!notBlocked(room)) return { ok: false, code: CONFLICT_TYPES.ROOM_UNAVAILABLE, reason: `${room.name} is unavailable at this time` };
         if (!free(room.id))    return { ok: false, code: CONFLICT_TYPES.ROOM_CLASH, reason: `${room.name} is already booked at this time` };
-        if (ctx.enforceRoomCapacity && room.capacity > 0 && room.capacity < demand.strength) {
-            return { ok: false, code: CONFLICT_TYPES.ROOM_CAPACITY, reason: `${room.name} seats ${room.capacity}, section needs ${demand.strength}` };
-        }
+        // Seat counts are not a constraint: a room is judged on its type and on
+        // being free. A merged lesson is one class in one room regardless of how
+        // many sections are sitting in it.
         return { ok: true, roomId: room.id };
     }
 
@@ -130,7 +140,7 @@ function resolveRoom(ctx, state, sectionId, demand, day, periods, ignoreBlockId 
             return {
                 ok: false,
                 code: CONFLICT_TYPES.PRACTICAL_ROOM_MISSING,
-                reason: `No room of type ${demand.roomTypes.join(' / ') || 'required'} exists with enough capacity`,
+                reason: `No room of type ${demand.roomTypes.join(' / ') || 'required'} exists`,
             };
         }
         for (const roomId of demand.candidateRooms) {
@@ -266,9 +276,14 @@ function checkPlacement(ctx, state, block, day, startIdx, opts = {}) {
 
     // HARD #1: one subject per section per slot (a merged group counts as one).
     for (const p of periods) {
-        const holder = state.sectionSlots.get(`${block.sectionId}#${slotKey(day, p)}`);
-        if (holder !== undefined && holder !== ignore) {
-            return { ok: false, code: CONFLICT_TYPES.CLASS_CLASH, reason: `${section.label} already has a subject at ${day} P${p}` };
+        for (const secId of sectionsOf(block)) {
+            const holder = state.sectionSlots.get(`${secId}#${slotKey(day, p)}`);
+            if (holder !== undefined && holder !== ignore) {
+                const label = secId === block.sectionId
+                    ? section.label
+                    : (ctx.sections.get(secId)?.label || 'a merged section');
+                return { ok: false, code: CONFLICT_TYPES.CLASS_CLASH, reason: `${label} already has a subject at ${day} P${p}` };
+            }
         }
     }
 
@@ -286,7 +301,9 @@ function checkPlacement(ctx, state, block, day, startIdx, opts = {}) {
         for (const [otherId, pl] of state.placements) {
             if (otherId === ignore || pl.day !== day) continue;
             const other = ctx.blockById.get(otherId);
-            if (!other || other.sectionId !== block.sectionId || other.subjectId !== block.subjectId) continue;
+            if (!other || other.subjectId !== block.subjectId) continue;
+            // Overlapping section sets count as the same class for this rule.
+            if (!sectionsOf(other).some((x) => sectionsOf(block).includes(x))) continue;
             const gap = Math.min(
                 Math.abs(Math.min(...periods) - Math.max(...pl.periods)),
                 Math.abs(Math.min(...pl.periods) - Math.max(...periods)),

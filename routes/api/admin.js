@@ -240,6 +240,19 @@ router.post('/timetable/rooms',          timetableGuard, ttGenCtrl.createRoom);
 router.put('/timetable/rooms/:id',       timetableGuard, ttGenCtrl.updateRoom);
 router.delete('/timetable/rooms/:id',    timetableGuard, ttGenCtrl.deleteRoom);
 
+// Start next year from last year's plan (dry-run unless apply:true)
+router.post('/timetable/carry-forward', timetableGuard, ttGenCtrl.carryForward);
+
+// Reports over the PUBLISHED week
+router.get('/timetable/reports/teacher-workload', timetableGuard, ttGenCtrl.teacherWorkload);
+router.get('/timetable/reports/room-utilisation', timetableGuard, ttGenCtrl.roomUtilisation);
+
+// Merge groups — sections taught a subject together (one teacher, one room)
+router.get('/timetable/merges',         timetableGuard, ttGenCtrl.listMergeGroups);
+router.post('/timetable/merges',        timetableGuard, ttGenCtrl.saveMergeGroup);
+router.put('/timetable/merges/:id',     timetableGuard, ttGenCtrl.saveMergeGroup);
+router.delete('/timetable/merges/:id',  timetableGuard, ttGenCtrl.deleteMergeGroup);
+
 router.get('/timetable/availability',              timetableGuard, ttGenCtrl.listAvailability);
 router.put('/timetable/availability/:teacherId',   timetableGuard, ttGenCtrl.saveAvailability);
 
@@ -255,6 +268,7 @@ router.get('/timetable/versions/:id/conflicts',           timetableGuard, ttGenC
 router.get('/timetable/versions/:id/export',              timetableGuard, ttGenCtrl.exportVersion);
 router.get('/timetable/versions/:id/compare/:otherId',    timetableGuard, ttGenCtrl.compareVersions);
 router.post('/timetable/versions/:id/validate',           timetableGuard, ttGenCtrl.validateVersion);
+router.get('/timetable/versions/:id/publish-preview', timetableGuard, ttGenCtrl.publishPreview);
 router.post('/timetable/versions/:id/publish',            timetableGuard, ttGenCtrl.publishVersion);
 router.post('/timetable/versions/:id/regenerate',         timetableGuard, ttGenCtrl.regenerate);
 router.post('/timetable/versions/:id/duplicate',          timetableGuard, ttGenCtrl.duplicateVersion);

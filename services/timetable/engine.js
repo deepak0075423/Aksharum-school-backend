@@ -170,7 +170,6 @@ function compile(input) {
         weights,
         solver,
         allowActivity,
-        enforceRoomCapacity: input.enforceRoomCapacity !== false,
         enforceTeacherQualified: input.enforceTeacherQualified !== false,
         blocks: [],
         blockById: new Map(),
@@ -184,7 +183,7 @@ function compile(input) {
     /* ── Demands (one subject's worth of scheduling need) ─────────────────── */
     // Built first, merged into units second: a merged group has to know every
     // member's teacher/room needs before it can be turned into a block.
-    const demands = [];
+    let demands = [];
     for (const req of input.requirements || []) {
         const sectionId = sid(req.sectionId);
         const section = sections.get(sectionId);
@@ -208,14 +207,16 @@ function compile(input) {
         } else if (wantedTypes.length) {
             candidateRooms = wantedTypes
                 .flatMap((type) => roomsByType.get(type) || [])
+                // Seat counts are deliberately not consulted: a room is chosen on
+                // type and on being free, and a merged class is one lesson in one
+                // room whatever its combined strength.
                 .filter((id) => {
                     const room = rooms.get(id);
                     if (!room) return false;
                     if (room.subjectIds && !room.subjectIds.has(sid(req.subjectId))) return false;
-                    if (ctx.enforceRoomCapacity && room.capacity > 0 && room.capacity < section.strength) return false;
                     return true;
                 })
-                .sort((a, b) => (rooms.get(a).capacity - rooms.get(b).capacity) || rooms.get(a).name.localeCompare(rooms.get(b).name));
+                .sort((a, b) => rooms.get(a).name.localeCompare(rooms.get(b).name));
             candidateRooms = [...new Set(candidateRooms)];
         }
 
@@ -230,7 +231,7 @@ function compile(input) {
                     severity: SEVERITY.ERROR,
                     sectionId,
                     subjectId: sid(req.subjectId),
-                    description: `${req.subjectName || 'Subject'} for ${section.label} requires a ${wantedTypes.join(' / ') || 'specific'} room, but no such room with enough capacity exists.`,
+                    description: `${req.subjectName || 'Subject'} for ${section.label} requires a ${wantedTypes.join(' / ') || 'specific'} room, but no room of that type exists.`,
                     suggestion: 'Add a compatible room under Timetable → Rooms, or clear the room requirement for this subject.',
                 });
             } else {
@@ -279,7 +280,79 @@ function compile(input) {
             weeklyPeriods: weekly,
             consecutivePeriods: size,
             mergeGroup: String(req.mergeGroup || '').trim(),
+            // Cross-section merge key: sections sharing it are taught together.
+            sectionMerge: String(req.sectionMerge || '').trim(),
+            sectionIds: [sectionId],
         });
+    }
+
+    /* ── Cross-section merges ─────────────────────────────────────────────── */
+    // The SAME subject taught to several sections AT ONCE — 9-A and 9-B sit in
+    // one lab with one teacher. This is a different axis from `mergeGroup`,
+    // which merges two subjects INSIDE one section: here several sections'
+    // demands collapse into a single CSP variable whose placement books a slot
+    // in every member section, one teacher and one room between them.
+    const absorbed = new Set();
+    const sectionMergeGroups = new Map();
+    for (const d of demands) {
+        if (!d.sectionMerge) continue;
+        const key = `${d.sectionMerge}#${d.subjectId}`;
+        if (!sectionMergeGroups.has(key)) sectionMergeGroups.set(key, []);
+        sectionMergeGroups.get(key).push(d);
+    }
+    for (const [, members] of sectionMergeGroups) {
+        // A group of one is just an ordinary demand — nothing to merge with.
+        if (members.length < 2) { members[0].sectionMerge = ''; continue; }
+        const lead  = members[0];
+        const label = (d) => ctx.sections.get(d.sectionId)?.label || 'section';
+
+        // One teacher for the combined class: only someone every member could
+        // have taken on their own. Falling back to the lead's own options would
+        // put a teacher in front of a section they are not assigned to.
+        const shared = lead.teacherOptions.filter((t) =>
+            members.every((m) => !m.teacherOptions.length || m.teacherOptions.includes(t)));
+        if (lead.teacherOptions.length && !shared.length) {
+            ctx.warnings.push({
+                type: CONFLICT_TYPES.TEACHER_NOT_QUALIFIED,
+                severity: SEVERITY.ERROR,
+                sectionId: lead.sectionId,
+                subjectId: lead.subjectId,
+                description: `${lead.subjectName} is merged across ${members.map(label).join(' + ')} but no one teacher is assigned to it in all of them.`,
+                suggestion: 'Assign the same teacher to this subject in every merged section, or pick the teacher on the merge itself.',
+            });
+        }
+
+        // The weekly count has to be one number. Taking the largest keeps every
+        // section's requirement met; a mismatch is worth saying out loud.
+        const weekly = Math.max(...members.map((m) => m.weeklyPeriods));
+        if (members.some((m) => m.weeklyPeriods !== weekly)) {
+            ctx.warnings.push({
+                type: CONFLICT_TYPES.SUBJECT_PERIOD_SHORTAGE,
+                severity: SEVERITY.WARNING,
+                sectionId: lead.sectionId,
+                subjectId: lead.subjectId,
+                description: `${lead.subjectName} is merged across ${members.map(label).join(' + ')} but they ask for different weekly counts (${members.map((m) => m.weeklyPeriods).join(', ')}). Scheduling ${weekly}.`,
+                suggestion: 'Give every merged section the same weekly period count for this subject.',
+            });
+        }
+
+        lead.sectionIds     = members.map((m) => m.sectionId);
+        lead.mergedSections = members.map((m) => ({ sectionId: m.sectionId, label: label(m) }));
+        lead.sectionMergeLabel = members.map(label).join(' + ');
+        // One room has to seat all of them.
+        lead.strength       = members.reduce((n, m) => n + (Number(m.strength) || 0), 0);
+        lead.teacherOptions = shared.length ? shared : lead.teacherOptions;
+        lead.weeklyPeriods  = weekly;
+        // Everything after the lead lives on inside it.
+        for (const m of members.slice(1)) absorbed.add(m);
+    }
+    if (absorbed.size) {
+        for (const m of absorbed) {
+            // Still a requirement of its own section for reporting and validation,
+            // just not a variable the solver places separately.
+            m.absorbedInto = sectionMergeGroups;
+        }
+        demands = demands.filter((d) => !absorbed.has(d));
     }
 
     /* ── Merge groups ─────────────────────────────────────────────────────── */
@@ -395,7 +468,7 @@ function compile(input) {
     // otherwise placing one of them would not invalidate this block's domain.
     for (const block of ctx.blocks) {
         block.domain = staticDomain(ctx, block);
-        index(ctx.bySection, block.sectionId, block);
+        for (const secId of block.sectionIds || [block.sectionId]) index(ctx.bySection, secId, block);
         for (const member of [block, ...(block.parallel || [])]) {
             for (const t of member.teacherOptions) index(ctx.byTeacher, t, block);
             for (const r of member.candidateRooms) index(ctx.byRoom, r, block);
@@ -459,6 +532,20 @@ function staticDomain(ctx, block) {
                 });
             });
             if (!everyMemberCovered) continue;
+
+            // A merged block occupies every member section at once, so the slot
+            // has to be a teaching period in all of them — a section that is
+            // closed that day, or on a break, cannot host the combined class.
+            const partners = (block.sectionIds || []).filter((x) => x !== block.sectionId);
+            if (partners.length) {
+                const allFree = partners.every((secId) => {
+                    const other = ctx.sections.get(secId);
+                    if (!other || !other.days.includes(day)) return false;
+                    const theirs = other.teachingByDay.get(day) || [];
+                    return periods.every((pn) => theirs.some((tp) => tp.periodNumber === pn));
+                });
+                if (!allFree) continue;
+            }
 
             out.push({ day, startIdx: i, periods });
         }
@@ -580,6 +667,40 @@ function preflight(ctx) {
                 description: `${bucket.label || 'Special rooms'}: ${bucket.demand} practical periods required but only ${capacity} room-periods available.`,
                 suggestion: 'Add another room of this type or reduce the weekly practical periods.',
                 meta: { demand: bucket.demand, capacity },
+            });
+        }
+    }
+
+    /* ── Is the school simply short of teachers? ──────────────────────────── */
+    // Per-teacher limits are checked above, one name at a time. That tells an
+    // admin that eleven individual people are overloaded; it does not tell them
+    // the school is 140 teacher-periods short, which is the thing they can act
+    // on. Said once, in the units they hire in.
+    {
+        let demand = 0;
+        for (const req of ctx.requirements) {
+            if (req.mergeGroup && !req.mergeLead) continue;      // merged partners share the slots
+            if (req.sectionMerge && !req.sectionMergeLead) { /* counted on the lead */ }
+            demand += req.weeklyPeriods || 0;
+        }
+        let supply = 0;
+        for (const t of ctx.teachers.values()) {
+            const perWeek = t.maxPerWeek > 0 ? t.maxPerWeek : Infinity;
+            let slots = 0;
+            for (const s of ctx.sections.values()) {
+                for (const day of s.days) slots += (s.teachingByDay.get(day) || []).length;
+                break;                                           // one section's week is the ceiling
+            }
+            supply += Math.min(perWeek, slots || perWeek);
+        }
+        if (Number.isFinite(supply) && supply > 0 && demand > supply) {
+            const shortBy = demand - supply;
+            conflicts.push({
+                type: CONFLICT_TYPES.WEEKLY_LIMIT_EXCEEDED,
+                severity: SEVERITY.ERROR,
+                description: `This plan needs ${demand} teacher-periods a week but the staff can cover ${supply} — about ${shortBy} short.`,
+                suggestion: `Roughly ${Math.ceil(shortBy / Math.max(1, Math.round(supply / Math.max(1, ctx.teachers.size))))} more teacher(s) at current loads, or reduce weekly periods.`,
+                meta: { demand, supply, shortBy, teachers: ctx.teachers.size },
             });
         }
     }
@@ -735,10 +856,14 @@ function runSearch(ctx, seed, pinned) {
     // Pinned (manually edited / locked) entries are placed first and never moved.
     const pinnedIds = new Set();
     for (const pin of pinned || []) {
+        // A cross-section merge is one block covering several sections, so a pin
+        // naming ANY member has to find it — that is how generating 9-B alone
+        // lands on the slot 9-A already fixed.
         const block = ctx.blocks.find((b) => !pinnedIds.has(b.id)
-            && b.sectionId === pin.sectionId && b.subjectId === pin.subjectId && b.size === (pin.size || 1));
+            && (b.sectionIds || [b.sectionId]).includes(pin.sectionId)
+            && b.subjectId === pin.subjectId && b.size === (pin.size || 1));
         if (!block) continue;
-        const section = ctx.sections.get(pin.sectionId);
+        const section = ctx.sections.get(block.sectionId);
         const teaching = section?.teachingByDay.get(pin.dayOfWeek) || [];
         const startIdx = teaching.findIndex((s) => s.periodNumber === Number(pin.periodNumber));
         if (startIdx < 0) continue;
@@ -786,6 +911,13 @@ function runSearch(ctx, seed, pinned) {
         pool.delete(block);
     }
 
+    // NOTE: a post-run repair sweep over parked blocks was tried here and
+    // removed. Placement-only, it found nothing — every straggler genuinely had
+    // no free slot left — and cost ~50% more wall time. With ejection it was
+    // worse than useless: displacing a settled block put it back in a pool
+    // nothing drains after the main loop, losing more periods than it won.
+    // The residual shortfall under heavy load is real contention, not the
+    // search giving up early.
     const unplaced = ctx.blocks.filter((b) => !state.placements.has(b.id));
     for (const b of ctx.blocks) delete b.unplaced;
     return { state, unplaced, pinnedIds };
@@ -893,9 +1025,17 @@ function generate(input, hooks = {}) {
     for (const [blockId, placement] of best.state.placements) {
         const block = ctx.blockById.get(blockId);
         if (!block) continue;
-        for (const periodNumber of placement.periods) {
+        // A cross-section merge is one lesson but every member section has to
+        // show it in its own grid, so the placement fans out into one row each,
+        // each naming the others.
+        const memberSections = block.sectionIds && block.sectionIds.length
+            ? block.sectionIds : [block.sectionId];
+        for (const periodNumber of placement.periods) for (const memberId of memberSections) {
             assignments.push({
-                sectionId: block.sectionId,
+                sectionId: memberId,
+                mergedSectionIds: memberSections.length > 1
+                    ? memberSections.filter((x) => x !== memberId) : [],
+                sectionMergeLabel: block.sectionMergeLabel || '',
                 subjectId: block.subjectId,
                 teacherId: placement.teacherId || null,
                 roomId: placement.roomId || null,

@@ -39,7 +39,8 @@ const TimetableConfigSchema = new db.Schema({
     defaults: {
         maxTeacherPeriodsPerDay:  { type: Number,  default: 6 },
         maxTeacherPeriodsPerWeek: { type: Number,  default: 30 },
-        enforceRoomCapacity:      { type: Boolean, default: true },
+        // Room capacity is deliberately not a scheduling rule — a room is chosen
+        // on type and availability — so there is no enforceRoomCapacity here.
         enforceTeacherQualified:  { type: Boolean, default: true },
         hardTeacherDailyLimit:    { type: Boolean, default: true },
     },

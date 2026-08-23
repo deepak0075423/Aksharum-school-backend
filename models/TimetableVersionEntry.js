@@ -60,6 +60,13 @@ const TimetableVersionEntrySchema = new db.Schema({
         type: String,
         default: '',
     },
+    // The OTHER sections sitting in this same lesson. Set when the subject is
+    // merged across sections: every member gets its own row so each grid shows
+    // the period, and each row names the ones it shares the room with.
+    mergedSections: [{
+        type: db.Types.UUID,
+        ref: 'ClassSection',
+    }],
     // Set when an admin moved/created this entry by hand — regeneration with
     // `preserveManualEdits` pins these before solving.
     isManual: {

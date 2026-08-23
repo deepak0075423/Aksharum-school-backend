@@ -19,6 +19,7 @@ const Timetable             = require('../../models/Timetable');
 const Room                  = require('../../models/Room');
 const TeacherAvailability   = require('../../models/TeacherAvailability');
 const SubjectRequirement    = require('../../models/SubjectRequirement');
+const TimetableMergeGroup   = require('../../models/TimetableMergeGroup');
 const TimetableConfig       = require('../../models/TimetableConfig');
 
 const { DAYS, PRACTICAL_TYPES, periodTypeOf } = require('./types');
@@ -130,6 +131,25 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
         Subject.find({ school: schoolId }).lean(),
     ]);
 
+    // Sections taught together. Loaded school-wide for the year, not just for
+    // the scope, so generating ONE section still knows it belongs to a merge —
+    // that is what lets a later run land on the slot an earlier one fixed.
+    const mergeGroups = await TimetableMergeGroup.find({
+        school: schoolId, academicYear: academicYearId, isActive: true,
+    }).lean();
+    // section#subject -> { key, sections, teacher, room }
+    const mergeBySectionSubject = new Map();
+    for (const g of mergeGroups) {
+        const members = uniq((g.sections || []).map(sid));
+        if (members.length < 2) continue;
+        for (const secId of members) {
+            mergeBySectionSubject.set(`${secId}#${sid(g.subject)}`, {
+                key: sid(g._id), members, teacher: sid(g.teacher), room: sid(g.room),
+            });
+        }
+    }
+    const mergeFor = (sectionId, subjectId) => mergeBySectionSubject.get(`${sectionId}#${subjectId}`) || null;
+
     const classIds = uniq(sections.map((s) => sid(s.class)));
     const [classes, timetables, sst, classSubjects] = await Promise.all([
         Class.find({ _id: { $in: classIds } }).select('className classNumber').lean(),
@@ -210,6 +230,21 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
         reqBySection.get(key).push(r);
     }
 
+    /**
+     * Merge fields for one requirement. A pinned teacher or room on the group
+     * wins over whatever the section had on its own — the whole point is that
+     * the merged sections share one of each.
+     */
+    const mergeFields = (sectionId, subjectId, ownTeacher, ownRoom) => {
+        const g = mergeFor(sectionId, subjectId);
+        if (!g) return { sectionMerge: '' };
+        return {
+            sectionMerge: g.key,
+            ...(g.teacher ? { teacherId: g.teacher } : {}),
+            ...(g.room ? { roomId: g.room, requiresRoom: true } : {}),
+        };
+    };
+
     const engineRequirements = [];
     const derivedFor = [];
     for (const section of engineSections) {
@@ -242,6 +277,7 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
                     priority: Number(r.priority) || 0,
                     // Shared key ⇒ scheduled in the same period as its partners.
                     mergeGroup: String(r.mergeGroup || '').trim(),
+                    ...mergeFields(section.id, sid(r.subject), sid(r.teacher), sid(r.room)),
                 });
             }
             continue;
@@ -283,6 +319,7 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
                 difficulty: 3,
                 priority: 0,
                 mergeGroup: '',
+                ...mergeFields(section.id, subjectId, teachers[0] || null, null),
                 derived: true,
             });
         }
@@ -316,7 +353,6 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
             weights: config?.softWeights,
             solver: config?.solver,
             allowActivity: !!config?.allowSubjectsInActivity,
-            enforceRoomCapacity: defaults.enforceRoomCapacity !== false,
             enforceTeacherQualified: defaults.enforceTeacherQualified !== false,
         },
         lookups: {
