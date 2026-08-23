@@ -1316,13 +1316,6 @@ function sheetRow(raw) {
     };
 }
 
-// A whole sheet can fail on one missing column, and the report rides back inside
-// the JSON/SSE response rather than costing a second round trip. That only stays
-// cheap if it is bounded: a student row is 76 columns, so ~200 of them is already
-// around half a megabyte of base64. Past that the sheet itself is the thing to
-// fix, and the "How to fix" page says so.
-const MAX_ERROR_ROWS = 200;
-
 /**
  * The rows that did NOT import, handed back as a workbook to correct.
  *
@@ -1332,15 +1325,19 @@ const MAX_ERROR_ROWS = 200;
  * sheet: fix what the Error column names, upload this same file, done. Rows that
  * imported are absent from it, so a re-upload cannot duplicate them.
  *
+ * Every failed row goes in, uncapped: an admin whose whole sheet failed needs
+ * the whole sheet back to work from, not a sample of it. The size looks after
+ * itself, because this file is the uploaded sheet plus two columns and that
+ * upload is already capped at 5 MB by `uploadExcel`.
+ *
  * @param {String[]} headers  the header row of the uploaded sheet, in order
  * @param {Array}    failures [{ row, reason, raw }] — `raw` is the original row
  * @returns {{ filename, base64, rows, total }|null}
  */
 function buildErrorReport(headers, failures, filename) {
     if (!failures.length) return null;
-    const shown = failures.slice(0, MAX_ERROR_ROWS);
-    const cols  = ['Row', 'Error', ...headers];
-    const body  = shown.map((f) => [
+    const cols = ['Row', 'Error', ...headers];
+    const body = failures.map((f) => [
         f.row,
         f.reason,
         ...headers.map((h) => {
@@ -1369,14 +1366,6 @@ function buildErrorReport(headers, failures, filename) {
         ['Only the rows that failed are in this file, so re-uploading cannot'],
         ['duplicate the ones that already imported.'],
     ];
-    if (failures.length > shown.length) {
-        guide.push(
-            [],
-            [`${failures.length} rows failed — the first ${shown.length} are listed here.`],
-            ['That many failures usually means one thing is wrong across the whole sheet.'],
-            ['Fix it in your original file and upload that again, rather than working from this one.'],
-        );
-    }
     const guideWs = XLSX.utils.aoa_to_sheet(guide);
     guideWs['!cols'] = [{ wch: 4 }, { wch: 78 }];
 
@@ -1384,10 +1373,13 @@ function buildErrorReport(headers, failures, filename) {
     XLSX.utils.book_append_sheet(wb, ws, 'Errors');
     XLSX.utils.book_append_sheet(wb, guideWs, 'How to fix');
 
+    // `rows` and `total` are the same number now that nothing is trimmed. Both
+    // stay in the payload because the web and mobile modals read them: `rows`
+    // labels the download button, `total` is what they compare it against.
     return {
         filename,
         base64: XLSX.write(wb, { type: 'base64', bookType: 'xlsx' }),
-        rows:   shown.length,
+        rows:   failures.length,
         total:  failures.length,
     };
 }
