@@ -2436,6 +2436,7 @@ async function notifyPublished(req, version, entries) {
             title: '🗓️ New timetable published',
             body: 'Your teaching schedule has been updated. Open Timetable to see your new periods.',
             recipients: teacherIds,
+            link: { type: 'timetable' },
         });
     }
     if (studentIds.length) {
@@ -2445,6 +2446,7 @@ async function notifyPublished(req, version, entries) {
             title: '🗓️ New class timetable',
             body: `The timetable for ${names.slice(0, 3).join(', ')}${names.length > 3 ? ` and ${names.length - 3} more` : ''} has been updated.`,
             recipients: studentIds,
+            link: { type: 'timetable' },
         });
     }
 }

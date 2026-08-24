@@ -518,6 +518,7 @@ exports.createAssignment = async (req, res) => {
             title: '🚌 Transport assigned',
             body: `Transport has been assigned on route "${route.name}".${b.seatNumber ? ` Seat: ${b.seatNumber}.` : ''}`,
             recipients: targets,
+            link: { type: 'transport.mine', entityId: a._id },
         })).catch(() => {});
         ok(res, a);
     } catch (e) { fail(res, e); }
@@ -553,6 +554,7 @@ exports.setAssignmentStatus = async (req, res) => {
             title: `🚌 Transport ${status === 'active' ? 'reactivated' : status}`,
             body: `Your transport assignment is now ${status}.${a.suspensionReason ? `\nReason: ${a.suspensionReason}` : ''}`,
             recipients: targets,
+            link: { type: 'transport.mine', entityId: a._id },
         })).catch(() => {});
         ok(res, a);
     } catch (e) { fail(res, e); }
@@ -1101,6 +1103,7 @@ exports.actOnRequest = async (req, res) => {
                 title: '🚌 Transport request rejected',
                 body: `Your transport request ${r.requestCode} (${r.requestType.replace(/_/g, ' ')}) was rejected.${note ? `\nNote: ${note}` : ''}`,
                 recipients: [r.requestedBy],
+                link: { type: 'transport.requests', entityId: r._id },
             });
             return ok(res, r);
         }
@@ -1134,6 +1137,7 @@ exports.actOnRequest = async (req, res) => {
             title: '🚌 Transport request approved',
             body: `Your transport request ${r.requestCode} (${r.requestType.replace(/_/g, ' ')}) has been approved.${note ? `\nNote: ${note}` : ''}`,
             recipients: [r.requestedBy],
+            link: { type: 'transport.requests', entityId: r._id },
         });
         ok(res, r);
     } catch (e) { fail(res, e); }

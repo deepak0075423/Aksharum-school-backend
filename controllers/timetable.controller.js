@@ -294,6 +294,7 @@ exports.adminSaveEntries = async (req, res) => {
                     title: '🗓️ Timetable updated',
                     body: `The timetable for ${label || 'your section'} has been updated. Check the new schedule.`,
                     recipients: [...(sec.enrolledStudents || []), ...teacherIds],
+                    link: { type: 'timetable.section', params: { sectionId: String(sec._id) } },
                 });
             } catch (e) { console.error('[timetable-notif]', e.message); }
         });

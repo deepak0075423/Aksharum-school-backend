@@ -80,11 +80,18 @@ async function createAssignment({ schoolId, actor, senderRef, body }) {
     // fan out notification to students (+ parents, future) when active & requested
     if (doc.notifyOnAssign && status === 'active' && recipients.length) {
         const audience = await withParents(recipients).catch(() => recipients);
+        const onlyVideo = (doc.contentType === 'video' && (doc.videos || []).length === 1)
+            ? String(doc.videos[0]) : null;
         notify({
             school: schoolId, sender: senderRef, senderRole: actor.role,
             title: 'New learning video assigned',
             body: `${doc.title} — ${recipients.length} student(s)`,
             recipients: audience,
+            // Only a single-video assignment has something to open directly;
+            // a playlist, a course or a batch of videos belongs on the list.
+            link: onlyVideo
+                ? { type: 'video.item', entityId: onlyVideo }
+                : { type: 'video.list', entityId: doc._id },
         });
     }
     return doc;

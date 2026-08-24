@@ -4166,6 +4166,7 @@ exports.sendAnnouncement = async (req, res) => {
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: urgent ? `🚨 ${title}` : title,
             body, recipients, email: !!email || urgent,
+            link: { type: 'hostel' },
         });
         await logAudit(req, { action: 'announce', entityType: 'HostelCommunication', hostel,
             description: `Announcement "${title}" sent to ${recipients.length} recipient(s) (${audience})`,

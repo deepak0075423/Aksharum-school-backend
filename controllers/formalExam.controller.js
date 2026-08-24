@@ -223,6 +223,7 @@ exports.adminApproveExam = async (req, res) => {
                     title: `📊 Results published: ${exam.title}`,
                     body: `Results for "${exam.title}" have been published. Check the Results section for your scorecard.`,
                     recipients: targets,
+                    link: { type: 'results.mine', entityId: exam._id },
                 });
             })
             .catch(e => console.error('[formalExam] generateResults error:', e.message));
@@ -250,6 +251,7 @@ exports.adminRejectExam = async (req, res) => {
                 title: `❌ Exam rejected: ${exam.title}`,
                 body: `The marks for "${exam.title}" were rejected by the admin.${reason ? `\nReason: ${reason}` : ''}`,
                 recipients: [sec.classTeacher],
+                link: { type: 'results.marks', entityId: exam._id },
             });
         }).catch(() => {});
         res.json({ success: true, data: exam });

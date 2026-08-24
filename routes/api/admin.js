@@ -173,6 +173,7 @@ router.delete('/classes/:classId/subjects',   guard, subjectCtrl.removeSubjectFr
 
 // ── Sections ────────────────────────────────────────────────────────────────
 router.get('/sections/:sectionId',                    guard, classCtrl.getSectionDetail);
+router.get('/sections/:sectionId/assignable-students', guard, classCtrl.getAssignableStudents);
 router.post('/sections/:sectionId/assign-student',    guard, classCtrl.assignStudentToSection);
 router.delete('/sections/:sectionId/remove-student',  guard, classCtrl.removeStudentFromSection);
 router.put('/sections/:sectionId/teachers',           guard, classCtrl.updateSectionTeacher);

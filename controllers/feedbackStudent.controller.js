@@ -354,6 +354,7 @@ exports.submit = async (req, res) => {
                 title: 'Feedback submitted',
                 body:  `Your feedback for ${campaign.name} has been submitted successfully. Thank you!`,
                 recipients: [req.userId], includeSender: true,
+                link: { type: 'feedback.pending' },
             });
         }
 

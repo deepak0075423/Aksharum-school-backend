@@ -9,7 +9,7 @@ const ChatMember     = require('../models/ChatMember');
 const { isDate }     = require('../utils/validators');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
-const { capacityError }   = require('../utils/sectionCapacity');
+const { capacityError, seatsFor, seatsOf } = require('../utils/sectionCapacity');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const Subject               = require('../models/Subject');
 const School                = require('../models/School');
@@ -758,66 +758,220 @@ exports.updateStudentRollNumber = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
+/**
+ * GET /admin/sections/:sectionId/assignable-students
+ * The pool the "add students" picker draws from. Everyone already on this
+ * section's roster is left out — they are not a choice to make — and everyone
+ * held by another section this academic year comes back flagged, with where
+ * they are, so the picker can explain itself instead of silently hiding them.
+ */
+exports.getAssignableStudents = async (req, res) => {
+    try {
+        const { search = '', limit = 100 } = req.query;
+
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+
+        const alreadyHere = new Set((section.enrolledStudents || []).map(String));
+
+        // Who this academic year's other sections are holding, and which one.
+        const siblings = await ClassSection.find(
+            { school: req.schoolId, academicYear: section.academicYear, _id: { $ne: section._id } },
+            '_id sectionName class enrolledStudents',
+        ).lean();
+        const classNames = {};
+        if (siblings.length) {
+            const classes = await Class.find({ _id: { $in: [...new Set(siblings.map(s => String(s.class)))] } }, 'className').lean();
+            classes.forEach(c => { classNames[String(c._id)] = c.className; });
+        }
+        const heldBy = new Map();
+        for (const sib of siblings) {
+            const where = `${classNames[String(sib.class)] || 'Another class'} – ${sib.sectionName}`;
+            for (const id of sib.enrolledStudents || []) heldBy.set(String(id), where);
+        }
+
+        const filter = { school: String(req.schoolId), role: 'student', isActive: { $ne: false } };
+        if (String(search).trim()) {
+            const rx = new RegExp(String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+            filter.$or = [{ name: rx }, { email: rx }];
+        }
+
+        // The roster is excluded here rather than after the limit, so a section
+        // with many students still fills a full page of actual candidates.
+        const users = await User.find(filter, 'name email profileImage').lean();
+        const candidates = users
+            .filter(u => !alreadyHere.has(String(u._id)))
+            .sort(byName('name'));
+
+        const profiles = candidates.length
+            ? await StudentProfile.find(
+                { user: { $in: candidates.map(u => u._id) } },
+                'user rollNumber gender admissionNumber currentClass currentSection',
+            ).lean()
+            : [];
+        const pMap = {};
+        profiles.forEach(p => { pMap[String(p.user)] = p; });
+
+        const sameClass = String(section.class);
+        const rows = candidates.map(u => {
+            const p    = pMap[String(u._id)] || {};
+            const held = heldBy.get(String(u._id)) || null;
+            return {
+                _id:             u._id,
+                name:            u.name,
+                email:           u.email,
+                admissionNumber: p.admissionNumber || '',
+                rollNumber:      p.rollNumber || '',
+                gender:          p.gender || '',
+                enrolledIn:      held,
+                assignable:      !held,
+                reason:          held ? `Already in ${held}` : '',
+                // Students admitted to this class but never placed are the ones
+                // the admin is nearly always looking for — surfaced first below.
+                sameClass:       !held && String(p.currentClass || '') === sameClass,
+            };
+        });
+
+        // Unplaced students of this very class, then other free students, then
+        // the ones another section is holding.
+        const rank = (r) => (r.sameClass ? 0 : r.assignable ? 1 : 2);
+        rows.sort((a, b) => rank(a) - rank(b) || byName('name')(a, b));
+
+        const capped    = rows.slice(0, Math.max(1, Number(limit) || 100));
+        const { free, capacity, occupied } = seatsFor(section);
+
+        ok(res, {
+            students:  capped,
+            total:     rows.length,
+            truncated: rows.length > capped.length,
+            seats:     { capacity, occupied, free: capacity ? free : null },
+        });
+    } catch (e) { err(res, e); }
+};
+
+/**
+ * POST /admin/sections/:sectionId/assign-student
+ * Enrols one student (`studentId`) or several at once (`studentIds`). Every
+ * student is judged on their own — one blocked by another section's roster does
+ * not stop the rest — and the response says what happened to each, so the
+ * picker can report "4 enrolled, 1 skipped" rather than a single yes/no.
+ */
 exports.assignStudentToSection = async (req, res) => {
     try {
-        const { studentId } = req.body;
-        if (!studentId) return err(res, { message: 'studentId is required' }, 400);
+        const requested = [...new Set(
+            (Array.isArray(req.body.studentIds) ? req.body.studentIds : [req.body.studentId])
+                .map(id => (id == null ? '' : String(id).trim()))
+                .filter(Boolean)
+        )];
+        if (!requested.length) return err(res, { message: 'studentId is required' }, 400);
 
         const section = await ClassSection.findById(req.params.sectionId).lean();
         if (!section) return err(res, { message: 'Section not found' }, 404);
 
-        // Check if already enrolled in another section for the same academic year
-        const alreadyIn = await ClassSection.findOne({
-            academicYear: section.academicYear,
-            enrolledStudents: studentId,
-            _id: { $ne: section._id },
-        }).lean();
-        if (alreadyIn) return err(res, { message: `Student is already enrolled in section "${alreadyIn.sectionName}". Remove them first.` }, 400);
+        const roster = new Set((section.enrolledStudents || []).map(String));
 
-        // A section's capacity is a limit, not a suggestion. The student is
-        // excluded from the count so re-adding someone already on the roster
-        // never reports the section as full.
-        const full = capacityError(section, studentId);
-        if (full) return err(res, { message: full }, 400);
-
-        await ClassSection.findByIdAndUpdate(req.params.sectionId, {
-            $addToSet: { enrolledStudents: studentId },
-            $inc: { currentCount: 1 },
-        });
-        // Keep the student's profile in sync — every read path (my-class,
-        // timetable, admin list, parent views) resolves class via currentSection.
-        const profileSet = { currentSection: req.params.sectionId, currentClass: section.class };
-
-        // Once a section has been numbered, a student joining later continues
-        // the sequence instead of arriving without a roll number.
-        let assignedRoll = null;
-        if (section.rollNumbersAssignedAt) {
-            const mine = await StudentProfile.findOne({ user: studentId }, 'rollNumber').lean();
-            const currentRoll = String(mine?.rollNumber || '').trim();
-            const keepExisting = currentRoll && !(await rollNumberTaken(section._id, currentRoll, studentId));
-            if (!keepExisting) {
-                const peers = (section.enrolledStudents || []).map(String).filter(id => id !== String(studentId));
-                const profiles = peers.length
-                    ? await StudentProfile.find({ user: { $in: peers } }, 'rollNumber').lean()
-                    : [];
-                const highest = profiles.reduce((max, p) => {
-                    const n = Number(String(p.rollNumber || '').trim());
-                    return Number.isFinite(n) ? Math.max(max, n) : max;
-                }, 0);
-                assignedRoll = String(highest + 1);
-                profileSet.rollNumber = assignedRoll;
+        // One lookup for the whole batch: who another section already holds.
+        const clashes = await ClassSection.find({
+            academicYear:     section.academicYear,
+            enrolledStudents: { $in: requested },
+            _id:              { $ne: section._id },
+        }, '_id sectionName enrolledStudents').lean();
+        const heldBy = new Map();
+        for (const c of clashes) {
+            for (const id of c.enrolledStudents || []) {
+                if (requested.includes(String(id)) && !heldBy.has(String(id))) heldBy.set(String(id), c.sectionName);
             }
         }
 
-        await StudentProfile.updateOne(
-            { user: studentId, school: req.schoolId },
-            { $set: profileSet }
-        );
+        const names = {};
+        (await User.find({ _id: { $in: requested } }, 'name').lean())
+            .forEach(u => { names[String(u._id)] = u.name; });
+
+        // Seats are counted once for the batch and spent as students are placed,
+        // so adding five to a section with three free seats fills the three and
+        // says so — rather than letting all five in past the limit.
+        let free = seatsFor(section).free;
+        const unlimited = !seatsOf(section);
+
+        // Where the numbering has reached, so a batch continues 12, 13, 14…
+        let nextRoll = null;
+        if (section.rollNumbersAssignedAt) {
+            const peers = (section.enrolledStudents || []).map(String);
+            const peerProfiles = peers.length
+                ? await StudentProfile.find({ user: { $in: peers } }, 'rollNumber').lean()
+                : [];
+            nextRoll = peerProfiles.reduce((max, p) => {
+                const n = Number(String(p.rollNumber || '').trim());
+                return Number.isFinite(n) ? Math.max(max, n) : max;
+            }, 0);
+        }
+
+        const enrolled = [], skipped = [], failed = [];
+
+        for (const studentId of requested) {
+            const name = names[studentId] || 'Student';
+            if (!names[studentId]) { failed.push({ _id: studentId, name, reason: 'Student not found' }); continue; }
+            if (roster.has(studentId)) { skipped.push({ _id: studentId, name, reason: 'Already in this section' }); continue; }
+
+            const held = heldBy.get(studentId);
+            if (held) {
+                failed.push({ _id: studentId, name, reason: `Already enrolled in section "${held}" — remove them from it first` });
+                continue;
+            }
+            if (!unlimited && free <= 0) {
+                failed.push({ _id: studentId, name, reason: `Section ${section.sectionName} is full` });
+                continue;
+            }
+
+            await ClassSection.findByIdAndUpdate(req.params.sectionId, {
+                $addToSet: { enrolledStudents: studentId },
+                $inc:      { currentCount: 1 },
+            });
+            roster.add(studentId);
+            free -= 1;
+
+            // Keep the student's profile in sync — every read path (my-class,
+            // timetable, admin list, parent views) resolves class via currentSection.
+            const profileSet = { currentSection: req.params.sectionId, currentClass: section.class };
+
+            // Once a section has been numbered, a student joining later continues
+            // the sequence instead of arriving without a roll number.
+            let assignedRoll = null;
+            if (nextRoll !== null) {
+                const mine = await StudentProfile.findOne({ user: studentId }, 'rollNumber').lean();
+                const currentRoll = String(mine?.rollNumber || '').trim();
+                const keepExisting = currentRoll && !(await rollNumberTaken(section._id, currentRoll, studentId));
+                if (keepExisting) {
+                    const n = Number(currentRoll);
+                    if (Number.isFinite(n)) nextRoll = Math.max(nextRoll, n);
+                } else {
+                    nextRoll += 1;
+                    assignedRoll = String(nextRoll);
+                    profileSet.rollNumber = assignedRoll;
+                }
+            }
+
+            await StudentProfile.updateOne(
+                { user: studentId, school: req.schoolId },
+                { $set: profileSet }
+            );
+            enrolled.push({ _id: studentId, name, rollNumber: assignedRoll });
+        }
+
+        // A single-student call that could not be honoured still reads as an
+        // error, the way the picker has always treated it.
+        if (requested.length === 1 && failed.length === 1) return err(res, { message: failed[0].reason }, 400);
+
+        const parts = [];
+        if (enrolled.length) parts.push(`${enrolled.length} student${enrolled.length === 1 ? '' : 's'} enrolled`);
+        if (skipped.length)  parts.push(`${skipped.length} already in this section`);
+        if (failed.length)   parts.push(`${failed.length} could not be enrolled`);
+
         ok(res, {
-            message: assignedRoll
-                ? `Student enrolled with roll number ${assignedRoll}`
-                : 'Student enrolled',
-            rollNumber: assignedRoll,
+            message: parts.join(', ') || 'Nothing to do',
+            enrolled, skipped, failed,
+            // Kept for callers written against the old single-student response
+            rollNumber: enrolled.length === 1 ? enrolled[0].rollNumber : null,
         });
     } catch (e) { err(res, e); }
 };

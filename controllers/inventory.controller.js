@@ -622,6 +622,7 @@ exports.actOnRequest = async (req, res) => {
             title: `📦 Purchase request ${action.replace('_', ' ')}`,
             body: `Your purchase request ${pr.requestNumber} has been ${action.replace('_', ' ')}.${comment ? `\nComment: ${comment}` : ''}`,
             recipients: [pr.requestedBy],
+            link: { type: 'inventory.requests', entityId: pr._id },
         });
         ok(res, pr);
     } catch (e) { err(res, e); }
@@ -848,6 +849,7 @@ exports.createIssue = async (req, res) => {
                 title: '📦 Inventory item issued to you',
                 body: `${qty} × ${it?.name || 'item'} issued to you (${issueNumber}).${expectedReturn ? ` Expected return: ${new Date(expectedReturn).toLocaleDateString('en-IN')}.` : ''}`,
                 recipients: [issuedToUser],
+                link: { type: 'inventory.issues', entityId: issue._id },
             })).catch(() => {});
         }
         ok(res, issue);

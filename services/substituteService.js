@@ -740,6 +740,7 @@ async function notifySubstituteAssigned(ctx, row, { changedFrom } = {}) {
         body: `You have been assigned to take a substitute class.\n\n${describe(ctx, row)}`,
         recipients: [row.substituteTeacher],
         email: !!s.emailSubstitute,
+        link: { type: 'substitutions', entityId: row._id },
     });
 
     if (s.notifyOriginalTeacher && row.originalTeacher) {
@@ -750,6 +751,7 @@ async function notifySubstituteAssigned(ctx, row, { changedFrom } = {}) {
             title: `Your class will be covered — ${headline(ctx, row)}`,
             body: `${teacherName(ctx, row.substituteTeacher) || 'A colleague'} will take this class in your absence.\n\n${describe(ctx, row)}`,
             recipients: [row.originalTeacher],
+            link: { type: 'substitutions', entityId: row._id },
         });
     }
 
@@ -762,6 +764,7 @@ async function notifySubstituteAssigned(ctx, row, { changedFrom } = {}) {
             title: `Substitute class reassigned — ${headline(ctx, row)}`,
             body: `This substitute class has been reassigned to ${teacherName(ctx, row.substituteTeacher) || 'another teacher'}. You no longer need to take it.\n\n${describe(ctx, row)}`,
             recipients: [changedFrom],
+            link: { type: 'substitutions', entityId: row._id },
         });
     }
 }
@@ -777,6 +780,7 @@ async function notifySubstituteCancelled(ctx, row, note) {
         title: `Substitute class cancelled — ${headline(ctx, row)}`,
         body: `This substitute class has been cancelled${note ? ` (${note})` : ''}. You no longer need to take it.\n\n${describe(ctx, row)}`,
         recipients: [row.substituteTeacher],
+        link: { type: 'substitutions', entityId: row._id },
     });
 }
 

@@ -135,6 +135,7 @@ exports.approveVideo = async (req, res) => {
             school: req.schoolId, sender: req.userId, senderRole: 'school_admin',
             title: 'Your video was approved', body: `"${v.title}" is now available to students.`,
             recipients: [v.createdBy],
+            link: { type: 'video.mine', entityId: v._id },
         });
         ok(res, { approved: true });
     } catch (e) { fail(res, e); }
@@ -153,6 +154,7 @@ exports.rejectVideo = async (req, res) => {
             title: 'Your video was rejected',
             body: `"${v.title}" was not approved. ${req.body.reason || ''}`.trim(),
             recipients: [v.createdBy],
+            link: { type: 'video.mine', entityId: v._id },
         });
         ok(res, { rejected: true });
     } catch (e) { fail(res, e); }

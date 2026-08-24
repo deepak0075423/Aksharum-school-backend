@@ -34,6 +34,15 @@ const NotificationSchema = new db.Schema({
         class:    { type: db.Types.UUID, ref: 'Class',        default: null },
         section:  { type: db.Types.UUID, ref: 'ClassSection', default: null },
     },
+    // Where this notification takes the reader. Deliberately NOT a URL: the same
+    // notification opens on different screens for a teacher, an admin and a
+    // parent, and web paths differ from the app's. services/notificationLinks
+    // turns this into a path per role and platform at read time.
+    link: {
+        type:     { type: String, default: '' },   // e.g. 'leave.mine'
+        entityId: { type: String, default: null }, // the record it is about
+        params:   { type: db.Types.JSON, default: null },
+    },
     recipientCount: { type: Number, default: 0 },
     emailSent:      { type: Boolean, default: false },
 }, { timestamps: true });

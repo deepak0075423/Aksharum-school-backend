@@ -15,6 +15,7 @@ const NotificationReceipt = require('../models/NotificationReceipt');
 const User                = require('../models/User');
 const { publishNotificationCount, publishToUser } = require('../utils/redisPublisher');
 const { sendSchoolMail, emailHeaderHtml, getMailContext } = require('../utils/schoolMailer');
+const notificationLinks   = require('./notificationLinks');
 
 async function _pushCount(userId) {
     try {
@@ -43,7 +44,22 @@ async function _pushCounts(userIds) {
     } catch {}
 }
 
-function _emailHtml({ school, recipientName, title, body }) {
+// The button points at /n/:receiptId rather than the resolved page: the same
+// email may be opened on a laptop or a phone, and that route decides where to
+// land (and hands off to the app when it is installed) at click time.
+function _openButton(url) {
+    if (!url) return '';
+    return `
+        <p style="margin:20px 0 0">
+          <a href="${url}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
+             padding:11px 22px;border-radius:8px;font-weight:600;font-size:.9rem">Open in Aksharum</a>
+        </p>
+        <p style="color:#9ca3af;font-size:.75rem;margin:10px 0 0;word-break:break-all">
+          Or paste this link into your browser: ${url}
+        </p>`;
+}
+
+function _emailHtml({ school, recipientName, title, body, openUrl }) {
     return `
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school, 'You have a new notification')}
@@ -53,6 +69,7 @@ function _emailHtml({ school, recipientName, title, body }) {
           <h2 style="margin:0 0 4px;font-size:1.05rem;color:#1e293b">${title}</h2>
         </div>
         <p style="white-space:pre-wrap;line-height:1.6;margin:0">${body}</p>
+        ${_openButton(openUrl)}
         <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0">
         <p style="color:#9ca3af;font-size:.8rem;margin:0">This is an automated notification — please do not reply.</p>
       </div>
@@ -71,13 +88,16 @@ function _emailHtml({ school, recipientName, title, body }) {
  * @param {Array}    opts.recipients  User ids (or {_id} docs); deduped, sender excluded
  * @param {Boolean}  [opts.email]     Also email recipients via school SMTP
  * @param {Boolean}  [opts.includeSender] Keep the sender in the recipient list
+ * @param {Object}   [opts.link]      Where it takes the reader — { type, entityId?, params? }.
+ *                                    See services/notificationLinks for the types.
+ *                                    Omitted, the notification opens on itself.
  */
 function notify(opts) {
     setImmediate(() => _notify(opts).catch(e =>
         console.error('[notify] failed:', e.message)));
 }
 
-async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false }) {
+async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false, link = null }) {
     if (!sender || !title || !body) return;
 
     const ids = [...new Set(
@@ -96,41 +116,64 @@ async function _notify({ school, sender, senderRole, title, body, recipients = [
         body:       String(body).trim(),
         channels:   { inApp: true, email: !!email },
         target:     { type: 'individual' },
+        link:       notificationLinks.normalize(link) || undefined,
         recipientCount: ids.length,
     });
 
-    await NotificationReceipt.insertMany(
+    // The inserted receipts already carry the ids each reader's link is built
+    // from, so the fan-out does not need a second pass over the table — which
+    // matters: a school-wide notification writes thousands of rows.
+    const inserted = await NotificationReceipt.insertMany(
         ids.map(uid => ({
             notification: notification._id,
             recipient:    uid,
             school:       school || null,
         })),
         { ordered: false }
-    ).catch(() => {});
+    ).catch(() => []);
 
-    // Real-time push: new-notification event + refreshed unread badge
-    const payload = {
-        _id:        notification._id,
-        title:      notification.title,
-        body:       notification.body,
-        senderRole: notification.senderRole,
-        createdAt:  notification.createdAt,
-    };
+    const receiptOf = new Map((inserted || []).map(r => [String(r.recipient), String(r._id)]));
+    // An insert that gave up part-way still has rows on disk; read back only
+    // then, rather than on every send.
+    if (receiptOf.size < ids.length) {
+        const rows = await NotificationReceipt.find({ notification: notification._id }, '_id recipient').lean();
+        rows.forEach(r => receiptOf.set(String(r.recipient), String(r._id)));
+    }
+
+    // The live payload carries each reader's own destination, and that depends
+    // on their role — so the push is built per recipient rather than broadcast
+    // identically. One indexed lookup for the whole fan-out.
+    const users  = await User.find({ _id: { $in: ids } }, 'name email role').lean();
+    const roleOf = new Map(users.map(u => [String(u._id), u.role]));
+
+    const stored = notificationLinks.normalize(link);
     for (const uid of ids) {
-        publishToUser(uid, 'notification:new', payload);
+        const receiptId = receiptOf.get(String(uid)) || null;
+        publishToUser(uid, 'notification:new', {
+            _id:        notification._id,
+            receiptId,
+            title:      notification.title,
+            body:       notification.body,
+            senderRole: notification.senderRole,
+            createdAt:  notification.createdAt,
+            link:       notificationLinks.resolve(stored, roleOf.get(String(uid)), receiptId),
+        });
     }
     _pushCounts(ids);
 
     if (email) {
         try {
-            const users = await User.find({ _id: { $in: ids } }, 'name email').lean();
             const { school: schoolDoc } = await getMailContext(school);
             for (const u of users) {
                 if (!u.email) continue;
+                const receiptId = receiptOf.get(String(u._id));
                 sendSchoolMail(school, {
                     to:      u.email,
                     subject: `[${schoolDoc?.name || 'Notification'}] ${title}`,
-                    html:    _emailHtml({ school: schoolDoc, recipientName: u.name, title, body }),
+                    html:    _emailHtml({
+                        school: schoolDoc, recipientName: u.name, title, body,
+                        openUrl: receiptId ? notificationLinks.receiptUrl(receiptId) : null,
+                    }),
                 });
             }
         } catch (e) {

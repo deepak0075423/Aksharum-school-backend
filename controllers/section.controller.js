@@ -144,6 +144,8 @@ exports.markAttendance = async (req, res) => {
                             title:      `Attendance: ${sp?.user?.name || 'Student'} marked ${status}`,
                             body:       `${sp?.user?.name || 'The student'} was marked ${status.toLowerCase()} on ${dateLabel}.`,
                             recipients: targets,
+                            // No id: the student's own calendar has no row keyed by a record
+                            link:       { type: 'attendance.student' },
                         });
                     }
                     if (!sp?.parent) continue;

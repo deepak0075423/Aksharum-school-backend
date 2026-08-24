@@ -787,6 +787,7 @@ exports.adminApproveRequest = async (req, res) => {
                 title: '🕓 Leave — first approval recorded',
                 body: `Your leave from ${fmtDate(app.fromDate)} to ${fmtDate(app.toDate)} cleared level ${app.approvalLevel} of ${required}. It is not approved until the final sign-off.`,
                 recipients: [app.teacher],
+                link: { type: 'leave.mine', entityId: app._id },
             });
             return res.json({ success: true, data: app, pendingLevels: required - app.approvalLevel });
         }
@@ -844,6 +845,7 @@ exports.adminApproveRequest = async (req, res) => {
             body: `Your leave from ${fmtDate(app.fromDate)} to ${fmtDate(app.toDate)} (${app.totalDays} day${app.totalDays === 1 ? '' : 's'}) has been approved.${app.adminComment ? `\nComment: ${app.adminComment}` : ''}`,
             recipients: [app.teacher],
             email: true,
+            link: { type: 'leave.mine', entityId: app._id },
         });
         res.json({ success: true, data: app });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -884,6 +886,7 @@ exports.adminRejectRequest = async (req, res) => {
             body: `Your leave from ${fmtDate(app.fromDate)} to ${fmtDate(app.toDate)} has been rejected.${app.adminComment ? `\nReason: ${app.adminComment}` : ''}`,
             recipients: [app.teacher],
             email: true,
+            link: { type: 'leave.mine', entityId: app._id },
         });
         res.json({ success: true, data: app });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -906,6 +909,7 @@ exports.adminRequestModification = async (req, res) => {
             title: '✏️ Leave request needs changes',
             body: `Your leave from ${fmtDate(app.fromDate)} to ${fmtDate(app.toDate)} needs modification.${app.adminComment ? `\nComment: ${app.adminComment}` : ''}`,
             recipients: [app.teacher],
+            link: { type: 'leave.mine', entityId: app._id },
         });
         res.json({ success: true, data: app });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -965,6 +969,7 @@ exports.adminReverseApproved = async (req, res) => {
             body: `Your approved leave from ${fmtDate(app.fromDate)} to ${fmtDate(app.toDate)} has been reversed and ${app.totalDays} day(s) restored to your balance.${adminComment ? `\nReason: ${adminComment}` : ''}`,
             recipients: [app.teacher],
             email: true,
+            link: { type: 'leave.mine', entityId: app._id },
         });
         res.json({ success: true, data: app });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -1902,6 +1907,7 @@ exports.teacherApplyLeave = async (req, res) => {
             title: '📋 New leave request',
             body: `${req.user?.name || 'A teacher'} applied for ${lt.name} leave from ${fmtDate(from)} to ${fmtDate(to)} (${totalDays} day${totalDays === 1 ? '' : 's'}).\nReason: ${reason}`,
             recipients,
+            link: { type: 'leave.approvals', entityId: app._id },
         })).catch(() => {});
         res.status(201).json({ success: true, data: app });
     } catch (e) {
@@ -1937,6 +1943,7 @@ exports.teacherCancelLeave = async (req, res) => {
             title: '🚫 Leave request cancelled',
             body: `${req.user?.name || 'A teacher'} cancelled their leave request for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)}.`,
             recipients: admins,
+            link: { type: 'leave.approvals', entityId: app._id },
         })).catch(() => {});
         res.json({ success: true, data: app });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }

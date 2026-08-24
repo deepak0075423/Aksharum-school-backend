@@ -607,6 +607,7 @@ exports.recordPayment = async (req, res) => {
             body: `Payment of ₹${Number(amount).toLocaleString('en-IN')} received for ${student?.name || 'student'}.\nReceipt: ${receiptNumber} (${paymentMode})`,
             recipients: targets,
             email: true,
+            link: { type: 'fees.mine', entityId: payment._id },
         })).catch(() => {});
 
         res.status(201).json({ success: true, data: payment });
@@ -645,6 +646,7 @@ exports.approvePayment = async (req, res) => {
             body: `Your payment of ₹${payment.amount.toLocaleString('en-IN')} has been approved.\nReceipt: ${receiptNumber}`,
             recipients: targets,
             email: true,
+            link: { type: 'fees.mine', entityId: payment._id },
         })).catch(() => {});
 
         res.json({ success: true, data: payment.toObject() });
@@ -665,6 +667,7 @@ exports.rejectPayment = async (req, res) => {
             body: `Your payment of ₹${payment.amount.toLocaleString('en-IN')} was rejected. Please contact the school office.`,
             recipients: targets,
             email: true,
+            link: { type: 'fees.mine', entityId: payment._id },
         })).catch(() => {});
         res.json({ success: true, data: payment });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }

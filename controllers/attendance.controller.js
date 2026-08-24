@@ -161,6 +161,7 @@ exports.adminReviewRegularization = async (req, res) => {
             title: newStatus === 'Approved' ? '✅ Regularization approved' : '❌ Regularization rejected',
             body: `Your attendance regularization for ${fmtDay(request.date)} was ${low(newStatus)}.${request.adminRemarks ? `\nRemarks: ${request.adminRemarks}` : ''}`,
             recipients: [request.teacher],
+            link: { type: 'attendance.mine', entityId: request._id },
         });
         ok(res, { ...request.toObject(), status: low(request.status) });
     } catch (e) { err(res, e); }
@@ -515,6 +516,7 @@ exports.submitRegularization = async (req, res) => {
             title: '🕐 New attendance regularization request',
             body: `${req.user?.name || 'A staff member'} requested regularization for ${fmtDay(reg.date)}.\nReason: ${reg.reason}`,
             recipients: admins,
+            link: { type: 'attendance.regularizations', entityId: reg._id },
         })).catch(() => {});
         ok(res, { ...reg.toObject(), status: low(reg.status) }, 201);
     } catch (e) { err(res, e); }
@@ -704,6 +706,8 @@ exports.reviewCorrection = async (req, res) => {
             title: newStatus === 'Approved' ? '✅ Attendance correction approved' : '❌ Attendance correction rejected',
             body: `Your attendance correction request for ${fmtDay(correction.date)} was ${low(newStatus)}.${correction.teacherRemarks ? `\nRemarks: ${correction.teacherRemarks}` : ''}`,
             recipients: [correction.student],
+            // No id: the student's attendance page lists days, not corrections
+            link: { type: 'attendance.student' },
         });
         ok(res, { ...correction.toObject(), status: low(correction.status) });
     } catch (e) { err(res, e); }
@@ -780,6 +784,7 @@ exports.submitStudentCorrection = async (req, res) => {
                 title: '📝 New attendance correction request',
                 body: `${req.user?.name || 'A student'} requested a correction for ${fmtDay(session.date)} (${record?.status || 'Not Marked'} → ${requested}).\nReason: ${String(reason).trim()}`,
                 recipients: [sec.classTeacher],
+                link: { type: 'attendance.corrections', entityId: corr._id },
             });
         }).catch(() => {});
         ok(res, { ...corr.toObject(), status: low(corr.status) }, 201);

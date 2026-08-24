@@ -732,6 +732,7 @@ async function approveRequest(request, ctx, { actorId, actorName, actorRole, com
             title: '🕓 Comp Off — first approval recorded',
             body: `Your Comp Off request for ${fmtDate(request.workDate)} cleared level ${request.approvalLevel} of ${required}. No balance is credited until the final approval.`,
             recipients: [request.teacher],
+            link: { type: 'compoff.mine', entityId: request._id },
         });
         return { ok: true, request, credited: 0, pendingLevels: required - request.approvalLevel };
     }
@@ -753,6 +754,7 @@ async function approveRequest(request, ctx, { actorId, actorName, actorRole, com
             + `${comment ? `\nComment: ${comment}` : ''}`,
         recipients: [request.teacher],
         email: true,
+        link: { type: 'compoff.mine', entityId: request._id },
     });
     return { ok: true, request, credited: credit.credited };
 }
@@ -776,6 +778,7 @@ async function rejectRequest(request, ctx, { actorId, actorRole, comment = '' })
         body: `Your Comp Off request for ${fmtDate(request.workDate)} was rejected. No balance has been credited.${comment ? `\nReason: ${comment}` : ''}`,
         recipients: [request.teacher],
         email: true,
+        link: { type: 'compoff.mine', entityId: request._id },
     });
     return { ok: true, request };
 }
@@ -794,6 +797,7 @@ async function notifyNewRequest(request, ctx) {
                 + `${request.workedHours ? ` — ${request.workedHours} hour(s) worked` : ''}.`
                 + `${request.reason ? `\nReason: ${request.reason}` : ''}`,
             recipients,
+            link: { type: 'compoff.approvals', entityId: request._id },
         });
     } catch { /* notification failures never block the request */ }
 }
@@ -870,6 +874,7 @@ async function generateFromAttendance(attendanceRecord, { actorId = null } = {})
                 + `${days} day(s) Comp Off. Open Leave → Comp Off to review and apply.`,
             recipients: [rec.teacher],
             includeSender: true,
+            link: { type: 'compoff.mine', entityId: result.request?._id },
         });
         return { created: true, request: result.request };
     } catch (e) {
@@ -945,6 +950,7 @@ async function runExpirySweep(schoolId) {
             body: `${round2(days)} day(s) of your Comp Off balance lapsed today without being used.`,
             recipients: [teacherId],
             includeSender: true,
+            link: { type: 'compoff.mine' },
         });
     }
 
@@ -979,6 +985,7 @@ async function runExpiryNotifications(schoolId) {
             body: `${left} day(s) of Comp Off earned for ${fmtDate(r.workDate)} expire on ${fmtDate(r.expiresAt)}. Apply for leave before then or the days will lapse.`,
             recipients: [r.teacher],
             includeSender: true,
+            link: { type: 'compoff.mine', entityId: r._id },
         });
         r.expiryNotifiedAt = now;
         await r.save();

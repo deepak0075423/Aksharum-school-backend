@@ -7,6 +7,7 @@ const ClassSection        = require('../models/ClassSection');
 const mailer              = require('../config/mailer');
 const { publishNotificationCount, publishToUser } = require('../utils/redisPublisher');
 const { sendSchoolMail, emailHeaderHtml } = require('../utils/schoolMailer');
+const notificationLinks   = require('../services/notificationLinks');
 
 // Recompute and push unread count for one user via the WebSocket Gateway
 async function _pushCount(userId) {
@@ -36,6 +37,22 @@ async function _pushCounts(userIds) {
     } catch {}
 }
 
+/**
+ * Give every receipt the destination it opens on, for THIS reader.
+ * Resolution happens here rather than at send time because the same
+ * notification points at different screens for a teacher, an admin and a
+ * parent — and the sender does not know who will read it on what.
+ */
+function withLinks(receipts, role) {
+    return receipts.map(r => {
+        const n = r.notification;
+        return {
+            ...r,
+            link: notificationLinks.resolve(n?.link, role, String(r._id)),
+        };
+    });
+}
+
 exports.getList = async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
@@ -52,36 +69,36 @@ exports.getList = async (req, res) => {
 async function resolveRecipients({ targetType, school, classId, sectionId, targetSchools = [] }) {
     switch (targetType) {
         case 'all':
-            return User.find({ school, role: { $in: ['teacher', 'student', 'parent', 'school_admin'] } }, '_id email name school').lean();
+            return User.find({ school, role: { $in: ['teacher', 'student', 'parent', 'school_admin'] } }, '_id email name school role').lean();
         case 'all_teachers':
-            return User.find({ school, role: 'teacher' }, '_id email name school').lean();
+            return User.find({ school, role: 'teacher' }, '_id email name school role').lean();
         case 'all_students':
-            return User.find({ school, role: 'student' }, '_id email name school').lean();
+            return User.find({ school, role: 'student' }, '_id email name school role').lean();
         case 'all_parents':
-            return User.find({ school, role: 'parent' }, '_id email name school').lean();
+            return User.find({ school, role: 'parent' }, '_id email name school role').lean();
         case 'class_students': {
             const secs = await ClassSection.find({ class: classId, school }, 'enrolledStudents').lean();
             const ids  = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
-            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school').lean();
+            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school role').lean();
         }
         case 'class_parents': {
             const secs       = await ClassSection.find({ class: classId, school }, 'enrolledStudents').lean();
             const studentIds = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
             const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
             const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school').lean();
+            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school role').lean();
         }
         case 'section_students': {
             const sec = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
             const ids = (sec?.enrolledStudents || []).map(id => id.toString());
-            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school').lean();
+            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school role').lean();
         }
         case 'section_parents': {
             const sec        = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
             const studentIds = (sec?.enrolledStudents || []).map(id => id.toString());
             const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
             const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school').lean();
+            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school role').lean();
         }
         case 'section_all': {
             const sec        = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
@@ -89,28 +106,39 @@ async function resolveRecipients({ targetType, school, classId, sectionId, targe
             const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
             const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
             const allIds     = [...new Set([...studentIds, ...parentIds])];
-            return User.find({ _id: { $in: allIds }, school }, '_id email name school').lean();
+            return User.find({ _id: { $in: allIds }, school }, '_id email name school role').lean();
         }
         // Super-admin targets — only school_admin recipients
         case 'all_schools':
-            return User.find({ role: 'school_admin' }, '_id email name school').lean();
+            return User.find({ role: 'school_admin' }, '_id email name school role').lean();
         case 'specific_school': {
             const schoolIds = (targetSchools.length ? targetSchools : (school ? [school] : []))
                 .map(String).filter(Boolean);
             if (!schoolIds.length) return [];
-            return User.find({ school: { $in: schoolIds }, role: 'school_admin' }, '_id email name school').lean();
+            return User.find({ school: { $in: schoolIds }, role: 'school_admin' }, '_id email name school role').lean();
         }
         default:
             return [];
     }
 }
 
-function dispatchEmails({ recipients, title, body, schoolName, schoolId, school }) {
-    const html = `
+function dispatchEmails({ recipients, title, body, schoolName, schoolId, school, receiptOf }) {
+    // The button is built per recipient — it points at that reader's own
+    // receipt, so opening it lands them on the notification (and marks it read)
+    // whichever device they happen to be on.
+    const html = (openUrl) => `
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school || { name: schoolName }, title)}
       <div style="background:#f9fafb;padding:24px 28px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none">
         <p style="white-space:pre-wrap;line-height:1.6;margin:0">${body}</p>
+        ${openUrl ? `
+        <p style="margin:20px 0 0">
+          <a href="${openUrl}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
+             padding:11px 22px;border-radius:8px;font-weight:600;font-size:.9rem">Open in Aksharum</a>
+        </p>
+        <p style="color:#9ca3af;font-size:.75rem;margin:10px 0 0;word-break:break-all">
+          Or paste this link into your browser: ${openUrl}
+        </p>` : ''}
         <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0">
         <p style="color:#9ca3af;font-size:.8rem;margin:0">This notification was sent by your school administration.</p>
       </div>
@@ -118,10 +146,11 @@ function dispatchEmails({ recipients, title, body, schoolName, schoolId, school 
 
     recipients.forEach(u => {
         if (!u.email) return;
+        const receiptId = receiptOf?.get(String(u._id));
         sendSchoolMail(schoolId, {
             to:      u.email,
             subject: `[${schoolName}] ${title}`,
-            html,
+            html:    html(receiptId ? notificationLinks.receiptUrl(receiptId) : null),
             fromName: schoolName,
         });
     });
@@ -185,19 +214,33 @@ exports.send = async (req, res) => {
                 // receipt to the recipient's school so it stays queryable.
                 school:       req.schoolId || u.school || null,
             }));
-            await NotificationReceipt.insertMany(docs, { ordered: false }).catch(() => {});
+            // A typed broadcast has no destination of its own, so each reader's
+            // link opens the notification itself — which needs their own receipt
+            // id, taken from the insert rather than a second pass over a table
+            // this may have just written thousands of rows to.
+            const inserted = await NotificationReceipt.insertMany(docs, { ordered: false }).catch(() => []);
+            const receiptOf = new Map((inserted || []).map(r => [String(r.recipient), String(r._id)]));
+            if (receiptOf.size < recipients.length) {
+                const rows = await NotificationReceipt
+                    .find({ notification: notification._id }, '_id recipient').lean();
+                rows.forEach(r => receiptOf.set(String(r.recipient), String(r._id)));
+            }
             // Fire-and-forget: real-time event + updated count via the WebSocket Gateway
-            const rtPayload = {
-                _id:        notification._id,
-                title:      notification.title,
-                body:       notification.body,
-                senderRole: notification.senderRole,
-                createdAt:  notification.createdAt,
-            };
             recipients.forEach(u => {
-                publishToUser(u._id, 'notification:new', rtPayload);
+                const receiptId = receiptOf.get(String(u._id)) || null;
+                publishToUser(u._id, 'notification:new', {
+                    _id:        notification._id,
+                    receiptId,
+                    title:      notification.title,
+                    body:       notification.body,
+                    senderRole: notification.senderRole,
+                    createdAt:  notification.createdAt,
+                    link:       notificationLinks.resolve(null, u.role, receiptId),
+                });
             });
             _pushCounts(recipients.map(u => u._id));
+            // Emails go out below and need the same per-reader ids
+            req._notifReceiptOf = receiptOf;
         }
 
         await Notification.findByIdAndUpdate(notification._id, { recipientCount: recipients.length });
@@ -213,6 +256,7 @@ exports.send = async (req, res) => {
                     schoolName: school?.name || 'School',
                     schoolId:   req.schoolId,
                     school,
+                    receiptOf:  req._notifReceiptOf,
                 });
             } else {
                 // Super-admin send: mail each school's admins through their own
@@ -229,6 +273,7 @@ exports.send = async (req, res) => {
                         schoolName: school?.name || 'School',
                         schoolId:   sid,
                         school,
+                        receiptOf:  req._notifReceiptOf,
                     });
                 }
             }
@@ -249,7 +294,7 @@ exports.getInboxApi = async (req, res) => {
             .limit(+limit)
             .lean();
         const unread = await NotificationReceipt.countDocuments({ recipient: req.userId, isRead: false, isCleared: false });
-        res.json({ success: true, data: receipts, unread });
+        res.json({ success: true, data: withLinks(receipts, req.userRole), unread });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -328,6 +373,47 @@ exports.getAllNotifications = async (req, res) => {
             .lean();
         const total  = await NotificationReceipt.countDocuments({ recipient: req.userId });
         const unread = await NotificationReceipt.countDocuments({ recipient: req.userId, isRead: false });
-        res.json({ success: true, data: receipts, total, unread, page: +page, pages: Math.ceil(total / +limit) });
+        res.json({
+            success: true, data: withLinks(receipts, req.userRole),
+            total, unread, page: +page, pages: Math.ceil(total / +limit),
+        });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+/**
+ * GET /notifications/:receiptId/resolve
+ * "I have this notification — where does it go, and what does it say?"
+ * The one thing an email link, a push tap and a cold app start all need, and
+ * the only place that also marks the notification read as a side effect of
+ * opening it. Returns 404 for a receipt that is not the caller's, so a guessed
+ * id tells the guesser nothing.
+ */
+exports.resolveReceipt = async (req, res) => {
+    try {
+        const receipt = await NotificationReceipt
+            .findOne({ _id: req.params.receiptId, recipient: req.userId })
+            .populate('notification')
+            .lean();
+        if (!receipt) return res.status(404).json({ success: false, message: 'Notification not found' });
+
+        if (!receipt.isRead) {
+            await NotificationReceipt.updateOne({ _id: receipt._id }, { isRead: true, readAt: new Date() });
+            _pushCount(req.userId);
+        }
+
+        const n = receipt.notification;
+        res.json({
+            success: true,
+            data: {
+                _id:       receipt._id,
+                isRead:    true,
+                createdAt: receipt.createdAt,
+                notification: n ? {
+                    _id: n._id, title: n.title, body: n.body,
+                    senderRole: n.senderRole, createdAt: n.createdAt,
+                } : null,
+                link: notificationLinks.resolve(n?.link, req.userRole, String(receipt._id)),
+            },
+        });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };

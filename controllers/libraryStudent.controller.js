@@ -144,6 +144,7 @@ exports.reserve = async (req, res) => {
                 : `You are number ${reservation.queuePosition} in the queue for "${book.title}". We will let you know when it is ready.`,
             recipients: [req.userId],
             includeSender: true,
+            link: { type: 'library.reservations' },
         });
 
         res.status(201).json({ success: true, data: reservation });

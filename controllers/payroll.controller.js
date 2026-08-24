@@ -489,6 +489,9 @@ exports.publishRun = async (req, res) => {
                 body: `Your payslip for ${MONTHS[(run.month || 1) - 1]} ${run.year} is now available.\nNet salary: ₹${(entry.netSalary || 0).toLocaleString('en-IN')}`,
                 recipients: [entry.employee],
                 email: true,
+                // The teacher's list is of payslips, not runs — name the row
+                // they will actually be looking at.
+                link: { type: 'payroll.payslips', entityId: payslip._id },
             });
         }
 

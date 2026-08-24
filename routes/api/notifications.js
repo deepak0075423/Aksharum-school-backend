@@ -12,6 +12,7 @@ router.get('/unread-count',              guard, ctrl.getUnreadCount);
 router.get('/sent',                      guard, ctrl.getSent);
 router.post('/mark-all-read',            guard, ctrl.markAllRead);
 router.post('/clear-all',               guard, ctrl.clearAll);
+router.get('/:receiptId/resolve',       guard, ctrl.resolveReceipt);
 router.patch('/:receiptId/mark-read',   guard, ctrl.markOneRead);
 router.delete('/:receiptId',            guard, ctrl.clearOne);
 router.get('/classes/:classId/sections', guard, ctrl.getSectionsByClass);

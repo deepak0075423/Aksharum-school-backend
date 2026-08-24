@@ -204,6 +204,7 @@ exports.confirmFinePayment = async (req, res) => {
             body: `A library fine of ₹${total.toLocaleString('en-IN')} has been paid online.\nReceipt: ${receiptNumber}`,
             recipients: await borrowerAudience({ issuedTo: subject.userId, issuedToRole: payer?.role || '' }),
             includeSender: true,
+            link: { type: 'library.myfines' },
         });
 
         res.json({ success: true, data: { receiptNumber, amount: total, count: fines.length } });

@@ -374,6 +374,7 @@ exports.adminCancelApproved = async (req, res) => {
             title: '↩️ Comp Off withdrawn',
             body: `Your approved Comp Off for ${fmtDate(request.workDate)} was withdrawn and ${result.reversed} day(s) removed from your balance.${comment ? `\nReason: ${comment}` : ''}`,
             recipients: [request.teacher],
+            link: { type: 'compoff.mine', entityId: request._id },
         });
         ok(res, { request, reversed: result.reversed });
     } catch (e) { bad(res, e.message, e.status || 500); }

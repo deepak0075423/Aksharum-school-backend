@@ -116,6 +116,7 @@ exports.createRequest = async (req, res) => {
             title: '📦 New purchase request',
             body: `${req.user?.name || 'A teacher'} raised ${requestNumber} (${normalized.length} item${normalized.length === 1 ? '' : 's'}, est. ₹${estimatedTotal.toLocaleString('en-IN')}).${reason ? `\nReason: ${reason}` : ''}`,
             recipients: admins,
+            link: { type: 'inventory.requests', entityId: pr._id },
         })).catch(() => {});
         ok(res, pr);
     } catch (e) {

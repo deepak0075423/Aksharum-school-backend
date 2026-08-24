@@ -112,7 +112,7 @@ function diffFields(before, after, fields) {
  * Notify a student and, when the setting allows it, their parents.
  * `settingKey` names the HostelSettings toggle that governs the parent copy.
  */
-async function notifyStudentAndParents(req, { studentId, title, body, settings, settingKey, email = null }) {
+async function notifyStudentAndParents(req, { studentId, title, body, settings, settingKey, email = null, link = null }) {
     try {
         const recipients = (settings && settingKey && settings[settingKey] === false)
             ? [String(studentId)]
@@ -125,12 +125,15 @@ async function notifyStudentAndParents(req, { studentId, title, body, settings, 
             recipients,
             email: email == null ? !!settings?.emailNotifications : email,
             includeSender: true,
+            // Every hostel event opens on the hostel screen unless a caller
+            // knows somewhere more specific.
+            link: link || { type: 'hostel' },
         });
     } catch { /* fire-and-forget */ }
 }
 
 /** Notify the staff who run a hostel: its warden, assistant and school admins. */
-async function notifyHostelStaff(req, { hostelId, title, body, email = false }) {
+async function notifyHostelStaff(req, { hostelId, title, body, email = false, link = null }) {
     try {
         const [h, assigns, admins] = await Promise.all([
             hostelId ? Hostel.findById(hostelId).select('warden assistantWarden').lean() : null,
@@ -149,6 +152,7 @@ async function notifyHostelStaff(req, { hostelId, title, body, email = false }) 
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title, body, recipients: [...new Set(ids)], email,
+            link: link || { type: 'hostel' },
         });
     } catch { /* fire-and-forget */ }
 }

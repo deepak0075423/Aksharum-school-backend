@@ -89,6 +89,7 @@ exports.addLinkVideo = async (req, res) => {
                 school: req.schoolId, sender: req.userId, senderRole: 'teacher',
                 title: 'Video pending approval', body: `A teacher submitted "${v.title}" for approval.`,
                 recipients: admins,
+                link: { type: 'video.approvals', entityId: v._id },
             });
         }
         ok(res, { ...v.toObject?.() || v, requiresApproval });

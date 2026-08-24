@@ -733,6 +733,7 @@ async function announceCampaign(campaign, req = null) {
             recipients: students,
             email: !!settings.emailNotifications,
             includeSender: true,
+            link: { type: 'feedback.pending', entityId: campaign._id },
         });
         return students.length;
     } catch (e) {
@@ -833,6 +834,7 @@ async function remindPending(campaign, req = null) {
         recipients: students,
         email: !!settings?.emailNotifications,
         includeSender: true,
+        link: { type: 'feedback.pending', entityId: campaign._id },
     });
     return students.length;
 }
@@ -1521,6 +1523,7 @@ async function runCampaignSchedule() {
                     recipients: students,
                     email: !!settings.emailNotifications,
                     includeSender: true,
+                    link: { type: 'feedback.pending', entityId: c._id },
                 });
                 if (closingSoon) result.closingSoon += students.length;
                 else result.reminded += students.length;

@@ -466,6 +466,7 @@ async function sweepOverdue(schoolId) {
                 + ` and is now ${days} day${days === 1 ? '' : 's'} overdue.`
                 + (rate ? ` A fine of ₹${rate} a day applies until it is returned.` : ' Please return it.'),
             recipients: await borrowerAudience(row),
+            link: { type: 'library.mybooks' },
         });
     }
     return rows.length;
@@ -508,6 +509,7 @@ async function expireStaleHolds(schoolId, bookId = null, { actor, actorRole } = 
                 body: `"${titleOf[String(row.book)] || 'A book'}" was held for you but not collected in time,`
                     + ` so it has gone back on the shelf. You can reserve it again if you still want it.`,
                 recipients: [row.reservedBy],
+                link: { type: 'library.reservations' },
             });
         }
 
@@ -560,6 +562,7 @@ async function promoteQueue(schoolId, bookId, policy, { actor, actorRole } = {})
                 title: '🔖 Reserved book available',
                 body: `"${book?.title || 'A book'}" you reserved is now available. Collect it before ${fmtLibDate(r.expiresAt)}.`,
                 recipients: [r.reservedBy],
+                link: { type: 'library.reservations' },
             });
         }
     }
@@ -591,6 +594,7 @@ async function sendDueSoonReminders(schoolId, { daysAhead = 2 } = {}) {
             title: '⏰ Library book due soon',
             body: `"${iss.book?.title || 'A library book'}" is due back on ${fmtLibDate(iss.dueDate)}. Renew it or bring it in to avoid a fine.`,
             recipients: [iss.issuedTo],
+            link: { type: 'library.mybooks' },
         });
         await LibraryIssuance.updateOne({ _id: iss._id }, { dueSoonNotifiedFor: iss.dueDate });
         sent += 1;
@@ -712,6 +716,7 @@ async function renewIssuance(schoolId, issuanceId, { onlyForUser = null, actor =
             + (left > 0 ? ` You can renew it ${left} more time${left === 1 ? '' : 's'}.` : ' This was the last renewal allowed.'),
         recipients: [issuance.issuedTo],
         includeSender: true,   // a member renewing their own loan is the recipient
+        link: { type: 'library.mybooks' },
     });
 
     return { ok: true, issuance };

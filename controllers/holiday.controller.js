@@ -81,6 +81,7 @@ async function sendHolidayNotification(holiday, schoolId, creatorId) {
             body:       `A ${typeLabel} holiday "${holiday.name}" has been scheduled on ${holidayDateRange(holiday)}.${holiday.description ? ' ' + holiday.description : ''}`,
             recipients,
             includeSender: true,
+            link:       { type: 'holidays', entityId: holiday._id },
         });
     } catch (e) {
         console.error('[holiday-notif]', e.message);
@@ -117,6 +118,7 @@ async function sendImportedHolidaysNotification(holidays, schoolId, creatorId) {
             body:       `The holiday calendar has been updated:\n${preview}${rest > 0 ? `\n…and ${rest} more` : ''}`,
             recipients,
             includeSender: true,
+            link:       { type: 'holidays' },
         });
     } catch (e) {
         console.error('[holiday-import-notif]', e.message);
