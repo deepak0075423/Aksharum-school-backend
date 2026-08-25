@@ -36,6 +36,7 @@ const designationSvc = require('../services/designationService');
 const mailer         = require('../config/mailer');
 const { sendSchoolMail, emailHeaderHtml, getMailContext, invalidate: invalidateMailer } = require('../utils/schoolMailer');
 const { notify } = require('../services/notifyService');
+const { setStudentSection } = require('../utils/sectionMembership');
 const { validate, isEmail, isPhone, isURL } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
@@ -672,6 +673,16 @@ exports.updateStudentFull = async (req, res) => {
         }
 
         await StudentProfile.findOneAndUpdate({ user: req.params.id }, profileUpdate, { upsert: true });
+        // Moving a student on the form has to move them on the class too —
+        // otherwise their record says 8-A while 5-A still holds them.
+        if (currentSection !== undefined) {
+            await setStudentSection({
+                studentId: req.params.id,
+                sectionId: currentSection || null,
+                schoolId:  req.schoolId,
+                classId:   profileUpdate.currentClass || null,
+            });
+        }
         if (resolvedParentId) {
             await ParentProfile.findOneAndUpdate(
                 { user: resolvedParentId },
@@ -1135,6 +1146,17 @@ exports.createStudent = async (req, res) => {
         const profileData = { user: user._id, school: req.schoolId, ...buildStudentProfile(profile, uploads) };
         if (resolvedParentId) profileData.parent = resolvedParentId;
         await StudentProfile.create(profileData);
+        // The profile now says which section they are in; the section itself has
+        // to agree, or the class page, attendance and the timetable fan-out all
+        // miss a student their own record says is enrolled.
+        if (profileData.currentSection) {
+            await setStudentSection({
+                studentId: user._id,
+                sectionId: profileData.currentSection,
+                schoolId:  req.schoolId,
+                classId:   profileData.currentClass || classId,
+            });
+        }
         if (resolvedParentId) {
             await ParentProfile.findOneAndUpdate(
                 { user: resolvedParentId },
@@ -1799,8 +1821,13 @@ exports.bulkStudents = async (req, res) => {
                 if (parentErr) { fail(parentErr); continue; }
                 if (!parentId) { fail('Parent / guardian details are required'); continue; }
 
-                // Blank in the sheet → generated from the school's format
-                const admissionNumber = admNo || await admissionNo.nextAdmissionNumber(bulkSchool, clasDoc);
+                // Blank in the sheet → keep the number this student already holds,
+                // and only mint a new one for a genuinely new admission. Without
+                // this a re-upload of a sheet with an empty Admission Number
+                // column renumbers every student it imported last time.
+                const admissionNumber = admNo
+                    || existingProfile?.admissionNumber
+                    || await admissionNo.nextAdmissionNumber(bulkSchool, clasDoc);
                 const profileData = {
                     school: req.schoolId,
                     ...buildStudentProfile(profile, {}),
@@ -1812,6 +1839,9 @@ exports.bulkStudents = async (req, res) => {
                     ...(rollNumber ? { rollNumber } : {}),
                 };
 
+                // 'created' vs 'updated' — a re-uploaded sheet is mostly the
+                // latter, and the admin has to be able to see that it was.
+                let action = 'created';
                 let studentUser = studentExists;
                 if (studentUser) {
                     await User.updateOne({ _id: studentUser._id }, { $set: { name, ...(phone ? { phone } : {}) } });
@@ -1822,6 +1852,7 @@ exports.bulkStudents = async (req, res) => {
                         { upsert: true },
                     );
                     updated++;
+                    action = 'updated';
                     sectionRoster.add(String(studentUser._id));
                 } else {
                     const otp = generateOTP();
@@ -1838,7 +1869,7 @@ exports.bulkStudents = async (req, res) => {
                 );
                 await ParentProfile.findOneAndUpdate({ user: parentId }, { $addToSet: { children: studentUser._id } });
 
-                push({ type: 'row_done', row: rowNum, name, success: true });
+                push({ type: 'row_done', row: rowNum, name, success: true, action });
             } catch (e) {
                 fail(e.code === 11000 ? 'Duplicate entry' : e.message);
             }
@@ -1851,8 +1882,11 @@ exports.bulkStudents = async (req, res) => {
         }));
         if (countOps.length) await ClassSection.bulkWrite(countOps);
 
+        // created + updated + errors === total. The client shows all four, so a
+        // run that stops early is visible as a shortfall instead of passing for
+        // a finished import.
         push({
-            type: 'done', created, updated, errors,
+            type: 'done', created, updated, errors, total: rows.length,
             errorFile: buildErrorReport(headerRow, failures, 'student-import-errors.xlsx'),
         });
         res.end();

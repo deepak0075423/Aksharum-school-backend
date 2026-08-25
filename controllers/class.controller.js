@@ -10,6 +10,7 @@ const { isDate }     = require('../utils/validators');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
 const { capacityError, seatsFor, seatsOf } = require('../utils/sectionCapacity');
+const { setStudentSection, syncCounts }   = require('../utils/sectionMembership');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const Subject               = require('../models/Subject');
 const School                = require('../models/School');
@@ -500,12 +501,19 @@ exports.autoAssignStudents = async (req, res) => {
         }));
         if (bulkOps.length) await ClassSection.bulkWrite(bulkOps);
 
-        // Point each promoted student's profile at their new section
+        // Point each promoted student's profile at their new section — and at
+        // the class that section belongs to. Writing only the section left
+        // promoted students recorded against last year's class, which is what
+        // the shuffle and the section picker read.
+        const promotedInto = await ClassSection.find(
+            { _id: { $in: Object.keys(sectionAddMap) } }, '_id class',
+        ).lean();
+        const classOfSection = new Map(promotedInto.map(s => [String(s._id), s.class]));
         for (const [sectionId, userIds] of Object.entries(sectionAddMap)) {
-            await StudentProfile.updateMany(
-                { user: { $in: userIds } },
-                { $set: { currentSection: sectionId } }
-            );
+            const set = { currentSection: sectionId };
+            const cls = classOfSection.get(String(sectionId));
+            if (cls) set.currentClass = cls;
+            await StudentProfile.updateMany({ user: { $in: userIds } }, { $set: set });
         }
 
         const assigned = Object.values(sectionAddMap).reduce((sum, arr) => sum + arr.length, 0);
@@ -883,8 +891,11 @@ exports.assignStudentToSection = async (req, res) => {
             }
         }
 
+        // Scoped to students of this school: an id that is a teacher, or belongs
+        // to another school, is refused as "not found" rather than enrolled —
+        // which would also have created a student record for them.
         const names = {};
-        (await User.find({ _id: { $in: requested } }, 'name').lean())
+        (await User.find({ _id: { $in: requested }, role: 'student', school: req.schoolId }, 'name').lean())
             .forEach(u => { names[String(u._id)] = u.name; });
 
         // Seats are counted once for the batch and spent as students are placed,
@@ -923,16 +934,8 @@ exports.assignStudentToSection = async (req, res) => {
                 continue;
             }
 
-            await ClassSection.findByIdAndUpdate(req.params.sectionId, {
-                $addToSet: { enrolledStudents: studentId },
-                $inc:      { currentCount: 1 },
-            });
             roster.add(studentId);
             free -= 1;
-
-            // Keep the student's profile in sync — every read path (my-class,
-            // timetable, admin list, parent views) resolves class via currentSection.
-            const profileSet = { currentSection: req.params.sectionId, currentClass: section.class };
 
             // Once a section has been numbered, a student joining later continues
             // the sequence instead of arriving without a roll number.
@@ -947,16 +950,26 @@ exports.assignStudentToSection = async (req, res) => {
                 } else {
                     nextRoll += 1;
                     assignedRoll = String(nextRoll);
-                    profileSet.rollNumber = assignedRoll;
                 }
             }
 
-            await StudentProfile.updateOne(
-                { user: studentId, school: req.schoolId },
-                { $set: profileSet }
-            );
+            // Roster and student record are written together — see
+            // utils/sectionMembership. It creates the record when the student
+            // has none, so enrolling can never leave a student on the class list
+            // with their own class and section blank. Headcounts are recomputed
+            // once after the loop rather than per student.
+            await setStudentSection({
+                studentId,
+                sectionId:   req.params.sectionId,
+                schoolId:    req.schoolId,
+                classId:     section.class,
+                extra:       assignedRoll ? { rollNumber: assignedRoll } : null,
+                deferCounts: true,
+            });
             enrolled.push({ _id: studentId, name, rollNumber: assignedRoll });
         }
+
+        if (enrolled.length) await syncCounts([req.params.sectionId]);
 
         // A single-student call that could not be honoured still reads as an
         // error, the way the picker has always treated it.
@@ -979,18 +992,11 @@ exports.removeStudentFromSection = async (req, res) => {
     try {
         const { studentId } = req.body;
         if (!studentId) return err(res, { message: 'studentId is required' }, 400);
-        const section = await ClassSection.findByIdAndUpdate(
-            req.params.sectionId,
-            { $pull: { enrolledStudents: studentId }, $inc: { currentCount: -1 } },
-            { new: true }
-        );
-        if (section && section.currentCount < 0) {
-            await ClassSection.findByIdAndUpdate(req.params.sectionId, { $set: { currentCount: 0 } });
-        }
-        await StudentProfile.updateOne(
-            { user: studentId, currentSection: req.params.sectionId },
-            { $set: { currentSection: null } }
-        );
+        // Roster and profile are two halves of one fact — see
+        // utils/sectionMembership. Passing no section unenrols them from every
+        // section and recomputes the headcounts from the actual rosters, so the
+        // counter cannot drift below zero the way $inc could.
+        await setStudentSection({ studentId, sectionId: null, schoolId: req.schoolId });
         ok(res, { message: 'Student removed' });
     } catch (e) { err(res, e); }
 };

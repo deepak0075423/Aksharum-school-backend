@@ -15,6 +15,7 @@ const TeacherProfile = require('../models/TeacherProfile');
 const XLSX           = require('xlsx');
 const compOff        = require('../services/compOffService');
 const { getActiveAcademicYearLabel, remainingOf, utcMidnight } = require('../utils/leaveDays');
+const { resolvePage } = require('../utils/focusPage');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const bad = (res, message, status = 400) => res.status(status).json({ success: false, message });
@@ -244,7 +245,7 @@ exports.listRequests = async (req, res) => {
             return ok(res, { enabled: false, reason: ctx.reason, items: [], total: 0, page: 1, pages: 0 });
         }
 
-        const { status, teacherId, dayCategory, source, fromDate, toDate, page = 1, limit = 20 } = req.query;
+        const { status, teacherId, dayCategory, source, fromDate, toDate, page = 1, limit = 20, focus } = req.query;
         const filter = { school: req.schoolId };
         if (status)      filter.status      = status;
         if (teacherId)   filter.teacher     = teacherId;
@@ -256,13 +257,19 @@ exports.listRequests = async (req, res) => {
             if (toDate)   filter.workDate.$lte = utcMidnight(toDate);
         }
 
+        const sort = { appliedAt: -1, workDate: -1 };
+        // Arriving from a notification: open on the page holding that request
+        // rather than page 1, where it usually is not.
+        const { page: effectivePage, focusFound } =
+            await resolvePage(CompOffRequest, filter, sort, +limit, focus, page);
+
         const [items, total, isApprover] = await Promise.all([
             CompOffRequest.find(filter)
                 .populate('teacher', 'name email')
                 .populate('holiday', 'name type')
                 .populate('approvedBy', 'name')
-                .sort({ appliedAt: -1, workDate: -1 })
-                .skip((+page - 1) * +limit)
+                .sort(sort)
+                .skip((effectivePage - 1) * +limit)
                 .limit(+limit)
                 .lean(),
             CompOffRequest.countDocuments(filter),
@@ -271,7 +278,8 @@ exports.listRequests = async (req, res) => {
 
         ok(res, {
             enabled: true, isApprover, policy: publicPolicy(ctx.policy),
-            items, total, page: +page, pages: Math.ceil(total / +limit),
+            items, total, page: effectivePage, pages: Math.ceil(total / +limit),
+            ...(focus ? { focusFound } : {}),
         });
     } catch (e) { bad(res, e.message, 500); }
 };

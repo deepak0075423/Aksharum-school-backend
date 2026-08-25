@@ -7,6 +7,7 @@ const School       = require('../models/School');
 const User         = require('../models/User');
 const TeacherProfile  = require('../models/TeacherProfile');
 const StudentProfile  = require('../models/StudentProfile');
+const { setStudentSection } = require('../utils/sectionMembership');
 const ParentProfile   = require('../models/ParentProfile');
 const ClassSection    = require('../models/ClassSection');
 const Class           = require('../models/Class');
@@ -578,6 +579,9 @@ exports.bulkStudents = async (req, res) => {
             const otp = generateOTP();
             const studentUser = await User.create({ name, email, phone, role: 'student', school: schoolId, password: await bcrypt.hash(otp, 12), isFirstLogin: true });
             await StudentProfile.create({ user: studentUser._id, school: schoolId, admissionNumber: admNo, dob, gender, bloodGroup, category, address, currentSection: section._id, parent: parentUserId });
+            // The section has to know too — a profile pointing at a class the
+            // class does not list is a student every roster-based screen misses.
+            await setStudentSection({ studentId: studentUser._id, sectionId: section._id, schoolId });
             await ParentProfile.findOneAndUpdate({ user: parentUserId }, { $addToSet: { children: studentUser._id } });
             sendWelcomeEmail(email, name, email, otp, schoolName, schoolId);
 

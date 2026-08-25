@@ -8,6 +8,7 @@ const AcademicYear     = require('../models/AcademicYear');
 const XLSX             = require('xlsx');
 const path             = require('path');
 const { notify, schoolAdminIds } = require('../services/notifyService');
+const { resolvePage } = require('../utils/focusPage');
 const compOff          = require('../services/compOffService');
 const leavePolicy      = require('../services/leavePolicyService');
 // Status change + balance move + ledger row, as one transaction under one lock.
@@ -472,7 +473,7 @@ exports.adminUpdateLeaveSettings = async (req, res) => {
 
 exports.adminGetRequests = async (req, res) => {
     try {
-        const { status, teacherId, leaveType, fromDate, toDate, page = 1, limit = 20 } = req.query;
+        const { status, teacherId, leaveType, fromDate, toDate, page = 1, limit = 20, focus } = req.query;
         const filter = { school: req.schoolId };
         if (status)    filter.status    = status;
         if (teacherId) filter.teacher   = teacherId;
@@ -482,21 +483,34 @@ exports.adminGetRequests = async (req, res) => {
             if (fromDate) filter.fromDate.$gte = new Date(fromDate);
             if (toDate)   filter.fromDate.$lte = new Date(toDate);
         }
+        // fromDate is indexed alongside (school, status); appliedAt is not, so
+        // sorting on it made every page of the queue sort in memory. Newest
+        // leave first reads the same to a user.
+        const sort = { fromDate: -1 };
+
+        // Arriving from a notification: open on the page holding that request
+        // rather than page 1, where it usually is not.
+        const { page: effectivePage, focusFound } =
+            await resolvePage(LeaveApplication, filter, sort, +limit, focus, page);
+
         const [apps, total] = await Promise.all([
             LeaveApplication.find(filter)
                 .populate('teacher',  'name email employeeId')
                 .populate('leaveType','name code category')
                 .populate('approvedBy','name')
-                // fromDate is indexed alongside (school, status); appliedAt is
-                // not, so sorting on it made every page of the queue sort in
-                // memory. Newest leave first reads the same to a user.
-                .sort({ fromDate: -1 })
-                .skip((+page - 1) * +limit)
+                .sort(sort)
+                .skip((effectivePage - 1) * +limit)
                 .limit(+limit)
                 .lean(),
             LeaveApplication.countDocuments(filter),
         ]);
-        res.json({ success: true, data: apps, total, page: +page, pages: Math.ceil(total / +limit) });
+        res.json({
+            success: true, data: apps, total,
+            page: effectivePage, pages: Math.ceil(total / +limit),
+            // false tells the caller the record is not in this filtered set, so
+            // it can widen the filters instead of showing a page without it.
+            ...(focus ? { focusFound } : {}),
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

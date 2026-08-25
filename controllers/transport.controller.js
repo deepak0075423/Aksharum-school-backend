@@ -22,6 +22,7 @@ const StudentProfile       = require('../models/StudentProfile');
 const User                 = require('../models/User');
 
 const { notify, withParents } = require('../services/notifyService');
+const { resolvePage } = require('../utils/focusPage');
 
 // ── tiny helpers ─────────────────────────────────────────────────────────────
 const toId = (id) => String(id);                        // uuid strings for aggregation $match
@@ -1075,16 +1076,23 @@ exports.cancelInvoice = async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 exports.getRequests = async (req, res) => {
     try {
-        const { status = 'pending', page = 1, limit = 20 } = req.query;
+        const { status = 'pending', page = 1, limit = 20, focus } = req.query;
         const q = { school: req.schoolId };
         if (status) q.status = status;
+        // Arriving from a notification: open on the page holding that request
+        // rather than page 1, where it usually is not.
+        const { page: effectivePage, focusFound } =
+            await resolvePage(TransportRequest, q, { createdAt: -1 }, +limit, focus, page);
         const [rows, total] = await Promise.all([
-            TransportRequest.find(q).sort('-createdAt').skip((page - 1) * limit).limit(+limit)
+            TransportRequest.find(q).sort('-createdAt').skip((effectivePage - 1) * limit).limit(+limit)
                 .populate('requestedBy', 'name role').populate('student', 'name')
                 .populate('details.route', 'name routeCode stops').lean(),
             TransportRequest.countDocuments(q),
         ]);
-        ok(res, { data: rows, total, page: +page, pages: Math.ceil(total / limit) });
+        ok(res, {
+            data: rows, total, page: effectivePage, pages: Math.ceil(total / limit),
+            ...(focus ? { focusFound } : {}),
+        });
     } catch (e) { fail(res, e); }
 };
 exports.actOnRequest = async (req, res) => {
