@@ -1417,8 +1417,19 @@ const suppliedOnly = (obj) => Object.fromEntries(
 );
 
 exports.bulkTeachers = async (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    // Stream progress via SSE, the same way the student import does. A sheet of
+    // several hundred teachers takes minutes — as one silent POST it looked to
+    // the admin like a hung request, and got cancelled halfway through.
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    const push = (data) => { res.write(`data: ${JSON.stringify(data)}\n\n`); if (res.flush) res.flush(); };
+
     try {
-        if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
         const schoolName = req.user?.school?.name || 'School';
         const wb   = XLSX.read(req.file.buffer, { type: 'buffer' });
         const sheet = wb.Sheets[wb.SheetNames[0]];
@@ -1427,6 +1438,9 @@ exports.bulkTeachers = async (req, res) => {
         // admin's own column order rather than a guessed one.
         const headerRow = (XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })[0] || [])
             .map((h) => String(h).trim());
+
+        push({ type: 'total', total: rows.length });
+
         // Needed once for the employee-ID format, not per row.
         const bulkSchoolDoc = await School.findById(req.schoolId).select('name code employeeIdFormat').lean();
 
@@ -1442,9 +1456,13 @@ exports.bulkTeachers = async (req, res) => {
 
             const name  = cell('full name', 'name');
             const email = cell('email address', 'email').toLowerCase();
+
+            push({ type: 'processing', current: i + 1, total: rows.length, name: name || `Row ${rowNum}` });
+
             const fail  = (reason) => {
                 errors.push({ row: rowNum, name: name || '?', reason });
                 failures.push({ row: rowNum, reason, raw: rows[i] });
+                push({ type: 'row_done', row: rowNum, name: name || '?', success: false, reason });
             };
 
             // Dates are dd/mm/yyyy. They are parsed here rather than left to the
@@ -1551,6 +1569,7 @@ exports.bulkTeachers = async (req, res) => {
                         await designationSvc.invalidateUser(exists._id);
                     }
                     updated++;
+                    push({ type: 'row_done', row: rowNum, name, success: true, action: 'updated' });
                     continue;
                 }
                 // An employee ID is part of the employee record, so a bulk-created
@@ -1573,15 +1592,23 @@ exports.bulkTeachers = async (req, res) => {
                 });
                 sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
                 created++;
+                push({ type: 'row_done', row: rowNum, name, success: true, action: 'created' });
             } catch (e) {
                 fail(e.code === 11000 ? 'Duplicate entry' : e.message);
             }
         }
-        res.json({
-            success: true, created, updated, errors,
+        // created + updated + errors === total. The client shows all four, so a
+        // run that stops early is visible as a shortfall instead of passing for
+        // a finished import.
+        push({
+            type: 'done', created, updated, errors, total: rows.length,
             errorFile: buildErrorReport(headerRow, failures, 'teacher-import-errors.xlsx'),
         });
-    } catch (err) { jsonErr(res, err); }
+        res.end();
+    } catch (err) {
+        push({ type: 'error', message: err.message });
+        res.end();
+    }
 };
 
 exports.bulkStudents = async (req, res) => {
