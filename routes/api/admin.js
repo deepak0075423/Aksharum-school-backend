@@ -98,6 +98,8 @@ router.post('/teachers/bulk',               guard, uploadExcel.single('excelFile
 router.get('/teachers/template',            guard, adminCtrl.downloadTeacherTemplate);
 router.delete('/teachers/:id',              guard, adminCtrl.deleteUser);
 router.get('/teachers/:id',                 guard, adminCtrl.getTeacherDetail);
+// What still points at a teacher, so Delete / Deactivate can show it first.
+router.get('/teachers/:id/dependencies',    guard, adminCtrl.getTeacherDependencies);
 
 // Students
 // Admission paperwork is posted as multipart; multer passes plain JSON bodies

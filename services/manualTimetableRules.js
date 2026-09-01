@@ -83,7 +83,10 @@ async function validateManualEntries({ schoolId, timetable, sectionId, rows }) {
     for (const e of rows) {
         if (!e.teacher) continue;
         if (inactive.has(sid(e.teacher))) {
-            add('error', 'TEACHER_INACTIVE', e, `${nameOfT(e.teacher)} is deactivated`);
+            // Fatal, not error: a deactivated teacher must not be assignable
+            // anywhere, so this is not one of the clashes `force` may overrule.
+            add('fatal', 'TEACHER_INACTIVE', e,
+                `${nameOfT(e.teacher)} is deactivated and cannot be given periods`);
             continue;
         }
         if (assignedPairs.size && !assignedPairs.has(`${sid(e.teacher)}#${sid(e.subject)}`)) {

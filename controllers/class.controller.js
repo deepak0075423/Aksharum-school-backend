@@ -7,6 +7,7 @@ const User           = require('../models/User');
 const Chat           = require('../models/Chat');
 const ChatMember     = require('../models/ChatMember');
 const { isDate }     = require('../utils/validators');
+const { inactiveTeacherError } = require('../utils/activeTeacher');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
 const { capacityError, seatsFor, seatsOf } = require('../utils/sectionCapacity');
@@ -1008,6 +1009,12 @@ exports.updateSectionTeacher = async (req, res) => {
         const update = {};
         if (req.body.teacherId     !== undefined) update.classTeacher      = req.body.teacherId     || null;
         if (req.body.viceTeacherId !== undefined) update.substituteTeacher = req.body.viceTeacherId || null;
+
+        // A deactivated account cannot hold either post. The picker already
+        // leaves them out; this is what a stale tab or a direct call hits.
+        const inactive = await inactiveTeacherError(
+            [update.classTeacher, update.substituteTeacher], req.schoolId);
+        if (inactive) return err(res, { message: inactive }, 400);
 
         // Resulting pair after this update (either field may be omitted)
         const nextClassTeacher = update.classTeacher      !== undefined ? update.classTeacher      : current.classTeacher;

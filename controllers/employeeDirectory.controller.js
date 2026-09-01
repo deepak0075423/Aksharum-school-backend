@@ -352,6 +352,11 @@ function matches(row, q) {
     if (q.staffType    && row.staffType         !== q.staffType)         return false;
     if (q.employmentType && row.employmentType  !== q.employmentType)    return false;
     if (q.status       && row.employmentStatus  !== q.status)            return false;
+    // Account state, which is NOT the `status` above: a teacher on approved
+    // leave today reads as 'on_leave' there while their account is perfectly
+    // active. 'all' (or omitting it) keeps everyone.
+    if (q.accountStatus === 'active'   && row.isActive === false) return false;
+    if (q.accountStatus === 'inactive' && row.isActive !== false) return false;
     if (q.joiningYear  && String(row.joiningYear || '') !== String(q.joiningYear)) return false;
     if (q.reportingManager && row.reportingManagerId !== String(q.reportingManager)) return false;
     if (q.subject) {

@@ -3,6 +3,7 @@ const Subject             = require('../models/Subject');
 const ClassSubject        = require('../models/ClassSubject');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
+const { inactiveTeacherError } = require('../utils/activeTeacher');
 
 const ok  = (res, d, s=200) => res.status(s).json({ success: true, data: d });
 const err = (res, e, s=500) => res.status(s).json({ success: false, message: e.message||e });
@@ -20,6 +21,9 @@ exports.createSubject = async (req, res) => {
         const { name, subjectName, code, subjectCode, type, description, teachers } = req.body;
         if (!(subjectName || name)?.trim()) return err(res, 'Subject name is required', 400);
         if (type && !['theory', 'practical', 'elective'].includes(type)) return err(res, 'Subject type must be theory, practical or elective', 400);
+        // A deactivated teacher cannot be listed against a subject.
+        const inactive = await inactiveTeacherError(teachers, req.schoolId);
+        if (inactive) return err(res, inactive, 400);
         const s = await Subject.create({
             subjectName: subjectName || name,
             subjectCode: subjectCode || code || null,
@@ -41,6 +45,10 @@ exports.updateSubject = async (req, res) => {
         if (type)                          update.type        = type;
         if (description !== undefined)     update.description = description;
         if (Array.isArray(teachers))       update.teachers    = teachers;
+        if (update.teachers) {
+            const inactive = await inactiveTeacherError(update.teachers, req.schoolId);
+            if (inactive) return err(res, inactive, 400);
+        }
         const s = await Subject.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, update, { new: true })
             .populate('teachers', 'name email');
         if (!s) return err(res, 'Subject not found', 404);
@@ -80,6 +88,10 @@ exports.getSectionSubjectTeachers = async (req, res) => {
 };
 exports.assignSubjectTeacher = async (req, res) => {
     try {
+        // The picker leaves deactivated teachers out; this is what a stale tab
+        // or a direct call hits.
+        const inactive = await inactiveTeacherError(req.body.teacher, req.schoolId);
+        if (inactive) return err(res, inactive, 400);
         const sst = await SectionSubjectTeacher.create({ section: req.params.sectionId, ...req.body });
         // Subject teachers belong to the section's teacher group chat
         syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});

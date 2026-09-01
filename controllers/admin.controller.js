@@ -46,6 +46,7 @@ const admissionNo = require('../utils/admissionNumber');
 const employeeIdUtil = require('../utils/employeeId');
 const { capacityErrorById } = require('../utils/sectionCapacity');
 const { syncSectionsToSchoolSaturday } = require('../utils/timetableDays');
+const teacherDeps = require('../services/teacherDependencies');
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -474,10 +475,23 @@ exports.getDashboard = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+/**
+ * `status` is 'active' | 'inactive' | 'all', defaulting to 'all'.
+ *
+ * Every screen that OFFERS a teacher — assign a class teacher, pick a subject
+ * teacher, allocate leave — asks for 'active', because a deactivated account
+ * must not be selectable anywhere. The management screens leave it off and get
+ * everyone, since that is the one place an inactive account is reactivated from.
+ *
+ * `$ne: false` rather than `=== true` so a legacy row with no value still reads
+ * as active, which is what the schema default means.
+ */
 const listUsers = (role) => async (req, res) => {
     try {
-        const { page = 1, limit = 20, search = '' } = req.query;
+        const { page = 1, limit = 20, search = '', status = 'all' } = req.query;
         const filter = { school: req.schoolId, role };
+        if (status === 'active')   filter.isActive = { $ne: false };
+        if (status === 'inactive') filter.isActive = false;
         if (search) filter.$or = [{ name: new RegExp(search, 'i') }, { email: new RegExp(search, 'i') }];
         const [users, total] = await Promise.all([
             User.find(filter).sort({ name: 1 }).skip((page-1)*+limit).limit(+limit).lean(),
@@ -733,14 +747,68 @@ exports.updateUser = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+/**
+ * Everything still pointing at a teacher — classes, subjects, books, periods.
+ *
+ * Read-only, so the Delete / Deactivate dialog can show the admin what is in the
+ * way before they commit to anything. The same report is what the two write
+ * paths below refuse on, so the dialog can never disagree with the server.
+ */
+exports.getTeacherDependencies = async (req, res) => {
+    try {
+        const teacher = await User.findOne({ _id: req.params.id, school: req.schoolId, role: 'teacher' })
+            .select('name email isActive').lean();
+        if (!teacher) return res.status(404).json({ success: false, message: 'Teacher not found' });
+        const report = await teacherDeps.collect(teacher._id, req.schoolId);
+        jsonOk(res, { teacher, ...report });
+    } catch (err) { jsonErr(res, err); }
+};
+
+/**
+ * Refuse a deactivation or deletion the teacher is not clear for, handing the
+ * whole report back so the caller can render it rather than guess.
+ *
+ * `force` clears the timetable and only the timetable — see the service header.
+ * Returns the report when the action may go ahead, or null once it has answered.
+ */
+async function guardTeacherRemoval(req, res, { action }) {
+    const force  = isTrue(req.body?.force ?? req.query?.force);
+    const report = await teacherDeps.collect(req.params.id, req.schoolId);
+
+    if (report.blocked && !(force && report.canForce)) {
+        res.status(409).json({
+            success: false,
+            code: 'TEACHER_HAS_DEPENDENCIES',
+            message: `This teacher cannot be ${action} yet — ${teacherDeps.summarise(report)} still assigned`,
+            data: report,
+        });
+        return null;
+    }
+    // Deliberately NOT cleared here: emptying the periods before the account
+    // write means a failed write leaves a timetable that was gutted for nothing.
+    // The caller runs this once its own write has gone through.
+    report.applyForce = (force && report.timetable.count)
+        ? () => teacherDeps.unassignTimetable(req.params.id, req.schoolId)
+        : null;
+    return report;
+}
+
 exports.toggleUser = async (req, res) => {
     try {
         const user = await User.findOne({ _id: req.params.id, school: req.schoolId });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        // Only on the way OUT. Re-activating a teacher resolves dependencies, it
+        // does not create them, and blocking it would strand the account.
+        let report = null;
+        if (user.role === 'teacher' && user.isActive) {
+            report = await guardTeacherRemoval(req, res, { action: 'deactivated' });
+            if (!report) return;
+        }
         user.isActive = !user.isActive;
         await user.save();
         await authCache.invalidate(user._id);
-        jsonOk(res, user);
+        const clearedPeriods = report?.applyForce ? await report.applyForce() : 0;
+        jsonOk(res, { ...(user.toObject ? user.toObject() : user), clearedPeriods });
     } catch (err) { jsonErr(res, err); }
 };
 
@@ -1199,6 +1267,15 @@ exports.deleteUser = async (req, res) => {
             return res.status(403).json({ success: false, message: 'Super admin accounts cannot be deleted' });
         if (String(target._id) === String(req.userId))
             return res.status(403).json({ success: false, message: 'You cannot delete your own account' });
+        // A teacher still holding classes, subjects, books or periods is not
+        // deletable — the same report the Delete dialog showed decides it, so
+        // the two can never disagree.
+        let applyForce = null;
+        if (target.role === 'teacher') {
+            const report = await guardTeacherRemoval(req, res, { action: 'deleted' });
+            if (!report) return;
+            applyForce = report.applyForce;
+        }
         // Remove from all section enrollments
         const affectedSections = await ClassSection.find({ enrolledStudents: userId }, '_id').lean();
         if (affectedSections.length) {
@@ -1214,9 +1291,20 @@ exports.deleteUser = async (req, res) => {
             if (ops.length) await ClassSection.bulkWrite(ops);
         }
         await StudentProfile.deleteOne({ user: userId });
+        // A deleted teacher used to leave their profile row behind, which held on
+        // to the employee ID and kept it out of circulation for good.
+        if (target.role === 'teacher') await TeacherProfile.deleteOne({ user: userId });
+        // Emptied before the row goes, not after: anything still pointing at the
+        // user has to let go first, and once the row is gone there is no id left
+        // to find those periods by.
+        const clearedPeriods = applyForce ? await applyForce() : 0;
         await User.findByIdAndDelete(userId);
         await authCache.invalidate(userId);
-        res.json({ success: true, message: 'User deleted' });
+        res.json({
+            success: true,
+            message: 'User deleted',
+            data: { clearedPeriods },
+        });
     } catch (err) { jsonErr(res, err); }
 };
 
@@ -1228,8 +1316,18 @@ exports.bulkDeleteUsers = async (req, res) => {
             _id: { $in: reqIds, $ne: req.userId },
             school: req.schoolId,
             role: { $ne: 'super_admin' },
-        }).select('_id').lean();
-        const ids = deletable.map(u => String(u._id));
+        }).select('_id role').lean();
+        // A teacher with live assignments is skipped rather than deleted — the
+        // single-delete path refuses those, and a bulk call must not be the way
+        // around it.
+        const blockedTeachers = [];
+        for (const u of deletable.filter(u => u.role === 'teacher')) {
+            const report = await teacherDeps.collect(u._id, req.schoolId);
+            if (report.blocked) blockedTeachers.push(String(u._id));
+        }
+        const ids = deletable
+            .map(u => String(u._id))
+            .filter(id => !blockedTeachers.includes(id));
         const skipped = reqIds.length - ids.length;
         if (!ids.length) return res.json({
             success: true, deleted: 0, skipped,
