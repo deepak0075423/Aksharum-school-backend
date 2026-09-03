@@ -2,6 +2,8 @@
 const Subject             = require('../models/Subject');
 const ClassSubject        = require('../models/ClassSubject');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
+const Class               = require('../models/Class');
+const ClassSection        = require('../models/ClassSection');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
 
@@ -98,6 +100,78 @@ exports.assignSubjectTeacher = async (req, res) => {
         ok(res, sst, 201);
     } catch (e) { err(res, e, 400); }
 };
+// ─────────────────────────────────────────────────────────────────────────────
+//  One subject + teacher onto SEVERAL sections of the same class.
+//
+//  Hindi in Class 5 is almost never Hindi in section A alone — it is A, B, C and
+//  D, and doing that a section at a time is the same four-field form four times.
+//  This takes the sections as a list and writes them in one action.
+//
+//  Additive like the rest of the setup tooling: a section that already has this
+//  exact subject-and-teacher pairing is reported as already done rather than
+//  failing the call, so a partly-finished class can be topped up by re-running
+//  with every section ticked.
+//
+//  Sections must all belong to `classId` — the screen only offers siblings, and
+//  the server holds that line so a hand-made call cannot fan a subject out
+//  across unrelated classes.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.assignSubjectToSections = async (req, res) => {
+    try {
+        const { subject, teacher, sectionIds, preview } = req.body;
+
+        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
+        if (!cls) return err(res, 'Class not found', 404);
+        if (!subject) return err(res, 'Pick a subject', 400);
+        if (!teacher) return err(res, 'Pick a teacher', 400);
+
+        const wanted = Array.isArray(sectionIds) ? [...new Set(sectionIds.map(String))] : [];
+        if (!wanted.length) return err(res, 'Pick at least one section', 400);
+
+        const subjectDoc = await Subject.findOne({ _id: subject, school: req.schoolId }).select('subjectName').lean();
+        if (!subjectDoc) return err(res, 'Subject not found', 404);
+
+        // A deactivated teacher cannot be assigned anywhere — same rule the
+        // single-section path enforces.
+        const inactive = await inactiveTeacherError(teacher, req.schoolId);
+        if (inactive) return err(res, inactive, 400);
+
+        const siblings = await ClassSection.find({ class: cls._id, school: req.schoolId })
+            .select('sectionName').lean();
+        const byId = new Map(siblings.map((x) => [String(x._id), x]));
+        const stray = wanted.filter((sid) => !byId.has(sid));
+        if (stray.length) return err(res, `Those sections are not in ${cls.className}`, 400);
+
+        const already = await SectionSubjectTeacher.find({
+            section: { $in: wanted }, subject, teacher,
+        }).select('section').lean();
+        const doneIds = new Set(already.map((r) => String(r.section)));
+
+        const toCreate = wanted.filter((sid) => !doneIds.has(sid));
+        const payload = {
+            classId:     String(cls._id),
+            className:   cls.className,
+            subjectName: subjectDoc.subjectName,
+            toCreate:    toCreate.map((sid) => byId.get(sid).sectionName),
+            alreadyDone: wanted.filter((sid) => doneIds.has(sid)).map((sid) => byId.get(sid).sectionName),
+        };
+        if (preview) return ok(res, { ...payload, preview: true });
+
+        for (const sid of toCreate) {
+            await SectionSubjectTeacher.create({ section: sid, subject, teacher });
+        }
+        // Subject teachers belong to each section's teacher group chat.
+        for (const sid of toCreate) {
+            syncSectionChatGroup(sid, req.schoolId, req.userId).catch(() => {});
+        }
+
+        ok(res, { ...payload, preview: false, created: toCreate.length }, 201);
+    } catch (e) {
+        if (e.code === 11000) return err(res, 'That teacher is already assigned to this subject in one of those sections.', 400);
+        err(res, e, 400);
+    }
+};
+
 exports.removeSectionSubject = async (req, res) => {
     try {
         await SectionSubjectTeacher.deleteOne({ section: req.params.sectionId, subject: req.params.subjectId });

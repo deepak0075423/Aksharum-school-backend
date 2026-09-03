@@ -192,6 +192,11 @@ router.put('/sections/:sectionId/students/:studentId/roll-number', guard, classC
 router.delete('/sections/:sectionId',                 guard, classCtrl.deleteSection);
 router.get('/sections/:sectionId/subjects',           guard, subjectCtrl.getSectionSubjectTeachers);
 router.post('/sections/:sectionId/subjects/assign',   guard, subjectCtrl.assignSubjectTeacher);
+// The same subject + teacher onto several sections of one class at once.
+// NOT '/subjects/assign' — that path is already assignSubjectToClass, which
+// links a subject to the class itself rather than to any section.
+// `preview: true` names the sections without writing them.
+router.post('/classes/:classId/subjects/assign-sections', guard, subjectCtrl.assignSubjectToSections);
 router.delete('/sections/:sectionId/subjects/:subjectId',                    guard, subjectCtrl.removeSectionSubject);
 router.delete('/sections/:sectionId/subjects/:subjectId/teachers/:teacherId', guard, subjectCtrl.removeSectionSubjectTeacher);
 router.get('/sections/:sectionId/teacher-options', guard, classCtrl.getSectionTeacherOptions);
