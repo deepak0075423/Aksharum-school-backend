@@ -160,11 +160,17 @@ router.patch('/academic-years/:id/set-active', guard, classCtrl.setActiveAcademi
 // ── Classes ─────────────────────────────────────────────────────────────────
 router.get('/classes',                        guard, classCtrl.getClasses);
 router.post('/classes',                       guard, classCtrl.createClass);
+// Whole grade range + N sections each, in one call. `preview: true` costs
+// nothing and reports exactly what a real run would create.
+router.post('/classes/bulk',                  guard, classCtrl.bulkCreateClasses);
 router.get('/classes/:classId',               guard, classCtrl.getClassDetail);
 router.put('/classes/:classId',               guard, classCtrl.updateClass);
 router.delete('/classes/:classId',            guard, classCtrl.deleteClass);
 router.post('/classes/auto-assign',           guard, classCtrl.autoAssignStudents);
 router.post('/classes/:classId/sections',     guard, classCtrl.createSection);
+// Several sections onto one class. `count` is how many to ADD, and
+// `preview: true` names the letters without writing them.
+router.post('/classes/:classId/sections/bulk', guard, classCtrl.bulkCreateSections);
 // Section shuffle — one random redistribution per class/year, then lockable
 router.get ('/classes/:classId/shuffle-preview',  guard, classCtrl.shufflePreview);
 router.post('/classes/:classId/shuffle-sections', guard, classCtrl.shuffleSections);

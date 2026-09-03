@@ -200,6 +200,155 @@ exports.createClass = async (req, res) => {
         err(res, e, 400);
     }
 };
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bulk class + section creation.
+//
+//  Setting a school up one class and one section at a time is 12 forms and then
+//  48 more. This takes a grade range and a section count and builds the lot.
+//
+//  It is ADDITIVE, never destructive: a class already in the year is left where
+//  it is and only its MISSING sections are added, so a half-finished setup can
+//  be completed by running the same range again, and a second identical run
+//  changes nothing. Nothing is ever renamed, renumbered or removed.
+//
+//  `preview: true` returns exactly what a real run would do without writing —
+//  the dialog shows that before the admin commits to 60 rows.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A-Z. Past 26 a school is not naming sections by letter any more.
+const SECTION_LETTERS = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i));
+// Guard rails against a typo'd range turning into thousands of rows.
+const MAX_CLASSES_PER_RUN = 30;
+const MAX_GRADE = 20;
+
+exports.bulkCreateClasses = async (req, res) => {
+    try {
+        const { fromClass, toClass, sectionsPerClass, capacity, preview } = req.body;
+
+        const from = Number(fromClass);
+        const to   = Number(toClass);
+        const secs = Number(sectionsPerClass);
+        const cap  = capacity === undefined || capacity === null || capacity === '' ? 40 : Number(capacity);
+
+        if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0)
+            return err(res, 'Give a whole-number class range, for example 1 to 12', 400);
+        if (from > to)
+            return err(res, 'The first class cannot be higher than the last', 400);
+        if (to > MAX_GRADE)
+            return err(res, `Classes go up to ${MAX_GRADE} here. Create anything above that one at a time.`, 400);
+        if (to - from + 1 > MAX_CLASSES_PER_RUN)
+            return err(res, `That range is ${to - from + 1} classes — ${MAX_CLASSES_PER_RUN} is the most in one go.`, 400);
+        if (!Number.isInteger(secs) || secs < 0 || secs > SECTION_LETTERS.length)
+            return err(res, `Sections per class must be between 0 and ${SECTION_LETTERS.length}`, 400);
+        if (!Number.isFinite(cap) || cap < 1)
+            return err(res, 'Capacity must be a positive number', 400);
+
+        let yearId = req.body.academicYear;
+        if (!yearId) {
+            const active = await AcademicYear.findOne({ school: req.schoolId, status: 'active' });
+            if (!active) return err(res, { message: 'No active academic year. Please set one first.' }, 400);
+            yearId = active._id;
+        }
+
+        const [existingClasses, school] = await Promise.all([
+            Class.find({ school: req.schoolId, academicYear: yearId }, 'className classNumber').lean(),
+            School.findById(req.schoolId).select('leaveSettings').lean(),
+        ]);
+        const byNumber = new Map(existingClasses.map((c) => [Number(c.classNumber), c]));
+        const byName   = new Map(existingClasses.map((c) => [c.className.trim().toLowerCase(), c]));
+
+        // Sections already on the classes this run touches, so a rerun tops up
+        // rather than colliding with the unique (class, sectionName) index.
+        const touchedIds = [];
+        for (let n = from; n <= to; n += 1) if (byNumber.has(n)) touchedIds.push(byNumber.get(n)._id);
+        const existingSections = touchedIds.length
+            ? await ClassSection.find({ class: { $in: touchedIds } }, 'class sectionName').lean()
+            : [];
+        const sectionsByClass = new Map();
+        for (const sec of existingSections) {
+            const k = String(sec.class);
+            if (!sectionsByClass.has(k)) sectionsByClass.set(k, new Set());
+            sectionsByClass.get(k).add(String(sec.sectionName).trim().toUpperCase());
+        }
+
+        const wanted = SECTION_LETTERS.slice(0, secs);
+        const plan = [];      // what this run would do, class by class
+        for (let n = from; n <= to; n += 1) {
+            const label = `Class ${n}`;
+            const existing = byNumber.get(n);
+            // A class of the same NAME on a different grade number is somebody
+            // else's row — skipped rather than silently folded into this range.
+            const nameClash = !existing && byName.has(label.toLowerCase());
+            const have = existing ? (sectionsByClass.get(String(existing._id)) || new Set()) : new Set();
+            plan.push({
+                classNumber: n,
+                className: existing ? existing.className : label,
+                classExists: !!existing,
+                skipped: nameClash
+                    ? `"${label}" already exists on a different grade number`
+                    : null,
+                sectionsToAdd: nameClash ? [] : wanted.filter((letter) => !have.has(letter)),
+                sectionsAlready: nameClash ? [] : wanted.filter((letter) => have.has(letter)),
+            });
+        }
+
+        const summary = {
+            academicYear: yearId,
+            classesToCreate: plan.filter((p) => !p.classExists && !p.skipped).length,
+            classesExisting: plan.filter((p) => p.classExists).length,
+            sectionsToCreate: plan.reduce((n, p) => n + p.sectionsToAdd.length, 0),
+            sectionsExisting: plan.reduce((n, p) => n + p.sectionsAlready.length, 0),
+            skipped: plan.filter((p) => p.skipped).map((p) => ({ className: p.className, reason: p.skipped })),
+            capacity: cap,
+            plan,
+        };
+
+        if (preview) return ok(res, { ...summary, preview: true });
+
+        // ── Write ────────────────────────────────────────────────────────────
+        const openOnSaturday = schoolWorksSaturday(school);
+        let createdClasses = 0;
+        let createdSections = 0;
+
+        for (const row of plan) {
+            if (row.skipped) continue;
+            let classId = byNumber.get(row.classNumber)?._id;
+            if (!classId) {
+                const cls = await Class.create({
+                    className: row.className,
+                    classNumber: row.classNumber,
+                    academicYear: yearId,
+                    school: req.schoolId,
+                    createdBy: req.userId || null,
+                });
+                classId = cls._id;
+                createdClasses += 1;
+            }
+            for (const letter of row.sectionsToAdd) {
+                await ClassSection.create({
+                    sectionName: letter,
+                    class: classId,
+                    academicYear: yearId,
+                    school: req.schoolId,
+                    maxStudents: cap,
+                    openOnSaturday,
+                });
+                createdSections += 1;
+            }
+        }
+
+        ok(res, {
+            ...summary,
+            preview: false,
+            createdClasses,
+            createdSections,
+        }, 201);
+    } catch (e) {
+        if (e.code === 11000) return err(res, { message: 'A class or section in that range already exists — reload and try again.' }, 400);
+        err(res, e, 400);
+    }
+};
+
 exports.getClassDetail = async (req, res) => {
     try {
         const cls = await Class.findById(req.params.classId).lean();
@@ -534,6 +683,71 @@ exports.autoAssignStudents = async (req, res) => {
 };
 
 // Sections
+// ─────────────────────────────────────────────────────────────────────────────
+//  Several sections onto ONE class.
+//
+//  The range dialog (bulkCreateClasses) sets up a whole school at once and takes
+//  the number of sections each class should END with. This is the other job: an
+//  admin standing on Class 5, which already has A and B, who wants four more.
+//  So `count` here is HOW MANY TO ADD, not the total — the two dialogs are
+//  answering different questions and the wording in each says which.
+//
+//  Letters are handed out in order, filling gaps first: a class holding A and C
+//  and asking for two gets B and D, not D and E.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.bulkCreateSections = async (req, res) => {
+    try {
+        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
+        if (!cls) return err(res, { message: 'Class not found' }, 404);
+
+        const count = Number(req.body.count);
+        const cap   = req.body.capacity === undefined || req.body.capacity === null || req.body.capacity === ''
+            ? 40 : Number(req.body.capacity);
+
+        if (!Number.isInteger(count) || count < 1)
+            return err(res, 'Tell me how many sections to add', 400);
+        if (!Number.isFinite(cap) || cap < 1)
+            return err(res, 'Capacity must be a positive number', 400);
+
+        const existingRows = await ClassSection.find({ class: cls._id }, 'sectionName').lean();
+        const taken = new Set(existingRows.map((r) => String(r.sectionName).trim().toUpperCase()));
+        const free  = SECTION_LETTERS.filter((l) => !taken.has(l));
+
+        if (count > free.length) {
+            return err(res, free.length === 0
+                ? `${cls.className} already has all ${SECTION_LETTERS.length} lettered sections.`
+                : `${cls.className} has room for ${free.length} more section(s), not ${count}.`, 400);
+        }
+
+        const toCreate = free.slice(0, count);
+        const payload  = {
+            classId:   String(cls._id),
+            className: cls.className,
+            existing:  SECTION_LETTERS.filter((l) => taken.has(l)),
+            toCreate,
+            capacity:  cap,
+        };
+        if (req.body.preview) return ok(res, { ...payload, preview: true });
+
+        const school = await School.findById(req.schoolId).select('leaveSettings').lean();
+        const openOnSaturday = schoolWorksSaturday(school);
+        for (const letter of toCreate) {
+            await ClassSection.create({
+                sectionName: letter,
+                class: cls._id,
+                academicYear: cls.academicYear,
+                school: req.schoolId,
+                maxStudents: cap,
+                openOnSaturday,
+            });
+        }
+        ok(res, { ...payload, preview: false, created: toCreate.length }, 201);
+    } catch (e) {
+        if (e.code === 11000) return err(res, { message: 'One of those sections already exists — reload and try again.' }, 400);
+        err(res, e, 400);
+    }
+};
+
 exports.createSection = async (req, res) => {
     try {
         const cls = await Class.findById(req.params.classId).lean();
