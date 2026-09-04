@@ -438,6 +438,108 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
     return { parentId: parentUser._id, error: null };
 }
 
+// ─── Dashboard helpers ───────────────────────────────────────────────────────
+// The admin dashboard asks four questions that no single model answers on its
+// own — how the school attended this week, which academic year is running, and
+// how much each headcount grew this month. Each is one grouped SQL statement
+// rather than rows pulled into Node and counted there.
+const pool = require('../db/pool');
+const Attendance       = require('../models/Attendance');
+const AttendanceRecord = require('../models/AttendanceRecord');
+
+
+/**
+ * School-wide student attendance for the last `days` calendar days, one row per
+ * day including days nobody marked (which read as zero sessions, not as 0%).
+ *
+ * Attendance sessions belong to a section, not to a school, so the school is
+ * reached through classsections. Grouped in Postgres because the alternative —
+ * every record for a week across every section — is tens of thousands of rows
+ * crossing the wire to be summed in JavaScript.
+ */
+async function attendanceTrend(schoolId, days = 7) {
+    // A session is stored at UTC midnight of the LOCAL calendar day it belongs to
+    // (see attendance.controller — every write is
+    // `new Date(dateStr + 'T00:00:00.000Z')` off a local date string). So the
+    // window is keyed on the local date but built and grouped in UTC: taking the
+    // UTC date instead would drop today's sessions for the hours where the two
+    // disagree — 00:00 to 05:30 in IST, when it is still "yesterday" in UTC.
+    const n = new Date();
+    const localToday = `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+    const today = new Date(`${localToday}T00:00:00.000Z`);
+    const from  = new Date(today);
+    from.setUTCDate(from.getUTCDate() - (days - 1));
+
+    const { rows } = await pool.query(
+        `SELECT to_char(a."date" AT TIME ZONE 'UTC', 'YYYY-MM-DD')         AS "date",
+                count(*) FILTER (WHERE r."status" = 'Present')::int        AS "present",
+                count(*) FILTER (WHERE r."status" = 'Absent')::int         AS "absent",
+                count(*) FILTER (WHERE r."status" = 'Late')::int           AS "late"
+           FROM ${qt(AttendanceRecord)} r
+           JOIN ${qt(Attendance)}   a ON a."_id" = r."attendance"
+           JOIN ${qt(ClassSection)} s ON s."_id" = a."section"
+          WHERE s."school" = $1 AND a."date" >= $2
+          GROUP BY to_char(a."date" AT TIME ZONE 'UTC', 'YYYY-MM-DD')`,
+        [String(schoolId), from],
+    );
+
+    const byDay = new Map(rows.map((r) => [r.date, r]));
+    const out   = [];
+    for (let i = 0; i < days; i += 1) {
+        const d = new Date(from);
+        d.setUTCDate(from.getUTCDate() + i);
+        const key = d.toISOString().slice(0, 10);
+        const hit = byDay.get(key) || { present: 0, absent: 0, late: 0 };
+        const total = hit.present + hit.absent + hit.late;
+        out.push({
+            date:       key,
+            weekday:    d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }),
+            present:    hit.present,
+            absent:     hit.absent,
+            late:       hit.late,
+            total,
+            // Late still counts as attended — the same rule the section reports use.
+            percentage: total ? Math.round(((hit.present + hit.late) / total) * 100) : 0,
+            marked:     total > 0,
+        });
+    }
+    return out;
+}
+
+/** New teachers / students / parents / sections since the 1st of this month. */
+async function monthGrowth(schoolId) {
+    const since = new Date();
+    since.setHours(0, 0, 0, 0);
+    since.setDate(1);
+
+    const [users, secs] = await Promise.all([
+        pool.query(
+            `SELECT "role", count(*)::int AS "n"
+               FROM ${qt(User)}
+              WHERE "school" = $1 AND "createdAt" >= $2
+              GROUP BY "role"`,
+            [String(schoolId), since],
+        ),
+        pool.query(
+            `SELECT count(*)::int AS "n"
+               FROM ${qt(ClassSection)}
+              WHERE "school" = $1 AND "createdAt" >= $2`,
+            [String(schoolId), since],
+        ),
+    ]);
+
+    const byRole = Object.fromEntries(users.rows.map((r) => [r.role, r.n]));
+    return {
+        teachers: byRole.teacher || 0,
+        students: byRole.student || 0,
+        parents:  byRole.parent  || 0,
+        sections: secs.rows[0]?.n || 0,
+    };
+}
+
+/** A model's table, quoted for interpolation into raw SQL. */
+function qt(Model) { return `"${Model.tableName}"`; }
+
 exports.getDashboard = async (req, res) => {
     try {
         const school = req.schoolId;
@@ -449,7 +551,7 @@ exports.getDashboard = async (req, res) => {
 
         const [teachers, students, parents, sections,
                pendingLeaves, pendingPayments, examsToPublish, pendingRegularizations,
-               recentNotifications] = await Promise.all([
+               recentNotifications, academicYear, trend, growth] = await Promise.all([
             User.countDocuments({ school, role: 'teacher' }),
             User.countDocuments({ school, role: 'student' }),
             User.countDocuments({ school, role: 'parent' }),
@@ -460,7 +562,17 @@ exports.getDashboard = async (req, res) => {
             TeacherAttendanceRegularization.countDocuments({ school, status: 'Pending' }).catch(() => 0),
             Notification.find({ school }).sort({ createdAt: -1 }).limit(5)
                 .select('title createdAt senderRole recipientCount').lean().catch(() => []),
+            AcademicYear.findOne({ school, status: 'active' })
+                .select('yearName startDate endDate status').lean().catch(() => null),
+            // Each of these is a nicety on the dashboard, never a reason for it
+            // to fail to load — a broken one degrades to "no data" in the UI.
+            // 30 days so the dashboard's range filter (week / fortnight / month)
+            // slices what it already has instead of asking again.
+            attendanceTrend(school, 30).catch(() => []),
+            monthGrowth(school).catch(() => null),
         ]);
+
+        const today = trend[trend.length - 1] || null;
 
         jsonOk(res, {
             teachers, students, parents, sections,
@@ -471,6 +583,9 @@ exports.getDashboard = async (req, res) => {
                 regularizations: pendingRegularizations,
             },
             recentNotifications,
+            academicYear,
+            growth,
+            attendance: { trend, today },
         });
     } catch (err) { jsonErr(res, err); }
 };
