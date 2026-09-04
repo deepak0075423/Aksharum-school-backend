@@ -10,6 +10,7 @@ exports.getDashboard = async (req, res) => {
         const AttendanceRecord = require('../models/AttendanceRecord');
         const FeeLedger        = require('../models/FeeLedger');
         const AcademicYear     = require('../models/AcademicYear');
+        const dashboardSvc     = require('../services/studentDashboard');
 
         const parent = await ParentProfile.findOne({ user: req.userId }).lean();
         const childIds = parent?.children?.length ? parent.children : (parent?.student ? [parent.student] : []);
@@ -18,7 +19,7 @@ exports.getDashboard = async (req, res) => {
         const now   = new Date();
         const start = new Date(Date.UTC(now.getFullYear(), now.getMonth(), 1));
 
-        if (!childIds.length) return res.json({ success: true, data: { parent, children: [] } });
+        if (!childIds.length) return res.json({ success: true, data: { parent, children: [], child: null } });
 
         // One query per collection for all children, instead of ~5 round trips per child.
         const [users, profiles] = await Promise.all([
@@ -88,7 +89,25 @@ exports.getDashboard = async (req, res) => {
             });
         }
 
-        res.json({ success: true, data: { parent, children } });
+        // ── The one child the dashboard is showing ────────────────────────
+        // `children` still carries the summary row for every child (the picker
+        // needs them all); this is the detail block for the selected one.
+        // ?childId= must belong to THIS parent — it is a caller-supplied id, so
+        // it is matched against the list above rather than trusted.
+        const wanted  = String(req.query.childId || '');
+        const chosen  = children.find((c) => String(c._id) === wanted) || children[0] || null;
+        let child = null;
+        if (chosen) {
+            const sp = profileByKid.get(String(chosen._id)) || null;
+            const snapshot = await dashboardSvc.studentSnapshot({
+                schoolId:  req.schoolId,
+                sectionId: sp?.currentSection?._id || null,
+                studentId: chosen._id,
+            }).catch(() => ({}));
+            child = { ...chosen, ...snapshot };
+        }
+
+        res.json({ success: true, data: { parent, children, child } });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 exports.getChildClass = async (req, res) => {
