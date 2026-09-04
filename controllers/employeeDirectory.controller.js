@@ -96,7 +96,8 @@ async function loadSnapshot(schoolId) {
         TeacherProfile.find({ school: schoolId }).lean(),
         ClassSection.find({ school: schoolId, ...yearFilter }).lean(),
         Class.find({ school: schoolId, ...yearFilter }).lean(),
-        Subject.find({ school: schoolId }).lean(),
+        // Scoped like the classes and sections above — subjects are per-year.
+        Subject.find({ school: schoolId, ...yearFilter }).lean(),
         EmployeeResponsibility.find({ school: schoolId, isActive: true }).lean(),
         EmployeeVerification.find({ school: schoolId }).lean(),
     ]);

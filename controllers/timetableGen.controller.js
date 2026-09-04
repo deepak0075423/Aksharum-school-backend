@@ -177,7 +177,8 @@ exports.getMeta = async (req, res) => {
             AcademicYear.find({ school: req.schoolId }).sort({ createdAt: -1 }).lean(),
             year ? Class.find({ school: req.schoolId, academicYear: year._id }).sort({ classNumber: 1 }).lean() : [],
             year ? ClassSection.find({ school: req.schoolId, academicYear: year._id, status: 'active' }).lean() : [],
-            Subject.find({ school: req.schoolId }).sort({ subjectName: 1 }).lean(),
+            // Per-year subjects: unscoped, this list would repeat every name once per year.
+            Subject.find({ school: req.schoolId, ...(year ? { academicYear: year._id } : {}) }).sort({ subjectName: 1 }).lean(),
             User.find({ school: req.schoolId, role: 'teacher', isActive: true }).select('name email').sort({ name: 1 }).lean(),
             Room.find({ school: req.schoolId, isActive: true }).sort({ roomName: 1 }).lean(),
             School.findById(req.schoolId).select('name leaveSettings').lean(),
@@ -312,7 +313,8 @@ exports.getClassPlan = async (req, res) => {
             Timetable.find({ section: { $in: scopeIds }, academicYear: year._id }).lean(),
             SectionSubjectTeacher.find({ section: { $in: scopeIds } }).lean(),
             ClassSubject.find({ class: classId }).lean(),
-            Subject.find({ school: req.schoolId }).sort({ subjectName: 1 }).lean(),
+            // Per-year subjects — scoped to the year this plan is for.
+            Subject.find({ school: req.schoolId, academicYear: year._id }).sort({ subjectName: 1 }).lean(),
             SubjectRequirement.find({ school: req.schoolId, academicYear: year._id, section: { $in: scopeIds } }).lean(),
             User.find({ school: req.schoolId, role: 'teacher', isActive: true }).select('name').sort({ name: 1 }).lean(),
         ]);

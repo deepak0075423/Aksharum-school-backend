@@ -156,6 +156,10 @@ router.post('/academic-years',                 guard, classCtrl.createAcademicYe
 router.put('/academic-years/:id',              guard, classCtrl.updateAcademicYear);
 router.delete('/academic-years/:id',           guard, classCtrl.deleteAcademicYear);
 router.patch('/academic-years/:id/set-active', guard, classCtrl.setActiveAcademicYear);
+// Copy last year's classes, sections, subject links and subject-teacher
+// assignments into this one. `:id` is the TARGET year, `fromYear` the source.
+// `preview: true` runs every check and reports without writing.
+router.post('/academic-years/:id/import-structure', guard, classCtrl.importYearStructure);
 
 // ── Classes ─────────────────────────────────────────────────────────────────
 router.get('/classes',                        guard, classCtrl.getClasses);

@@ -77,6 +77,7 @@ exports.getExamMeta = async (req, res) => {
                 $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
             }).populate('class', 'name className').lean(),
             TimetableEntry.find({ teacher: req.userId }).distinct('timetable'),
+            // Filtered to the active year below — subjects are per-year now.
             Subject.find({ school: req.schoolId }).sort('subjectName').lean(),
             getActiveYear(req.schoolId),
         ]);
@@ -90,7 +91,12 @@ exports.getExamMeta = async (req, res) => {
         const map = {};
         [...ownSections, ...taughtSections].forEach(s => { map[s._id.toString()] = s; });
 
-        res.json({ success: true, data: { sections: Object.values(map), subjects, academicYear } });
+        // Subjects are per-year: offer only the active year's, or the picker
+        // would repeat every name once per academic year the school has had.
+        const yearSubjects = academicYear
+            ? subjects.filter((s) => String(s.academicYear || '') === String(academicYear._id))
+            : subjects;
+        res.json({ success: true, data: { sections: Object.values(map), subjects: yearSubjects, academicYear } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

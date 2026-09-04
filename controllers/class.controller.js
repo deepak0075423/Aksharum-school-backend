@@ -13,6 +13,7 @@ const { rollNumberTaken } = require('../utils/rollNumbers');
 const { capacityError, seatsFor, seatsOf } = require('../utils/sectionCapacity');
 const { setStudentSection, syncCounts }   = require('../utils/sectionMembership');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
+const ClassSubject          = require('../models/ClassSubject');
 const Subject               = require('../models/Subject');
 const School                = require('../models/School');
 const { schoolWorksSaturday } = require('../utils/timetableDays');
@@ -148,6 +149,392 @@ exports.getClasses = async (req, res) => {
         })));
     } catch (e) { err(res, e); }
 };
+// ─────────────────────────────────────────────────────────────────────────────
+//  Import a year's academic structure into another year.
+//
+//  Setting up 2027-28 means rebuilding what 2026-27 already describes: the same
+//  classes, the same sections, the same subjects against each class and the same
+//  teacher against each subject in each section. This copies it.
+//
+//  What is and is not year-scoped decides what gets copied:
+//
+//    Class, ClassSection    carry `academicYear` — duplicated into the new year.
+//    Subject                carries it too, so the year's subject list is copied
+//                           and the new year owns its own rows. Matched by name,
+//                           so a subject already added by hand is reused.
+//    ClassSubject           scoped through its class, so the LINKS are rebuilt
+//                           against the new year's classes AND its subjects.
+//    SectionSubjectTeacher  scoped through its section, likewise.
+//
+//  Nothing is overwritten. A class, section, subject link or teacher assignment
+//  that already exists in the target year is left exactly as it is and reported
+//  as "already there", so an import onto a partly-built year tops it up and a
+//  second run changes nothing.
+//
+//  `include` narrows what is copied — the Subjects screen imports the curriculum
+//  alone, without also building 12 classes and 48 sections. Anything switched
+//  off is not created, and whatever depended on it is skipped by name rather
+//  than silently: a subject link needs its class, an assignment needs its
+//  section, so asking for subjects in a year with no classes reports exactly
+//  that. Omit `include` and everything is copied, as it always was.
+//
+//  `preview: true` runs every check and returns the identical report without
+//  writing, which is what the confirmation screen shows.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.importYearStructure = async (req, res) => {
+    try {
+        const { fromYear, includeClassTeachers, preview } = req.body;
+        const inc = {
+            classes:     req.body.include?.classes     !== false,
+            sections:    req.body.include?.sections    !== false,
+            subjects:    req.body.include?.subjects    !== false,
+            assignments: req.body.include?.assignments !== false,
+        };
+        if (!inc.classes && !inc.sections && !inc.subjects && !inc.assignments)
+            return err(res, { message: 'Pick at least one thing to import' }, 400);
+
+        const target = await AcademicYear.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!target) return err(res, { message: 'Academic year not found' }, 404);
+        if (!fromYear) return err(res, { message: 'Pick the year to import from' }, 400);
+        if (String(fromYear) === String(target._id))
+            return err(res, { message: 'Pick a different year to import from' }, 400);
+
+        const source = await AcademicYear.findOne({ _id: fromYear, school: req.schoolId }).lean();
+        if (!source) return err(res, { message: 'That academic year was not found' }, 404);
+
+        // ── Read both years ──────────────────────────────────────────────────
+        const [srcClasses, tgtClasses] = await Promise.all([
+            Class.find({ school: req.schoolId, academicYear: source._id }).lean(),
+            Class.find({ school: req.schoolId, academicYear: target._id }).lean(),
+        ]);
+        if (!srcClasses.length)
+            return err(res, { message: `${source.yearName} has no classes to import.` }, 400);
+
+        const srcClassIds = srcClasses.map((c) => c._id);
+        const [srcSections, tgtSections, srcLinks, subjects] = await Promise.all([
+            ClassSection.find({ class: { $in: srcClassIds } }).lean(),
+            ClassSection.find({ school: req.schoolId, academicYear: target._id }).lean(),
+            ClassSubject.find({ class: { $in: srcClassIds } }).lean(),
+            Subject.find({ school: req.schoolId, academicYear: source._id })
+                .select('subjectName subjectCode type description').lean(),
+        ]);
+        const tgtSubjects = await Subject.find({ school: req.schoolId, academicYear: target._id })
+            .select('subjectName').lean();
+        // Matched on name, case-insensitively: the same subject typed into both
+        // years by hand must not become two rows.
+        const tgtSubjectByName = new Map(tgtSubjects.map((x) => [x.subjectName.trim().toLowerCase(), x]));
+        const srcSST = srcSections.length
+            ? await SectionSubjectTeacher.find({ section: { $in: srcSections.map((s) => s._id) } }).lean()
+            : [];
+
+        const skipped = [];   // { kind, label, reason } — shown verbatim to the admin
+        const note = (kind, label, reason) => skipped.push({ kind, label, reason });
+
+        const subjectName = new Map(subjects.map((s) => [String(s._id), s.subjectName]));
+        // Source subject -> the target year's row standing for it. Filled during
+        // the write; on a preview it only has the ones already there.
+        const subjectMap = new Map();
+        for (const s of subjects) {
+            const hit = tgtSubjectByName.get(s.subjectName.trim().toLowerCase());
+            if (hit) subjectMap.set(String(s._id), hit);
+        }
+        const subjectsToCreate = inc.subjects
+            ? subjects.filter((s) => !tgtSubjectByName.has(s.subjectName.trim().toLowerCase())).length
+            : 0;
+        for (const s of subjects) {
+            if (tgtSubjectByName.has(s.subjectName.trim().toLowerCase())) {
+                note('subjectRow', s.subjectName, 'already in this year');
+            } else if (!inc.subjects) {
+                note('subjectRow', s.subjectName, 'subjects were not part of this import');
+            }
+        }
+
+        // Teachers must still be here AND still active — last year's staff list
+        // is not this year's.
+        const teacherIds = [...new Set([
+            ...srcSST.map((r) => String(r.teacher)),
+            ...srcSections.flatMap((s) => [s.classTeacher, s.substituteTeacher].filter(Boolean).map(String)),
+        ])];
+        const teachers = teacherIds.length
+            ? await User.find({ _id: { $in: teacherIds }, school: req.schoolId, role: 'teacher' })
+                .select('name isActive').lean()
+            : [];
+        const teacherById = new Map(teachers.map((t) => [String(t._id), t]));
+
+        // ── Existing target state, so nothing is duplicated ──────────────────
+        const tgtClassByNumber = new Map(tgtClasses.map((c) => [Number(c.classNumber), c]));
+        const tgtSectionKey = new Set(tgtSections.map((s) => `${String(s.class)}#${String(s.sectionName).toUpperCase()}`));
+        const tgtLinks = tgtClasses.length
+            ? await ClassSubject.find({ class: { $in: tgtClasses.map((c) => c._id) } }).lean()
+            : [];
+        const tgtLinkKey = new Set(tgtLinks.map((l) => `${String(l.class)}#${String(l.subject)}`));
+        const tgtSST = tgtSections.length
+            ? await SectionSubjectTeacher.find({ section: { $in: tgtSections.map((s) => s._id) } }).lean()
+            : [];
+        const tgtSSTKey = new Set(tgtSST.map((r) => `${String(r.section)}#${String(r.subject)}#${String(r.teacher)}`));
+
+
+        // ── Plan: classes ────────────────────────────────────────────────────
+        const classPlan = srcClasses.map((c) => ({
+            source: c,
+            existing: tgtClassByNumber.get(Number(c.classNumber)) || null,
+        }));
+        const classesToCreate = inc.classes ? classPlan.filter((p) => !p.existing).length : 0;
+        for (const p of classPlan) {
+            if (p.existing) note('class', p.source.className, 'already in this year');
+            else if (!inc.classes) note('class', p.source.className, 'classes were not part of this import');
+        }
+
+        // ── Plan: sections. Keyed by source class, since target ids may not
+        //    exist yet on a preview.
+        const srcSectionsByClass = new Map();
+        for (const s of srcSections) {
+            const k = String(s.class);
+            if (!srcSectionsByClass.has(k)) srcSectionsByClass.set(k, []);
+            srcSectionsByClass.get(k).push(s);
+        }
+        let sectionsToCreate = 0;
+        for (const p of classPlan) {
+            for (const s of srcSectionsByClass.get(String(p.source._id)) || []) {
+                const label = `${p.source.className} – ${s.sectionName}`;
+                const dup = p.existing
+                    && tgtSectionKey.has(`${String(p.existing._id)}#${String(s.sectionName).toUpperCase()}`);
+                if (dup) { note('section', label, 'already in this year'); continue; }
+                if (!inc.sections) { note('section', label, 'sections were not part of this import'); continue; }
+                // A section can only be made under a class that will be there.
+                if (!p.existing && !inc.classes) {
+                    note('section', label, `${p.source.className} does not exist in this year`);
+                    continue;
+                }
+                sectionsToCreate += 1;
+            }
+        }
+
+        // ── Plan: class ↔ subject links ──────────────────────────────────────
+        let linksToCreate = 0;
+        for (const l of srcLinks) {
+            const p = classPlan.find((x) => String(x.source._id) === String(l.class));
+            const label = `${p?.source.className || 'Class'} – ${subjectName.get(String(l.subject)) || 'subject'}`;
+            if (!l.subject || !subjectName.has(String(l.subject))) {
+                note('subject', label, 'that subject no longer exists');
+                continue;
+            }
+            if (p?.existing && tgtLinkKey.has(`${String(p.existing._id)}#${String(l.subject)}`)) {
+                note('subject', label, 'already in this year');
+                continue;
+            }
+            if (!inc.subjects && !subjectMap.has(String(l.subject))) {
+                note('subject', label, `${subjectName.get(String(l.subject))} is not in this year`);
+                continue;
+            }
+            if (!p?.existing && !inc.classes) {
+                note('subject', label, `${p?.source.className || 'that class'} does not exist in this year`);
+                continue;
+            }
+            linksToCreate += 1;
+        }
+
+        // ── Plan: subject teachers ───────────────────────────────────────────
+        const sectionById = new Map(srcSections.map((s) => [String(s._id), s]));
+        const classById   = new Map(srcClasses.map((c) => [String(c._id), c]));
+        let assignmentsToCreate = 0;
+        const sstPlan = [];
+        for (const r of srcSST) {
+            const sec = sectionById.get(String(r.section));
+            const cls = sec ? classById.get(String(sec.class)) : null;
+            const subj = subjectName.get(String(r.subject));
+            const teacher = teacherById.get(String(r.teacher));
+            const label = `${cls?.className || 'Class'} – ${sec?.sectionName || '?'} · ${subj || 'subject'}`;
+
+            if (!subj)              { note('assignment', label, 'that subject no longer exists'); continue; }
+            if (!teacher)           { note('assignment', label, 'that teacher is no longer on the staff list'); continue; }
+            if (teacher.isActive === false) {
+                note('assignment', `${label} · ${teacher.name}`, 'that teacher is deactivated');
+                continue;
+            }
+            const p = classPlan.find((x) => String(x.source._id) === String(sec.class));
+            if (p?.existing) {
+                const tgtSec = tgtSections.find((s) => String(s.class) === String(p.existing._id)
+                    && String(s.sectionName).toUpperCase() === String(sec.sectionName).toUpperCase());
+                if (tgtSec && tgtSSTKey.has(`${String(tgtSec._id)}#${String(r.subject)}#${String(r.teacher)}`)) {
+                    note('assignment', `${label} · ${teacher.name}`, 'already in this year');
+                    continue;
+                }
+            }
+            if (!inc.assignments) { note('assignment', label, 'subject teachers were not part of this import'); continue; }
+            if (!inc.subjects && !subjectMap.has(String(r.subject))) {
+                note('assignment', label, `${subj} is not in this year`);
+                continue;
+            }
+            // Needs its section to be there — either already, or created by this run.
+            const tgtSecExists = p?.existing && tgtSections.some((x) => String(x.class) === String(p.existing._id)
+                && String(x.sectionName).toUpperCase() === String(sec.sectionName).toUpperCase());
+            if (!tgtSecExists && !inc.sections) {
+                note('assignment', label, `section ${sec.sectionName} does not exist in this year`);
+                continue;
+            }
+            sstPlan.push({ row: r, sec, label });
+            assignmentsToCreate += 1;
+        }
+
+        // ── Plan: class / vice class teacher, only when asked for ────────────
+        let classTeachersToSet = 0;
+        if (includeClassTeachers && inc.sections) {
+            for (const s of srcSections) {
+                for (const [field, role] of [['classTeacher', 'class teacher'], ['substituteTeacher', 'vice class teacher']]) {
+                    if (!s[field]) continue;
+                    const t = teacherById.get(String(s[field]));
+                    const cls = classById.get(String(s.class));
+                    const label = `${cls?.className || 'Class'} – ${s.sectionName} ${role}`;
+                    if (!t) { note('classTeacher', label, 'that teacher is no longer on the staff list'); continue; }
+                    if (t.isActive === false) { note('classTeacher', `${label} · ${t.name}`, 'that teacher is deactivated'); continue; }
+                    classTeachersToSet += 1;
+                }
+            }
+        }
+
+        // What the SOURCE actually holds. Without this a zero is unattributable:
+        // "0 subjects on a class" reads the same whether the target already has
+        // them or the source never had any to give, and those need different
+        // actions from the admin. Nothing to skip means nothing in the skip list
+        // either, so the count alone cannot explain itself.
+        const sourceTotals = {
+            classes:     srcClasses.length,
+            sections:    srcSections.length,
+            subjects:    subjects.length,      // the year's subject list
+            curriculum:  srcLinks.length,      // which class teaches what
+            assignments: srcSST.length,
+        };
+
+        const summary = {
+            fromYear: { _id: String(source._id), yearName: source.yearName },
+            toYear:   { _id: String(target._id), yearName: target.yearName },
+            sourceTotals,
+            classesToCreate,
+            sectionsToCreate,
+            subjectsToCreate,
+            linksToCreate,
+            assignmentsToCreate,
+            classTeachersToSet,
+            skipped,
+            // Subjects themselves are shared by every year — say so, because
+            // "import subjects" reads like it should duplicate them.
+            subjectsAreShared: true,
+        };
+
+        if (preview) return ok(res, { ...summary, preview: true });
+
+        // ── Write ────────────────────────────────────────────────────────────
+        const school = await School.findById(req.schoolId).select('leaveSettings').lean();
+        const openOnSaturday = schoolWorksSaturday(school);
+
+        const createdIds = { classes: new Map(), sections: new Map() };   // source id -> target row
+        let createdClasses = 0, createdSections = 0, createdLinks = 0, createdAssignments = 0, setClassTeachers = 0;
+        let createdSubjects = 0;
+
+        // Subjects first: a class-subject link and a subject-teacher row both
+        // need the target year's own subject row to point at.
+        if (inc.subjects) {
+            for (const s of subjects) {
+                if (subjectMap.has(String(s._id))) continue;
+                const row = await Subject.create({
+                    school:       req.schoolId,
+                    academicYear: target._id,
+                    subjectName:  s.subjectName,
+                    subjectCode:  s.subjectCode || null,
+                    type:         s.type || 'theory',
+                    description:  s.description || '',
+                    teachers:     [],   // staffing is this year's decision
+                });
+                subjectMap.set(String(s._id), row);
+                createdSubjects += 1;
+            }
+        }
+
+        for (const p of classPlan) {
+            let targetCls = p.existing;
+            // Not creating classes? Then only the ones already here can be
+            // mapped, and anything hanging off the rest was skipped in the plan.
+            if (!targetCls && !inc.classes) continue;
+            if (!targetCls) {
+                targetCls = await Class.create({
+                    className: p.source.className,
+                    classNumber: p.source.classNumber,
+                    academicYear: target._id,
+                    school: req.schoolId,
+                    createdBy: req.userId || null,
+                });
+                createdClasses += 1;
+            }
+            createdIds.classes.set(String(p.source._id), targetCls);
+
+            for (const s of srcSectionsByClass.get(String(p.source._id)) || []) {
+                const key = `${String(targetCls._id)}#${String(s.sectionName).toUpperCase()}`;
+                let targetSec = tgtSections.find((x) => `${String(x.class)}#${String(x.sectionName).toUpperCase()}` === key);
+                if (!targetSec && !inc.sections) continue;
+                if (!targetSec) {
+                    const fields = {
+                        sectionName: s.sectionName,
+                        class: targetCls._id,
+                        academicYear: target._id,
+                        school: req.schoolId,
+                        maxStudents: s.maxStudents || 40,
+                        openOnSaturday,
+                    };
+                    // Students never carry over — a new year's roster is its own
+                    // thing, and the shuffle/lock state starts clean too.
+                    if (includeClassTeachers) {
+                        const ct = s.classTeacher && teacherById.get(String(s.classTeacher));
+                        const vt = s.substituteTeacher && teacherById.get(String(s.substituteTeacher));
+                        if (ct && ct.isActive !== false) { fields.classTeacher = s.classTeacher; setClassTeachers += 1; }
+                        if (vt && vt.isActive !== false) { fields.substituteTeacher = s.substituteTeacher; setClassTeachers += 1; }
+                    }
+                    targetSec = await ClassSection.create(fields);
+                    createdSections += 1;
+                }
+                createdIds.sections.set(String(s._id), targetSec);
+            }
+        }
+
+        for (const l of srcLinks) {
+            if (!inc.subjects) break;
+            if (!l.subject || !subjectName.has(String(l.subject))) continue;
+            const targetCls = createdIds.classes.get(String(l.class));
+            if (!targetCls) continue;
+            const tgtSubject = subjectMap.get(String(l.subject));
+            if (!tgtSubject) continue;      // its subject is not in the target year
+            if (tgtLinkKey.has(`${String(targetCls._id)}#${String(tgtSubject._id)}`)) continue;
+            await ClassSubject.create({ class: targetCls._id, subject: tgtSubject._id });
+            tgtLinkKey.add(`${String(targetCls._id)}#${String(tgtSubject._id)}`);
+            createdLinks += 1;
+        }
+
+        for (const { row, sec } of sstPlan) {
+            if (!inc.assignments) break;
+            const targetSec = createdIds.sections.get(String(sec._id));
+            if (!targetSec) continue;
+            const tgtSubject = subjectMap.get(String(row.subject));
+            if (!tgtSubject) continue;      // its subject is not in the target year
+            const key = `${String(targetSec._id)}#${String(tgtSubject._id)}#${String(row.teacher)}`;
+            if (tgtSSTKey.has(key)) continue;
+            await SectionSubjectTeacher.create({
+                section: targetSec._id, subject: tgtSubject._id, teacher: row.teacher,
+            });
+            tgtSSTKey.add(key);
+            createdAssignments += 1;
+        }
+
+        ok(res, {
+            ...summary,
+            preview: false,
+            createdClasses, createdSections, createdSubjects, createdLinks, createdAssignments, setClassTeachers,
+        }, 201);
+    } catch (e) {
+        if (e.code === 11000) return err(res, { message: 'Part of that structure already exists — reload and try again.' }, 400);
+        err(res, e, 400);
+    }
+};
+
 exports.createClass = async (req, res) => {
     try {
         const { name, className, classNumber, level, academicYear } = req.body;
@@ -534,10 +921,34 @@ exports.lockSectionShuffle = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
+/**
+ * Delete a class and everything that hangs off it.
+ *
+ * This used to delete the Class row alone, which left its sections behind with a
+ * `class` pointing at nothing, and their subject-teacher rows behind with them.
+ * Orphans are invisible rather than harmless: every year-scoped query reaches a
+ * section THROUGH its class, so a subject still assigned on an orphaned section
+ * silently reads as "not used this year" — the row exists, but nothing can see
+ * it, edit it or delete it through the UI.
+ */
 exports.deleteClass = async (req, res) => {
     try {
-        await Class.findByIdAndDelete(req.params.classId);
-        res.json({ success: true });
+        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
+        if (!cls) return err(res, { message: 'Class not found' }, 404);
+
+        const sections = await ClassSection.find({ class: cls._id }).select('_id').lean();
+        const sectionIds = sections.map((s) => s._id);
+        if (sectionIds.length) {
+            await SectionSubjectTeacher.deleteMany({ section: { $in: sectionIds } });
+            await ClassSection.deleteMany({ _id: { $in: sectionIds } });
+        }
+        await ClassSubject.deleteMany({ class: cls._id });
+        await Class.findByIdAndDelete(cls._id);
+
+        res.json({
+            success: true,
+            data: { deletedSections: sectionIds.length },
+        });
     } catch (e) { err(res, e); }
 };
 exports.autoAssignStudents = async (req, res) => {
@@ -1283,9 +1694,16 @@ exports.updateSectionCapacity = async (req, res) => {
         ok(res, updated);
     } catch (e) { err(res, e); }
 };
+/**
+ * Delete a section and the subject-teacher rows that hang off it — same reason
+ * as deleteClass above: a row whose section is gone can never be reached again.
+ */
 exports.deleteSection = async (req, res) => {
     try {
-        await ClassSection.findByIdAndDelete(req.params.sectionId);
+        const sec = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
+        if (!sec) return err(res, { message: 'Section not found' }, 404);
+        await SectionSubjectTeacher.deleteMany({ section: sec._id });
+        await ClassSection.findByIdAndDelete(sec._id);
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };

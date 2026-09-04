@@ -75,7 +75,9 @@ exports.getMeta = async (req, res) => {
             AcademicYear.find({ school }).select('yearName status startDate').sort({ startDate: -1 }).lean(),
             Class.find({ school, status: 'active' }).select('className classNumber academicYear').sort({ classNumber: 1 }).lean(),
             ClassSection.find({ school, status: 'active' }).select('sectionName class academicYear').lean(),
-            Subject.find({ school }).select('subjectName subjectCode').sort({ subjectName: 1 }).lean(),
+            // Per-year subjects — narrowed to the active year after the await,
+            // or this picker would list every name once per academic year.
+            Subject.find({ school }).select('subjectName subjectCode academicYear').sort({ subjectName: 1 }).lean(),
             User.find({ school, role: 'teacher', isActive: true }).select('name email').sort({ name: 1 }).lean(),
             TeacherProfile.find({ school }).select('user department designation employeeId').lean(),
             FeedbackTemplate.find({ school, status: 'active' }).select('name description isDefault questions').sort({ name: 1 }).lean(),
@@ -89,7 +91,9 @@ exports.getMeta = async (req, res) => {
             academicYears: years.map((y) => ({ _id: sid(y._id), yearName: y.yearName, status: y.status })),
             classes: classes.map((c) => ({ _id: sid(c._id), className: c.className, classNumber: c.classNumber, academicYear: sid(c.academicYear) })),
             sections: sections.map((s) => ({ _id: sid(s._id), sectionName: s.sectionName, class: sid(s.class), academicYear: sid(s.academicYear) })),
-            subjects: subjects.map((s) => ({ _id: sid(s._id), subjectName: s.subjectName, subjectCode: s.subjectCode || '' })),
+            // Carries its year, exactly as classes and sections above do, so the
+            // picker can narrow by year rather than listing one name per year.
+            subjects: subjects.map((s) => ({ _id: sid(s._id), subjectName: s.subjectName, subjectCode: s.subjectCode || '', academicYear: sid(s.academicYear) })),
             teachers: teachers.map((t) => ({
                 _id: sid(t._id), name: t.name, email: t.email,
                 department: profByUser.get(sid(t._id))?.department || '',

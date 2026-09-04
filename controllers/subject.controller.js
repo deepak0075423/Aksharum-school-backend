@@ -4,24 +4,122 @@ const ClassSubject        = require('../models/ClassSubject');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const Class               = require('../models/Class');
 const ClassSection        = require('../models/ClassSection');
+const AcademicYear        = require('../models/AcademicYear');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
 
-const ok  = (res, d, s=200) => res.status(s).json({ success: true, data: d });
+// `meta` rides alongside `data` in the envelope — useFetch on the client hands
+// the whole envelope back as `meta`, so a caller can read counts without them
+// having to be smuggled into the array.
+const ok  = (res, d, s=200, meta=null) => res.status(s).json({ success: true, data: d, ...(meta || {}) });
 const err = (res, e, s=500) => res.status(s).json({ success: false, message: e.message||e });
 
+/**
+ * One year's subjects.
+ *
+ * A Subject belongs to a single academic year, so this always filters by one.
+ * `?academicYear=<id>` names it; without the parameter the school's ACTIVE year
+ * is used, which is what every dropdown in the app wants — a timetable or an
+ * exam is being built for the year the school is actually in.
+ *
+ * Passing the year explicitly also attaches a `usage` block per subject saying
+ * where it is used that year, which is what lets the Subjects screen separate
+ * "in use" from "not used yet". Dropdowns do not need that and do not pay for it.
+ */
 exports.getSubjects = async (req, res) => {
     try {
-        const subjects = await Subject.find({ school: req.schoolId })
+        const yearId = req.query.academicYear;
+        const year = yearId
+            ? await AcademicYear.findOne({ _id: yearId, school: req.schoolId }).lean()
+            : await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
+        if (yearId && !year) return err(res, 'Academic year not found', 404);
+
+        // No year at all (a school mid-setup) can only mean "everything", or the
+        // subject screen would be empty with no way to explain itself.
+        const filter = { school: req.schoolId, ...(year ? { academicYear: year._id } : {}) };
+        const subjects = await Subject.find(filter)
             .populate('teachers', 'name email')
             .lean();
-        ok(res, subjects);
+
+        if (!yearId) return ok(res, subjects);
+
+        const classes  = await Class.find({ school: req.schoolId, academicYear: year._id })
+            .select('className classNumber').lean();
+        const sections = classes.length
+            ? await ClassSection.find({ class: { $in: classes.map((c) => c._id) } })
+                .select('sectionName class').lean()
+            : [];
+        const [links, assignments] = await Promise.all([
+            classes.length
+                ? ClassSubject.find({ class: { $in: classes.map((c) => c._id) } }).select('class subject').lean()
+                : [],
+            sections.length
+                ? SectionSubjectTeacher.find({ section: { $in: sections.map((x) => x._id) } })
+                    .select('section subject teacher').lean()
+                : [],
+        ]);
+
+        const classById   = new Map(classes.map((c) => [String(c._id), c]));
+        const sectionById = new Map(sections.map((x) => [String(x._id), x]));
+
+        // subjectId -> { class labels, section labels, teacher ids }
+        const usage = new Map();
+        const slot = (sid) => {
+            const k = String(sid);
+            if (!usage.has(k)) usage.set(k, { classes: new Set(), sections: new Set(), teachers: new Set() });
+            return usage.get(k);
+        };
+        for (const l of links) {
+            const c = classById.get(String(l.class));
+            if (c) slot(l.subject).classes.add(c.className);
+        }
+        for (const a of assignments) {
+            const sec = sectionById.get(String(a.section));
+            if (!sec) continue;
+            const c = classById.get(String(sec.class));
+            const u = slot(a.subject);
+            if (c) u.classes.add(c.className);
+            u.sections.add(`${c?.className || 'Class'} – ${sec.sectionName}`);
+            if (a.teacher) u.teachers.add(String(a.teacher));
+        }
+
+        const withUsage = subjects.map((s) => {
+            const u = usage.get(String(s._id));
+            return {
+                ...s,
+                usage: {
+                    inUse:        !!u,
+                    classes:      u ? [...u.classes].sort() : [],
+                    sections:     u ? [...u.sections].sort() : [],
+                    classCount:   u ? u.classes.size : 0,
+                    sectionCount: u ? u.sections.size : 0,
+                    teacherCount: u ? u.teachers.size : 0,
+                },
+            };
+        });
+
+        ok(res, withUsage, 200, {
+            academicYear: { _id: String(year._id), yearName: year.yearName },
+            inUse:    withUsage.filter((s) => s.usage.inUse).length,
+            notInUse: withUsage.filter((s) => !s.usage.inUse).length,
+        });
     } catch (e) { err(res, e); }
 };
 exports.createSubject = async (req, res) => {
     try {
         const { name, subjectName, code, subjectCode, type, description, teachers } = req.body;
         if (!(subjectName || name)?.trim()) return err(res, 'Subject name is required', 400);
+        // A subject is created INTO a year — the one the screen is showing, or
+        // the active one when the caller does not say.
+        let yearId = req.body.academicYear;
+        if (yearId) {
+            const y = await AcademicYear.findOne({ _id: yearId, school: req.schoolId }).lean();
+            if (!y) return err(res, 'Academic year not found', 404);
+        } else {
+            const active = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
+            if (!active) return err(res, 'No active academic year. Please set one first.', 400);
+            yearId = active._id;
+        }
         if (type && !['theory', 'practical', 'elective'].includes(type)) return err(res, 'Subject type must be theory, practical or elective', 400);
         // A deactivated teacher cannot be listed against a subject.
         const inactive = await inactiveTeacherError(teachers, req.schoolId);
@@ -33,6 +131,7 @@ exports.createSubject = async (req, res) => {
             description: description || '',
             teachers:    Array.isArray(teachers) ? teachers : [],
             school:      req.schoolId,
+            academicYear: yearId,
         });
         const populated = await s.populate('teachers', 'name email');
         ok(res, populated, 201);
@@ -81,6 +180,31 @@ exports.removeSubjectFromClass = async (req, res) => {
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };
+/**
+ * Make sure "this class teaches this subject" is on record.
+ *
+ * Two tables describe the same fact at different grains: ClassSubject says the
+ * CLASS teaches a subject, SectionSubjectTeacher says who teaches it in a given
+ * SECTION. Assigning a teacher to a section obviously implies the first, but
+ * nothing ever wrote it — no screen on either platform posts to the class-level
+ * endpoint — so ClassSubject sat empty while assignments piled up.
+ *
+ * That is not cosmetic. The parent portal reads a child's subject list from
+ * ClassSubject alone (parent.controller), the timetable generator folds it in
+ * alongside the section rows, and the year-structure import copies it. All three
+ * were reading a table nothing filled.
+ *
+ * So the link is written here, as a consequence of the assignment. Idempotent:
+ * the pair is unique, and an existing link is left alone.
+ */
+async function ensureClassSubject(sectionId, subjectId) {
+    if (!sectionId || !subjectId) return;
+    const section = await ClassSection.findById(sectionId).select('class').lean();
+    if (!section?.class) return;
+    const exists = await ClassSubject.findOne({ class: section.class, subject: subjectId }).lean();
+    if (!exists) await ClassSubject.create({ class: section.class, subject: subjectId });
+}
+
 exports.getSectionSubjectTeachers = async (req, res) => {
     try {
         const sst = await SectionSubjectTeacher.find({ section: req.params.sectionId })
@@ -95,6 +219,9 @@ exports.assignSubjectTeacher = async (req, res) => {
         const inactive = await inactiveTeacherError(req.body.teacher, req.schoolId);
         if (inactive) return err(res, inactive, 400);
         const sst = await SectionSubjectTeacher.create({ section: req.params.sectionId, ...req.body });
+        // The class teaches this subject — record that too, or the parent portal
+        // and the year import never learn about it. See ensureClassSubject.
+        await ensureClassSubject(req.params.sectionId, req.body.subject);
         // Subject teachers belong to the section's teacher group chat
         syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
         ok(res, sst, 201);
@@ -159,6 +286,7 @@ exports.assignSubjectToSections = async (req, res) => {
 
         for (const sid of toCreate) {
             await SectionSubjectTeacher.create({ section: sid, subject, teacher });
+            await ensureClassSubject(sid, subject);
         }
         // Subject teachers belong to each section's teacher group chat.
         for (const sid of toCreate) {
