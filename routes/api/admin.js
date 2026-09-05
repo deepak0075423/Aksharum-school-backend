@@ -96,6 +96,9 @@ const teacherDocFields = uploadStaffDoc.fields([
 router.put('/teachers/:id',                 guard, teacherDocFields, adminCtrl.updateTeacherFull);
 router.post('/teachers/bulk',               guard, uploadExcel.single('excelFile'), adminCtrl.bulkTeachers);
 router.get('/teachers/template',            guard, adminCtrl.downloadTeacherTemplate);
+// The list as it stands on screen, as a spreadsheet — same filters, no paging.
+// Declared above '/teachers/:id' so 'export' is not read as an id.
+router.get('/teachers/export',              guard, adminCtrl.exportTeachers);
 router.delete('/teachers/:id',              guard, adminCtrl.deleteUser);
 router.get('/teachers/:id',                 guard, adminCtrl.getTeacherDetail);
 // What still points at a teacher, so Delete / Deactivate can show it first.
@@ -111,6 +114,7 @@ router.put('/students/:id',                 guard, studentDocFields, adminCtrl.u
 router.post('/students/bulk',               guard, uploadExcel.single('excelFile'), adminCtrl.bulkStudents);
 router.get('/students/template',            guard, adminCtrl.downloadStudentTemplate);
 router.get('/students/parent-lookup',       guard, adminCtrl.parentLookup);
+router.get('/students/export',              guard, adminCtrl.exportStudents);
 // Address helpers for the student form
 router.get('/states',            guard, adminCtrl.getStates);
 router.get('/admission-number/preview', guard, adminCtrl.previewAdmissionNumber);
@@ -121,6 +125,7 @@ router.get('/students/:id',                 guard, adminCtrl.getStudentDetail);
 
 // Admins
 router.get('/admins',                       guard, adminCtrl.getAdmins);
+router.get('/admins/export',                guard, adminCtrl.exportAdmins);
 router.post('/admins',                      guard, adminCtrl.createAdmin);
 router.delete('/admins/:id',                guard, adminCtrl.deleteUser);
 

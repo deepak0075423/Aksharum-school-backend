@@ -5,6 +5,8 @@ const XLSX          = require('xlsx');
 const User          = require('../models/User');
 const TeacherProfile = require('../models/TeacherProfile');
 const StudentProfile = require('../models/StudentProfile');
+const Subject               = require('../models/Subject');
+const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const ParentProfile  = require('../models/ParentProfile');
 const ClassSection   = require('../models/ClassSection');
 const Class          = require('../models/Class');
@@ -590,88 +592,486 @@ exports.getDashboard = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   ACCOUNT LISTS — students, teachers, admins
+   The three management screens. Each one wants the same four things: a page of
+   rows, a total for the pager, the school-wide headcounts its summary tiles
+   show, and the values its filter dropdowns offer.
+
+   These are raw SQL rather than model calls because the rows are stitched from
+   several tables — a student's class comes through their section, a teacher's
+   subjects from their profile — and the aggregation layer above the ORM runs
+   in JavaScript: a $lookup on anything but _id loads the whole target table
+   into Node to join it there. One JOIN per request instead, so a school with
+   twenty thousand accounts costs the same as one with twenty.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const { isUuid } = require('../db/schema');
+
+/**
+ * Where "this academic year" starts, for the "new this year" tile.
+ * Falls back to the 1st of January when the school has no year running, so the
+ * tile still counts something honest rather than everything ever created.
+ */
+async function yearStart(schoolId) {
+    const year = await AcademicYear.findOne({ school: schoolId, status: 'active' })
+        .select('startDate').lean().catch(() => null);
+    if (year?.startDate) return new Date(year.startDate);
+    const d = new Date();
+    d.setMonth(0, 1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+}
+
+/**
+ * The four figures every list page leads with. School-wide on purpose — they
+ * describe the school, not the filter currently applied, so switching a filter
+ * does not make the summary jump around.
+ */
+async function accountStats(schoolId, role) {
+    const { rows } = await pool.query(
+        `SELECT count(*)::int                                        AS "total",
+                count(*) FILTER (WHERE "isActive" IS NOT FALSE)::int AS "active",
+                count(*) FILTER (WHERE "isActive" = FALSE)::int      AS "inactive",
+                count(*) FILTER (WHERE "createdAt" >= $2)::int       AS "recent"
+           FROM ${qt(User)}
+          WHERE "school" = $1 AND "role" = $3`,
+        [String(schoolId), await yearStart(schoolId), role],
+    );
+    return rows[0] || { total: 0, active: 0, inactive: 0, recent: 0 };
+}
+
+/** Paging that can't be talked into scanning the whole school. */
+function paging(query, { maxLimit = 200 } = {}) {
+    const page  = Math.max(1, Number(query.page)  || 1);
+    const limit = Math.min(maxLimit, Math.max(1, Number(query.limit) || 20));
+    return { page, limit, offset: (page - 1) * limit };
+}
+
 /**
  * `status` is 'active' | 'inactive' | 'all', defaulting to 'all'.
  *
- * Every screen that OFFERS a teacher — assign a class teacher, pick a subject
+ * Every screen that OFFERS an account — assign a class teacher, pick a subject
  * teacher, allocate leave — asks for 'active', because a deactivated account
  * must not be selectable anywhere. The management screens leave it off and get
  * everyone, since that is the one place an inactive account is reactivated from.
  *
- * `$ne: false` rather than `=== true` so a legacy row with no value still reads
+ * `IS NOT FALSE` rather than `= TRUE` so a legacy row with no value still reads
  * as active, which is what the schema default means.
  */
-const listUsers = (role) => async (req, res) => {
-    try {
-        const { page = 1, limit = 20, search = '', status = 'all' } = req.query;
-        const filter = { school: req.schoolId, role };
-        if (status === 'active')   filter.isActive = { $ne: false };
-        if (status === 'inactive') filter.isActive = false;
-        if (search) filter.$or = [{ name: new RegExp(search, 'i') }, { email: new RegExp(search, 'i') }];
-        const [users, total] = await Promise.all([
-            User.find(filter).sort({ name: 1 }).skip((page-1)*+limit).limit(+limit).lean(),
-            User.countDocuments(filter),
-        ]);
-        if (role === 'teacher' && users.length) {
-            const profiles = await TeacherProfile.find({ user: { $in: users.map((u) => u._id) } })
-                .select('user designation').lean();
-            const desig = new Map(profiles.map((p) => [String(p.user), p.designation]));
-            for (const u of users) u.designation = desig.get(String(u._id)) || '';
-        }
-        res.json({ success: true, data: { data: users, total, page: +page, pages: Math.ceil(total/+limit) } });
-    } catch (err) { jsonErr(res, err); }
+function statusClause(status, col = 'u') {
+    if (status === 'active')   return `${col}."isActive" IS NOT FALSE`;
+    if (status === 'inactive') return `${col}."isActive" = FALSE`;
+    return null;
+}
+
+/** Collects `WHERE` fragments and their bind values in step with each other. */
+function conditions(seed = []) {
+    const where  = [];
+    const values = [...seed];
+    return {
+        where,
+        values,
+        add(sql, ...vals) {
+            let i = 0;
+            where.push(sql.replace(/\?/g, () => `$${values.push(vals[i++])}`));
+        },
+        sql() { return where.length ? `WHERE ${where.join(' AND ')}` : ''; },
+    };
+}
+
+// ── Students ─────────────────────────────────────────────────────────────────
+
+// The class shows through the section when there is one, and straight off the
+// profile when the student has been admitted to a class but not placed yet.
+const STUDENT_FROM = `
+       FROM ${qt(User)}            u
+  LEFT JOIN ${qt(StudentProfile)}  sp ON sp."user" = u."_id"
+  LEFT JOIN ${qt(ClassSection)}    cs ON cs."_id"  = sp."currentSection"
+  LEFT JOIN ${qt(Class)}          csc ON csc."_id" = cs."class"
+  LEFT JOIN ${qt(Class)}          ocl ON ocl."_id" = sp."currentClass"
+  LEFT JOIN ${qt(User)}            pu ON pu."_id"  = sp."parent"
+  LEFT JOIN ${qt(ParentProfile)}   pp ON pp."user" = sp."parent"`;
+
+const STUDENT_COLUMNS = `
+        u."_id", u."name", u."email", u."phone", u."profileImage",
+        u."isActive", u."createdAt",
+        sp."rollNumber", sp."admissionNumber", sp."gender", sp."dob",
+        sp."currentSection", cs."sectionName",
+        COALESCE(cs."class", sp."currentClass")           AS "classId",
+        COALESCE(csc."className", ocl."className")        AS "className",
+        pu."_id"  AS "parentId",
+        pu."name" AS "parentName",
+        COALESCE(NULLIF(pu."phone", ''), pp."father"->>'phone',
+                 pp."mother"->>'phone', pp."guardian"->>'phone',
+                 NULLIF(pp."emergencyContact", ''))       AS "parentPhone"`;
+
+/**
+ * Rows-per-page ordering. Name is the default everywhere; the rest are what the
+ * list page offers under "Sort by". Roll numbers are text but read as numbers,
+ * so 2 sorts before 10 rather than after it.
+ */
+const STUDENT_ORDER = {
+    name:     'u."name" ASC',
+    name_z:   'u."name" DESC',
+    newest:   'u."createdAt" DESC, u."name" ASC',
+    oldest:   'u."createdAt" ASC, u."name" ASC',
+    roll:     `CASE WHEN sp."rollNumber" ~ '^[0-9]{1,9}$' THEN sp."rollNumber"::int END ASC NULLS LAST,
+               NULLIF(sp."rollNumber", '') ASC NULLS LAST, u."name" ASC`,
+    class:    `COALESCE(csc."className", ocl."className") ASC NULLS LAST, cs."sectionName" ASC NULLS LAST, u."name" ASC`,
 };
 
-exports.getTeachers = listUsers('teacher');
-exports.getAdmins   = listUsers('school_admin');
+/** Everything the students list is asked to narrow itself by, in one place. */
+function studentFilters(req) {
+    const c = conditions([String(req.schoolId)]);
+    c.where.push(`u."school" = $1`, `u."role" = 'student'`);
+
+    const { search = '', status = 'all', gender = '', classId = '', sectionId = '' } = req.query;
+    if (search.trim()) {
+        c.add(`(u."name" ILIKE ? OR u."email" ILIKE ? OR sp."rollNumber" ILIKE ? OR sp."admissionNumber" ILIKE ?)`,
+            ...Array(4).fill(`%${search.trim()}%`));
+    }
+    const st = statusClause(status);
+    if (st) c.where.push(st);
+    if (gender)                 c.add(`sp."gender" = ?`, gender);
+    if (isUuid(sectionId))      c.add(`sp."currentSection" = ?::uuid`, sectionId);
+    else if (isUuid(classId))   c.add(`COALESCE(cs."class", sp."currentClass") = ?::uuid`, classId);
+    return c;
+}
 
 exports.getStudents = async (req, res) => {
     try {
-        const { page = 1, limit = 20, search = '' } = req.query;
-        const schoolOid = String(req.schoolId);
-        const matchFilter = { school: schoolOid, role: 'student' };
-        if (search) matchFilter.$or = [
-            { name: new RegExp(search, 'i') },
-            { email: new RegExp(search, 'i') },
-        ];
-        const skip = (Number(page) - 1) * Number(limit);
+        const { page, limit, offset } = paging(req.query);
+        const c     = studentFilters(req);
+        const order = STUDENT_ORDER[req.query.sort] || STUDENT_ORDER.name;
 
-        const [result] = await User.aggregate([
-            { $match: matchFilter },
-            { $sort: { name: 1 } },
-            { $facet: {
-                data: [
-                    { $skip: skip },
-                    { $limit: Number(limit) },
-                    { $lookup: { from: 'studentprofiles', localField: '_id', foreignField: 'user', as: '_p' } },
-                    { $addFields: { _p: { $arrayElemAt: ['$_p', 0] } } },
-                    { $addFields: {
-                        rollNumber:      '$_p.rollNumber',
-                        gender:          '$_p.gender',
-                        currentSection:  '$_p.currentSection',
-                        currentClass:    '$_p.currentClass',
-                    }},
-                    { $lookup: { from: 'classsections', localField: 'currentSection', foreignField: '_id', as: '_sec' } },
-                    { $addFields: { _sec: { $arrayElemAt: ['$_sec', 0] } } },
-                    { $lookup: { from: 'classes', localField: '_sec.class', foreignField: '_id', as: '_cls' } },
-                    // Students with a class but no section yet still show their class
-                    { $lookup: { from: 'classes', localField: 'currentClass', foreignField: '_id', as: '_ownCls' } },
-                    { $addFields: {
-                        sectionName: '$_sec.sectionName',
-                        className:   { $ifNull: [
-                            { $arrayElemAt: ['$_cls.className', 0] },
-                            { $arrayElemAt: ['$_ownCls.className', 0] },
-                        ] },
-                    }},
-                    { $project: { _p: 0, _sec: 0, _cls: 0, _ownCls: 0 } },
-                ],
-                total: [{ $count: 'n' }],
-            }},
+        const [rows, count, stats] = await Promise.all([
+            pool.query(
+                `SELECT ${STUDENT_COLUMNS} ${STUDENT_FROM} ${c.sql()}
+                  ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`,
+                c.values,
+            ),
+            pool.query(`SELECT count(*)::int AS "n" ${STUDENT_FROM} ${c.sql()}`, c.values),
+            accountStats(req.schoolId, 'student'),
         ]);
 
-        const students = result?.data || [];
-        const total    = result?.total?.[0]?.n || 0;
-        res.json({ success: true, data: { data: students, total, page: Number(page), pages: Math.ceil(total / Number(limit)) } });
+        const total = count.rows[0]?.n || 0;
+        res.json({
+            success: true,
+            data: {
+                data: rows.rows, total, page, pages: Math.ceil(total / limit) || 1,
+                stats: {
+                    total: stats.total, active: stats.active,
+                    inactive: stats.inactive, newThisYear: stats.recent,
+                },
+            },
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
+// ── Teachers ─────────────────────────────────────────────────────────────────
+
+const TEACHER_FROM = `
+       FROM ${qt(User)}            u
+  LEFT JOIN ${qt(TeacherProfile)}  tp ON tp."user" = u."_id"`;
+
+// What a teacher actually teaches lives on the section-subject assignments, not
+// on their profile — the profile's `subjects` is only what the intake form was
+// told. The list column wants both, so it takes the union.
+const TAUGHT_SUBJECTS = `(
+        SELECT COALESCE(jsonb_agg(DISTINCT sub."subjectName"), '[]'::jsonb)
+          FROM ${qt(SectionSubjectTeacher)} sst
+          JOIN ${qt(Subject)} sub ON sub."_id" = sst."subject"
+         WHERE sst."teacher" = u."_id" AND sub."school" = u."school"
+    )`;
+
+const TEACHER_COLUMNS = `
+        u."_id", u."name", u."email", u."phone", u."profileImage",
+        u."isActive", u."createdAt",
+        tp."employeeId", tp."designation", tp."department", tp."gender",
+        tp."staffType", tp."joiningDate", tp."qualification",
+        COALESCE(tp."subjects", '[]'::jsonb) AS "profileSubjects",
+        ${TAUGHT_SUBJECTS}                   AS "taughtSubjects",
+        COALESCE(tp."classes",  '[]'::jsonb) AS "classes"`;
+
+/** Profile-declared and actually-assigned subjects, deduplicated, in one list. */
+function withSubjects(row) {
+    const seen = new Map();
+    for (const s of [...(row.taughtSubjects || []), ...(row.profileSubjects || [])]) {
+        const key = String(s || '').trim().toLowerCase();
+        if (key && !seen.has(key)) seen.set(key, String(s).trim());
+    }
+    return { ...row, subjects: [...seen.values()] };
+}
+
+const TEACHER_ORDER = {
+    name:    'u."name" ASC',
+    name_z:  'u."name" DESC',
+    newest:  'u."createdAt" DESC, u."name" ASC',
+    oldest:  'u."createdAt" ASC, u."name" ASC',
+    joined:  'tp."joiningDate" DESC NULLS LAST, u."name" ASC',
+    desig:   'NULLIF(tp."designation", \'\') ASC NULLS LAST, u."name" ASC',
+};
+
+function teacherFilters(req) {
+    const c = conditions([String(req.schoolId)]);
+    c.where.push(`u."school" = $1`, `u."role" = 'teacher'`);
+
+    const { search = '', status = 'all', designation = '', department = '',
+            subject = '', gender = '', staffType = '' } = req.query;
+    if (search.trim()) {
+        c.add(`(u."name" ILIKE ? OR u."email" ILIKE ? OR u."phone" ILIKE ?
+                OR tp."employeeId" ILIKE ? OR tp."designation" ILIKE ?)`,
+            ...Array(5).fill(`%${search.trim()}%`));
+    }
+    const st = statusClause(status);
+    if (st) c.where.push(st);
+    if (designation) c.add(`tp."designation" = ?`, designation);
+    if (department)  c.add(`tp."department" = ?`, department);
+    if (gender)      c.add(`tp."gender" = ?`, gender);
+    if (staffType)   c.add(`tp."staffType" = ?`, staffType);
+    // Either source counts: `@>` on a jsonb array is "contains this element",
+    // and the EXISTS covers a teacher assigned the subject on a section but
+    // whose intake form never listed it.
+    if (subject) {
+        c.add(`(tp."subjects" @> ?::jsonb OR EXISTS (
+                    SELECT 1 FROM ${qt(SectionSubjectTeacher)} sst
+                      JOIN ${qt(Subject)} sub ON sub."_id" = sst."subject"
+                     WHERE sst."teacher" = u."_id" AND sub."school" = u."school"
+                       AND sub."subjectName" = ?))`,
+            JSON.stringify([subject]), subject);
+    }
+    return c;
+}
+
+/**
+ * The values the filter dropdowns offer — taken from what teachers actually
+ * carry, so no option in the list can match nothing.
+ */
+async function teacherOptions(schoolId) {
+    const [text, subjects] = await Promise.all([
+        pool.query(
+            `SELECT DISTINCT NULLIF(trim("designation"), '') AS "designation",
+                             NULLIF(trim("department"),  '') AS "department"
+               FROM ${qt(TeacherProfile)} WHERE "school" = $1`,
+            [String(schoolId)],
+        ),
+        pool.query(
+            `SELECT DISTINCT trim(s.value) AS "subject"
+               FROM ${qt(TeacherProfile)} tp
+               CROSS JOIN LATERAL jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(tp."subjects") = 'array' THEN tp."subjects" ELSE '[]'::jsonb END
+               ) AS s(value)
+              WHERE tp."school" = $1 AND trim(s.value) <> ''
+              UNION
+             SELECT DISTINCT trim(sub."subjectName")
+               FROM ${qt(Subject)} sub
+              WHERE sub."school" = $1 AND trim(sub."subjectName") <> ''
+                AND EXISTS (SELECT 1 FROM ${qt(SectionSubjectTeacher)} sst
+                             WHERE sst."subject" = sub."_id")`,
+            [String(schoolId)],
+        ),
+    ]);
+    const uniq = (list) => [...new Set(list.filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+    return {
+        designations: uniq(text.rows.map((r) => r.designation)),
+        departments:  uniq(text.rows.map((r) => r.department)),
+        subjects:     uniq(subjects.rows.map((r) => r.subject)),
+    };
+}
+
+exports.getTeachers = async (req, res) => {
+    try {
+        const { page, limit, offset } = paging(req.query, { maxLimit: 500 });
+        const c     = teacherFilters(req);
+        const order = TEACHER_ORDER[req.query.sort] || TEACHER_ORDER.name;
+
+        const [rows, count, stats, options] = await Promise.all([
+            pool.query(
+                `SELECT ${TEACHER_COLUMNS} ${TEACHER_FROM} ${c.sql()}
+                  ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`,
+                c.values,
+            ),
+            pool.query(`SELECT count(*)::int AS "n" ${TEACHER_FROM} ${c.sql()}`, c.values),
+            accountStats(req.schoolId, 'teacher'),
+            teacherOptions(req.schoolId),
+        ]);
+
+        const total = count.rows[0]?.n || 0;
+        res.json({
+            success: true,
+            data: {
+                data: rows.rows.map(withSubjects), total, page, pages: Math.ceil(total / limit) || 1,
+                options,
+                stats: {
+                    total: stats.total, active: stats.active, inactive: stats.inactive,
+                    newThisYear: stats.recent, subjectsCovered: options.subjects.length,
+                },
+            },
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
+// ── Admins ───────────────────────────────────────────────────────────────────
+
+const ADMIN_FROM    = ` FROM ${qt(User)} u`;
+const ADMIN_COLUMNS = `
+        u."_id", u."name", u."email", u."phone", u."profileImage",
+        u."isActive", u."createdAt", u."lastSeenAt", u."isFirstLogin"`;
+
+const ADMIN_ORDER = {
+    name:   'u."name" ASC',
+    name_z: 'u."name" DESC',
+    newest: 'u."createdAt" DESC, u."name" ASC',
+    oldest: 'u."createdAt" ASC, u."name" ASC',
+    active: 'u."lastSeenAt" DESC NULLS LAST, u."name" ASC',
+};
+
+function adminFilters(req) {
+    const c = conditions([String(req.schoolId)]);
+    c.where.push(`u."school" = $1`, `u."role" = 'school_admin'`);
+
+    const { search = '', status = 'all' } = req.query;
+    if (search.trim()) {
+        c.add(`(u."name" ILIKE ? OR u."email" ILIKE ? OR u."phone" ILIKE ?)`,
+            ...Array(3).fill(`%${search.trim()}%`));
+    }
+    const st = statusClause(status);
+    if (st) c.where.push(st);
+    return c;
+}
+
+exports.getAdmins = async (req, res) => {
+    try {
+        const { page, limit, offset } = paging(req.query);
+        const c     = adminFilters(req);
+        const order = ADMIN_ORDER[req.query.sort] || ADMIN_ORDER.name;
+
+        const [rows, count, stats] = await Promise.all([
+            pool.query(
+                `SELECT ${ADMIN_COLUMNS} ${ADMIN_FROM} ${c.sql()}
+                  ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`,
+                c.values,
+            ),
+            pool.query(`SELECT count(*)::int AS "n" ${ADMIN_FROM} ${c.sql()}`, c.values),
+            accountStats(req.schoolId, 'school_admin'),
+        ]);
+
+        const total = count.rows[0]?.n || 0;
+        res.json({
+            success: true,
+            data: {
+                data: rows.rows, total, page, pages: Math.ceil(total / limit) || 1,
+                stats: {
+                    total: stats.total, active: stats.active,
+                    inactive: stats.inactive, newThisYear: stats.recent,
+                },
+            },
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
+// ── Export ───────────────────────────────────────────────────────────────────
+/**
+ * The list on screen, as a spreadsheet — same filters, same order, no paging.
+ *
+ * Capped rather than unbounded: an export is a document someone opens, and a
+ * school that has grown past the cap wants a filtered export, not a 40MB file.
+ */
+const EXPORT_LIMIT = 5000;
+
+function sendSheet(res, { filename, sheet, headers, rows, widths, textColumns = [] }) {
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    // Phone numbers and roll numbers must stay text, or Excel eats the leading
+    // zero and turns anything long into scientific notation.
+    for (const col of textColumns) {
+        for (let r = 1; r <= rows.length; r += 1) {
+            const cell = XLSX.utils.encode_cell({ r, c: col });
+            if (ws[cell]) { ws[cell].t = 's'; ws[cell].z = '@'; }
+        }
+    }
+    ws['!cols'] = widths.map((wch) => ({ wch }));
+    XLSX.utils.book_append_sheet(wb, ws, sheet);
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buf);
+}
+
+const sheetDate = (d) => (d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '');
+const asList    = (v) => (Array.isArray(v) ? v.join(', ') : (v || ''));
+
+exports.exportStudents = async (req, res) => {
+    try {
+        const c     = studentFilters(req);
+        const order = STUDENT_ORDER[req.query.sort] || STUDENT_ORDER.name;
+        const { rows } = await pool.query(
+            `SELECT ${STUDENT_COLUMNS} ${STUDENT_FROM} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
+            c.values,
+        );
+        sendSheet(res, {
+            filename: 'students.xlsx',
+            sheet: 'Students',
+            headers: ['Admission No', 'Roll No', 'Name', 'Email', 'Class', 'Section',
+                      'Gender', 'Date of Birth', 'Parent / Guardian', 'Parent Phone', 'Status'],
+            rows: rows.map((s) => [
+                s.admissionNumber || '', s.rollNumber || '', s.name, s.email,
+                s.className || '', s.sectionName || '', s.gender || '', sheetDate(s.dob),
+                s.parentName || '', s.parentPhone || '', s.isActive === false ? 'Inactive' : 'Active',
+            ]),
+            widths: [16, 10, 24, 30, 14, 10, 10, 15, 24, 16, 10],
+            textColumns: [0, 1, 9],
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
+exports.exportTeachers = async (req, res) => {
+    try {
+        const c     = teacherFilters(req);
+        const order = TEACHER_ORDER[req.query.sort] || TEACHER_ORDER.name;
+        const { rows } = await pool.query(
+            `SELECT ${TEACHER_COLUMNS} ${TEACHER_FROM} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
+            c.values,
+        );
+        sendSheet(res, {
+            filename: 'teachers.xlsx',
+            sheet: 'Teachers',
+            headers: ['Employee ID', 'Name', 'Email', 'Phone', 'Designation', 'Department',
+                      'Staff Type', 'Gender', 'Subjects', 'Classes', 'Joining Date', 'Status'],
+            rows: rows.map(withSubjects).map((t) => [
+                t.employeeId || '', t.name, t.email, t.phone || '',
+                t.designation || '', t.department || '', t.staffType || '', t.gender || '',
+                asList(t.subjects), asList(t.classes), sheetDate(t.joiningDate),
+                t.isActive === false ? 'Inactive' : 'Active',
+            ]),
+            widths: [14, 24, 30, 15, 18, 18, 14, 10, 26, 20, 14, 10],
+            textColumns: [0, 3],
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
+exports.exportAdmins = async (req, res) => {
+    try {
+        const c     = adminFilters(req);
+        const order = ADMIN_ORDER[req.query.sort] || ADMIN_ORDER.name;
+        const { rows } = await pool.query(
+            `SELECT ${ADMIN_COLUMNS} ${ADMIN_FROM} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
+            c.values,
+        );
+        sendSheet(res, {
+            filename: 'admins.xlsx',
+            sheet: 'Admins',
+            headers: ['Name', 'Email', 'Phone', 'Role', 'Status', 'Added On', 'Last Active'],
+            rows: rows.map((a) => [
+                a.name, a.email, a.phone || '', 'School Admin',
+                a.isActive === false ? 'Inactive' : 'Active',
+                sheetDate(a.createdAt), sheetDate(a.lastSeenAt),
+            ]),
+            widths: [24, 30, 15, 14, 10, 14, 14],
+            textColumns: [2],
+        });
     } catch (err) { jsonErr(res, err); }
 };
 
@@ -912,6 +1312,11 @@ exports.toggleUser = async (req, res) => {
     try {
         const user = await User.findOne({ _id: req.params.id, school: req.schoolId });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        // Deactivating your own account signs you out of a school you may be the
+        // only administrator of, with no way back in. Deletion already refuses
+        // this; so does switching yourself off.
+        if (String(user._id) === String(req.userId))
+            return res.status(403).json({ success: false, message: 'You cannot deactivate your own account' });
         // Only on the way OUT. Re-activating a teacher resolves dependencies, it
         // does not create them, and blocking it would strand the account.
         let report = null;
