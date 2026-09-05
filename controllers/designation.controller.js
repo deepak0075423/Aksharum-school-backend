@@ -87,16 +87,22 @@ exports.create = async (req, res) => {
             ? svc.sanitizePermissions(req.body.permissions)
             : svc.defaultPermissionsFor(name);
 
+        const description = String(req.body.description || '').trim();
+        if (description.length > 160) return bad(res, 'Description must be 160 characters or fewer');
+
         const row = await Designation.create({
             school: schoolId,
             name,
+            description: description || svc.defaultDescriptionFor(name),
             permissions,
             isActive: req.body.isActive === undefined ? true : !!req.body.isActive,
             createdBy: req.userId || null,
         });
         await svc.invalidate(schoolId);
         await svc.syncSchoolNames(schoolId);
-        jsonOk(res, { _id: row._id, name: row.name, permissions, isActive: row.isActive }, 201);
+        jsonOk(res, {
+            _id: row._id, name: row.name, description: row.description, permissions, isActive: row.isActive,
+        }, 201);
     } catch (err) { jsonErr(res, err); }
 };
 
@@ -125,6 +131,11 @@ exports.update = async (req, res) => {
                 renamed = await svc.renameProfiles(schoolId, row.name, name);
             }
         }
+        if (req.body.description !== undefined) {
+            const description = String(req.body.description).trim();
+            if (description.length > 160) return bad(res, 'Description must be 160 characters or fewer');
+            update.description = description;
+        }
         if (req.body.permissions !== undefined) {
             // Merged over what is stored, so a client that only knows about the
             // school's currently-enabled modules cannot wipe the levels held for
@@ -143,6 +154,7 @@ exports.update = async (req, res) => {
         jsonOk(res, {
             _id: row._id,
             name: update.name ?? row.name,
+            description: update.description ?? (row.description || ''),
             permissions: update.permissions ?? svc.sanitizePermissions(row.permissions),
             isActive: update.isActive ?? (row.isActive !== false),
             teachersRenamed: renamed,

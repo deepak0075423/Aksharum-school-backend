@@ -43,6 +43,30 @@ const LEGACY_ADMIN_GRANTS = {
 
 const DEFAULT_DESIGNATIONS = ['Teacher', 'Class Teacher', 'Librarian', 'Principal', 'Vice Principal'];
 
+// A starting line for the designations a school is likely to have, so the list
+// reads as sentences the first time it is opened rather than as bare names. Only
+// ever a default: an admin edits it and this is never consulted again.
+const DEFAULT_DESCRIPTIONS = {
+    'teacher':          'General teacher access for academic activities',
+    'class teacher':    'Handles class management and student records',
+    'librarian':        'Manages library books and records',
+    'principal':        'Full access to academic and administrative functions',
+    'vice principal':   'Assists principal with academic and administrative tasks',
+    'headmaster':       'Full access to academic and administrative functions',
+    'headmistress':     'Full access to academic and administrative functions',
+    'accountant':       'Manages fees, payroll and financial records',
+    'admin':            'Administrative access across enabled modules',
+    'counsellor':       'Supports student wellbeing and guidance',
+    'counselor':        'Supports student wellbeing and guidance',
+    'coordinator':      'Coordinates academics across classes and sections',
+    'warden':           'Manages hostel admissions, rooms and mess',
+    'lab assistant':    'Supports laboratory equipment and practicals',
+    'sports teacher':   'Runs physical education and sports activities',
+    'receptionist':     'Front desk, visitors and enquiries',
+};
+
+const defaultDescriptionFor = (name) => DEFAULT_DESCRIPTIONS[key(name)] || '';
+
 const norm = (name) => String(name || '').trim();
 const key  = (name) => norm(name).toLowerCase();
 
@@ -263,6 +287,7 @@ async function ensureSeeded(schoolId, createdBy = null) {
         await Designation.create({
             school: schoolId,
             name,
+            description: defaultDescriptionFor(name),
             permissions: defaultPermissionsFor(name),
             isActive: true,
             createdBy,
@@ -272,24 +297,40 @@ async function ensureSeeded(schoolId, createdBy = null) {
     return true;
 }
 
-// How many live teachers hold each designation, keyed by lowercased name.
+// Who holds each designation, keyed by lowercased name, split by the role of the
+// holder: { total, teachers, admins }.
+//
 // Deleting a user leaves their TeacherProfile behind, so the profiles are joined
 // back to existing users — otherwise orphaned rows inflate every count and block
-// designations from being deleted.
-async function teacherCountsByDesignation(schoolId) {
+// designations from being deleted. The split is by User.role rather than assumed
+// from the profile: only teachers carry a profile today, but a designation the
+// list reports as held by nobody must say so for the right reason.
+async function holderCountsByDesignation(schoolId) {
     const profiles = await TeacherProfile.find({ school: schoolId }).select('designation user').lean();
     if (!profiles.length) return {};
     const users = await User.find({ _id: { $in: profiles.map((p) => String(p.user)) } })
-        .select('_id').lean();
-    const live = new Set(users.map((u) => String(u._id)));
+        .select('_id role').lean();
+    const roleById = new Map(users.map((u) => [String(u._id), u.role]));
 
     const counts = {};
     for (const p of profiles) {
-        if (!live.has(String(p.user))) continue;
+        const role = roleById.get(String(p.user));
+        if (!role) continue;
         const k = key(p.designation);
-        if (k) counts[k] = (counts[k] || 0) + 1;
+        if (!k) continue;
+        const bucket = counts[k] || (counts[k] = { total: 0, teachers: 0, admins: 0 });
+        bucket.total += 1;
+        if (role === 'school_admin' || role === 'super_admin') bucket.admins += 1;
+        else bucket.teachers += 1;
     }
     return counts;
+}
+
+// The same roll-up as a plain {name: count} map, for callers that only need to
+// know whether a designation is still in use.
+async function teacherCountsByDesignation(schoolId) {
+    const counts = await holderCountsByDesignation(schoolId);
+    return Object.fromEntries(Object.entries(counts).map(([k, v]) => [k, v.total]));
 }
 
 // Full matrix for the management screens: every designation with its stored
@@ -299,19 +340,25 @@ async function listWithPermissions(schoolId) {
     const [school, rows, counts] = await Promise.all([
         School.findById(schoolId).select('modules').lean(),
         Designation.find({ school: schoolId }).sort('name').lean(),
-        teacherCountsByDesignation(schoolId),
+        holderCountsByDesignation(schoolId),
     ]);
     const moduleFlags = schoolModuleFlags(school);
 
     const designations = rows.map((r) => {
         const permissions = sanitizePermissions(r.permissions);
+        const held = counts[key(r.name)] || { total: 0, teachers: 0, admins: 0 };
         return {
             _id: r._id,
             name: r.name,
+            // Rows created before the field existed fall back to the stock line
+            // for their name, so the list never shows a column of blanks.
+            description: r.description || defaultDescriptionFor(r.name),
             isActive: r.isActive !== false,
             permissions,                                  // as configured
             effectivePermissions: gate(permissions, moduleFlags), // what users get today
-            teacherCount: counts[key(r.name)] || 0,
+            teacherCount: held.teachers,
+            adminCount: held.admins,
+            holderCount: held.total,
             createdAt: r.createdAt,
         };
     });
@@ -351,5 +398,6 @@ module.exports = {
     requestAccess, resolveRequestAccess, meets, teacherDesignation,
     invalidateUser, invalidateUsers,
     ensureSeeded, listWithPermissions, renameProfiles, countTeachers,
-    teacherCountsByDesignation, syncSchoolNames,
+    teacherCountsByDesignation, holderCountsByDesignation, syncSchoolNames,
+    defaultDescriptionFor,
 };

@@ -29,6 +29,13 @@ const DesignationSchema = new db.Schema({
         required: true,
         trim: true,
     },
+    // One line about what the designation is for, shown beside it on the
+    // management screen. Purely descriptive — it grants nothing.
+    description: {
+        type: String,
+        default: '',
+        trim: true,
+    },
     permissions: {
         type: db.Types.JSON,
         default: {},
