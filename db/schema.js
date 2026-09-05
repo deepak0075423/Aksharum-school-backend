@@ -189,6 +189,27 @@ function extractId(v) {
     return String(v);
 }
 
+// An id column is a uuid, and an empty string is not one.
+//
+// Every HTML form posts "" for an unset <select>, so an optional reference —
+// a student with no section yet, a teacher with no reporting manager — arrives
+// as "" and used to reach Postgres verbatim: `invalid input syntax for type
+// uuid: ""`, thrown at INSERT time, which in a two-step create is *after* the
+// account row it belonged with has already been written. Blank means "not set",
+// so it becomes NULL here, once, for every model.
+//
+// Anything else that is not a uuid is a genuine bug rather than an empty field,
+// so it still fails — but it fails here, naming the value and the table it was
+// meant to point at, instead of as a Postgres type error further down.
+function toIdColumn(meta, v) {
+    const id = extractId(v);
+    if (id === null || id.trim() === '') return null;
+    if (!UUID_RE.test(id)) {
+        throw new Error(`Invalid ${meta && meta.ref ? `${meta.ref} ` : ''}reference: ${JSON.stringify(id)} is not a valid id`);
+    }
+    return id;
+}
+
 function deepPlain(v) {
     if (v == null) return v;
     if (v instanceof Date) return v;
@@ -209,7 +230,10 @@ function deepPlain(v) {
 // assign subdocument _ids, keep Dates so JSON.stringify makes ISO strings).
 function castJsonValue(meta, v) {
     if (v == null) return v;
-    if (meta && meta.kind === 'id') return extractId(v);
+    if (meta && meta.kind === 'id') {
+        const id = extractId(v);
+        return id !== null && id.trim() === '' ? null : id;
+    }
     if (meta && meta.kind === 'date') return v instanceof Date ? v : new Date(v);
     if (meta && meta.array) {
         const arr = Array.isArray(v) ? v : [v];
@@ -257,10 +281,7 @@ function toColumnValue(meta, v) {
         if (v == null) return null;
         return v instanceof Date ? v : new Date(v);
     }
-    if (meta.kind === 'id') {
-        const id = extractId(v);
-        return id === null ? null : id;
-    }
+    if (meta.kind === 'id') return toIdColumn(meta, v);
     // json / mixed / arrays -> JSONB (stringified by caller)
     const plain = meta.kind === 'mixed' ? deepPlain(v) : castJsonValue(meta, v);
     return plain === undefined ? null : plain;

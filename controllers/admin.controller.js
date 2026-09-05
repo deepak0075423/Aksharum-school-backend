@@ -281,6 +281,13 @@ function buildStudentProfile(profile = {}, uploads = {}) {
     const out = { ...profile };
     const str = (v) => String(v ?? '').trim();
 
+    // The spread above carries the posted object through as-is, so the three
+    // reference fields arrive exactly as the form left them — and an unpicked
+    // <select> posts "", not nothing. They are ids: blank means "not assigned".
+    for (const key of ['currentClass', 'currentSection', 'parent']) {
+        if (out[key] !== undefined && !str(out[key])) out[key] = null;
+    }
+
     out.nationality  = str(profile.nationality) || 'Indian';
     out.country      = str(profile.country) || 'India';
     if (profile.aadhaarNumber !== undefined) out.aadhaarNumber = str(profile.aadhaarNumber).replace(/\s/g, '');
@@ -1552,6 +1559,37 @@ function fileStubsFor(profile) {
     return out;
 }
 
+/**
+ * Finish creating an account whose details live in a second table.
+ *
+ * The account row and its profile are two inserts, and until now a profile that
+ * failed left the account behind: a teacher or student who exists, can be
+ * emailed and shows in the list, but has no record attached — the "created
+ * without details" account an admin then cannot fix from the form that made it.
+ *
+ * There is no transaction across the pair (the ORM issues each statement on its
+ * own connection, deliberately — see db/pool.js), so the account is removed by
+ * hand and the original error is rethrown untouched. Only the row this request
+ * just created is ever deleted.
+ *
+ * Wrap the profile insert and nothing else. The steps after it — the section
+ * roster, the parent link — have written rows of their own by then, and pulling
+ * the account out from under those would trade one orphan for another.
+ */
+async function withProfile(user, create) {
+    try {
+        return await create();
+    } catch (err) {
+        try { await User.findByIdAndDelete(user._id); }
+        catch (cleanupErr) {
+            // The account really is orphaned now; say so in the log, and still
+            // report the failure that caused it rather than the cleanup's.
+            console.error(`[createUser] could not roll back orphaned user ${user._id}:`, cleanupErr.message);
+        }
+        throw err;
+    }
+}
+
 exports.createTeacher = async (req, res) => {
     try {
         const b     = req.body;
@@ -1577,12 +1615,12 @@ exports.createTeacher = async (req, res) => {
 
         const otp  = generateOTP();
         const user = await createUserHelper({ name, email, phone, designation, password: otp }, 'teacher', req.schoolId);
-        await TeacherProfile.create({
+        await withProfile(user, () => TeacherProfile.create({
             user: user._id,
             school: req.schoolId,
             employeeId,
             ...buildTeacherProfile(b, files),
-        });
+        }));
 
         const schoolName = req.user?.school?.name || 'School';
         sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
@@ -1733,7 +1771,7 @@ exports.createStudent = async (req, res) => {
         );
         const profileData = { user: user._id, school: req.schoolId, ...buildStudentProfile(profile, uploads) };
         if (resolvedParentId) profileData.parent = resolvedParentId;
-        await StudentProfile.create(profileData);
+        await withProfile(user, () => StudentProfile.create(profileData));
         // The profile now says which section they are in; the section itself has
         // to agree, or the class page, attendance and the timetable fan-out all
         // miss a student their own record says is enrolled.
