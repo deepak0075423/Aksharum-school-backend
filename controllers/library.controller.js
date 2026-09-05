@@ -25,7 +25,8 @@ const {
     checkBorrowerEligibility, buildCopy, calcFine, reindexQueue,
     sweepOverdue, expireStaleHolds, promoteQueue, fineApplies, renewIssuance,
     BORROWER_ROLES, commitIssue, commitReturn, borrowerAudience, nextFineReceiptNumber,
-    outstandingOf, fineStatusFor,
+    outstandingOf, fineStatusFor, ACTIVE_RESERVATION, notifyLibraryStaff,
+    attachFineSummary,
 } = require('../services/libraryRules');
 
 // How a book can come back over the counter.
@@ -71,7 +72,10 @@ exports.getDashboard = async (req, res) => {
         // numbers that barely move. One grouped query, cached briefly per
         // school — the recent-activity list below stays live.
         const redis = getCacheRedis();
-        const key   = `lib:dash:${req.schoolId}`;
+        // v2: the reservation tile changed meaning (queued → queued + held) and
+        // the fine total became outstanding rather than as-charged, so cached
+        // v1 payloads would keep serving the old numbers for a minute.
+        const key   = `lib:dash:v2:${req.schoolId}`;
         let tiles = null;
         if (redis) {
             try {
@@ -87,10 +91,11 @@ exports.getDashboard = async (req, res) => {
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1)                                  AS "totalCopies",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1 AND "status" = 'issued')          AS "issuedCopies",
                    (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1 AND "status" = 'overdue')         AS "overdue",
-                   (SELECT count(*) FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'pending')         AS "reservations",
+                   (SELECT count(*) FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = ANY($2::text[]))    AS "reservations",
                    (SELECT count(*) FROM "${LibraryFine.tableName}"        WHERE "school" = $1 AND "status" = 'pending')         AS "pendingFines",
-                   (SELECT COALESCE(sum("amount"), 0) FROM "${LibraryFine.tableName}" WHERE "school" = $1 AND "status" = 'pending') AS "pendingFineTotal"`,
-                [String(req.schoolId)],
+                   (SELECT COALESCE(sum("amount" - COALESCE("waivedAmount", 0) - COALESCE("paidAmount", 0)), 0)
+                      FROM "${LibraryFine.tableName}" WHERE "school" = $1 AND "status" = 'pending')                              AS "pendingFineTotal"`,
+                [String(req.schoolId), ACTIVE_RESERVATION],
             );
             tiles = Object.fromEntries(Object.entries(rows[0]).map(([k, v]) => [k, Number(v)]));
             if (redis) {
@@ -493,6 +498,13 @@ exports.markCopyStatus = async (req, res) => {
                         recipients: await audienceForUser(req.schoolId, last.issuedTo),
                         link: { type: 'library.myfines' },
                     });
+                    notifyLibraryStaff({
+                        schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                        title: status === 'lost' ? '📕 Lost book charge raised' : '📙 Damaged book charge raised',
+                        body: `Copy ${copy.uniqueCode} of "${bookDoc?.title || 'a library book'}" was marked ${status}`
+                            + ` and a ₹${amount} charge was raised against its last borrower.`,
+                        link: { type: 'library.manage.fines' },
+                    });
                 }
             }
         } else if (oldStatus === 'lost' || oldStatus === 'damaged') {
@@ -771,6 +783,12 @@ exports.issueBook = async (req, res) => {
             recipients: [userId],
             link: { type: 'library.mybooks' },
         });
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '📚 Book issued',
+            body: `"${book.title}" was issued to ${eligible.user.name || 'a member'}, due ${fmtLibDate(computedDue)}.`,
+            link: { type: 'library.manage.circulation' },
+        });
         res.status(201).json({ success: true, data: issuance });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -867,6 +885,16 @@ exports.returnBook = async (req, res) => {
             recipients: fine ? await borrowerAudience(issuance) : [issuance.issuedTo],
             link: { type: fine ? 'library.myfines' : 'library.mybooks' },
         });
+        const borrower = await User.findById(issuance.issuedTo).select('name').lean().catch(() => null);
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: condition === 'lost'    ? '📕 Book recorded as lost'
+                 : condition === 'damaged' ? '📙 Book returned damaged'
+                 : '📚 Book returned',
+            body: `"${bookDoc?.title || 'A book'}" from ${borrower?.name || 'a member'} was recorded as ${condition}.`
+                + (fine ? ` A ₹${fine.amount} ${fine.fineType.replace(/_/g, ' ')} charge was raised.` : ''),
+            link: { type: fine ? 'library.manage.fines' : 'library.manage.circulation' },
+        });
 
         res.json({ success: true, data: { issuance, fine } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -915,7 +943,7 @@ exports.getIssuances = async (req, res) => {
         // The export is the same list without the page window — what the
         // librarian filtered down to, not just the rows currently on screen.
         if (wantsXlsx(req)) {
-            const all = await query().limit(5000).lean();
+            const all = await attachFineSummary(await query().limit(5000).lean());
             const now = new Date();
             return sendXlsx(res, 'library_circulation', all.map(i => ({
                 Book: i.book?.title || '',
@@ -931,6 +959,14 @@ exports.getIssuances = async (req, res) => {
                     ? Math.ceil((now - new Date(i.dueDate)) / 86400000) : 0,
                 Renewals: i.renewalCount ?? 0,
                 'Issued by': i.issuedBy?.name || '',
+                // A closed-as-lost loan is a money record as much as a stock
+                // one; the register has to carry both or it does not reconcile.
+                'Fine charged':     i.fineSummary?.charged ?? 0,
+                'Fine waived':      i.fineSummary?.waived ?? 0,
+                'Fine paid':        i.fineSummary?.paid ?? 0,
+                'Fine outstanding': i.fineSummary?.outstanding ?? 0,
+                'Payment status':   i.fineSummary ? i.fineSummary.status : '',
+                'Receipt':          (i.fineSummary?.receipts || []).join(', '),
             })));
         }
 
@@ -938,7 +974,10 @@ exports.getIssuances = async (req, res) => {
             query().skip(skip).limit(limit).lean(),
             LibraryIssuance.countDocuments(filter),
         ]);
-        res.json({ success: true, data: issuances, total, page, pages: Math.ceil(total / limit) });
+        res.json({
+            success: true, data: await attachFineSummary(issuances),
+            total, page, pages: Math.ceil(total / limit),
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -1046,6 +1085,12 @@ exports.markReservationReady = async (req, res) => {
             recipients: [res_.reservedBy],
             link: { type: 'library.reservations' },
         })).catch(() => {});
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '🔖 Reservation ready for collection',
+            body: `A reserved copy is now being held for collection until ${fmtLibDate(res_.expiresAt)}.`,
+            link: { type: 'library.manage.reservations' },
+        });
         res.json({ success: true, data: res_ });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -1071,6 +1116,13 @@ exports.cancelReservation = async (req, res) => {
                 + (req.body?.reason ? `\nReason: ${String(req.body.reason).trim()}` : ''),
             recipients: [reservation.reservedBy],
             link: { type: 'library.reservations' },
+        });
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '🚫 Reservation cancelled',
+            body: `A reservation for "${cancelledBook?.title || 'a book'}" was cancelled by the library.`
+                + (req.body?.reason ? `\nReason: ${String(req.body.reason).trim()}` : ''),
+            link: { type: 'library.manage.reservations' },
         });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -1215,6 +1267,13 @@ exports.collectFine = async (req, res) => {
             recipients: await audienceForUser(req.schoolId, fine.user),
             link: { type: 'library.myfines' },
         });
+        const payer = await User.findById(fine.user).select('name').lean().catch(() => null);
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '💵 Library fine collected at the counter',
+            body: `₹${owed} was collected from ${payer?.name || 'a member'} against receipt ${receiptNumber}.`,
+            link: { type: 'library.manage.fines' },
+        });
         res.json({ success: true, data: { ...fine.toObject?.() ?? fine, collected: owed } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -1265,6 +1324,15 @@ exports.waiveFine = async (req, res) => {
                 : `A library fine of ₹${fine.amount} has been waived in full.\nReason: ${reason.trim()}`,
             recipients: await audienceForUser(req.schoolId, fine.user),
             link: { type: 'library.myfines' },
+        });
+        const waivedFor = await User.findById(fine.user).select('name').lean().catch(() => null);
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: stillOwed > 0 ? '💳 Library fine part-waived' : '💳 Library fine waived',
+            body: `₹${waive} of a ₹${fine.amount} fine for ${waivedFor?.name || 'a member'} was written off`
+                + (stillOwed > 0 ? `, leaving ₹${stillOwed} to pay.` : ' in full.')
+                + `\nReason: ${reason.trim()}`,
+            link: { type: 'library.manage.fines' },
         });
         res.json({ success: true, data: { ...fine.toObject?.() ?? fine, outstanding: stillOwed } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }

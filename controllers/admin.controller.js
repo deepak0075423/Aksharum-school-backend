@@ -1978,6 +1978,42 @@ const normalizeBloodGroup = (raw) => {
 const sheetBool = (raw) => ['yes', 'y', 'true', '1'].includes(String(raw ?? '').trim().toLowerCase());
 
 /**
+ * The school's designation master, as a lookup for importers.
+ *
+ * A designation is not a label. It is the key the whole permission chain hangs
+ * off — School flag → Designation permission → user access — so a sheet that
+ * invents "Sr. Librarian" does not create a teacher with a nice job title, it
+ * creates one whose module access nobody has ever configured and which resolves
+ * through the legacy fallback instead. The add-teacher form offers a dropdown;
+ * an uploaded sheet is the one way in that never had the same guard.
+ *
+ * Returns the canonical spelling keyed by a lowercased name, so "librarian" in
+ * a sheet is accepted and stored as "Librarian" — the join back to the table is
+ * by name, and two casings of it read as two designations on any screen that
+ * groups by the string.
+ */
+async function designationMaster(schoolId, createdBy = null) {
+    await designationSvc.ensureSeeded(schoolId, createdBy);
+    const rows = await Designation.find({ school: schoolId, isActive: true }).sort('name').select('name').lean();
+    return new Map(rows.map((r) => [String(r.name).trim().toLowerCase(), String(r.name).trim()]));
+}
+
+/**
+ * `null` when the typed designation is acceptable (blank counts — it means
+ * "not recorded", the same as leaving the field empty on the form), otherwise
+ * the reason to reject the row.
+ */
+function designationProblem(typed, master) {
+    if (!typed || !master.size) return null;
+    if (master.has(typed.trim().toLowerCase())) return null;
+    const known = [...master.values()];
+    const shown = known.slice(0, 8).join(', ');
+    return `Designation "${typed}" is not in this school's designation list.`
+        + ` Use one of: ${shown}${known.length > 8 ? `, … (${known.length} in total)` : ''}.`
+        + ' Add it under Settings → Designations first if it is missing.';
+}
+
+/**
  * Column reader for one sheet row. Headers are matched case- and
  * space-insensitively, and every field also accepts the shorter headers of the
  * earlier templates, so a sheet a school has already filled in still imports.
@@ -2099,6 +2135,9 @@ exports.bulkTeachers = async (req, res) => {
 
         // Needed once for the employee-ID format, not per row.
         const bulkSchoolDoc = await School.findById(req.schoolId).select('name code employeeIdFormat').lean();
+        // Same list the downloaded template puts on its reference sheet, so the
+        // sheet an admin was handed and the sheet the importer accepts agree.
+        const designations = await designationMaster(req.schoolId, req.userId);
 
         let created = 0;
         let updated = 0;
@@ -2183,6 +2222,16 @@ exports.bulkTeachers = async (req, res) => {
                 sameAsCurrent:  sheetBool(cell('permanent same as current', 'same as current')),
                 employmentType: matchOption(cell('employment type'), ['fresher', 'experienced']).toLowerCase(),
             };
+
+            // The form offers designations as a dropdown; a sheet can type
+            // anything, so it is checked against the same master here. Held to
+            // the canonical spelling as well as the canonical set — the name is
+            // the join key, and "librarian" and "Librarian" are two rows to
+            // anything that groups by it.
+            const typedDesignation = cell('designation');
+            const designationIssue = designationProblem(typedDesignation, designations);
+            if (designationIssue) { fail(designationIssue); continue; }
+            if (typedDesignation) b.designation = designations.get(typedDesignation.trim().toLowerCase());
 
             // Every rule the add-teacher form enforces, minus the uploads.
             const problem = validateTeacherIntake(b, {}, { requireDocuments: false });
@@ -2817,12 +2866,12 @@ exports.downloadTeacherTemplate = async (req, res) => {
         const headers = TEACHER_TEMPLATE_HEADERS;
 
         // The designation list the add-teacher form itself offers, so the sample
-        // row and the reference sheet cannot suggest one that does not exist.
-        await designationSvc.ensureSeeded(req.schoolId, req.userId);
-        const rows   = await Designation.find({ school: req.schoolId, isActive: true }).sort('name').select('name').lean();
+        // row and the reference sheet cannot suggest one that does not exist —
+        // and the same list the importer holds the uploaded sheet to.
+        const master = await designationMaster(req.schoolId, req.userId);
         const school = await School.findById(req.schoolId).select('designations city state').lean();
-        const designations = rows.length
-            ? rows.map((r) => r.name)
+        const designations = master.size
+            ? [...master.values()]
             : (school?.designations?.length ? school.designations : DEFAULT_DESIGNATIONS);
         const city  = school?.city  || 'Pune';
         const state = STATES_AND_UTS.includes(school?.state) ? school.state : 'Maharashtra';
@@ -2864,7 +2913,7 @@ exports.downloadTeacherTemplate = async (req, res) => {
         XLSX.utils.book_append_sheet(wb, ws, 'Teachers');
 
         referenceSheet(wb, [
-            ['Designations (this school)', designations],
+            ['Designations (this school) — a row with any other value is rejected', designations],
             ['Gender', GENDERS],
             ['Blood Group', BLOOD_GROUPS],
             ['Qualification', [

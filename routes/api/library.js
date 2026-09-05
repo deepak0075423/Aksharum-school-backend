@@ -81,9 +81,16 @@ router.get('/reports/accession',  librarianGuard, repCtrl.accessionRegister);
 router.get('/reports/stock-take', librarianGuard, repCtrl.stockTake);
 router.get('/reports/fines',      librarianGuard, repCtrl.fineLedger);
 
-// Policy & Audit (admin only)
-router.get('/policy',     adminOnlyGuard, libCtrl.getPolicy);
-router.put('/policy',     adminOnlyGuard, libCtrl.updatePolicy);
+// Policy — administrative access to the LIBRARY module, not the school.
+// This was requireRole('school_admin'), which refuses a teacher whose
+// designation makes them a library administrator: the Policy tab is on their
+// nav, the page loaded, and every field rendered as a dash because the fetch
+// behind it 403'd. Administering the module is precisely what the designation
+// grants, so the policy is part of it.
+router.get('/policy',     librarianGuard, libCtrl.getPolicy);
+router.put('/policy',     librarianGuard, libCtrl.updatePolicy);
+
+// The audit log stays school_admin-only: it records what the librarians did.
 router.get('/audit-log',  adminOnlyGuard, libCtrl.getAuditLog);
 
 // ── Student ───────────────────────────────────────────────────────────────────

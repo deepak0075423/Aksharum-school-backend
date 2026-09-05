@@ -5,8 +5,42 @@ const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const Class               = require('../models/Class');
 const ClassSection        = require('../models/ClassSection');
 const AcademicYear        = require('../models/AcademicYear');
+const TeacherProfile        = require('../models/TeacherProfile');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
+
+/**
+ * Adds department and designation to teachers already populated on a document.
+ *
+ * Both live on TeacherProfile, not on User, so `populate('teachers')` can never
+ * reach them however many fields it is given — hence a second, bounded lookup.
+ * Without it every teacher picker built on a Subject shows a name and an email,
+ * which is exactly the pair that does not tell two Priya Sharmas apart.
+ */
+async function attachTeacherDetail(docs, key = 'teachers') {
+    const rows = Array.isArray(docs) ? docs : [docs];
+    const ids = [...new Set(rows.flatMap((d) =>
+        (Array.isArray(d?.[key]) ? d[key] : [d?.[key]])
+            .filter((t) => t && typeof t === 'object' && t._id)
+            .map((t) => String(t._id))))];
+    if (!ids.length) return docs;
+
+    const profiles = await TeacherProfile.find({ user: { $in: ids } })
+        .select('user designation department employeeId').lean();
+    const byUser = new Map(profiles.map((p) => [String(p.user), p]));
+
+    for (const d of rows) {
+        const list = Array.isArray(d?.[key]) ? d[key] : (d?.[key] ? [d[key]] : []);
+        for (const t of list) {
+            if (!t || typeof t !== 'object' || !t._id) continue;
+            const p = byUser.get(String(t._id));
+            t.designation = p?.designation || '';
+            t.department  = p?.department  || '';
+            t.employeeId  = p?.employeeId  || '';
+        }
+    }
+    return docs;
+}
 
 // `meta` rides alongside `data` in the envelope — useFetch on the client hands
 // the whole envelope back as `meta`, so a caller can read counts without them
@@ -37,9 +71,9 @@ exports.getSubjects = async (req, res) => {
         // No year at all (a school mid-setup) can only mean "everything", or the
         // subject screen would be empty with no way to explain itself.
         const filter = { school: req.schoolId, ...(year ? { academicYear: year._id } : {}) };
-        const subjects = await Subject.find(filter)
-            .populate('teachers', 'name email')
-            .lean();
+        const subjects = await attachTeacherDetail(
+            await Subject.find(filter).populate('teachers', 'name email').lean(),
+        );
 
         if (!yearId) return ok(res, subjects);
 
@@ -134,7 +168,7 @@ exports.createSubject = async (req, res) => {
             academicYear: yearId,
         });
         const populated = await s.populate('teachers', 'name email');
-        ok(res, populated, 201);
+        ok(res, await attachTeacherDetail(populated.toObject?.() ?? populated), 201);
     } catch (e) { err(res, e, 400); }
 };
 exports.updateSubject = async (req, res) => {
@@ -153,7 +187,7 @@ exports.updateSubject = async (req, res) => {
         const s = await Subject.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, update, { new: true })
             .populate('teachers', 'name email');
         if (!s) return err(res, 'Subject not found', 404);
-        ok(res, s);
+        ok(res, await attachTeacherDetail(s.toObject?.() ?? s));
     } catch (e) { err(res, e, 400); }
 };
 exports.deleteSubject = async (req, res) => {
@@ -207,8 +241,11 @@ async function ensureClassSubject(sectionId, subjectId) {
 
 exports.getSectionSubjectTeachers = async (req, res) => {
     try {
-        const sst = await SectionSubjectTeacher.find({ section: req.params.sectionId })
-            .populate('subject teacher').lean();
+        const sst = await attachTeacherDetail(
+            await SectionSubjectTeacher.find({ section: req.params.sectionId })
+                .populate('subject teacher').lean(),
+            'teacher',
+        );
         ok(res, sst);
     } catch (e) { err(res, e); }
 };

@@ -4,9 +4,11 @@ const LibraryIssuance    = require('../models/LibraryIssuance');
 const LibraryReservation = require('../models/LibraryReservation');
 const LibraryFine        = require('../models/LibraryFine');
 const LibraryAuditLog    = require('../models/LibraryAuditLog');
+const User               = require('../models/User');
 const {
     ACTIVE_ISSUANCE, getOrCreatePolicy, reindexQueue, activeReservation,
     sweepOverdue, expireStaleHolds, renewIssuance, fmtLibDate,
+    notifyLibraryStaff, attachFineSummary,
 } = require('../services/libraryRules');
 const { notify } = require('../services/notifyService');
 
@@ -147,6 +149,19 @@ exports.reserve = async (req, res) => {
             link: { type: 'library.reservations' },
         });
 
+        // A reservation is placed by the member, so nobody at the desk has seen
+        // it happen. This is the notification the module was most obviously
+        // missing: a hold shelf nobody is told to fill.
+        const member = await User.findById(req.userId).select('name').lean().catch(() => null);
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: readyNow ? '🔖 Reserved copy to hold' : '🔖 New reservation',
+            body: readyNow
+                ? `${member?.name || 'A member'} reserved "${book.title}" — a copy is free, set it aside before ${fmtLibDate(reservation.expiresAt)}.`
+                : `${member?.name || 'A member'} joined the queue for "${book.title}" at position ${reservation.queuePosition}.`,
+            link: { type: 'library.manage.reservations' },
+        });
+
         res.status(201).json({ success: true, data: reservation });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -164,6 +179,18 @@ exports.cancelReservation = async (req, res) => {
             school: req.schoolId, user: req.userId, role: req.userRole,
             actionType: 'RESERVATION_CANCELLED', entityType: 'Reservation', entityId: reservation._id,
         });
+        // Only worth the desk's attention when a copy was actually being held
+        // for them — a queue place given up changes nothing on the shelf.
+        if (reservation.status === 'cancelled' && reservation.readyAt) {
+            const book = await LibraryBook.findById(reservation.book).select('title').lean().catch(() => null);
+            const who  = await User.findById(req.userId).select('name').lean().catch(() => null);
+            notifyLibraryStaff({
+                schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: '🔖 Held copy released',
+                body: `${who?.name || 'A member'} cancelled their hold on "${book?.title || 'a book'}" — the copy can go back on the shelf.`,
+                link: { type: 'library.manage.reservations' },
+            });
+        }
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -202,7 +229,11 @@ exports.getMyBooks = async (req, res) => {
             .lean();
 
         const now = new Date();
-        const data = issuances.map(i => ({
+        // A lost book is still a row on this list, and until now it carried
+        // nothing but the word "lost" — no charge, no receipt, no way to tell a
+        // settled loss from an unpaid one.
+        const withFines = await attachFineSummary(issuances);
+        const data = withFines.map(i => ({
             ...i,
             isOverdue: ACTIVE_ISSUANCE.includes(i.status) && now > new Date(i.dueDate),
         }));

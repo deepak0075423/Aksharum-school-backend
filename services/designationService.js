@@ -392,7 +392,7 @@ async function syncSchoolNames(schoolId) {
 }
 
 module.exports = {
-    ADMIN, USER, NONE, LEVELS, RANK, DEFAULT_DESIGNATIONS,
+    ADMIN, USER, NONE, LEVELS, RANK, DEFAULT_DESIGNATIONS, CACHE_TTL,
     sanitizePermissions, defaultPermissionsFor, emptyPermissions, gate,
     getSnapshot, invalidate, resolveDesignation, resolveFromSnapshot,
     requestAccess, resolveRequestAccess, meets, teacherDesignation,

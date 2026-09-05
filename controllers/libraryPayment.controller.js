@@ -23,7 +23,8 @@ const ReceiptTemplate = require('../models/ReceiptTemplate');
 
 const paymentGateway = require('../services/paymentGateway');
 const { renderReceipt, defaultTemplate } = require('../services/receiptRenderer');
-const { nextFineReceiptNumber, borrowerAudience, outstandingOf, fineStatusFor } = require('../services/libraryRules');
+const { nextFineReceiptNumber, borrowerAudience, outstandingOf, fineStatusFor,
+        notifyLibraryStaff } = require('../services/libraryRules');
 const { notify } = require('../services/notifyService');
 
 const FINE_LABEL = { late_return: 'Late return', lost: 'Lost book', damaged: 'Damaged book' };
@@ -205,6 +206,17 @@ exports.confirmFinePayment = async (req, res) => {
             recipients: await borrowerAudience({ issuedTo: subject.userId, issuedToRole: payer?.role || '' }),
             includeSender: true,
             link: { type: 'library.myfines' },
+        });
+        // Money arriving without anyone at the counter: the desk finds out here
+        // or not at all.
+        const member = await User.findById(subject.userId).select('name').lean().catch(() => null);
+        notifyLibraryStaff({
+            schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '💳 Library fine paid online',
+            body: `${member?.name || 'A member'} paid ₹${total.toLocaleString('en-IN')} online`
+                + ` against ${fines.length} fine${fines.length === 1 ? '' : 's'}. Receipt: ${receiptNumber}.`,
+            link: { type: 'library.manage.fines' },
+            exclude: [req.userId],
         });
 
         res.json({ success: true, data: { receiptNumber, amount: total, count: fines.length } });

@@ -17,8 +17,11 @@ const LibraryPolicy      = require('../models/LibraryPolicy');
 const LibraryAuditLog    = require('../models/LibraryAuditLog');
 const User               = require('../models/User');
 const pool               = require('../db/pool');
+const TeacherProfile     = require('../models/TeacherProfile');
 const { notify, withParents } = require('./notifyService');
 const { withTransaction, lock, buildInsert } = require('./dbTx');
+const designations       = require('./designationService');
+const { getCacheRedis }  = require('../config/cacheRedis');
 
 const fmtLibDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 
@@ -26,6 +29,11 @@ const fmtLibDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric'
 const MAX_COPIES_PER_ADD = 100;
 const COPY_STATUSES = ['available', 'reserved', 'lost', 'damaged', 'issued'];
 const ACTIVE_ISSUANCE = ['issued', 'overdue'];
+// A reservation that still has a claim on a copy: queued for one, or holding
+// one waiting to be collected. Anything else is finished business. The
+// dashboard tile counted only 'pending' and so never showed the people
+// actually standing at the hold shelf.
+const ACTIVE_RESERVATION = ['pending', 'ready'];
 // A loan longer than a school year is a typo, not a policy.
 const MAX_LOAN_DAYS = 365;
 
@@ -315,9 +323,15 @@ async function commitReturn({ schoolId, issuance, condition, copyStatus, fineAmo
         );
         if (!closed.rowCount) return null;   // someone else closed it first
 
+        // A copy that comes back lost or damaged leaves the collection, and the
+        // accession register reads `writtenOffAt` to say when. markCopyStatus
+        // stamped it; the return desk never did, so a book lost at the counter
+        // showed in the register as still on the books.
         await q(
-            `UPDATE ${T_COPY()} SET "status" = $2 WHERE "_id" = $1::uuid`,
-            [String(issuance.bookCopy), copyStatus],
+            `UPDATE ${T_COPY()} SET "status" = $2,
+                    "writtenOffAt" = CASE WHEN $2 = ANY($3::text[]) THEN now() ELSE NULL END
+              WHERE "_id" = $1::uuid`,
+            [String(issuance.bookCopy), copyStatus, ['lost', 'damaged']],
         );
 
         if (copyStatus === 'available') {
@@ -388,6 +402,71 @@ function fineStatusFor(fine) {
 }
 
 /**
+ * Attaches what a loan cost, and whether that has been settled, to each row.
+ *
+ * A loan closed as `lost` is the case this exists for: the copy is gone, the
+ * borrower has been charged, and the only thing the screens could say about it
+ * was the loan status. "Lost" on its own does not tell a parent whether they
+ * still owe anything, and a fine paid in full left the row looking identical to
+ * one nobody has settled.
+ *
+ * Joined on LibraryFine.issuance rather than on LibraryIssuance.fine, because
+ * that column holds only the charge raised at the return desk — a loss found
+ * later at a stock check raises a second fine against the same loan and never
+ * writes back to it. Summing every fine on the loan is the only figure that is
+ * always the truth.
+ */
+async function attachFineSummary(issuances) {
+    const rows = Array.isArray(issuances) ? issuances : [];
+    if (!rows.length) return rows;
+
+    const fines = await LibraryFine.find({ issuance: { $in: rows.map((i) => String(i._id)) } })
+        .select('issuance fineType amount waivedAmount paidAmount paidAt paymentMode receiptNumber')
+        .lean();
+    if (!fines.length) return rows.map((i) => ({ ...i, fineSummary: null }));
+
+    const byIssuance = new Map();
+    for (const f of fines) {
+        const key = String(f.issuance);
+        const acc = byIssuance.get(key) || {
+            charged: 0, waived: 0, paid: 0, outstanding: 0,
+            types: [], receipts: [], paymentModes: [], paidAt: null, count: 0,
+        };
+        acc.charged     += Number(f.amount || 0);
+        acc.waived      += Number(f.waivedAmount || 0);
+        acc.paid        += Number(f.paidAmount || 0);
+        acc.outstanding += outstandingOf(f);
+        acc.count       += 1;
+        if (f.fineType && !acc.types.includes(f.fineType)) acc.types.push(f.fineType);
+        if (f.receiptNumber && !acc.receipts.includes(f.receiptNumber)) acc.receipts.push(f.receiptNumber);
+        // Only a mode that actually carried money — the column defaults to
+        // 'cash' on every row, unpaid ones included.
+        if (f.paymentMode && Number(f.paidAmount || 0) > 0 && !acc.paymentModes.includes(f.paymentMode)) {
+            acc.paymentModes.push(f.paymentMode);
+        }
+        if (f.paidAt && (!acc.paidAt || new Date(f.paidAt) > new Date(acc.paidAt))) acc.paidAt = f.paidAt;
+        byIssuance.set(key, acc);
+    }
+
+    return rows.map((i) => {
+        const acc = byIssuance.get(String(i._id));
+        if (!acc) return { ...i, fineSummary: null };
+        return {
+            ...i,
+            fineSummary: {
+                ...acc,
+                // Derived from the arithmetic, exactly as a single fine's is, so
+                // a part-waived-part-paid loan cannot read as settled while
+                // money is still owed.
+                status: fineStatusFor({
+                    amount: acc.charged, waivedAmount: acc.waived, paidAmount: acc.paid,
+                }),
+            },
+        };
+    });
+}
+
+/**
  * Fills in waivedAmount / paidAmount on fines settled before those columns
  * existed. Without it every historical 'paid' row reads as fully outstanding,
  * because its paidAmount defaults to zero. Self-healing: once every row is
@@ -417,6 +496,107 @@ async function backfillFineAmounts(schoolId) {
 // never lapsed — one no-show froze a copy permanently.
 //
 // Each is a single UPDATE, cheap enough to run on the read paths that care.
+
+/**
+ * The people who run the library: every school admin, plus every teacher whose
+ * designation grants administrative access to the library module.
+ *
+ * This is deliberately resolved the same way `allowModuleAdmin('library')`
+ * resolves it, rather than by looking for a designation literally named
+ * "Librarian" — a school that renamed the designation, or gave library admin to
+ * its Vice Principal, has to get the same answer at the notification desk as at
+ * the route guard. `resolveFromSnapshot` also carries the legacy fallback, so a
+ * designation with no configured row still counts if its name historically
+ * implied the privilege.
+ *
+ * Cached for the same 60 seconds the designation snapshot behind it is, so a
+ * busy counter does not re-derive the list on every issue — and so a change to
+ * who counts as library staff reaches this list in exactly the window it
+ * already takes to reach the route guards. No separate invalidation to keep in
+ * step with designationService's.
+ */
+const STAFF_TTL = designations.CACHE_TTL || 60;
+const staffCacheKey = (schoolId) => `lib:staff:${schoolId}`;
+
+async function libraryStaffIds(schoolId) {
+    if (!schoolId) return [];
+    const redis = getCacheRedis();
+    if (redis) {
+        try {
+            const hit = await redis.get(staffCacheKey(schoolId));
+            if (hit) return JSON.parse(hit);
+        } catch { /* fall through to the database */ }
+    }
+
+    let ids = [];
+    try {
+        const snapshot = await designations.getSnapshot(schoolId);
+        // The module being off for the school is the one case where nobody is
+        // library staff, however their designation is configured.
+        if (snapshot?.moduleFlags?.library) {
+            const [admins, profiles] = await Promise.all([
+                User.find({ school: schoolId, role: 'school_admin', isActive: true }).select('_id').lean(),
+                TeacherProfile.find({ school: schoolId }).select('user designation').lean(),
+            ]);
+
+            // One resolution per distinct designation name, not one per teacher.
+            const verdict = new Map();
+            const moduleAdmins = profiles.filter((p) => {
+                const key = String(p.designation || '').toLowerCase();
+                if (!verdict.has(key)) {
+                    verdict.set(key, designations.resolveFromSnapshot(snapshot, p.designation)
+                        .permissions.library === designations.ADMIN);
+                }
+                return verdict.get(key);
+            });
+
+            // A TeacherProfile outlives the user it belonged to, so the ids are
+            // joined back to live, active teacher accounts.
+            const teachers = moduleAdmins.length
+                ? await User.find({
+                    _id: { $in: moduleAdmins.map((p) => String(p.user)) },
+                    school: schoolId, role: 'teacher', isActive: true,
+                }).select('_id').lean()
+                : [];
+
+            ids = [...new Set([...admins, ...teachers].map((u) => String(u._id)))];
+        }
+    } catch (e) {
+        console.error('[library] libraryStaffIds failed:', e.message);
+        return [];   // a notification is never worth failing the request over
+    }
+
+    if (redis) {
+        try { await redis.set(staffCacheKey(schoolId), JSON.stringify(ids), 'EX', STAFF_TTL); }
+        catch { /* best effort */ }
+    }
+    return ids;
+}
+
+/**
+ * The desk's copy of a member-facing notice.
+ *
+ * Kept separate from the member's own message rather than bolted onto its
+ * recipient list, because the two need different words and different
+ * destinations: the borrower is sent to "My Books", the librarian to the
+ * circulation register. notify() drops the sender, so the librarian who
+ * performed the action is never told about their own click.
+ */
+function notifyLibraryStaff({ schoolId, sender, senderRole, title, body, link, exclude = [] }) {
+    setImmediate(() => {
+        libraryStaffIds(schoolId)
+            .then((ids) => {
+                const skip = new Set(exclude.filter(Boolean).map(String));
+                const recipients = ids.filter((id) => !skip.has(String(id)));
+                if (!recipients.length) return;
+                notify({
+                    school: schoolId, sender: sender || null, senderRole: senderRole || 'system',
+                    title, body, recipients, link: link || { type: 'library.manage.circulation' },
+                });
+            })
+            .catch((e) => console.error('[library] staff notify failed:', e.message));
+    });
+}
 
 /**
  * A student's people: the student plus whoever the profile lists as parent.
@@ -469,6 +649,19 @@ async function sweepOverdue(schoolId) {
             link: { type: 'library.mybooks' },
         });
     }
+
+    // The desk gets one line for the batch. Forty loans tipping past midnight
+    // is one piece of news to a librarian and forty separate emergencies to
+    // each borrower — the same event, told at two different resolutions.
+    notifyLibraryStaff({
+        schoolId,
+        senderRole: 'system',
+        title: '⚠️ Library loans now overdue',
+        body: rows.length === 1
+            ? `"${titleOf[String(rows[0].book)] || 'A library book'}" has passed its due date and is now overdue.`
+            : `${rows.length} library loans have passed their due date and are now overdue.`,
+        link: { type: 'library.manage.circulation' },
+    });
     return rows.length;
 }
 
@@ -516,6 +709,16 @@ async function expireStaleHolds(schoolId, bookId = null, { actor, actorRole } = 
         await reindexQueue(schoolId, row.book);
         await promoteQueue(schoolId, row.book, policy, { actor, actorRole });
     }
+
+    // Shelf work: a lapsed hold means a book to take off the reservation shelf.
+    notifyLibraryStaff({
+        schoolId, sender: actor, senderRole: actorRole,
+        title: '⌛ Reservation holds lapsed',
+        body: lapsed.length === 1
+            ? `A hold on "${titleOf[String(lapsed[0].book)] || 'a book'}" was not collected in time and has gone back on the shelf.`
+            : `${lapsed.length} reservation holds were not collected in time and have gone back on the shelf.`,
+        link: { type: 'library.manage.reservations' },
+    });
     return lapsed;
 }
 
@@ -565,6 +768,18 @@ async function promoteQueue(schoolId, bookId, policy, { actor, actorRole } = {})
                 link: { type: 'library.reservations' },
             });
         }
+
+        // Nobody has physically moved the copy yet — the queue promotion is a
+        // database event. Without this the member is told to come and collect a
+        // book that is still filed on the shelf.
+        notifyLibraryStaff({
+            schoolId, sender: actor, senderRole: actorRole,
+            title: '🔖 Copies to put on the hold shelf',
+            body: promoted.length === 1
+                ? `A copy of "${book?.title || 'a book'}" has been promised to the next person in the queue — set it aside for collection.`
+                : `${promoted.length} copies of "${book?.title || 'a book'}" have been promised to the queue — set them aside for collection.`,
+            link: { type: 'library.manage.reservations' },
+        });
     }
     return promoted;
 }
@@ -719,6 +934,15 @@ async function renewIssuance(schoolId, issuanceId, { onlyForUser = null, actor =
         link: { type: 'library.mybooks' },
     });
 
+    // A member can renew their own loan without the desk ever seeing them, so
+    // the register moving under the librarian's feet is worth a line.
+    notifyLibraryStaff({
+        schoolId, sender: actor || issuance.issuedBy, senderRole: actorRole,
+        title: '🔄 Library book renewed',
+        body: `"${book?.title || 'A library book'}" has been renewed and is now due on ${fmtLibDate(issuance.dueDate)}.`,
+        link: { type: 'library.manage.circulation' },
+    });
+
     return { ok: true, issuance };
 }
 
@@ -731,12 +955,13 @@ async function activeReservation(schoolId, userId, bookId) {
 }
 
 module.exports = {
-    MAX_COPIES_PER_ADD, COPY_STATUSES, ACTIVE_ISSUANCE, MAX_LOAN_DAYS, BORROWER_ROLES,
+    MAX_COPIES_PER_ADD, COPY_STATUSES, ACTIVE_ISSUANCE, ACTIVE_RESERVATION, MAX_LOAN_DAYS, BORROWER_ROLES,
     fmtLibDate, getOrCreatePolicy, audit, reserveCopyCodes, bumpBookCounts,
     normIsbn, normText, isValidIsbn, findDuplicateBook, duplicateResponse,
     checkBorrowerEligibility, buildCopy, calcFine, reindexQueue, activeReservation,
     sweepOverdue, expireStaleHolds, promoteQueue, fineApplies, renewIssuance,
     commitIssue, commitReturn, sendDueSoonReminders, runLibrarySweep, pruneAuditLog,
     borrowerAudience, backfillIssuedToRole, nextFineReceiptNumber,
-    outstandingOf, fineStatusFor, backfillFineAmounts,
+    libraryStaffIds, notifyLibraryStaff,
+    outstandingOf, fineStatusFor, backfillFineAmounts, attachFineSummary,
 };

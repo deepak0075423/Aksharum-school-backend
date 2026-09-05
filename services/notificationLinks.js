@@ -106,9 +106,29 @@ const ROUTES = {
         parent:       { web: '/parent/dashboard',          mobile: '/modules/library-parent' },
         school_admin: { web: '/admin/library/reservations', mobile: '/modules/library-admin/reservations' },
     },
+    // The earlier spelling of 'library.manage.circulation' below, which nothing
+    // writes any more. Kept registered so a notification stored under it before
+    // the rename still opens where it meant to instead of falling back to the
+    // reader's inbox.
     'library.circulation': {
         school_admin: { web: '/admin/library/circulation',   mobile: '/modules/library-admin/circulation' },
         teacher:      { web: '/teacher/manage-library/circulation', mobile: '/modules/library-admin/circulation' },
+    },
+
+    // Staff-side destinations. A librarian is also a borrower, so the member
+    // types above send a teacher to their OWN books and fines — which is wrong
+    // for a notice about somebody else's loan. These are the desk's versions.
+    'library.manage.circulation': {
+        school_admin: { web: '/admin/library/circulation',           mobile: '/modules/library-admin/circulation' },
+        teacher:      { web: '/teacher/manage-library/circulation',  mobile: '/modules/library-admin/circulation' },
+    },
+    'library.manage.reservations': {
+        school_admin: { web: '/admin/library/reservations',          mobile: '/modules/library-admin/reservations' },
+        teacher:      { web: '/teacher/manage-library/reservations', mobile: '/modules/library-admin/reservations' },
+    },
+    'library.manage.fines': {
+        school_admin: { web: '/admin/library/fines',                 mobile: '/modules/library-admin/fines' },
+        teacher:      { web: '/teacher/manage-library/fines',        mobile: '/modules/library-admin/fines' },
     },
 
     // ── Exams & results ──────────────────────────────────────────────────────
