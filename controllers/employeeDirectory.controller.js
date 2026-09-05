@@ -483,6 +483,26 @@ exports.getDashboard = async (req, res) => {
         const recentCutoff = new Date();
         recentCutoff.setMonth(recentCutoff.getMonth() - 3);
 
+        // Anyone who joined on or after the active year began. The overview
+        // reports the school's own year rather than a rolling three months —
+        // "new this year" is the number an admin is actually asked for.
+        const yearStart = isDate(snap.activeYear?.startDate) ? new Date(snap.activeYear.startDate) : null;
+        const joinedThisYear = yearStart
+            ? rows.filter((r) => isDate(r.joiningDate) && new Date(r.joiningDate) >= yearStart)
+            : [];
+        // Headcount before this year began, and the growth since. Derived from
+        // joining dates only, so it counts arrivals and cannot see departures —
+        // the client says "new this year", never "turnover".
+        const carriedOver = rows.length - joinedThisYear.length;
+        const growthPct = carriedOver > 0
+            ? Math.round((joinedThisYear.length / carriedOver) * 1000) / 10
+            : null;
+
+        // Three buckets rather than one average: an average of 24% hides whether
+        // that is everyone half-done or most people not started.
+        const complete   = rows.filter((r) => r.profileCompletion >= 100).length;
+        const notStarted = rows.filter((r) => r.profileCompletion < 25).length;
+
         ok(res, {
             totals: {
                 employees: rows.length,
@@ -496,7 +516,30 @@ exports.getDashboard = async (req, res) => {
                 documentsNeedAttention: rows.filter((r) => r.missingDocumentCount > 0).length,
                 classTeachers: rows.filter((r) => r.isClassTeacher).length,
                 newJoiners: rows.filter((r) => isDate(r.joiningDate) && new Date(r.joiningDate) >= recentCutoff).length,
+                newThisYear: joinedThisYear.length,
             },
+            growthPct,
+            completionBuckets: {
+                complete,
+                notStarted,
+                inProgress: rows.length - complete - notStarted,
+            },
+            // The newest arrivals, newest first. Someone with no joining date on
+            // file has nothing to be recent by, so they are left out rather than
+            // sorted to one end of a list titled "recently joined".
+            recentEmployees: rows
+                .filter((r) => isDate(r.joiningDate))
+                .sort((a, b) => new Date(b.joiningDate) - new Date(a.joiningDate))
+                .slice(0, 5)
+                .map((r) => ({
+                    _id: r._id,
+                    name: r.name,
+                    profileImage: r.profileImage,
+                    designation: r.designation,
+                    department: r.department,
+                    joiningDate: r.joiningDate,
+                    employmentStatus: r.employmentStatus,
+                })),
             byDepartment:  byKey((r) => r.department),
             byDesignation: byKey((r) => r.designation),
             averageCompletion: rows.length
@@ -507,6 +550,7 @@ exports.getDashboard = async (req, res) => {
                 .slice(0, 5)
                 .map((r) => ({ _id: r._id, name: r.name, employeeId: r.employeeId, percent: r.profileCompletion })),
             academicYear: snap.activeYear?.yearName || '',
+            academicYearStart: snap.activeYear?.startDate || null,
         });
     } catch (e) { fail(res, e); }
 };
@@ -514,9 +558,36 @@ exports.getDashboard = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  GET /employees — the paged directory.
 // ─────────────────────────────────────────────────────────────────────────────
+// Headcounts for the tiles above the list.
+//
+// Counted over every row the caller may see, NOT the filtered page: the tiles
+// describe the school, and a summary that moved every time a filter changed
+// would be answering a different question each time it was read. Active and
+// inactive are the ACCOUNT state here, so the two sum to the total and each
+// tile maps onto the accountStatus filter it sets.
+function headcounts(rows, activeYear) {
+    const yearStart = isDate(activeYear?.startDate) ? new Date(activeYear.startDate) : null;
+    const newThisYear = yearStart
+        ? rows.filter((r) => isDate(r.joiningDate) && new Date(r.joiningDate) >= yearStart).length
+        : 0;
+    const carriedOver = rows.length - newThisYear;
+    return {
+        employees:   rows.length,
+        active:      rows.filter((r) => r.isActive !== false).length,
+        inactive:    rows.filter((r) => r.isActive === false).length,
+        teaching:    rows.filter((r) => r.staffType === 'teaching').length,
+        nonTeaching: rows.filter((r) => r.staffType === 'non_teaching').length,
+        onLeave:     rows.filter((r) => r.employmentStatus === 'on_leave').length,
+        newThisYear,
+        // Arrivals only — joining dates cannot show who left, so the client
+        // says "joined this year" rather than implying net turnover.
+        growthPct: carriedOver > 0 ? Math.round((newThisYear / carriedOver) * 1000) / 10 : null,
+    };
+}
+
 exports.getEmployees = async (req, res) => {
     try {
-        const { viewer, rows } = await collect(req);
+        const { viewer, snap, rows } = await collect(req);
         const page  = Math.max(1, Number(req.query.page) || 1);
         // The UI offers 10 / 25 / 50 / 100. Anything else is clamped rather than
         // rejected, so a caller can never talk the server into returning the
@@ -533,6 +604,7 @@ exports.getEmployees = async (req, res) => {
             page, limit,
             pages: Math.max(1, Math.ceil(filtered.length / limit)),
             grandTotal: rows.length,
+            stats: headcounts(rows, snap.activeYear),
             viewer: { level: viewer.level, isAdmin: viewer.isAdmin, userId: viewer.userId },
         });
     } catch (e) { fail(res, e); }
