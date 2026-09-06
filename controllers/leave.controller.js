@@ -105,12 +105,12 @@ async function yearOf(app, schoolId) {
     return app.academicYear || await getActiveAcademicYearLabel(schoolId);
 }
 
-// Returns an existing pending/approved/modification_requested leave that overlaps [from, to]
+// Returns an existing pending/approved leave that overlaps [from, to]
 async function getOverlappingLeave(teacherId, schoolId, from, to, excludeId = null) {
     const query = {
         teacher: teacherId,
         school:  schoolId,
-        status:  { $in: ['pending', 'approved', 'modification_requested'] },
+        status:  { $in: ['pending', 'approved'] },
         fromDate: { $lte: to },
         toDate:   { $gte: from },
     };
@@ -820,7 +820,7 @@ exports.adminApproveRequest = async (req, res) => {
             leaveTypeId: app.leaveType, academicYear: ay,
             // Lost-race guard: this handler read the application before taking
             // the lock, so the status is confirmed again inside it.
-            expectStatus: ['pending', 'modification_requested'],
+            expectStatus: ['pending'],
             statusPatch: { status: 'approved', approvedBy: String(req.userId), approvedAt },
             inc: { used: paid, pending: -paid },
             // A wholly unpaid leave moves no entitlement, so it gets no ledger
@@ -870,59 +870,34 @@ exports.adminRejectRequest = async (req, res) => {
         const { adminComment } = req.body;
         const app = await LeaveApplication.findOne({ _id: req.params.id, school: req.schoolId });
         if (!app) return res.status(404).json({ success: false, message: 'Leave request not found' });
-        if (!['pending', 'modification_requested'].includes(app.status))
+        if (app.status !== 'pending')
             return res.status(400).json({ success: false, message: 'Cannot reject in current status' });
 
         const policy = await leavePolicy.getPolicy(req.schoolId, app.leaveType);
         if (policy && !await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, policy))
             return res.status(403).json({ success: false, message: 'You are not an approver for this leave type' });
 
-        const oldStatus = app.status;
         app.status      = 'rejected';
         app.rejectedAt  = new Date();
         app.adminComment = adminComment || '';
         await app.save();
 
-        // If it was pending or modification_requested, the pending count was set
-        // on apply — release it. No ledger row: a hold that is released was
-        // never consumed, and SUM(delta) must stay a true position.
-        if (['pending', 'modification_requested'].includes(oldStatus)) {
-            const ay = await yearOf(app, req.schoolId);
-            await commitTransition({
-                schoolId: req.schoolId, appId: app._id, teacherId: app.teacher,
-                leaveTypeId: app.leaveType, academicYear: ay,
-                inc: { pending: -paidOf(app) },
-            });
-        }
+        // Only a pending application reaches here, so its days are still held by
+        // the pending count set on apply — release them. No ledger row: a hold
+        // that is released was never consumed, and SUM(delta) must stay a true
+        // position.
+        const ay = await yearOf(app, req.schoolId);
+        await commitTransition({
+            schoolId: req.schoolId, appId: app._id, teacherId: app.teacher,
+            leaveTypeId: app.leaveType, academicYear: ay,
+            inc: { pending: -paidOf(app) },
+        });
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '❌ Leave request rejected',
             body: `Your leave from ${fmtDate(app.fromDate)} to ${fmtDate(app.toDate)} has been rejected.${app.adminComment ? `\nReason: ${app.adminComment}` : ''}`,
             recipients: [app.teacher],
             email: true,
-            link: { type: 'leave.mine', entityId: app._id },
-        });
-        res.json({ success: true, data: app });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.adminRequestModification = async (req, res) => {
-    try {
-        const { adminComment } = req.body;
-        const app = await LeaveApplication.findOne({ _id: req.params.id, school: req.schoolId });
-        if (!app) return res.status(404).json({ success: false, message: 'Leave request not found' });
-        if (app.status !== 'pending')
-            return res.status(400).json({ success: false, message: 'Only pending requests can be sent back for modification' });
-
-        app.status = 'modification_requested';
-        app.modificationRequestedAt = new Date();
-        app.adminComment = adminComment || '';
-        await app.save();
-        notify({
-            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-            title: '✏️ Leave request needs changes',
-            body: `Your leave from ${fmtDate(app.fromDate)} to ${fmtDate(app.toDate)} needs modification.${app.adminComment ? `\nComment: ${app.adminComment}` : ''}`,
-            recipients: [app.teacher],
             link: { type: 'leave.mine', entityId: app._id },
         });
         res.json({ success: true, data: app });
@@ -1216,7 +1191,7 @@ exports.adminGetYearClosePreview = async (req, res) => {
             LeaveBalance.find({ school: req.schoolId, academicYear }).lean(),
             LeaveApplication.countDocuments({
                 school: req.schoolId, academicYear,
-                status: { $in: ['pending', 'modification_requested'] },
+                status: 'pending',
             }),
             getActiveAcademicYearLabel(req.schoolId),
         ]);
@@ -1271,7 +1246,7 @@ exports.adminCloseAcademicYear = async (req, res) => {
 
         const openApps = await LeaveApplication.countDocuments({
             school: req.schoolId, academicYear,
-            status: { $in: ['pending', 'modification_requested'] },
+            status: 'pending',
         });
         if (openApps)
             return res.status(400).json({ success: false, message: `${openApps} application(s) are still awaiting a decision for ${academicYear} — settle them first` });
@@ -1934,24 +1909,21 @@ exports.teacherCancelLeave = async (req, res) => {
     try {
         const app = await LeaveApplication.findOne({ _id: req.params.id, teacher: req.userId, school: req.schoolId });
         if (!app) return res.status(404).json({ success: false, message: 'Leave request not found' });
-        if (!['pending', 'modification_requested'].includes(app.status))
+        if (app.status !== 'pending')
             return res.status(400).json({ success: false, message: 'Only pending applications can be cancelled' });
 
-        const oldStatus = app.status;
         app.status      = 'cancelled';
         app.cancelledAt = new Date();
         await app.save();
 
-        // pending was set on apply and never cleared for modification_requested,
-        // so release it for both. A released hold writes no ledger row.
-        if (['pending', 'modification_requested'].includes(oldStatus)) {
-            const ay = await yearOf(app, req.schoolId);
-            await commitTransition({
-                schoolId: req.schoolId, appId: app._id, teacherId: req.userId,
-                leaveTypeId: app.leaveType, academicYear: ay,
-                inc: { pending: -paidOf(app) },
-            });
-        }
+        // Only a pending application reaches here, so the hold set on apply is
+        // always still standing — release it. A released hold writes no ledger row.
+        const ay = await yearOf(app, req.schoolId);
+        await commitTransition({
+            schoolId: req.schoolId, appId: app._id, teacherId: req.userId,
+            leaveTypeId: app.leaveType, academicYear: ay,
+            inc: { pending: -paidOf(app) },
+        });
         schoolAdminIds(req.schoolId).then(admins => notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '🚫 Leave request cancelled',

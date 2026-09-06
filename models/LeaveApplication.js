@@ -50,7 +50,7 @@ const LeaveApplicationSchema = new db.Schema({
     document: { type: String, default: null }, // file path
     status: {
         type: String,
-        enum: ['pending', 'approved', 'rejected', 'modification_requested', 'cancelled'],
+        enum: ['pending', 'approved', 'rejected', 'cancelled'],
         default: 'pending',
     },
     adminComment: { type: String, default: '' },
@@ -70,7 +70,6 @@ const LeaveApplicationSchema = new db.Schema({
     appliedAt: { type: Date, default: Date.now },
     approvedAt: { type: Date, default: null },
     rejectedAt: { type: Date, default: null },
-    modificationRequestedAt: { type: Date, default: null },
     cancelledAt: { type: Date, default: null },
 }, { timestamps: true });
 
@@ -85,7 +84,7 @@ LeaveApplicationSchema.index(
     { teacher: 1, school: 1, fromDate: 1, toDate: 1 },
     {
         unique: true,
-        partialFilterExpression: { status: { $in: ['pending', 'approved', 'modification_requested'] } },
+        partialFilterExpression: { status: { $in: ['pending', 'approved'] } },
         name: 'unique_active_leave_dates',
     }
 );

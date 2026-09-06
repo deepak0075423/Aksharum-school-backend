@@ -301,7 +301,7 @@ async function validateApplication({
     }
 
     // ── Frequency caps ─────────────────────────────────────────────────────
-    const countable = ['pending', 'approved', 'modification_requested'];
+    const countable = ['pending', 'approved'];
     if (policy.maxApplicationsPerMonth > 0 || policy.maxDaysPerMonth > 0) {
         const mStart = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
         const mEnd   = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth() + 1, 0, 23, 59, 59));

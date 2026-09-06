@@ -361,7 +361,6 @@ router.get('/leave/balance',                       leaveGuard, leaveCtrl.adminGe
 router.get('/leave/apply-preview',                 leaveGuard, leaveCtrl.adminApplyPreview);
 router.post('/leave/requests/:id/approve',         leaveGuard, leaveCtrl.adminApproveRequest);
 router.post('/leave/requests/:id/reject',          leaveGuard, leaveCtrl.adminRejectRequest);
-router.post('/leave/requests/:id/modification',    leaveGuard, leaveCtrl.adminRequestModification);
 router.get('/leave/allocations',                   leaveGuard, leaveCtrl.adminGetAllocations);
 router.post('/leave/allocations',                  leaveGuard, leaveCtrl.adminAllocate);
 router.get('/leave/allocations/template',          leaveGuard, leaveCtrl.adminGetAllocationTemplate);
