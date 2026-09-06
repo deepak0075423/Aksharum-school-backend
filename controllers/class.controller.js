@@ -317,6 +317,11 @@ exports.getClasses = async (req, res) => {
 //                           so a subject already added by hand is reused.
 //    ClassSubject           scoped through its class, so the LINKS are rebuilt
 //                           against the new year's classes AND its subjects.
+//                           Its own `curriculum` part, NOT part of `subjects`:
+//                           copying a year's subject list is a different
+//                           request from deciding which class teaches what, and
+//                           bundling them silently put last year's curriculum
+//                           onto this year's classes.
 //    SectionSubjectTeacher  scoped through its section, likewise.
 //
 //  Nothing is overwritten. A class, section, subject link or teacher assignment
@@ -324,10 +329,10 @@ exports.getClasses = async (req, res) => {
 //  as "already there", so an import onto a partly-built year tops it up and a
 //  second run changes nothing.
 //
-//  `include` narrows what is copied — the Subjects screen imports the curriculum
-//  alone, without also building 12 classes and 48 sections. Anything switched
-//  off is not created, and whatever depended on it is skipped by name rather
-//  than silently: a subject link needs its class, an assignment needs its
+//  `include` narrows what is copied — the Subjects screen imports the subject
+//  list alone, without also building 12 classes and 48 sections. Anything
+//  switched off is not created, and whatever depended on it is skipped by name
+//  rather than silently: a subject link needs its class, an assignment needs its
 //  section, so asking for subjects in a year with no classes reports exactly
 //  that. Omit `include` and everything is copied, as it always was.
 //
@@ -341,9 +346,12 @@ exports.importYearStructure = async (req, res) => {
             classes:     req.body.include?.classes     !== false,
             sections:    req.body.include?.sections    !== false,
             subjects:    req.body.include?.subjects    !== false,
+            // Which class teaches which subject. Separate from `subjects` so
+            // "copy this year's subject list" cannot also decide the curriculum.
+            curriculum:  req.body.include?.curriculum  !== false,
             assignments: req.body.include?.assignments !== false,
         };
-        if (!inc.classes && !inc.sections && !inc.subjects && !inc.assignments)
+        if (!inc.classes && !inc.sections && !inc.subjects && !inc.curriculum && !inc.assignments)
             return err(res, { message: 'Pick at least one thing to import' }, 400);
 
         const target = await AcademicYear.findOne({ _id: req.params.id, school: req.schoolId }).lean();
@@ -472,11 +480,20 @@ exports.importYearStructure = async (req, res) => {
                 note('subject', label, 'that subject no longer exists');
                 continue;
             }
-            if (p?.existing && tgtLinkKey.has(`${String(p.existing._id)}#${String(l.subject)}`)) {
+            // The link is rebuilt against the TARGET year's own subject row, so
+            // "already there" has to be keyed on that row. Keyed on the source
+            // subject id it never matched, and every existing link was counted
+            // as new.
+            const tgtSubj = subjectMap.get(String(l.subject));
+            if (p?.existing && tgtSubj && tgtLinkKey.has(`${String(p.existing._id)}#${String(tgtSubj._id)}`)) {
                 note('subject', label, 'already in this year');
                 continue;
             }
-            if (!inc.subjects && !subjectMap.has(String(l.subject))) {
+            if (!inc.curriculum) {
+                note('subject', label, 'the curriculum was not part of this import');
+                continue;
+            }
+            if (!inc.subjects && !tgtSubj) {
                 note('subject', label, `${subjectName.get(String(l.subject))} is not in this year`);
                 continue;
             }
@@ -570,9 +587,6 @@ exports.importYearStructure = async (req, res) => {
             assignmentsToCreate,
             classTeachersToSet,
             skipped,
-            // Subjects themselves are shared by every year — say so, because
-            // "import subjects" reads like it should duplicate them.
-            subjectsAreShared: true,
         };
 
         if (preview) return ok(res, { ...summary, preview: true });
@@ -650,7 +664,7 @@ exports.importYearStructure = async (req, res) => {
         }
 
         for (const l of srcLinks) {
-            if (!inc.subjects) break;
+            if (!inc.curriculum) break;
             if (!l.subject || !subjectName.has(String(l.subject))) continue;
             const targetCls = createdIds.classes.get(String(l.class));
             if (!targetCls) continue;
