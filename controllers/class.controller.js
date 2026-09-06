@@ -17,6 +17,7 @@ const ClassSubject          = require('../models/ClassSubject');
 const Subject               = require('../models/Subject');
 const School                = require('../models/School');
 const { schoolWorksSaturday } = require('../utils/timetableDays');
+const pool = require('../db/pool');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const err = (res, e, status = 500)    => res.status(status).json({ success: false, message: e.message || e });
@@ -37,6 +38,58 @@ async function findOverlappingYear(schoolId, startDate, endDate, excludeId = nul
 const byName = (key) => (a, b) =>
     String(a[key] || '').localeCompare(String(b[key] || ''), 'en', { numeric: true, sensitivity: 'base' });
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  What each academic year actually holds.
+//
+//  The Academic Years screen leads with these figures — a year with 12 classes
+//  and 320 students is a different thing from an empty shell you can still
+//  delete — and the delete guard below reads the same numbers. Two grouped
+//  statements over the whole school rather than a query per year: the list is
+//  small, but the sections underneath it are not, and counting enrolments in
+//  JavaScript would mean pulling every section row across the wire.
+// ─────────────────────────────────────────────────────────────────────────────
+function qt(Model) { return `"${Model.tableName}"`; }
+
+const EMPTY_YEAR_COUNTS = { classes: 0, sections: 0, students: 0, subjects: 0 };
+
+async function yearCounts(schoolId) {
+    const [classes, sections, subjects] = await Promise.all([
+        pool.query(
+            `SELECT "academicYear" AS y, count(*)::int AS n
+               FROM ${qt(Class)} WHERE "school" = $1 GROUP BY "academicYear"`,
+            [String(schoolId)],
+        ),
+        // enrolledStudents is a jsonb array on the section; jsonb_array_length
+        // throws on anything that is not one, so the type is checked first
+        // rather than trusted.
+        pool.query(
+            `SELECT "academicYear" AS y,
+                    count(*)::int AS n,
+                    coalesce(sum(CASE WHEN jsonb_typeof("enrolledStudents") = 'array'
+                                      THEN jsonb_array_length("enrolledStudents") ELSE 0 END), 0)::int AS students
+               FROM ${qt(ClassSection)} WHERE "school" = $1 GROUP BY "academicYear"`,
+            [String(schoolId)],
+        ),
+        pool.query(
+            `SELECT "academicYear" AS y, count(*)::int AS n
+               FROM ${qt(Subject)} WHERE "school" = $1 AND "academicYear" IS NOT NULL
+              GROUP BY "academicYear"`,
+            [String(schoolId)],
+        ),
+    ]);
+
+    const map = new Map();
+    const at = (id) => {
+        const key = String(id);
+        if (!map.has(key)) map.set(key, { ...EMPTY_YEAR_COUNTS });
+        return map.get(key);
+    };
+    classes.rows.forEach((r)  => { at(r.y).classes  = r.n; });
+    sections.rows.forEach((r) => { const c = at(r.y); c.sections = r.n; c.students = r.students; });
+    subjects.rows.forEach((r) => { at(r.y).subjects = r.n; });
+    return map;
+}
+
 const dmy = (d) => new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 const overlapMessage = (clash) =>
     `These dates overlap academic year "${clash.yearName}" (${dmy(clash.startDate)} – ${dmy(clash.endDate)}). Academic years cannot overlap.`;
@@ -44,8 +97,9 @@ const overlapMessage = (clash) =>
 // Academic Years
 exports.getAcademicYears = async (req, res) => {
     try {
-        const years = await AcademicYear.find({ school: req.schoolId }).sort({ startDate: -1 }).lean();
-        ok(res, years);
+        const years  = await AcademicYear.find({ school: req.schoolId }).sort({ startDate: -1 }).lean();
+        const counts = await yearCounts(req.schoolId);
+        ok(res, years.map((y) => ({ ...y, ...(counts.get(String(y._id)) || EMPTY_YEAR_COUNTS) })));
     } catch (e) { err(res, e); }
 };
 exports.createAcademicYear = async (req, res) => {
@@ -102,21 +156,128 @@ exports.updateAcademicYear = async (req, res) => {
 };
 exports.deleteAcademicYear = async (req, res) => {
     try {
-        await AcademicYear.findByIdAndDelete(req.params.id);
+        const year = await AcademicYear.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!year) return err(res, 'Academic year not found', 404);
+
+        // The running year is what every "current year" lookup in the app
+        // resolves to; deleting it leaves the school without one.
+        if (year.status === 'active')
+            return err(res, `"${year.yearName}" is the active academic year. Set another year active before deleting it.`, 400);
+
+        // Classes, sections and subjects carry the year on the row, and nothing
+        // in the database cascades — deleting a year underneath them would
+        // leave rows pointing at a year that no longer exists. Refused, with
+        // what is in the way, the same way a designation with holders is.
+        const counts = (await yearCounts(req.schoolId)).get(String(year._id)) || EMPTY_YEAR_COUNTS;
+        if (counts.classes || counts.sections || counts.subjects) {
+            const parts = [
+                counts.classes  && `${counts.classes} class${counts.classes === 1 ? '' : 'es'}`,
+                counts.sections && `${counts.sections} section${counts.sections === 1 ? '' : 's'}`,
+                counts.students && `${counts.students} enrolled student${counts.students === 1 ? '' : 's'}`,
+                counts.subjects && `${counts.subjects} subject${counts.subjects === 1 ? '' : 's'}`,
+            ].filter(Boolean);
+            return res.status(400).json({
+                success: false,
+                code: 'ACADEMIC_YEAR_IN_USE',
+                message: `Cannot delete "${year.yearName}" — it still holds ${parts.join(', ')}. Remove them first.`,
+                yearName: year.yearName,
+                counts,
+            });
+        }
+
+        await AcademicYear.findByIdAndDelete(year._id);
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };
 exports.setActiveAcademicYear = async (req, res) => {
     try {
+        // Checked before anything is written: the sweep below deactivates every
+        // year in the school, so an id belonging to another school (or to
+        // nothing) would leave this one with no active year at all.
+        const target = await AcademicYear.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!target) return err(res, 'Academic year not found', 404);
+
         await AcademicYear.updateMany({ school: req.schoolId }, { $set: { status: 'inactive' } });
         const year = await AcademicYear.findByIdAndUpdate(
-            req.params.id, { $set: { status: 'active' } }, { new: true }
+            target._id, { $set: { status: 'active' } }, { new: true }
         );
         ok(res, year);
     } catch (e) { err(res, e); }
 };
 
 // Classes
+// ─────────────────────────────────────────────────────────────────────────────
+//  What each class actually holds.
+//
+//  The Classes screen is a set of cards rather than a list of names, and every
+//  figure on a card comes from here: how many sections, how full they are, how
+//  many of them have a class teacher, how many teachers the class sees in total
+//  and how many subjects it is taught. Three grouped statements over the year's
+//  classes — the alternative is every section, every subject link and every
+//  section-subject-teacher row crossing the wire to be counted in JavaScript.
+// ─────────────────────────────────────────────────────────────────────────────
+const EMPTY_CLASS_COUNTS = {
+    sectionCount: 0, studentCount: 0, seats: 0,
+    classTeacherCount: 0, teacherCount: 0, subjectCount: 0,
+};
+
+async function classCounts(classIds) {
+    if (!classIds.length) return new Map();
+    const ids = classIds.map(String);
+
+    const [sections, teachers, subjects] = await Promise.all([
+        // enrolledStudents is a jsonb array; jsonb_array_length throws on
+        // anything that is not one, so the type is checked rather than trusted.
+        pool.query(
+            `SELECT "class" AS c,
+                    count(*)::int AS "sectionCount",
+                    coalesce(sum(CASE WHEN jsonb_typeof("enrolledStudents") = 'array'
+                                      THEN jsonb_array_length("enrolledStudents") ELSE 0 END), 0)::int AS "studentCount",
+                    coalesce(sum("maxStudents"), 0)::int AS "seats",
+                    count(*) FILTER (WHERE "classTeacher" IS NOT NULL)::int AS "classTeacherCount"
+               FROM ${qt(ClassSection)} WHERE "class" = ANY($1::uuid[]) GROUP BY "class"`,
+            [ids],
+        ),
+        // One teacher taking three subjects in a class is one teacher, and a
+        // class teacher who also teaches a subject is not two — hence DISTINCT
+        // over both sources rather than two counts added together.
+        pool.query(
+            `SELECT c, count(DISTINCT t)::int AS "teacherCount" FROM (
+                 SELECT s."class" AS c, s."classTeacher" AS t
+                   FROM ${qt(ClassSection)} s
+                  WHERE s."class" = ANY($1::uuid[]) AND s."classTeacher" IS NOT NULL
+                 UNION ALL
+                 SELECT s."class" AS c, sst."teacher" AS t
+                   FROM ${qt(SectionSubjectTeacher)} sst
+                   JOIN ${qt(ClassSection)} s ON s."_id" = sst."section"
+                  WHERE s."class" = ANY($1::uuid[])
+             ) x GROUP BY c`,
+            [ids],
+        ),
+        pool.query(
+            `SELECT "class" AS c, count(*)::int AS "subjectCount"
+               FROM ${qt(ClassSubject)} WHERE "class" = ANY($1::uuid[]) GROUP BY "class"`,
+            [ids],
+        ),
+    ]);
+
+    const map = new Map();
+    const at = (id) => {
+        const key = String(id);
+        if (!map.has(key)) map.set(key, { ...EMPTY_CLASS_COUNTS });
+        return map.get(key);
+    };
+    sections.rows.forEach((r) => Object.assign(at(r.c), {
+        sectionCount: r.sectionCount,
+        studentCount: r.studentCount,
+        seats: r.seats,
+        classTeacherCount: r.classTeacherCount,
+    }));
+    teachers.rows.forEach((r) => { at(r.c).teacherCount = r.teacherCount; });
+    subjects.rows.forEach((r) => { at(r.c).subjectCount = r.subjectCount; });
+    return map;
+}
+
 exports.getClasses = async (req, res) => {
     try {
         const filter = { school: req.schoolId };
@@ -133,19 +294,11 @@ exports.getClasses = async (req, res) => {
             .populate('academicYear', 'yearName status')
             .lean())
             .sort(byName('className'));
-        const classIds = classes.map(c => c._id);
-        const sections = await ClassSection.find({ class: { $in: classIds } }, 'class enrolledStudents').lean();
-        const secMap = {};
-        sections.forEach(s => {
-            const id = s.class.toString();
-            secMap[id] = (secMap[id] || { count: 0, students: 0 });
-            secMap[id].count++;
-            secMap[id].students += (s.enrolledStudents || []).length;
-        });
+        const counts = await classCounts(classes.map(c => c._id));
         ok(res, classes.map(c => ({
             ...c,
-            sectionCount: secMap[c._id.toString()]?.count || 0,
-            studentCount: secMap[c._id.toString()]?.students || 0,
+            ...EMPTY_CLASS_COUNTS,
+            ...(counts.get(String(c._id)) || {}),
         })));
     } catch (e) { err(res, e); }
 };
@@ -736,12 +889,69 @@ exports.bulkCreateClasses = async (req, res) => {
     }
 };
 
+/**
+ * How much of each section's teaching is actually staffed.
+ *
+ * A section's own row says who its class teacher is; who teaches WHAT in it
+ * lives in SectionSubjectTeacher, one row per section+subject+teacher. Counted
+ * here as distinct subjects and distinct teachers, so a section with one
+ * teacher taking three subjects reads as three subjects covered, not three
+ * teachers.
+ */
+async function sectionTeachingCounts(sectionIds) {
+    if (!sectionIds.length) return new Map();
+    const { rows } = await pool.query(
+        `SELECT "section" AS s,
+                count(DISTINCT "subject")::int AS "subjectsTaught",
+                count(DISTINCT "teacher")::int AS "subjectTeacherCount"
+           FROM ${qt(SectionSubjectTeacher)} WHERE "section" = ANY($1::uuid[]) GROUP BY "section"`,
+        [sectionIds.map(String)],
+    );
+    return new Map(rows.map((r) => [String(r.s), r]));
+}
+
 exports.getClassDetail = async (req, res) => {
     try {
-        const cls = await Class.findById(req.params.classId).lean();
-        const sections = (await ClassSection.find({ class: req.params.classId }).lean())
+        // School-scoped: without it, any class id from any school came back here
+        // with every section under it.
+        const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId })
+            .populate('academicYear', 'yearName status')
+            .lean();
+        if (!cls) return err(res, { message: 'Class not found' }, 404);
+
+        const sections = (await ClassSection.find({ class: cls._id })
+            .populate('classTeacher',      'name email phone')
+            .populate('substituteTeacher', 'name email phone')
+            .lean())
             .sort(byName('sectionName'));
-        ok(res, { class: cls, sections });
+
+        const [taught, subjectCount] = await Promise.all([
+            sectionTeachingCounts(sections.map(s => s._id)),
+            ClassSubject.countDocuments({ class: cls._id }),
+        ]);
+
+        // enrolledStudents is the list the section actually holds; currentCount
+        // is a cached figure kept beside it, so the length is what is reported.
+        const rows = sections.map((sec) => {
+            const t = taught.get(String(sec._id)) || {};
+            return {
+                ...sec,
+                studentCount:        (sec.enrolledStudents || []).length,
+                subjectsTaught:      t.subjectsTaught || 0,
+                subjectTeacherCount: t.subjectTeacherCount || 0,
+            };
+        });
+
+        ok(res, {
+            class: {
+                ...cls,
+                subjectCount,
+                sectionCount: rows.length,
+                studentCount: rows.reduce((n, s) => n + s.studentCount, 0),
+                seats:        rows.reduce((n, s) => n + (s.maxStudents || 0), 0),
+            },
+            sections: rows,
+        });
     } catch (e) { err(res, e); }
 };
 exports.updateClass = async (req, res) => {
@@ -935,6 +1145,31 @@ exports.deleteClass = async (req, res) => {
     try {
         const cls = await Class.findOne({ _id: req.params.classId, school: req.schoolId }).lean();
         if (!cls) return err(res, { message: 'Class not found' }, 404);
+
+        // Deleting a class takes its sections with it (below), and a student's
+        // profile still points at the class and section they were placed in —
+        // nothing in the database cascades that away. So a class anyone is still
+        // in is refused rather than silently leaving profiles pointing at rows
+        // that no longer exist. Move or unassign the students first.
+        const counts = (await classCounts([cls._id])).get(String(cls._id)) || EMPTY_CLASS_COUNTS;
+        const placed = await StudentProfile.countDocuments({
+            school: req.schoolId,
+            $or: [{ currentClass: cls._id }, { class: cls._id }],
+        });
+        const students = Math.max(counts.studentCount, placed);
+        if (students) {
+            return res.status(400).json({
+                success: false,
+                code: 'CLASS_HAS_STUDENTS',
+                // Counted two ways — enrolled in one of its sections, or recorded
+                // against the class on their profile without a section yet — and
+                // either one blocks, so the sentence covers both.
+                message: `Cannot delete "${cls.className}" — ${students} student${students === 1 ? ' is' : 's are'} `
+                    + 'still assigned to it. Move them to another class first.',
+                className: cls.className,
+                counts: { ...counts, students },
+            });
+        }
 
         const sections = await ClassSection.find({ class: cls._id }).select('_id').lean();
         const sectionIds = sections.map((s) => s._id);
@@ -1297,11 +1532,29 @@ exports.syncSectionChatGroup = async (req, res) => {
 
 exports.getSectionDetail = async (req, res) => {
     try {
-        const section = await ClassSection.findById(req.params.sectionId)
+        // School-scoped: without it any section id from any school came back
+        // here with its whole roster.
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId })
             .populate('classTeacher',     'name email phone')
             .populate('substituteTeacher','name email phone')
-            .populate('enrolledStudents', 'name email')
+            .populate('enrolledStudents', 'name email isActive')
             .lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+
+        // What the section belongs to, as FLAT fields. `class` stays the raw id
+        // — both clients pass it straight back to /admin/classes/:id, and
+        // populating it into an object turns that into "[object Object]".
+        const [parent, classSubjectCount] = await Promise.all([
+            Class.findById(section.class, 'className classNumber status academicYear').lean(),
+            ClassSubject.countDocuments({ class: section.class }),
+        ]);
+        const year = parent?.academicYear
+            ? await AcademicYear.findById(parent.academicYear, 'yearName status').lean()
+            : null;
+        section.className        = parent?.className || '';
+        section.classStatus      = parent?.status || '';
+        section.academicYearName = year?.yearName || '';
+        section.classSubjectCount = classSubjectCount;
 
         // Enrich enrolled students with roll number + gender from StudentProfile
         const enrolled = section?.enrolledStudents || [];
@@ -1702,6 +1955,26 @@ exports.deleteSection = async (req, res) => {
     try {
         const sec = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
         if (!sec) return err(res, { message: 'Section not found' }, 404);
+
+        // A student's profile points at the section they sit in and nothing
+        // cascades that away, so a section anyone is still in is refused —
+        // move them to another section of the class first.
+        const enrolled = (sec.enrolledStudents || []).length;
+        const placed   = await StudentProfile.countDocuments({
+            school: req.schoolId, currentSection: sec._id,
+        });
+        const students = Math.max(enrolled, placed);
+        if (students) {
+            return res.status(400).json({
+                success: false,
+                code: 'SECTION_HAS_STUDENTS',
+                message: `Cannot delete section ${sec.sectionName} — ${students} student${students === 1 ? ' is' : 's are'} `
+                    + 'still in it. Move them to another section first.',
+                sectionName: sec.sectionName,
+                students,
+            });
+        }
+
         await SectionSubjectTeacher.deleteMany({ section: sec._id });
         await ClassSection.findByIdAndDelete(sec._id);
         res.json({ success: true });
