@@ -336,6 +336,15 @@ exports.getClasses = async (req, res) => {
 //  section, so asking for subjects in a year with no classes reports exactly
 //  that. Omit `include` and everything is copied, as it always was.
 //
+//  The parts rest on one another, and a part may only be imported when what it
+//  points at will be there — already in the target year, or created by this same
+//  run. A class↔subject link needs a class AND a subject; a subject teacher
+//  needs the section and the class↔subject link on top of those, because a
+//  teacher against a subject the class is not marked as teaching is not a fact
+//  the tables can hold. Asking for one whose foundation is missing is refused
+//  with what it is missing, rather than accepted and silently skipped row by row
+//  — `blocked` in the response says so, and the dialog greys the box.
+//
 //  `preview: true` runs every check and returns the identical report without
 //  writing, which is what the confirmation screen shows.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -433,6 +442,44 @@ exports.importYearStructure = async (req, res) => {
             ? await SectionSubjectTeacher.find({ section: { $in: tgtSections.map((s) => s._id) } }).lean()
             : [];
         const tgtSSTKey = new Set(tgtSST.map((r) => `${String(r.section)}#${String(r.subject)}#${String(r.teacher)}`));
+
+        // ── What the target year already holds, and what that permits ────────
+        // A dependency is met if the year already has it or this run creates it,
+        // so importing a curriculum into a year that already has its subjects
+        // and classes is fine — only importing one with nothing to hang it on is
+        // refused. `targetHas` goes out with the plan so the dialog can say why
+        // a box is greyed instead of leaving the admin to guess.
+        const targetHas = {
+            classes:    tgtClasses.length,
+            sections:   tgtSections.length,
+            subjects:   tgtSubjects.length,
+            curriculum: tgtLinks.length,
+        };
+        const NEEDS = {
+            sections:    ['classes'],
+            curriculum:  ['subjects', 'classes'],
+            assignments: ['subjects', 'classes', 'sections', 'curriculum'],
+        };
+        const PART_LABEL = {
+            classes: 'Classes', sections: 'Sections', subjects: 'Subjects',
+            curriculum: 'Curriculum', assignments: 'Subject teachers',
+        };
+        const willHave = (k) => inc[k] || targetHas[k] > 0;
+        const blocked = [];
+        for (const [part, needs] of Object.entries(NEEDS)) {
+            if (!inc[part]) continue;
+            const missing = needs.filter((n) => !willHave(n));
+            if (!missing.length) continue;
+            const names = missing.map((m) => PART_LABEL[m]);
+            blocked.push({
+                part,
+                needs: missing,
+                message: `${PART_LABEL[part]} needs ${names.slice(0, -1).join(', ')}`
+                    + `${names.length > 1 ? ' and ' : ''}${names[names.length - 1]}.`
+                    + ` Tick ${names.length > 1 ? 'them' : 'it'} too, or set`
+                    + ` ${names.length > 1 ? 'them' : 'it'} up in ${target.yearName} first.`,
+            });
+        }
 
 
         // ── Plan: classes ────────────────────────────────────────────────────
@@ -587,9 +634,16 @@ exports.importYearStructure = async (req, res) => {
             assignmentsToCreate,
             classTeachersToSet,
             skipped,
+            targetHas,
+            // Empty means every ticked part has what it rests on.
+            blocked,
         };
 
         if (preview) return ok(res, { ...summary, preview: true });
+
+        // The dialog greys these out, but the endpoint is callable on its own
+        // and must not write a curriculum with no subjects under it.
+        if (blocked.length) return err(res, { message: blocked[0].message }, 400);
 
         // ── Write ────────────────────────────────────────────────────────────
         const school = await School.findById(req.schoolId).select('leaveSettings').lean();
