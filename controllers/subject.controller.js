@@ -192,7 +192,53 @@ exports.updateSubject = async (req, res) => {
 };
 exports.deleteSubject = async (req, res) => {
     try {
-        await Subject.findOneAndDelete({ _id: req.params.id, school: req.schoolId });
+        const subject = await Subject.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!subject) return err(res, 'Subject not found', 404);
+
+        // A subject is referenced by the classes that carry it (ClassSubject)
+        // and by every section that has a teacher for it — and nothing in the
+        // database cascades, so deleting one underneath them leaves rows
+        // pointing at a subject that no longer exists. Refused, with what is in
+        // the way, the same shape as the other academic deletes.
+        const [links, assignments] = await Promise.all([
+            ClassSubject.find({ subject: subject._id }).select('class').lean(),
+            SectionSubjectTeacher.find({ subject: subject._id }).select('section teacher').lean(),
+        ]);
+
+        if (links.length || assignments.length) {
+            const classIds = [...new Set(links.map((l) => String(l.class)))];
+            const sections = assignments.length
+                ? await ClassSection.find({ _id: { $in: assignments.map((a) => a.section) } })
+                    .select('sectionName class').lean()
+                : [];
+            const classes = await Class.find({
+                _id: { $in: [...new Set([...classIds, ...sections.map((x) => String(x.class))])] },
+            }).select('className').lean();
+            const names = [...new Set(classes.map((c) => c.className))].sort();
+            const teachers = new Set(assignments.map((a) => String(a.teacher)).filter(Boolean));
+
+            const parts = [
+                names.length && `${names.length} class${names.length === 1 ? '' : 'es'}`,
+                sections.length && `${sections.length} section${sections.length === 1 ? '' : 's'}`,
+                teachers.size && `${teachers.size} teacher assignment${teachers.size === 1 ? '' : 's'}`,
+            ].filter(Boolean);
+
+            return res.status(400).json({
+                success: false,
+                code: 'SUBJECT_IN_USE',
+                message: `Cannot delete "${subject.subjectName}" — it is still used by ${parts.join(', ')}. `
+                    + 'Remove it from those classes and sections first.',
+                subjectName: subject.subjectName,
+                counts: {
+                    classCount:   names.length,
+                    sectionCount: sections.length,
+                    teacherCount: teachers.size,
+                },
+                classes: names,
+            });
+        }
+
+        await Subject.findByIdAndDelete(subject._id);
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };
