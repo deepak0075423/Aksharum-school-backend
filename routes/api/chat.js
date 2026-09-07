@@ -2,9 +2,18 @@
 const express = require('express');
 const router  = express.Router();
 const { verifyToken, requirePasswordReset } = require('../../middleware/auth');
+const { requireModule } = require('../../middleware/moduleAccess');
 const ctrl = require('../../controllers/chat.controller');
 
-const guard = [verifyToken, requirePasswordReset];
+// Chat was the one module with no server-side gate: the nav hid it when a
+// school switched it off, but /api/chat answered anyone who typed the URL. It
+// is gated like every other module now — the school's flag first, then the
+// caller's designation level, both resolved once per request.
+//
+// Students and parents resolve to normal access on whatever their school has
+// enabled (see designationService.resolveRequestAccess), so this only ever
+// denies them when the school itself has chat off.
+const guard = [verifyToken, requirePasswordReset, requireModule('chat')];
 
 // ── Chat list & messages ──────────────────────────────────────────────────────
 router.get('/chats',                  guard, ctrl.getChats);
