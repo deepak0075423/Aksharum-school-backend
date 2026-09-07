@@ -348,7 +348,16 @@ function matches(row, q) {
         const terms = search.split(/\s+/).filter(Boolean);
         if (!terms.every((t) => row._search.includes(t))) return false;
     }
-    if (q.department   && low(row.department)   !== low(q.department))   return false;
+    // "Unassigned" is the bucket getDepartments() emits for a row with no
+    // department, so filtering by it here means the same thing it means there:
+    // the people who have not been placed. Without this the Departments screen
+    // could count them but never show them, and an empty ?department= is
+    // indistinguishable from "no filter".
+    if (q.department) {
+        const wanted = low(q.department);
+        const held   = low(row.department);
+        if (wanted === 'unassigned' ? !!held : held !== wanted) return false;
+    }
     if (q.designation  && low(row.designation)  !== low(q.designation))  return false;
     if (q.staffType    && row.staffType         !== q.staffType)         return false;
     if (q.employmentType && row.employmentType  !== q.employmentType)    return false;
@@ -419,7 +428,12 @@ exports.getMeta = async (req, res) => {
             modules: viewer.modules,
             academicYear: snap.activeYear ? { _id: String(snap.activeYear._id), yearName: snap.activeYear.yearName } : null,
             filters: {
-                departments:  uniq(rows.map((r) => r.department)),
+                // The unplaced are offered as a filter only when there are
+                // some, and always last — it is a gap, not a department.
+                departments: [
+                    ...uniq(rows.map((r) => r.department)),
+                    ...(rows.some((r) => !trim(r.department)) ? ['Unassigned'] : []),
+                ],
                 designations: uniq(rows.map((r) => r.designation)),
                 joiningYears: admin
                     ? [...new Set(rows.map((r) => r.joiningYear).filter(Boolean))].sort((a, b) => b - a)
