@@ -28,6 +28,7 @@ const FeeLedger             = require('../models/FeeLedger');
 const FeePayment            = require('../models/FeePayment');
 const StudentFeeAssignment  = require('../models/StudentFeeAssignment');
 const StudentConcession     = require('../models/StudentConcession');
+const FeeHead               = require('../models/FeeHead');
 const LibraryIssuance       = require('../models/LibraryIssuance');
 const LibraryFine           = require('../models/LibraryFine');
 const LibraryReservation    = require('../models/LibraryReservation');
@@ -695,11 +696,11 @@ async function generalBlock(ctx) {
 async function attendanceBlock(ctx) {
     const { user, profile } = ctx;
     const sectionId = sid(profile.currentSection);
-    if (!sectionId) return { tracked: false, total: 0, present: 0, absent: 0, late: 0, percent: null, monthly: [], recent: [], rank: null, sectionSize: 0 };
+    if (!sectionId) return { tracked: false, total: 0, sessionsHeld: 0, present: 0, absent: 0, late: 0, percent: null, monthly: [], days: [], recent: [], rank: null, sectionSize: 0 };
 
     const sessions = await Attendance.find({ section: sectionId }).sort({ date: 1 }).lean();
     if (!sessions.length) {
-        return { tracked: false, total: 0, present: 0, absent: 0, late: 0, percent: null, monthly: [], recent: [], rank: null, sectionSize: 0 };
+        return { tracked: false, total: 0, sessionsHeld: 0, present: 0, absent: 0, late: 0, percent: null, monthly: [], days: [], recent: [], rank: null, sectionSize: 0 };
     }
     const sessionIds = sessions.map((s) => s._id);
     const dateOf = Object.fromEntries(sessions.map((s) => [String(s._id), s.date]));
@@ -734,14 +735,18 @@ async function attendanceBlock(ctx) {
     const rank = ladder.findIndex((x) => x.id === String(user._id)) + 1;
 
     const total = mine.length;
-    const recent = mine
+    // Every marked day, not just the last twenty: a calendar has to colour the
+    // whole month it is showing, and the rows are already in memory here.
+    const days = mine
         .map((r) => ({ date: dateOf[String(r.attendance)], status: low(r.status), remarks: r.remarks || '' }))
-        .sort((a, b) => new Date(b.date) - new Date(a.date))
-        .slice(0, 20);
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+    const recent = days.slice(0, 20);
 
     return {
         tracked:     true,
         total,
+        sessionsHeld: sessions.length,
+        days,
         present:     counts.present,
         absent:      counts.absent,
         late:        counts.late,
@@ -791,6 +796,7 @@ async function resultsBlock(ctx) {
             grade:    s.grade || '',
             isPassed: s.isPassed,
             isAbsent: s.isAbsent,
+            remarks:  s.remarks || '',
             percent:  pct(s.marksObtained, s.maxMarks),
         })),
     }));
@@ -902,7 +908,7 @@ async function feesBlock(ctx) {
         FeePayment.find({ student: user._id, school: schoolId, ...yearFilter })
             .sort({ paymentDate: -1 }).limit(20).lean(),
         StudentFeeAssignment.findOne({ student: user._id, school: schoolId, isActive: true, ...yearFilter })
-            .populate('feeStructure', 'name').lean(),
+            .populate('feeStructure', 'name items totalAmount dueDay').lean(),
         StudentConcession.find({ student: user._id, school: schoolId, isActive: true, ...yearFilter })
             .populate('concession', 'name concessionType value').lean(),
     ]);
@@ -922,7 +928,40 @@ async function feesBlock(ctx) {
 
     const confirmed = payments.filter((p) => low(p.paymentStatus) === 'completed');
 
+    // What was charged, head by head. The demand posts to the ledger as one
+    // lump ("Fee demand: <structure>"), so the split lives on the structure the
+    // student is assigned to — and payments only carry a head when the person
+    // taking the money allocated one. Anything unallocated is reported as such
+    // rather than spread across the heads, which would invent a payment.
+    const items = (assignment?.feeStructure?.items || []).filter((i) => i.isActive !== false);
+    const headNames = items.length
+        ? await FeeHead.find({ _id: { $in: items.map((i) => sid(i.feeHead)) } }).select('name').lean()
+        : [];
+    const headName = Object.fromEntries(headNames.map((h) => [String(h._id), h.name]));
+
+    const paidByHead = {};
+    confirmed.forEach((p) => (p.lines || []).forEach((l) => {
+        const k = l.feeName || headName[sid(l.feeHead)] || '';
+        if (!k) return;
+        paidByHead[k] = (paidByHead[k] || 0) + (Number(l.amount) || 0);
+    }));
+    const heads = items.map((i) => {
+        const name = headName[sid(i.feeHead)] || 'Fee head';
+        const headPaid = Math.min(paidByHead[name] || 0, Number(i.amount) || 0);
+        return {
+            name,
+            charged: money(i.amount),
+            paid:    money(headPaid),
+            pending: money(Math.max(0, (Number(i.amount) || 0) - headPaid)),
+        };
+    }).sort((a, b) => b.charged - a.charged);
+    const allocated = sum(heads, (h) => h.paid);
+
     return {
+        heads,
+        // Money received that no head was named for. Shown, never distributed.
+        unallocatedPaid: money(Math.max(0, paid - allocated)),
+        dueDay: assignment?.feeStructure?.dueDay ?? null,
         summary: {
             assigned:   money(assignment?.totalAmount || charged),
             charged:    money(charged),
@@ -1014,7 +1053,15 @@ async function libraryBlock(ctx) {
 async function transportBlock(ctx) {
     const { user, schoolId } = ctx;
     const assignment = await TransportAssignment.findOne({ student: user._id, school: schoolId, status: 'active' })
-        .populate('route', 'name routeCode stops')
+        .populate({
+            path: 'route', select: 'name routeCode stops driver attendant',
+            // A phone number for the person driving the bus is the single most
+            // useful thing on this tab, and it is one join away.
+            populate: [
+                { path: 'driver',    select: 'name phone' },
+                { path: 'attendant', select: 'name phone' },
+            ],
+        })
         .populate('vehicle', 'vehicleNumber busName registrationNumber')
         .populate('feePlan', 'name amount frequency')
         .lean();
@@ -1070,6 +1117,17 @@ async function transportBlock(ctx) {
             feePlan:    assignment.feePlan?.name || '',
             since:      assignment.effectiveDate,
             temporary:  !!assignment.isTemporary,
+            driver:     assignment.route?.driver
+                ? { name: assignment.route.driver.name, phone: assignment.route.driver.phone || '' } : null,
+            attendant:  assignment.route?.attendant
+                ? { name: assignment.route.attendant.name, phone: assignment.route.attendant.phone || '' } : null,
+            stops: (assignment.route?.stops || []).map((st) => ({
+                name:      st.name || '',
+                arrival:   st.arrivalTime || '',
+                departure: st.departureTime || '',
+                isPickup:  String(st._id) === String(assignment.pickupStop),
+                isDrop:    String(st._id) === String(assignment.dropStop),
+            })),
         },
         trips: {
             total:   myEvents.length,
@@ -1147,6 +1205,10 @@ async function videosBlock(ctx) {
         recent: progress.slice(0, 15).map((p) => ({
             _id:        p._id,
             title:      p.video?.title || 'Video',
+            // Already populated for the title — carrying it costs nothing and
+            // is the difference between a list and something worth looking at.
+            thumbnail:  p.video?.thumbnailUrl || '',
+            durationMin: p.video?.durationSec ? Math.round(p.video.durationSec / 60) : null,
             progress:   p.progressPercent,
             completed:  p.completed,
             watchedMin: Math.round((p.watchedSeconds || 0) / 60),
@@ -1173,9 +1235,9 @@ async function documentsBlock(ctx) {
         ],
     };
     const [assignments, submissions] = await Promise.all([
-        Document.find(targetFilter).select('title dueDate totalMarks marksEnabled allowSubmission createdAt').sort({ createdAt: -1 }).lean(),
+        Document.find(targetFilter).select('title subject category dueDate totalMarks marksEnabled allowSubmission createdAt').sort({ createdAt: -1 }).lean(),
         AssignmentSubmission.find({ student: user._id, school: schoolId })
-            .populate('document', 'title dueDate totalMarks').sort({ submittedAt: -1 }).lean(),
+            .populate('document', 'title subject category dueDate totalMarks').sort({ submittedAt: -1 }).lean(),
     ]);
 
     const submittedFor = new Set(submissions.map((s) => sid(s.document)));
@@ -1193,12 +1255,15 @@ async function documentsBlock(ctx) {
             avgMarks:   graded.length ? Math.round((sum(graded, (s) => s.marks) / graded.length) * 10) / 10 : null,
             onTimeRate: pct(submissions.length - late, submissions.length),
         },
-        pending: pending.slice(0, 10).map((a) => ({
-            _id: a._id, title: a.title, dueDate: a.dueDate,
+        pending: pending.slice(0, 15).map((a) => ({
+            _id: a._id, title: a.title, subject: a.subject || '', type: a.category || '',
+            assignedAt: a.createdAt, dueDate: a.dueDate,
             overdue: !!(a.dueDate && new Date(a.dueDate) < new Date()),
         })),
         submissions: submissions.slice(0, 15).map((s) => ({
             _id: s._id, title: s.document?.title || 'Assignment',
+            subject: s.document?.subject || '', type: s.document?.category || '',
+            dueDate: s.document?.dueDate || null,
             status: low(s.status), submittedAt: s.submittedAt,
             marks: s.marks ?? null, totalMarks: s.document?.totalMarks ?? null,
             feedback: s.feedback || '', reviewedAt: s.reviewedAt,
@@ -1206,17 +1271,21 @@ async function documentsBlock(ctx) {
     };
 }
 
+const WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
 async function timetableBlock(ctx) {
     const { profile } = ctx;
     const sectionId = sid(profile.currentSection);
-    if (!sectionId) return { hasTimetable: false, periodsPerWeek: 0, subjects: [] };
+    const none = { hasTimetable: false, periodsPerWeek: 0, subjects: [], days: [], periods: [], entries: [] };
+    if (!sectionId) return none;
 
     const timetable = await Timetable.findOne({ section: sectionId }).lean();
-    if (!timetable) return { hasTimetable: false, periodsPerWeek: 0, subjects: [] };
+    if (!timetable) return none;
 
     const entries = await TimetableEntry.find({ timetable: timetable._id })
         .populate('subject', 'subjectName')
-        .populate('teacher', 'name').lean();
+        .populate('teacher', 'name')
+        .populate('room', 'roomName roomNumber').lean();
 
     const bySubject = {};
     entries.forEach((e) => {
@@ -1228,9 +1297,39 @@ async function timetableBlock(ctx) {
         if (t && !bySubject[name].teachers.includes(t)) bySubject[name].teachers.push(t);
     });
 
+    // The grid itself. These rows were already being read to count periods per
+    // subject and then discarded — which left the timetable tab unable to say
+    // what the student's week actually looks like.
+    const periods = (timetable.periodsStructure || [])
+        .map((p) => ({
+            period:     p.periodNumber,
+            startTime:  p.startTime || '',
+            endTime:    p.endTime || '',
+            isRecess:   !!p.isRecess,
+            recessName: p.recessName || 'Break',
+        }))
+        .sort((a, b) => a.period - b.period);
+
+    // Only the days the section is actually taught on, in week order.
+    const taught = new Set(entries.map((e) => e.dayOfWeek));
+    const days = WEEK.filter((d) => taught.has(d));
+
     return {
         hasTimetable:   true,
         periodsPerWeek: entries.length,
+        startTime:      timetable.schoolStartTime || '',
+        endTime:        timetable.schoolEndTime || '',
+        days,
+        periods,
+        entries: entries.map((e) => ({
+            _id:     e._id,
+            day:     e.dayOfWeek,
+            period:  e.periodNumber,
+            subject: e.subject?.subjectName || '',
+            teacher: e.teacher?.name || '',
+            room:    e.room ? (e.room.roomNumber
+                ? `${e.room.roomName} (${e.room.roomNumber})` : e.room.roomName) : '',
+        })),
         subjects: Object.values(bySubject).sort((a, b) => b.periods - a.periods),
     };
 }
@@ -1254,11 +1353,28 @@ async function inventoryBlock(ctx) {
     };
 }
 
+// A notification's link type is what it is about — 'fees.mine', 'leave.mine',
+// 'attendance.section'. The head of it is the category a reader recognises.
+const alertCategory = (linkType) => {
+    const head = String(linkType || '').split('.')[0];
+    return head || 'general';
+};
+
 async function notificationsBlock(ctx) {
     const { user, schoolId } = ctx;
-    const receipts = await NotificationReceipt.find({ recipient: user._id, school: schoolId })
-        .select('isRead readAt createdAt').lean();
+    const receipts = await NotificationReceipt.find({ recipient: user._id, school: schoolId, isCleared: false })
+        .populate('notification')
+        .sort({ createdAt: -1 }).lean();
     const read = receipts.filter((r) => r.isRead).length;
+
+    // Rows whose notification has since been deleted carry no message to show.
+    const live = receipts.filter((r) => r.notification);
+    const byCategory = {};
+    live.forEach((r) => {
+        const c = alertCategory(r.notification.link?.type);
+        byCategory[c] = (byCategory[c] || 0) + 1;
+    });
+
     return {
         summary: {
             received: receipts.length,
@@ -1266,6 +1382,19 @@ async function notificationsBlock(ctx) {
             unread:   receipts.length - read,
             readRate: pct(read, receipts.length),
         },
+        byCategory: Object.entries(byCategory)
+            .map(([category, count]) => ({ category, count }))
+            .sort((a, b) => b.count - a.count),
+        recent: live.slice(0, 25).map((r) => ({
+            _id:      r._id,
+            title:    r.notification.title,
+            body:     r.notification.body,
+            category: alertCategory(r.notification.link?.type),
+            from:     r.notification.senderRole || '',
+            sentAt:   r.notification.createdAt || r.createdAt,
+            isRead:   !!r.isRead,
+            readAt:   r.readAt || null,
+        })),
     };
 }
 
