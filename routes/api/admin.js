@@ -444,6 +444,7 @@ router.get('/holidays/mine',       holidayGuard, holidayCtrl.adminGetMyHolidays)
 router.post('/holidays',           holidayGuard, holidayCtrl.adminCreateHoliday);
 router.put('/holidays/:id',        holidayGuard, holidayCtrl.adminUpdateHoliday);
 router.delete('/holidays/:id',     holidayGuard, holidayCtrl.adminDeleteHoliday);
+router.post('/holidays/bulk-delete', holidayGuard, holidayCtrl.adminBulkDeleteHolidays);
 router.post('/holidays/import',    holidayGuard, uploadCsv.single('csvFile'), holidayCtrl.adminImportHolidays);
 router.get('/holidays/export',     holidayGuard, holidayCtrl.adminExportHolidays);
 router.get('/holidays/template',   holidayGuard, holidayCtrl.adminGetImportTemplate);

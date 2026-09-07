@@ -133,6 +133,25 @@ function parseDate(val) {
     return isNaN(d) ? null : d;
 }
 
+/**
+ * Which academic year a holiday belongs to.
+ *
+ * Every holiday used to be written with `academicYear: null`, which made the
+ * year filter on the admin screen filter nothing and left the student/parent
+ * read path leaning on the null branch of its own year scoping. The year a
+ * holiday sits in is a fact about its start date, so it is derived from that —
+ * falling back to the running year for a date outside every configured one.
+ */
+async function yearForDate(schoolId, date) {
+    const years = await AcademicYear.find({ school: schoolId }).select('startDate endDate status').lean();
+    if (!years.length) return null;
+    const t = new Date(date).getTime();
+    const containing = years.find(y =>
+        y.startDate && y.endDate && t >= new Date(y.startDate).getTime() && t <= new Date(y.endDate).getTime());
+    if (containing) return containing._id;
+    return years.find(y => y.status === 'active')?._id || null;
+}
+
 // ── Admin: list ───────────────────────────────────────────────────────────────
 exports.adminGetHolidays = async (req, res) => {
     try {
@@ -173,7 +192,7 @@ exports.adminCreateHoliday = async (req, res) => {
             type,
             description:  description?.trim() || '',
             isRecurring:  !!isRecurring,
-            academicYear: academicYear || null,
+            academicYear: academicYear || await yearForDate(req.schoolId, start),
             createdBy:    req.userId,
             applicability: {
                 // 'specific_departments' was removed from the form; anything
@@ -183,8 +202,10 @@ exports.adminCreateHoliday = async (req, res) => {
             },
         });
 
-        // Fire-and-forget in-app notifications
-        sendHolidayNotification(holiday, req.schoolId, req.userId);
+        // Fire-and-forget in-app notifications. Back-filling last year's
+        // calendar should not ring every phone in the school, so the caller can
+        // turn this off; leaving it out keeps the old always-notify behaviour.
+        if (req.body.notify !== false) sendHolidayNotification(holiday, req.schoolId, req.userId);
 
         res.status(201).json({ success: true, data: holiday });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -272,13 +293,31 @@ exports.adminImportHolidays = async (req, res) => {
             });
         });
 
+        // A preview parses and reports, and writes nothing. It is the same code
+        // path as the real import, so what it shows is what will land.
+        const preview = req.query.preview === '1' || req.body?.preview === '1' || req.body?.preview === true;
+        if (preview) {
+            return res.json({
+                success: true, preview: true, total: rows.length,
+                valid: docs.length, invalid: errors.length,
+                rows: docs.slice(0, 50).map(d => ({
+                    name: d.name, startDate: d.startDate, endDate: d.endDate,
+                    type: d.type, description: d.description,
+                })),
+                errors: errors.length ? errors : undefined,
+            });
+        }
+
         if (!docs.length)
             return res.status(400).json({ success: false, message: 'No valid rows to import', errors });
 
+        for (const d of docs) d.academicYear = await yearForDate(req.schoolId, d.startDate);
         const created = await Holiday.insertMany(docs, { ordered: false });
 
         // Fire-and-forget in-app notification (pushed live over the WebSocket Gateway)
-        sendImportedHolidaysNotification(created.length ? created : docs, req.schoolId, req.userId);
+        if (req.body?.notify !== 'false') {
+            sendImportedHolidaysNotification(created.length ? created : docs, req.schoolId, req.userId);
+        }
 
         res.json({ success: true, imported: docs.length, errors: errors.length ? errors : undefined });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -291,9 +330,22 @@ exports.getHolidayTypes = async (req, res) => {
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
+/**
+ * Rewrite the school's holiday-type list.
+ *
+ * Two rules the old version did not have.
+ *
+ * A type can be **renamed**, and the holidays wearing the old name are carried
+ * across in the same request — deleting and re-adding used to leave every one
+ * of those rows holding a type that no longer exists.
+ *
+ * A type **in use cannot be removed**. Nothing in the database points a holiday
+ * at its type, so removing one silently orphaned however many holidays wore it;
+ * the count comes back instead so the caller can say which ones.
+ */
 exports.updateHolidayTypes = async (req, res) => {
     try {
-        let { holidayTypes } = req.body;
+        let { holidayTypes, renames } = req.body;
         if (!Array.isArray(holidayTypes))
             return res.status(400).json({ success: false, message: 'holidayTypes must be an array' });
 
@@ -309,8 +361,52 @@ exports.updateHolidayTypes = async (req, res) => {
         if (!holidayTypes.length)
             return res.status(400).json({ success: false, message: 'Keep at least one holiday type' });
 
+        const before = await schoolHolidayTypes(req.schoolId);
+
+        // Renames first, so a renamed type is not then read as a removed one.
+        const applied = [];
+        for (const r of Array.isArray(renames) ? renames : []) {
+            const from = String(r?.from || '').trim();
+            const to   = String(r?.to || '').trim();
+            if (!from || !to || from === to) continue;
+            if (!holidayTypes.includes(to)) continue;      // renaming into a type nobody keeps
+            if (!before.includes(from)) continue;          // renaming something that was never there
+            const { modifiedCount } = await Holiday.updateMany(
+                { school: req.schoolId, type: from }, { $set: { type: to } },
+            );
+            applied.push({ from, to, moved: modifiedCount ?? 0 });
+        }
+
+        const kept    = new Set(holidayTypes.map(t => t.toLowerCase()));
+        const removed = before.filter(t => !kept.has(t.toLowerCase()));
+        if (removed.length) {
+            const inUse = [];
+            for (const t of removed) {
+                const count = await Holiday.countDocuments({ school: req.schoolId, type: t });
+                if (count) inUse.push({ type: t, count });
+            }
+            if (inUse.length) {
+                return res.status(409).json({
+                    success: false, inUse,
+                    message: inUse.map(u => `${u.count} holiday${u.count === 1 ? '' : 's'} still use "${u.type}"`).join('; ')
+                        + '. Rename it, or change those holidays first.',
+                });
+            }
+        }
+
         await School.updateOne({ _id: req.schoolId }, { $set: { holidayTypes } });
-        res.json({ success: true, data: holidayTypes });
+        res.json({ success: true, data: holidayTypes, renamed: applied });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+// ── Admin: delete several at once ────────────────────────────────────────────
+exports.adminBulkDeleteHolidays = async (req, res) => {
+    try {
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+        if (!ids.length) return res.status(400).json({ success: false, message: 'Select at least one holiday' });
+        // Scoped to the caller's school, so an id from elsewhere deletes nothing.
+        const result = await Holiday.deleteMany({ _id: { $in: ids }, school: req.schoolId });
+        res.json({ success: true, deleted: result?.deletedCount ?? 0 });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -338,10 +434,16 @@ exports.adminExportHolidays = async (req, res) => {
 // ── Admin: download import template ──────────────────────────────────────────
 exports.adminGetImportTemplate = async (req, res) => {
     try {
+        // The sample rows wear THIS school's own types. The template used to
+        // ship the legacy slugs ('public', 'school_specific'), which imported
+        // as a type that is not in the school's list and then showed up as a
+        // raw slug on the screen.
+        const types = await schoolHolidayTypes(req.schoolId);
+        const year  = new Date().getFullYear();
         const sample = [
-            { name: 'Diwali',     startDate: '2024-11-01', endDate: '2024-11-03', type: 'public',          description: 'Festival of lights' },
-            { name: 'Annual Day', startDate: '2024-12-15', endDate: '2024-12-15', type: 'school_specific', description: 'Annual school celebration' },
-            { name: 'Exam Break', startDate: '2024-10-20', endDate: '2024-10-22', type: 'exam_break',      description: 'Mid-term exam break' },
+            { name: 'Diwali',     startDate: `${year}-11-01`, endDate: `${year}-11-03`, type: types[0], description: 'Festival of lights' },
+            { name: 'Annual Day', startDate: `${year}-12-15`, endDate: `${year}-12-15`, type: types[1] || types[0], description: 'Annual school celebration' },
+            { name: 'Exam Break', startDate: `${year}-10-20`, endDate: `${year}-10-22`, type: types[2] || types[0], description: 'Mid-term exam break' },
         ];
         const wb  = XLSX.utils.book_new();
         const ws  = XLSX.utils.json_to_sheet(sample);
