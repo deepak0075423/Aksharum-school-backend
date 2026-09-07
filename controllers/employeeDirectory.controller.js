@@ -358,7 +358,13 @@ function matches(row, q) {
         const held   = low(row.department);
         if (wanted === 'unassigned' ? !!held : held !== wanted) return false;
     }
-    if (q.designation  && low(row.designation)  !== low(q.designation))  return false;
+    // Same rule as the department above: the "Unassigned" bucket the roll-ups
+    // emit is a real filter value here, meaning nobody set one.
+    if (q.designation) {
+        const wanted = low(q.designation);
+        const held   = low(row.designation);
+        if (wanted === 'unassigned' ? !!held : held !== wanted) return false;
+    }
     if (q.staffType    && row.staffType         !== q.staffType)         return false;
     if (q.employmentType && row.employmentType  !== q.employmentType)    return false;
     if (q.status       && row.employmentStatus  !== q.status)            return false;
@@ -434,7 +440,10 @@ exports.getMeta = async (req, res) => {
                     ...uniq(rows.map((r) => r.department)),
                     ...(rows.some((r) => !trim(r.department)) ? ['Unassigned'] : []),
                 ],
-                designations: uniq(rows.map((r) => r.designation)),
+                designations: [
+                    ...uniq(rows.map((r) => r.designation)),
+                    ...(rows.some((r) => !trim(r.designation)) ? ['Unassigned'] : []),
+                ],
                 joiningYears: admin
                     ? [...new Set(rows.map((r) => r.joiningYear).filter(Boolean))].sort((a, b) => b - a)
                     : [],
