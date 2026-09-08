@@ -212,19 +212,127 @@ exports.getDashboard = async (req, res) => {
 
 // ── Books ─────────────────────────────────────────────────────────────────────
 
+/**
+ * A book's own state, from its copies.
+ *
+ * `availableCopies` alone cannot answer it: a title with four copies out, one of
+ * them weeks late, is a different problem from one that is merely popular. The
+ * order matters — overdue outranks everything, because it is the only state
+ * anybody has to act on.
+ */
+const BOOK_STATUS_SQL = `CASE
+    WHEN COALESCE(b."totalCopies", 0) = 0 THEN 'no_copies'
+    WHEN ov."n" > 0                       THEN 'overdue'
+    WHEN COALESCE(b."availableCopies", 0) = 0 THEN 'issued_out'
+    ELSE 'available' END`;
+
+// What may be sorted on, and the column behind it. A whitelist because the
+// value lands in the ORDER BY — never interpolate a query parameter there.
+const BOOK_SORTS = {
+    title:     'b."title"',
+    authors:   'b."authors"',
+    isbn:      'b."isbn"',
+    category:  'b."category"',
+    available: 'b."availableCopies"',
+    total:     'b."totalCopies"',
+    status:    '"status"',
+    added:     'b."createdAt"',
+};
+
 exports.getBooks = async (req, res) => {
     try {
-        const { q, category } = req.query;
+        const { q, category, status } = req.query;
         const { page, limit, skip } = paging(req.query);
-        const filter = { school: req.schoolId };
-        if (category) filter.category = category;
-        if (q) filter.$or = [{ title: { $regex: q, $options: 'i' } }, { isbn: { $regex: q, $options: 'i' } }];
 
-        const [books, total] = await Promise.all([
-            LibraryBook.find(filter).sort({ title: 1 }).skip(skip).limit(limit).lean(),
-            LibraryBook.countDocuments(filter),
+        const where  = ['b."school" = $1'];
+        const values = [String(req.schoolId)];
+        if (category) { values.push(category); where.push(`b."category" = $${values.length}`); }
+        if (q) {
+            // Title, ISBN, publisher and the author list — the search box says
+            // "author" and until now searching one returned nothing.
+            values.push(`%${q}%`);
+            const i = values.length;
+            where.push(`(b."title" ILIKE $${i} OR b."isbn" ILIKE $${i} OR b."publisher" ILIKE $${i}
+                         OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+                              CASE WHEN jsonb_typeof(b."authors") = 'array' THEN b."authors" ELSE '[]'::jsonb END
+                            ) a WHERE a ILIKE $${i}))`);
+        }
+
+        // The reservation list is a bound parameter, and the two queries below
+        // bind it at different positions — so the FROM is built per query
+        // rather than shared with a hard-coded placeholder.
+        const fromSql = (resParam) => `
+            FROM "${LibraryBook.tableName}" b
+            LEFT JOIN LATERAL (
+                SELECT count(*)::int AS "n" FROM "${LibraryIssuance.tableName}" i
+                 WHERE i."book" = b."_id" AND i."status" = 'overdue') ov ON true
+            LEFT JOIN LATERAL (
+                SELECT count(*)::int AS "n" FROM "${LibraryReservation.tableName}" r
+                 WHERE r."book" = b."_id" AND r."status" = ANY($${resParam}::text[])) rs ON true`;
+        const from = fromSql(values.length + 1);
+        values.push(ACTIVE_RESERVATION);
+
+        // The status filter runs on the derived value, so it has to be applied
+        // after the joins rather than in the WHERE above.
+        const having = status ? `WHERE "status" = $${values.length + 1}` : '';
+        if (status) values.push(status);
+
+        const sortKey = BOOK_SORTS[req.query.sortBy] ? req.query.sortBy : 'title';
+        const dir     = String(req.query.sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+        const orderBy = `${sortKey === 'status' ? '"status"' : BOOK_SORTS[sortKey]} ${dir} NULLS LAST, b."title" ASC`;
+
+        const base = `SELECT b.*, ov."n" AS "overdueCount", rs."n" AS "reservedCount",
+                             ${BOOK_STATUS_SQL} AS "status" ${from} WHERE ${where.join(' AND ')}`;
+
+        const [rows, count, stats] = await Promise.all([
+            pool.query(`SELECT * FROM (${base}) t ${having} ORDER BY ${orderBy.replace(/\bb\./g, 't.')} LIMIT ${limit} OFFSET ${skip}`, values),
+            pool.query(`SELECT count(*)::int AS "n" FROM (${base}) t ${having}`, values),
+            // The tiles count the whole catalogue, not the filtered page — they
+            // are the denominator the percentages beside them are taken from.
+            pool.query(
+                `SELECT "status", count(*)::int AS "n" FROM (
+                    SELECT ${BOOK_STATUS_SQL} AS "status" ${fromSql(2)} WHERE b."school" = $1
+                 ) t GROUP BY 1`,
+                [String(req.schoolId), ACTIVE_RESERVATION],
+            ),
         ]);
-        res.json({ success: true, data: books, total, page, pages: Math.ceil(total / limit) });
+
+        const by = Object.fromEntries(stats.rows.map((r) => [r.status, r.n]));
+        // The categories this catalogue actually uses — a filter that offered
+        // anything else would only ever empty the table.
+        const cats = await pool.query(
+            `SELECT COALESCE(NULLIF(btrim("category"), ''), '') AS "category", count(*)::int AS "count"
+               FROM "${LibraryBook.tableName}" WHERE "school" = $1
+              GROUP BY 1 ORDER BY 2 DESC, 1 ASC`,
+            [String(req.schoolId)],
+        );
+        const totalBooks = Object.values(by).reduce((n, v) => n + v, 0);
+        // Titles with somebody waiting, and titles catalogued this month.
+        const extra = await pool.query(
+            `SELECT
+               (SELECT count(DISTINCT r."book")::int FROM "${LibraryReservation.tableName}" r
+                 WHERE r."school" = $1 AND r."status" = ANY($2::text[]))              AS "reserved",
+               (SELECT count(*)::int FROM "${LibraryBook.tableName}"
+                 WHERE "school" = $1 AND "createdAt" >= date_trunc('month', now()))   AS "addedThisMonth"`,
+            [String(req.schoolId), ACTIVE_RESERVATION],
+        );
+
+        const total = count.rows[0].n;
+        res.json({
+            success: true,
+            data: rows.rows,
+            total, page, pages: Math.ceil(total / limit) || 1,
+            stats: {
+                total: totalBooks,
+                available:  by.available  || 0,
+                issuedOut:  by.issued_out || 0,
+                overdue:    by.overdue    || 0,
+                noCopies:   by.no_copies  || 0,
+                reserved:       extra.rows[0].reserved,
+                addedThisMonth: extra.rows[0].addedThisMonth,
+            },
+            categories: cats.rows.filter((c) => c.category),
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -338,6 +446,46 @@ exports.deleteBook = async (req, res) => {
         ]);
         audit(req.schoolId, req.userId, req.userRole, 'BOOK_DELETED', 'Book', book._id, book.toObject(), null);
         res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Delete several books at once.
+ *
+ * Runs each one through the same three refusals the single delete uses — a book
+ * on loan, queued for, or with a copy still marked issued stays put — and says
+ * which ones it would not take rather than failing the whole batch or, worse,
+ * quietly deleting the rest.
+ */
+exports.bulkDeleteBooks = async (req, res) => {
+    try {
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+        if (!ids.length) return res.status(400).json({ success: false, message: 'Select at least one book' });
+
+        const books = await LibraryBook.find({ _id: { $in: ids }, school: req.schoolId }).lean();
+        const deleted = [];
+        const skipped = [];
+
+        for (const book of books) {
+            const [onLoan, queued, outCopy] = await Promise.all([
+                LibraryIssuance.exists({ book: book._id, status: { $in: ACTIVE_ISSUANCE } }),
+                LibraryReservation.exists({ book: book._id, status: { $in: ACTIVE_RESERVATION } }),
+                LibraryBookCopy.exists({ book: book._id, status: 'issued' }),
+            ]);
+            const reason = onLoan ? 'copies are still out on loan'
+                : queued ? 'people are queued for it'
+                : outCopy ? 'a copy is still marked issued' : null;
+            if (reason) { skipped.push({ title: book.title, reason }); continue; }
+
+            await Promise.all([
+                LibraryBook.deleteOne({ _id: book._id }),
+                LibraryBookCopy.deleteMany({ book: book._id }),
+            ]);
+            audit(req.schoolId, req.userId, req.userRole, 'BOOK_DELETED', 'Book', book._id, book, null);
+            deleted.push(book.title);
+        }
+
+        res.json({ success: true, deleted: deleted.length, skipped });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

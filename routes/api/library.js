@@ -36,6 +36,7 @@ router.post('/books/bulk-upload',          librarianGuard, uploadExcel.single('f
 router.get('/books/:id',                   librarianGuard, libCtrl.getBookDetail);
 router.put('/books/:id',                   librarianGuard, libCtrl.updateBook);
 router.delete('/books/:id',                librarianGuard, libCtrl.deleteBook);
+router.post('/books/bulk-delete',          librarianGuard, libCtrl.bulkDeleteBooks);
 
 // Copies
 router.post('/books/:id/copies',              librarianGuard, libCtrl.addCopy);
