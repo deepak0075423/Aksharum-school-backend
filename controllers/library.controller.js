@@ -72,10 +72,10 @@ exports.getDashboard = async (req, res) => {
         // numbers that barely move. One grouped query, cached briefly per
         // school — the recent-activity list below stays live.
         const redis = getCacheRedis();
-        // v2: the reservation tile changed meaning (queued → queued + held) and
-        // the fine total became outstanding rather than as-charged, so cached
-        // v1 payloads would keep serving the old numbers for a minute.
-        const key   = `lib:dash:v2:${req.schoolId}`;
+        // v3: the tiles gained their period comparisons, and the payload gained
+        // the category split and the weekly circulation series — a cached v2
+        // body would keep serving a dashboard missing half its panels.
+        const key   = `lib:dash:v3:${req.schoolId}`;
         let tiles = null;
         if (redis) {
             try {
@@ -85,8 +85,14 @@ exports.getDashboard = async (req, res) => {
         }
 
         if (!tiles) {
-            const { rows } = await pool.query(
-                `SELECT
+            // Every figure the tiles show, and what each one is being compared
+            // against. A tile that says "3 issued out" and nothing else cannot
+            // tell a librarian whether that is a busy week or a dead one, so
+            // each count arrives beside the same count a period ago — measured,
+            // not estimated.
+            const [{ rows }, cats, series] = await Promise.all([
+                pool.query(
+                    `SELECT
                    (SELECT count(*) FROM "${LibraryBook.tableName}"        WHERE "school" = $1)                                  AS "totalBooks",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1)                                  AS "totalCopies",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1 AND "status" = 'issued')          AS "issuedCopies",
@@ -94,23 +100,113 @@ exports.getDashboard = async (req, res) => {
                    (SELECT count(*) FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = ANY($2::text[]))    AS "reservations",
                    (SELECT count(*) FROM "${LibraryFine.tableName}"        WHERE "school" = $1 AND "status" = 'pending')         AS "pendingFines",
                    (SELECT COALESCE(sum("amount" - COALESCE("waivedAmount", 0) - COALESCE("paidAmount", 0)), 0)
-                      FROM "${LibraryFine.tableName}" WHERE "school" = $1 AND "status" = 'pending')                              AS "pendingFineTotal"`,
-                [String(req.schoolId), ACTIVE_RESERVATION],
-            );
+                      FROM "${LibraryFine.tableName}" WHERE "school" = $1 AND "status" = 'pending')                              AS "pendingFineTotal",
+                   (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1 AND "status" = 'available')        AS "availableCopies",
+                   -- What has changed, and over what.
+                   (SELECT count(*) FROM "${LibraryBook.tableName}"        WHERE "school" = $1
+                      AND "createdAt" >= date_trunc('month', now()))                                                             AS "booksThisMonth",
+                   (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1
+                      AND "createdAt" >= date_trunc('month', now()))                                                             AS "copiesThisMonth",
+                   (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1
+                      AND "issueDate" >= date_trunc('month', now()))                                                             AS "issuedThisMonth",
+                   (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1
+                      AND "issueDate" >= date_trunc('month', now()) - interval '1 month'
+                      AND "issueDate" <  date_trunc('month', now()))                                                             AS "issuedLastMonth",
+                   -- Overdue is a live status, so a week ago has to be derived:
+                   -- past its due date then, and not yet back at that point.
+                   (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1
+                      AND "dueDate" < now() - interval '7 days'
+                      AND ("returnDate" IS NULL OR "returnDate" > now() - interval '7 days'))                                     AS "overdueLastWeek",
+                   (SELECT count(*) FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+                      AND "status" = ANY($2::text[]) AND "createdAt" < now() - interval '7 days')                                 AS "reservationsLastWeek"`,
+                    [String(req.schoolId), ACTIVE_RESERVATION],
+                ),
+                // What the collection is made of. Every book has exactly one
+                // category, so these sum to the title count.
+                pool.query(
+                    `SELECT COALESCE(NULLIF(btrim("category"), ''), 'Uncategorised') AS "category",
+                            count(*)::int AS "count"
+                       FROM "${LibraryBook.tableName}" WHERE "school" = $1
+                      GROUP BY 1 ORDER BY 2 DESC, 1 ASC`,
+                    [String(req.schoolId)],
+                ),
+                // Twelve weeks of counter traffic. The client shows the last
+                // four, eight or all twelve of these without asking again.
+                pool.query(
+                    `WITH w AS (
+                        SELECT generate_series(
+                            date_trunc('week', now()) - interval '11 weeks',
+                            date_trunc('week', now()),
+                            interval '1 week') AS "start")
+                     SELECT to_char(w."start", 'YYYY-MM-DD') AS "week",
+                       (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" i
+                         WHERE i."school" = $1 AND i."issueDate" >= w."start"
+                           AND i."issueDate" < w."start" + interval '1 week')  AS "issued",
+                       (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" i
+                         WHERE i."school" = $1 AND i."returnDate" >= w."start"
+                           AND i."returnDate" < w."start" + interval '1 week') AS "returned"
+                       FROM w ORDER BY w."start"`,
+                    [String(req.schoolId)],
+                ),
+            ]);
+
             tiles = Object.fromEntries(Object.entries(rows[0]).map(([k, v]) => [k, Number(v)]));
+            tiles.categories  = cats.rows;
+            tiles.circulation = series.rows;
             if (redis) {
                 try { await redis.set(key, JSON.stringify(tiles), 'EX', DASH_TTL); } catch { /* best effort */ }
             }
         }
 
-        const recent = await LibraryIssuance.find({ school: req.schoolId })
-            .populate('book',    'title')
-            .populate('issuedTo','name')
-            .sort({ issueDate: -1 })
-            .limit(10)
-            .lean();
+        // The two live lists. A librarian chasing a book needs the borrower's
+        // class, which lives two joins away on their student profile — the
+        // populate chain that used to build this list could not reach it.
+        const listSql = (where, order, limit) => `
+            SELECT i."_id", i."issueDate", i."dueDate", i."status",
+                   b."title", b."authors",
+                   u."name" AS "borrowerName", u."role" AS "borrowerRole",
+                   c."className", cs."sectionName"
+              FROM "${LibraryIssuance.tableName}" i
+              JOIN "${LibraryBook.tableName}" b  ON b."_id" = i."book"
+              JOIN "${User.tableName}" u         ON u."_id" = i."issuedTo"
+         LEFT JOIN "${StudentProfile.tableName}" sp ON sp."user" = u."_id"
+         LEFT JOIN "${ClassSection.tableName}" cs   ON cs."_id" = sp."currentSection"
+         LEFT JOIN "${Class.tableName}" c           ON c."_id"  = cs."class"
+             WHERE i."school" = $1 ${where}
+             ORDER BY ${order} LIMIT ${limit}`;
 
-        res.json({ success: true, data: { ...tiles, recent } });
+        const [recentRows, overdueRows] = await Promise.all([
+            pool.query(listSql('', 'i."issueDate" DESC', 10), [String(req.schoolId)]),
+            pool.query(listSql(`AND i."status" = 'overdue'`, 'i."dueDate" ASC', 8), [String(req.schoolId)]),
+        ]);
+
+        const shape = (r) => ({
+            _id: r._id,
+            issueDate: r.issueDate,
+            dueDate: r.dueDate,
+            status: r.status,
+            book: { title: r.title, authors: Array.isArray(r.authors) ? r.authors : [] },
+            issuedTo: {
+                name: r.borrowerName,
+                role: r.borrowerRole,
+                // Staff have no class; saying so beats an empty cell.
+                className: [r.className, r.sectionName].filter(Boolean).join(' '),
+            },
+            // Only a book still out can be late. Measuring a returned one
+            // against today made every old issuance look weeks overdue.
+            daysOverdue: r.dueDate && ACTIVE_ISSUANCE.includes(r.status)
+                ? Math.max(0, Math.floor((Date.now() - new Date(r.dueDate).getTime()) / 86400000))
+                : 0,
+        });
+
+        res.json({
+            success: true,
+            data: {
+                ...tiles,
+                recent:  recentRows.rows.map(shape),
+                overdueList: overdueRows.rows.map(shape),
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
