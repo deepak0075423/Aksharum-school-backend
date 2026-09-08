@@ -52,6 +52,12 @@ const emptyFineSummary = () => ({
 // Dashboard tiles are counts of slow-moving things; a minute stale is fine.
 const DASH_TTL = 60;
 
+/** A populated ref or a bare id, reduced to the id. */
+const sid = (v) => (v == null ? '' : String(v._id ?? v));
+
+/** A search term is data, not a pattern — neutralise it before it becomes one. */
+const escapeRx = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /** Page/limit from a query string, clamped so `?limit=999999` cannot be used to pull the table. */
 function paging(query, defaultLimit = 20) {
     const page  = Math.max(1, Math.floor(Number(query.page)  || 1));
@@ -1144,16 +1150,116 @@ exports.returnBook = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * Which class each borrower is in.
+ *
+ * A loan points at a User; the class lives two hops away on their student
+ * profile. Chasing an overdue book means knowing the class, and the page window
+ * is at most a hundred rows, so it is three bounded lookups rather than a join
+ * on every issuance in the school.
+ */
+async function withBorrowerClass(schoolId, rows) {
+    const ids = [...new Set(rows.map((r) => sid(r.issuedTo)).filter(Boolean))];
+    if (!ids.length) return rows;
+
+    const profiles = await StudentProfile.find({ school: schoolId, user: { $in: ids } })
+        .select('user currentSection').lean();
+    const sectionIds = [...new Set(profiles.map((p) => sid(p.currentSection)).filter(Boolean))];
+    const sections = sectionIds.length
+        ? await ClassSection.find({ _id: { $in: sectionIds } }).select('sectionName class').lean()
+        : [];
+    const classIds = [...new Set(sections.map((x) => sid(x.class)).filter(Boolean))];
+    const classes = classIds.length
+        ? await Class.find({ _id: { $in: classIds } }).select('className').lean()
+        : [];
+
+    const className = Object.fromEntries(classes.map((c) => [String(c._id), c.className]));
+    const bySection = Object.fromEntries(sections.map((x) => [
+        String(x._id), `${className[sid(x.class)] || ''} ${x.sectionName || ''}`.trim(),
+    ]));
+    const byUser = Object.fromEntries(profiles.map((p) => [String(p.user), bySection[sid(p.currentSection)] || '']));
+
+    return rows.map((r) => ({ ...r, borrowerClass: byUser[sid(r.issuedTo)] || '' }));
+}
+
+/**
+ * The four figures above the register, each against the same week before it.
+ *
+ * "Overdue" is a live status with no history, so a week ago is derived: past
+ * its due date then, and not yet back at that point. Fines collected is money
+ * actually taken in the window, not money charged.
+ */
+async function circulationStats(schoolId) {
+    const { rows } = await pool.query(
+        `SELECT
+           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+              AND "issueDate" >= date_trunc('week', now()))                                   AS "issued",
+           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+              AND "issueDate" >= date_trunc('week', now()) - interval '1 week'
+              AND "issueDate" <  date_trunc('week', now()))                                   AS "issuedPrev",
+           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+              AND "returnDate" >= date_trunc('week', now()))                                  AS "returned",
+           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+              AND "returnDate" >= date_trunc('week', now()) - interval '1 week'
+              AND "returnDate" <  date_trunc('week', now()))                                  AS "returnedPrev",
+           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+              AND "status" = 'overdue')                                                       AS "overdue",
+           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+              AND "dueDate" < now() - interval '7 days'
+              AND ("returnDate" IS NULL OR "returnDate" > now() - interval '7 days'))          AS "overduePrev",
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}" WHERE "school" = $1
+              AND "paidAt" >= date_trunc('week', now()))                                      AS "collected",
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}" WHERE "school" = $1
+              AND "paidAt" >= date_trunc('week', now()) - interval '1 week'
+              AND "paidAt" <  date_trunc('week', now()))                                      AS "collectedPrev",
+           (SELECT COALESCE(sum("amount" - COALESCE("waivedAmount", 0) - COALESCE("paidAmount", 0)), 0)::float
+              FROM "${LibraryFine.tableName}" WHERE "school" = $1 AND "status" = 'pending')    AS "outstanding"`,
+        [String(schoolId)],
+    );
+    return rows[0];
+}
+
 exports.getIssuances = async (req, res) => {
     try {
         await sweepOverdue(req.schoolId);
 
-        const { status, userId, role, classId, sectionId } = req.query;
+        const { status, userId, role, classId, sectionId, q, from, to } = req.query;
         const { page, limit, skip } = paging(req.query);
         const filter = { school: req.schoolId };
         if (status) filter.status   = status;
         if (userId) filter.issuedTo = userId;
         if (BORROWER_ROLES.includes(role)) filter.issuedToRole = role;
+
+        // A date window on when the loan was made. Both ends are optional, and
+        // `to` covers the whole of its day rather than midnight at its start.
+        if (from || to) {
+            filter.issueDate = {};
+            if (from) filter.issueDate.$gte = new Date(`${from}T00:00:00.000Z`);
+            if (to)   filter.issueDate.$lte = new Date(`${to}T23:59:59.999Z`);
+        }
+
+        // One search box over three different records — the book, the copy on
+        // the shelf, and the person holding it. Each is resolved to a bounded
+        // set of ids first, because a loan carries only their references.
+        if (q && q.trim()) {
+            const rx = { $regex: escapeRx(q.trim()), $options: 'i' };
+            const [books, copies, people] = await Promise.all([
+                LibraryBook.find({ school: req.schoolId, $or: [{ title: rx }, { isbn: rx }] }).select('_id').limit(500).lean(),
+                LibraryBookCopy.find({ school: req.schoolId, uniqueCode: rx }).select('_id').limit(500).lean(),
+                User.find({ school: req.schoolId, name: rx }).select('_id').limit(500).lean(),
+            ]);
+            const or = [];
+            if (books.length)  or.push({ book:     { $in: books.map((b) => String(b._id)) } });
+            if (copies.length) or.push({ bookCopy: { $in: copies.map((c) => String(c._id)) } });
+            if (people.length) or.push({ issuedTo: { $in: people.map((u) => String(u._id)) } });
+            // Nothing matched the term anywhere, so nothing can match the loan.
+            if (!or.length) {
+                return wantsXlsx(req)
+                    ? sendXlsx(res, 'library_circulation', [])
+                    : res.json({ success: true, data: [], total: 0, page, pages: 0, stats: await circulationStats(req.schoolId) });
+            }
+            filter.$or = or;
+        }
 
         // Class and section live on the student profile, not on the loan, so
         // narrow to those students first. A class is a bounded set, so the
@@ -1172,7 +1278,7 @@ exports.getIssuances = async (req, res) => {
             if (!ids.length) {
                 return wantsXlsx(req)
                     ? sendXlsx(res, 'library_circulation', [])
-                    : res.json({ success: true, data: [], total: 0, page, pages: 0 });
+                    : res.json({ success: true, data: [], total: 0, page, pages: 0, stats: await circulationStats(req.schoolId) });
             }
             filter.issuedTo = { $in: ids };
         }
@@ -1214,14 +1320,46 @@ exports.getIssuances = async (req, res) => {
             })));
         }
 
-        const [issuances, total] = await Promise.all([
+        const [issuances, total, stats] = await Promise.all([
             query().skip(skip).limit(limit).lean(),
             LibraryIssuance.countDocuments(filter),
+            circulationStats(req.schoolId),
         ]);
         res.json({
-            success: true, data: await attachFineSummary(issuances),
-            total, page, pages: Math.ceil(total / limit),
+            success: true, data: await withBorrowerClass(req.schoolId, await attachFineSummary(issuances)),
+            total, page, pages: Math.ceil(total / limit) || 1, stats,
         });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Renew several loans at once.
+ *
+ * Each id goes through `renewIssuance` exactly as a single renewal does, so the
+ * renewal cap, the reservation queue and every other rule still apply — the
+ * batch reports what each one did rather than stopping at the first refusal.
+ */
+exports.bulkRenew = async (req, res) => {
+    try {
+        await sweepOverdue(req.schoolId);
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+        if (!ids.length) return res.status(400).json({ success: false, message: 'Select at least one loan' });
+
+        const renewed = [];
+        const skipped = [];
+        for (const id of ids) {
+            // eslint-disable-next-line no-await-in-loop -- each renewal moves the
+            // same copy's state; running them together would race on the queue.
+            const result = await renewIssuance(req.schoolId, id, { actor: req.userId, actorRole: req.userRole });
+            if (result.ok) {
+                audit(req.schoolId, req.userId, req.userRole, 'BOOK_RENEWED', 'Issuance', result.issuance._id, null,
+                    { newDueDate: result.issuance.dueDate, renewalCount: result.issuance.renewalCount });
+                renewed.push(id);
+            } else {
+                skipped.push({ id, reason: result.message });
+            }
+        }
+        res.json({ success: true, renewed: renewed.length, skipped });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

@@ -60,6 +60,7 @@ router.post('/issue',             librarianGuard, libCtrl.issueBook);
 router.get('/return',             librarianGuard, libCtrl.getReturnForm);
 router.post('/return',            librarianGuard, libCtrl.returnBook);
 router.get('/issuances',          librarianGuard, libCtrl.getIssuances);
+router.post('/issuances/renew',     librarianGuard, libCtrl.bulkRenew);
 router.post('/issuances/:id/renew', librarianGuard, libCtrl.renewBook);
 
 // Reservations
