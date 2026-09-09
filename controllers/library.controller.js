@@ -26,7 +26,7 @@ const {
     sweepOverdue, expireStaleHolds, promoteQueue, fineApplies, renewIssuance,
     BORROWER_ROLES, commitIssue, commitReturn, borrowerAudience, nextFineReceiptNumber,
     outstandingOf, fineStatusFor, ACTIVE_RESERVATION, notifyLibraryStaff,
-    attachFineSummary,
+    attachFineSummary, placeReservation,
 } = require('../services/libraryRules');
 
 // How a book can come back over the counter.
@@ -1020,7 +1020,7 @@ exports.issueBook = async (req, res) => {
         // Their own reservation is now fulfilled — leaving it 'ready' would
         // expire it and hold up everyone behind them in the queue.
         if (claim) {
-            await LibraryReservation.updateOne({ _id: claim._id }, { status: 'collected' });
+            await LibraryReservation.updateOne({ _id: claim._id }, { status: 'collected', closedAt: new Date() });
             audit(req.schoolId, req.userId, req.userRole, 'RESERVATION_COLLECTED', 'Reservation', claim._id, { status: 'ready' }, { status: 'collected' });
             await reindexQueue(req.schoolId, bookId);
         }
@@ -1158,8 +1158,8 @@ exports.returnBook = async (req, res) => {
  * is at most a hundred rows, so it is three bounded lookups rather than a join
  * on every issuance in the school.
  */
-async function withBorrowerClass(schoolId, rows) {
-    const ids = [...new Set(rows.map((r) => sid(r.issuedTo)).filter(Boolean))];
+async function withBorrowerClass(schoolId, rows, field = 'issuedTo') {
+    const ids = [...new Set(rows.map((r) => sid(r[field])).filter(Boolean))];
     if (!ids.length) return rows;
 
     const profiles = await StudentProfile.find({ school: schoolId, user: { $in: ids } })
@@ -1179,7 +1179,7 @@ async function withBorrowerClass(schoolId, rows) {
     ]));
     const byUser = Object.fromEntries(profiles.map((p) => [String(p.user), bySection[sid(p.currentSection)] || '']));
 
-    return rows.map((r) => ({ ...r, borrowerClass: byUser[sid(r.issuedTo)] || '' }));
+    return rows.map((r) => ({ ...r, borrowerClass: byUser[sid(r[field])] || '' }));
 }
 
 /**
@@ -1377,22 +1377,142 @@ exports.renewBook = async (req, res) => {
 
 // ── Reservations ──────────────────────────────────────────────────────────────
 
+/**
+ * The four figures above the queue, and the counts behind the status chips.
+ *
+ * "Ready" and "waiting" are counts of a live state; "collected" and "closed"
+ * are counts of a month's work, so each of those carries the same month before
+ * it. A reservation that expired on the shelf is counted with the cancelled
+ * ones — from the member's side nothing came of either.
+ */
+async function reservationStats(schoolId) {
+    const { rows } = await pool.query(
+        `SELECT
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'ready')     AS "ready",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'pending')   AS "waiting",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'collected') AS "collected",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'cancelled') AS "cancelled",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'expired')   AS "expired",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1)                            AS "all",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+              AND "status" = 'collected' AND "closedAt" >= date_trunc('month', now()))                                 AS "collectedThisMonth",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+              AND "status" = 'collected' AND "closedAt" >= date_trunc('month', now()) - interval '1 month'
+              AND "closedAt" < date_trunc('month', now()))                                                             AS "collectedLastMonth",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+              AND "status" = ANY(ARRAY['cancelled','expired']) AND "closedAt" >= date_trunc('month', now()))           AS "closedThisMonth",
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+              AND "status" = ANY(ARRAY['cancelled','expired'])
+              AND "closedAt" >= date_trunc('month', now()) - interval '1 month'
+              AND "closedAt" < date_trunc('month', now()))                                                             AS "closedLastMonth",
+           -- What is about to fall off the hold shelf: the actionable number.
+           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+              AND "status" = 'ready' AND "expiresAt" IS NOT NULL
+              AND "expiresAt" < now() + interval '2 days')                                                              AS "expiringSoon",
+           -- How long the person at the front of the queue has been waiting.
+           (SELECT COALESCE(EXTRACT(day FROM now() - min("reservedAt")), 0)::int
+              FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'pending')                       AS "longestWaitDays"`,
+        [String(schoolId)],
+    );
+    return rows[0];
+}
+
+/**
+ * Queue somebody at the desk.
+ *
+ * The member cannot place this themselves — they are standing at the counter —
+ * so the librarian does it for them, through exactly the rules the member's own
+ * screen enforces (`placeReservation`). Before this the button did not exist and
+ * the only way to queue a person was to log in as them.
+ */
+exports.createReservation = async (req, res) => {
+    try {
+        const { bookId, userId } = req.body || {};
+        if (!bookId || !userId)
+            return res.status(400).json({ success: false, message: 'Choose a book and a member' });
+
+        const member = await User.findOne({ _id: userId, school: req.schoolId }).select('name role').lean();
+        if (!member) return res.status(404).json({ success: false, message: 'Member not found' });
+        if (!BORROWER_ROLES.includes(member.role))
+            return res.status(400).json({ success: false, message: 'Only students and staff can reserve books' });
+
+        const result = await placeReservation({
+            schoolId: req.schoolId, bookId, userId,
+            actorId: req.userId, actorRole: req.userRole,
+        });
+        if (!result.ok) return res.status(result.status).json({ success: false, message: result.message });
+
+        const { reservation, book, readyNow } = result;
+        // The member did not place this, so they are the ones who need telling.
+        notify({
+            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: readyNow ? '🔖 Reserved book ready' : '🔖 Reservation placed for you',
+            body: readyNow
+                ? `"${book.title}" is being held for you. Collect it before ${fmtLibDate(reservation.expiresAt)}.`
+                : `You are number ${reservation.queuePosition} in the queue for "${book.title}". We will let you know when it is ready.`,
+            recipients: [userId],
+            link: { type: 'library.reservations' },
+        });
+
+        res.status(201).json({ success: true, data: reservation });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
 exports.getReservations = async (req, res) => {
     try {
         await expireStaleHolds(req.schoolId, null, { actor: req.userId, actorRole: req.userRole });
 
-        const { status } = req.query;
+        const { status, classId, userId, q, from, to } = req.query;
         const { page, limit, skip } = paging(req.query);
         const filter = { school: req.schoolId };
         if (status) filter.status = status;
+        if (userId) filter.reservedBy = userId;
+
+        // A window on when the reservation was placed; `to` covers its whole day.
+        if (from || to) {
+            filter.reservedAt = {};
+            if (from) filter.reservedAt.$gte = new Date(`${from}T00:00:00.000Z`);
+            if (to)   filter.reservedAt.$lte = new Date(`${to}T23:59:59.999Z`);
+        }
+
+        // Class lives on the student profile, not on the reservation, so narrow
+        // to those students first. Naming one member is more specific than
+        // describing a group they might be in, so it wins.
+        if (!userId && classId) {
+            const students = await StudentProfile.find({ school: req.schoolId, currentClass: classId })
+                .select('user').lean();
+            const ids = students.map((p) => String(p.user));
+            if (!ids.length) {
+                return res.json({ success: true, data: [], total: 0, page, pages: 1, stats: await reservationStats(req.schoolId) });
+            }
+            filter.reservedBy = { $in: ids };
+        }
+
+        // One search box over the book and the person waiting for it. Each is
+        // resolved to a bounded id set first, because a reservation carries
+        // only their references.
+        if (q && q.trim()) {
+            const rx = { $regex: escapeRx(q.trim()), $options: 'i' };
+            const [books, people] = await Promise.all([
+                LibraryBook.find({ school: req.schoolId, $or: [{ title: rx }, { isbn: rx }] }).select('_id').limit(500).lean(),
+                User.find({ school: req.schoolId, name: rx }).select('_id').limit(500).lean(),
+            ]);
+            const or = [];
+            if (books.length)  or.push({ book:       { $in: books.map((b) => String(b._id)) } });
+            if (people.length) or.push({ reservedBy: { $in: people.map((u) => String(u._id)) } });
+            if (!or.length) {
+                return res.json({ success: true, data: [], total: 0, page, pages: 1, stats: await reservationStats(req.schoolId) });
+            }
+            filter.$or = or;
+        }
 
         const [reservations, total] = await Promise.all([
             LibraryReservation.find(filter)
                 .populate('book',      'title isbn')
                 .populate('reservedBy','name email')
                 .sort({ queuePosition: 1, reservedAt: 1 })
-                .skip(skip)
-                .limit(limit)
+                .skip(wantsXlsx(req) ? 0 : skip)
+                .limit(wantsXlsx(req) ? 5000 : limit)
                 .lean(),
             LibraryReservation.countDocuments(filter),
         ]);
@@ -1422,7 +1542,31 @@ exports.getReservations = async (req, res) => {
             return { ...r, availableCopy: copy, freeCopies: pool.length };
         });
 
-        res.json({ success: true, data, total, page, pages: Math.ceil(total / limit) });
+        const rows = await withBorrowerClass(req.schoolId, data, 'reservedBy');
+
+        // The export is what the librarian filtered down to, not just the page
+        // in front of them — the same rule the circulation register follows.
+        if (wantsXlsx(req)) {
+            return sendXlsx(res, 'library_reservations', rows.map((r) => ({
+                Book:   r.book?.title || '',
+                ISBN:   r.book?.isbn || '',
+                Member: r.reservedBy?.name || '',
+                Class:  r.borrowerClass || '',
+                'Queue #':    r.queuePosition || '',
+                Status:       r.status,
+                'Reserved on': day(r.reservedAt || r.createdAt),
+                'Ready on':    day(r.readyAt),
+                'Expires on':  day(r.expiresAt),
+                'Closed on':   day(r.closedAt),
+                'Copy to give': r.availableCopy?.uniqueCode || '',
+            })));
+        }
+
+        res.json({
+            success: true, data: rows,
+            total, page, pages: Math.ceil(total / limit) || 1,
+            stats: await reservationStats(req.schoolId),
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -1481,7 +1625,7 @@ exports.cancelReservation = async (req, res) => {
     try {
         const reservation = await LibraryReservation.findOneAndUpdate(
             { _id: req.params.id, school: req.schoolId, status: { $in: ['pending','ready'] } },
-            { status: 'cancelled' },
+            { status: 'cancelled', closedAt: new Date() },
             { new: true }
         ).lean();
         if (!reservation) return res.status(404).json({ success: false, message: 'Reservation not found' });

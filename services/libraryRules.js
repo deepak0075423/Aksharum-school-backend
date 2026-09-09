@@ -672,7 +672,7 @@ async function sweepOverdue(schoolId) {
 async function expireStaleHolds(schoolId, bookId = null, { actor, actorRole } = {}) {
     const T = `"${LibraryReservation.tableName}"`;
     const { rows: lapsed } = await pool.query(
-        `UPDATE ${T} SET "status" = 'expired'
+        `UPDATE ${T} SET "status" = 'expired', "closedAt" = now()
           WHERE "school" = $1 AND "status" = 'ready'
             AND "expiresAt" IS NOT NULL AND "expiresAt" < now()
             AND ($2::uuid IS NULL OR "book" = $2::uuid)
@@ -954,7 +954,88 @@ async function activeReservation(schoolId, userId, bookId) {
     }).lean();
 }
 
+/**
+ * Place a reservation for one member on one book.
+ *
+ * Every rule a reservation has to satisfy lives here and only here: the member
+ * may not already hold or have queued for the title, may not exceed the
+ * per-member cap, and may not queue at all with a fine outstanding when the
+ * policy says so. Two screens create reservations — a member reserving for
+ * themselves, and a librarian queueing somebody at the desk — and before this
+ * existed only the first one enforced any of it.
+ *
+ * Returns `{ ok: false, status, message }` or `{ ok: true, reservation, book, readyNow }`;
+ * the caller owns the response and whatever it notifies.
+ */
+async function placeReservation({ schoolId, bookId, userId, actorId, actorRole, self = false }) {
+    // The same refusal is read by two different people — the member on their
+    // own screen, and a librarian queueing somebody at the desk.
+    const who  = self ? 'You' : 'This member';
+    const whom = self ? 'you' : 'this member';
+    const book = await LibraryBook.findOne({ _id: bookId, school: schoolId }).lean();
+    if (!book) return { ok: false, status: 404, message: 'Book not found' };
+
+    // A title with nothing behind it is a catalogue stub, not something a queue
+    // can ever be served from.
+    if ((book.totalCopies || 0) === 0)
+        return { ok: false, status: 400, message: 'This book has no copies in the library yet' };
+
+    const policy = await getOrCreatePolicy(schoolId);
+    await expireStaleHolds(schoolId, bookId, { actor: actorId, actorRole });
+
+    const existing = await activeReservation(schoolId, userId, bookId);
+    if (existing) return { ok: false, status: 400, message: self
+        ? 'You have already reserved this book'
+        : 'This member has already reserved this book' };
+
+    // Holding a copy and queueing for the same title means asking for two
+    // copies of one book — the same rule the issue counter enforces.
+    if (!policy.allowMultipleCopiesPerUser) {
+        const holding = await LibraryIssuance.findOne({
+            school: schoolId, issuedTo: userId, book: bookId, status: { $in: ACTIVE_ISSUANCE } }).lean();
+        if (holding) return { ok: false, status: 400, message: `${who} already ${self ? 'have' : 'has'} this book out — it has to come back before another copy is reserved` };
+    }
+
+    const held = await LibraryReservation.countDocuments({
+        school: schoolId, reservedBy: userId, status: { $in: ACTIVE_RESERVATION } });
+    const maxRes = policy.maxReservationsPerUser || 3;
+    if (held >= maxRes)
+        return { ok: false, status: 400, message: `${who} already ${self ? 'have' : 'has'} ${held} of a maximum ${maxRes} reservations` };
+
+    if (policy.blockIssueOnPendingFine) {
+        const fines = await LibraryFine.find({ school: schoolId, user: userId, status: 'pending' }).select('amount').lean();
+        if (fines.length) {
+            const owed = fines.reduce((sum, f) => sum + (f.amount || 0), 0);
+            return { ok: false, status: 400, message: `₹${owed} in library fines owed by ${whom} has to be cleared before reserving` };
+        }
+    }
+
+    // Position is left at its default and assigned by reindexQueue below,
+    // ordered by reservedAt — reading "max + 1" here used to race.
+    const readyNow = (book.availableCopies || 0) > 0;
+    const created = await LibraryReservation.create({
+        school: schoolId, book: bookId, reservedBy: userId,
+        status: readyNow ? 'ready' : 'pending',
+        readyAt:   readyNow ? new Date() : null,
+        expiresAt: readyNow
+            ? new Date(Date.now() + (policy.reservationExpiryDays || 2) * 86400000)
+            : null,
+    });
+    await reindexQueue(schoolId, bookId);
+
+    await LibraryAuditLog.create({
+        school: schoolId, user: actorId, role: actorRole,
+        actionType: 'RESERVATION_CREATED', entityType: 'Reservation', entityId: created._id,
+    });
+
+    // Re-read for the settled queue position, which is what the member actually
+    // wants to know.
+    const reservation = await LibraryReservation.findById(created._id).lean();
+    return { ok: true, reservation, book, readyNow, policy };
+}
+
 module.exports = {
+    placeReservation,
     MAX_COPIES_PER_ADD, COPY_STATUSES, ACTIVE_ISSUANCE, ACTIVE_RESERVATION, MAX_LOAN_DAYS, BORROWER_ROLES,
     fmtLibDate, getOrCreatePolicy, audit, reserveCopyCodes, bumpBookCounts,
     normIsbn, normText, isValidIsbn, findDuplicateBook, duplicateResponse,

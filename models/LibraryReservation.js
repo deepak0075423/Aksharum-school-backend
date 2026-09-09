@@ -55,6 +55,15 @@ const LibraryReservationSchema = new db.Schema({
         type: Date,
         default: Date.now,
     },
+    // When the reservation reached a terminal state — collected, cancelled or
+    // expired. Without it "collected this month" had no date to count on, and
+    // the row carries no other record of when it stopped being live. Rows
+    // closed before this field existed leave it null and are simply not counted
+    // in a month, which is honest: nobody knows when they closed.
+    closedAt: {
+        type: Date,
+        default: null,
+    },
 });
 
 // Prevent duplicate active reservations for same user+book

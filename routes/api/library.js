@@ -65,6 +65,7 @@ router.post('/issuances/:id/renew', librarianGuard, libCtrl.renewBook);
 
 // Reservations
 router.get('/reservations',                      librarianGuard, libCtrl.getReservations);
+router.post('/reservations',                     librarianGuard, libCtrl.createReservation);
 router.post('/reservations/:id/mark-ready',      librarianGuard, libCtrl.markReservationReady);
 router.delete('/reservations/:id',               librarianGuard, libCtrl.cancelReservation);
 

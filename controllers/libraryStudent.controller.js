@@ -6,7 +6,7 @@ const LibraryFine        = require('../models/LibraryFine');
 const LibraryAuditLog    = require('../models/LibraryAuditLog');
 const User               = require('../models/User');
 const {
-    ACTIVE_ISSUANCE, getOrCreatePolicy, reindexQueue, activeReservation,
+    ACTIVE_ISSUANCE, getOrCreatePolicy, reindexQueue, activeReservation, placeReservation,
     sweepOverdue, expireStaleHolds, renewIssuance, fmtLibDate,
     notifyLibraryStaff, attachFineSummary,
 } = require('../services/libraryRules');
@@ -78,63 +78,14 @@ exports.search = async (req, res) => {
 exports.reserve = async (req, res) => {
     try {
         const { bookId } = req.params;
-        const book = await LibraryBook.findOne({ _id: bookId, school: req.schoolId }).lean();
-        if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
-
-        // A title with nothing behind it is a catalogue stub, not something a
-        // queue can ever be served from.
-        if ((book.totalCopies || 0) === 0)
-            return res.status(400).json({ success: false, message: 'This book has no copies in the library yet' });
-
-        const policy = await getOrCreatePolicy(req.schoolId);
-        await expireStaleHolds(req.schoolId, bookId, { actor: req.userId, actorRole: req.userRole });
-
-        const existing = await activeReservation(req.schoolId, req.userId, bookId);
-        if (existing) return res.status(400).json({ success: false, message: 'You have already reserved this book' });
-
-        // Holding a copy and queueing for the same title means asking for two
-        // copies of one book — the same rule the issue counter enforces.
-        if (!policy.allowMultipleCopiesPerUser) {
-            const holding = await LibraryIssuance.findOne({
-                school: req.schoolId, issuedTo: req.userId, book: bookId, status: { $in: ACTIVE_ISSUANCE } }).lean();
-            if (holding) return res.status(400).json({ success: false, message: 'You already have this book — return it before reserving another copy' });
-        }
-
-        const activeReservations = await LibraryReservation.countDocuments({
-            school: req.schoolId, reservedBy: req.userId, status: { $in: ['pending', 'ready'] } });
-        const maxRes = policy.maxReservationsPerUser || 3;
-        if (activeReservations >= maxRes)
-            return res.status(400).json({ success: false, message: `You already have ${activeReservations} of a maximum ${maxRes} reservations` });
-
-        if (policy.blockIssueOnPendingFine) {
-            const fines = await LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' }).select('amount').lean();
-            if (fines.length) {
-                const owed = fines.reduce((sum, f) => sum + (f.amount || 0), 0);
-                return res.status(400).json({ success: false, message: `Clear your ₹${owed} in library fines before reserving` });
-            }
-        }
-
-        // Position is left at its default and assigned by reindexQueue below,
-        // ordered by reservedAt — reading "max + 1" here used to race.
-        const readyNow = (book.availableCopies || 0) > 0;
-        const created = await LibraryReservation.create({
-            school: req.schoolId, book: bookId, reservedBy: req.userId,
-            status: readyNow ? 'ready' : 'pending',
-            readyAt:   readyNow ? new Date() : null,
-            expiresAt: readyNow
-                ? new Date(Date.now() + (policy.reservationExpiryDays || 2) * 86400000)
-                : null,
+        // Every rule lives in placeReservation, so the desk and the member's own
+        // screen cannot drift apart on what a reservation is allowed to be.
+        const result = await placeReservation({
+            schoolId: req.schoolId, bookId, userId: req.userId,
+            actorId: req.userId, actorRole: req.userRole, self: true,
         });
-        await reindexQueue(req.schoolId, bookId);
-
-        await LibraryAuditLog.create({
-            school: req.schoolId, user: req.userId, role: req.userRole,
-            actionType: 'RESERVATION_CREATED', entityType: 'Reservation', entityId: created._id,
-        });
-
-        // Re-read for the settled queue position, which is what the member
-        // actually wants to know.
-        const reservation = await LibraryReservation.findById(created._id).lean();
+        if (!result.ok) return res.status(result.status).json({ success: false, message: result.message });
+        const { reservation, book, readyNow } = result;
 
         // A silent success reads as a failure — say what happened and where
         // they stand.
@@ -170,7 +121,7 @@ exports.cancelReservation = async (req, res) => {
     try {
         const reservation = await LibraryReservation.findOneAndUpdate(
             { _id: req.params.id, reservedBy: req.userId, school: req.schoolId, status: { $in: ['pending','ready'] } },
-            { status: 'cancelled' },
+            { status: 'cancelled', closedAt: new Date() },
             { new: true }
         ).lean();
         if (!reservation) return res.status(404).json({ success: false, message: 'Active reservation not found' });
