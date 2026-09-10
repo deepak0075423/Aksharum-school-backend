@@ -85,6 +85,11 @@ router.get('/reports/member',     librarianGuard, repCtrl.memberHistory);
 router.get('/reports/accession',  librarianGuard, repCtrl.accessionRegister);
 router.get('/reports/stock-take', librarianGuard, repCtrl.stockTake);
 router.get('/reports/fines',      librarianGuard, repCtrl.fineLedger);
+router.get('/reports/usage',      librarianGuard, repCtrl.usageStatistics);
+// The register's next action: the overdue notice a librarian would otherwise
+// have to chase by hand, sent to the borrower and — for a student — to their
+// parents, exactly the audience the automatic overdue notice reaches.
+router.post('/reports/overdue/remind', librarianGuard, repCtrl.remindOverdue);
 
 // Policy — administrative access to the LIBRARY module, not the school.
 // This was requireRole('school_admin'), which refuses a teacher whose
