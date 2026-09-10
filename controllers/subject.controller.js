@@ -6,6 +6,7 @@ const Class               = require('../models/Class');
 const ClassSection        = require('../models/ClassSection');
 const AcademicYear        = require('../models/AcademicYear');
 const TeacherProfile        = require('../models/TeacherProfile');
+const User                  = require('../models/User');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
 
@@ -136,6 +137,151 @@ exports.getSubjects = async (req, res) => {
             academicYear: { _id: String(year._id), yearName: year.yearName },
             inUse:    withUsage.filter((s) => s.usage.inUse).length,
             notInUse: withUsage.filter((s) => !s.usage.inUse).length,
+        });
+    } catch (e) { err(res, e); }
+};
+/**
+ * One subject, with everywhere it is actually used.
+ *
+ * The list already says whether a subject is in use; this says *where*. A
+ * subject reaches a section two ways — the class carries it (ClassSubject) and
+ * a section has a teacher for it (SectionSubjectTeacher) — and the two do not
+ * have to agree: a class can carry a subject nobody teaches yet, and a stray
+ * teacher assignment can outlive the class link. Both are folded into one tree
+ * of classes → sections → teachers, and each node says which of the two it
+ * came from, because that difference is the work still to be done.
+ */
+exports.getSubject = async (req, res) => {
+    try {
+        const subject = await attachTeacherDetail(
+            await Subject.findOne({ _id: req.params.id, school: req.schoolId })
+                .populate('teachers', 'name email').lean(),
+        );
+        if (!subject) return err(res, 'Subject not found', 404);
+
+        const year = subject.academicYear
+            ? await AcademicYear.findOne({ _id: subject.academicYear, school: req.schoolId })
+                .select('yearName status').lean()
+            : null;
+
+        const [links, assignments] = await Promise.all([
+            ClassSubject.find({ subject: subject._id }).select('class').lean(),
+            SectionSubjectTeacher.find({ subject: subject._id }).select('section teacher').lean(),
+        ]);
+
+        // The sections named by the teacher assignments, and the classes named
+        // by either side. Loaded once each rather than per row.
+        const sections = assignments.length
+            ? await ClassSection.find({ _id: { $in: [...new Set(assignments.map((a) => String(a.section)))] } })
+                .select('sectionName class currentCount status').lean()
+            : [];
+        const classIds = [...new Set([
+            ...links.map((l) => String(l.class)),
+            ...sections.map((x) => String(x.class)),
+        ])];
+        const classes = classIds.length
+            ? await Class.find({ _id: { $in: classIds }, school: req.schoolId })
+                .select('className classNumber').lean()
+            : [];
+
+        const teacherIds = [...new Set(assignments.map((a) => String(a.teacher)).filter(Boolean))];
+        const teacherRows = teacherIds.length
+            ? await User.find({ _id: { $in: teacherIds } }).select('name email').lean()
+            : [];
+        const teacherById = new Map(teacherRows.map((t) => [String(t._id), t]));
+
+        // section id -> the teachers assigned to teach this subject there
+        const bySection = new Map();
+        for (const a of assignments) {
+            const k = String(a.section);
+            if (!bySection.has(k)) bySection.set(k, []);
+            const t = teacherById.get(String(a.teacher));
+            if (t) bySection.get(k).push({ _id: String(t._id), name: t.name, email: t.email });
+        }
+
+        const carried = new Set(links.map((l) => String(l.class)));
+        const sectionsOfClass = new Map();
+        for (const sec of sections) {
+            const k = String(sec.class);
+            if (!sectionsOfClass.has(k)) sectionsOfClass.set(k, []);
+            sectionsOfClass.get(k).push({
+                _id: String(sec._id),
+                sectionName: sec.sectionName,
+                studentCount: sec.currentCount || 0,
+                status: sec.status || 'active',
+                teachers: (bySection.get(String(sec._id)) || [])
+                    .sort((a, b) => String(a.name).localeCompare(String(b.name))),
+            });
+        }
+
+        const tree = classes.map((c) => ({
+            _id: String(c._id),
+            className: c.className,
+            classNumber: c.classNumber,
+            carried: carried.has(String(c._id)),   // the class list says it teaches this
+            sections: (sectionsOfClass.get(String(c._id)) || [])
+                .sort((a, b) => String(a.sectionName).localeCompare(String(b.sectionName), 'en', { numeric: true })),
+        })).sort((a, b) => (a.classNumber ?? 999) - (b.classNumber ?? 999)
+            || String(a.className).localeCompare(String(b.className), 'en', { numeric: true }));
+
+        const sectionCount = sections.length;
+
+        /*
+         * Everyone the subject touches, in one list.
+         *
+         * There are two different populations and neither is a subset of the
+         * other: `subject.teachers` is the catalogue pool — the shortlist a
+         * section picks from — while SectionSubjectTeacher is who is actually
+         * in front of a class. A teacher can be in the pool and teach nothing,
+         * and a section can be handed to somebody who was never added to the
+         * pool. Listing only the pool is what made a subject with five staffed
+         * sections read as "nobody is listed against this subject yet", so the
+         * two are merged and each person says which of the two they are.
+         */
+        const people = new Map();
+        const person = (id) => {
+            const k = String(id);
+            if (!people.has(k)) people.set(k, { _id: k, name: '', email: '', inPool: false, sections: [] });
+            return people.get(k);
+        };
+        for (const t of subject.teachers || []) {
+            Object.assign(person(t._id), {
+                name: t.name || '', email: t.email || '',
+                designation: t.designation || '', department: t.department || '',
+                employeeId: t.employeeId || '', inPool: true,
+            });
+        }
+        for (const t of teacherRows) {
+            const p = person(t._id);
+            if (!p.name) { p.name = t.name || ''; p.email = t.email || ''; }
+        }
+        for (const c of tree) {
+            for (const sec of c.sections) {
+                for (const t of sec.teachers) person(t._id).sections.push(`${c.className} – ${sec.sectionName}`);
+            }
+        }
+        // The assignment-only names arrived from User and carry no profile, so
+        // they need the same second lookup the pool got.
+        await attachTeacherDetail({ teachers: [...people.values()].filter((p) => !p.inPool) });
+
+        const roster = [...people.values()].sort((a, b) =>
+            b.sections.length - a.sections.length || String(a.name).localeCompare(String(b.name)));
+
+        ok(res, {
+            ...subject,
+            academicYear: year
+                ? { _id: String(year._id), yearName: year.yearName, status: year.status }
+                : null,
+            usage: {
+                inUse:        !!(links.length || assignments.length),
+                classCount:   tree.length,
+                sectionCount,
+                teacherCount: teacherIds.length,
+                classes:      tree.map((c) => c.className).sort(),
+                sections:     tree.flatMap((c) => c.sections.map((x) => `${c.className} – ${x.sectionName}`)),
+            },
+            classes: tree,
+            people: roster,
         });
     } catch (e) { err(res, e); }
 };
@@ -383,11 +529,48 @@ exports.assignSubjectToSections = async (req, res) => {
     }
 };
 
+/**
+ * The other half of ensureClassSubject.
+ *
+ * Assigning a teacher writes the class-level link as a consequence; removing
+ * the last one has to take it away again, or the class goes on carrying a
+ * subject nobody teaches anywhere in it. That is not cosmetic — ClassSubject is
+ * what the parent portal lists as the child's subjects, what the timetable
+ * generator plans around, and what the year import copies forward, so a
+ * left-behind link seeds next year with a subject that was dropped.
+ *
+ * Scoped to the whole CLASS, not the section: Hindi is still taught in Class 5
+ * while any of its sections has a teacher for it. Only when the last one goes
+ * does the class stop carrying it.
+ *
+ * Returns what happened so the caller can say so rather than leaving the admin
+ * to notice a second change they did not ask for.
+ */
+async function pruneClassSubject(sectionId, subjectId) {
+    const none = { unassigned: false, className: '', remaining: 0 };
+    if (!sectionId || !subjectId) return none;
+
+    const section = await ClassSection.findById(sectionId).select('class').lean();
+    if (!section?.class) return none;
+
+    const siblings = await ClassSection.find({ class: section.class }).select('_id').lean();
+    const remaining = await SectionSubjectTeacher.countDocuments({
+        section: { $in: siblings.map((x) => x._id) },
+        subject: subjectId,
+    });
+    if (remaining > 0) return { ...none, remaining };
+
+    const cls = await Class.findById(section.class).select('className').lean();
+    await ClassSubject.deleteOne({ class: section.class, subject: subjectId });
+    return { unassigned: true, className: cls?.className || '', remaining: 0 };
+}
+
 exports.removeSectionSubject = async (req, res) => {
     try {
-        await SectionSubjectTeacher.deleteOne({ section: req.params.sectionId, subject: req.params.subjectId });
+        await SectionSubjectTeacher.deleteMany({ section: req.params.sectionId, subject: req.params.subjectId });
+        const pruned = await pruneClassSubject(req.params.sectionId, req.params.subjectId);
         syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
-        res.json({ success: true });
+        res.json({ success: true, ...pruned });
     } catch (e) { err(res, e); }
 };
 exports.removeSectionSubjectTeacher = async (req, res) => {
@@ -397,7 +580,10 @@ exports.removeSectionSubjectTeacher = async (req, res) => {
             subject: req.params.subjectId,
             teacher: req.params.teacherId,
         });
+        // Was that the last teacher this subject had anywhere in the class? Then
+        // the class no longer teaches it either.
+        const pruned = await pruneClassSubject(req.params.sectionId, req.params.subjectId);
         syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
-        res.json({ success: true });
+        res.json({ success: true, ...pruned });
     } catch (e) { err(res, e); }
 };

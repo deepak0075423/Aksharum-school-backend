@@ -409,14 +409,24 @@ function splitPaidAndLop(policy, leaveType, totalDays, spendable) {
 // ── Approver RBAC (mirrors compOffService, driven by this policy) ─────────────
 
 /**
- * @param designation optional pre-resolved designation. Callers that ask about
- *        many leave types in a row should pass it — without it this reloads the
- *        same profile once per type, which is how the approver queue managed
- *        ten identical lookups on every open.
+ * May this user sign off leave of this type?
+ *
+ * @param opts.designation optional pre-resolved designation. Callers that ask
+ *        about many leave types in a row should pass it — without it this
+ *        reloads the same profile once per type, which is how the approver
+ *        queue managed ten identical lookups on every open.
+ * @param opts.moduleAdmin true when the caller holds ADMINISTRATIVE access to
+ *        the leave module. "Admin" in an approval mode means an administrator
+ *        of leave, not the school_admin role: a designation granting admin on
+ *        the leave module puts a teacher on the module's admin screens, and
+ *        without this they would be refused by every action on them.
  */
-async function canApprove(userId, userRole, schoolId, policy, designation) {
+async function canApprove(userId, userRole, schoolId, policy, opts = {}) {
+    const { designation, moduleAdmin = false } = typeof opts === 'string'
+        ? { designation: opts }          // legacy positional form
+        : opts;
     const mode = policy.approval.mode;
-    const isAdmin = userRole === 'school_admin';
+    const isAdmin = userRole === 'school_admin' || moduleAdmin === true;
     if (mode === 'admin') return isAdmin;
     if (mode === 'both' && isAdmin) return true;
 

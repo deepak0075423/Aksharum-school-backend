@@ -631,29 +631,89 @@ exports.teacherDownloadTimetable = async (req, res) => {
     }
 };
 
+/**
+ * A section's own weekly timetable, for a teacher attached to that section.
+ *
+ * Attached means any of the three roles, not just the two that own the
+ * section: a subject teacher asking "when do I have them, and what else does
+ * this class have that day" is asking about the section's timetable, and
+ * refusing them left the My Section page with a button that could not work.
+ *
+ * `?section=` names which one. Without it the pick is unchanged — the first
+ * section of theirs that actually has a timetable, preferring the active year
+ * — because that is what "My Class" has always meant here.
+ */
 exports.teacherClassTimetable = async (req, res) => {
     try {
         const AcademicYear = require('../models/AcademicYear');
+        const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
         const activeYear   = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
 
-        // Find ALL sections where this teacher is class teacher or substitute
-        const allSections = await ClassSection.find({
-            school: req.schoolId,
-            $or: [
-                { classTeacher:      req.userId },
-                { substituteTeacher: req.userId },
-            ],
-        }).populate('class').lean();
+        // Every section this teacher is attached to: class teacher or vice on
+        // the section itself, or holding a subject in it.
+        const [own, links] = await Promise.all([
+            ClassSection.find({
+                school: req.schoolId,
+                $or: [
+                    { classTeacher:      req.userId },
+                    { substituteTeacher: req.userId },
+                ],
+            }).populate('class').lean(),
+            SectionSubjectTeacher.find({ teacher: req.userId }).select('section').lean(),
+        ]);
+        const ownIds  = new Set(own.map((s) => String(s._id)));
+        const linkIds = [...new Set(links.map((l) => String(l.section)).filter((id) => id && !ownIds.has(id)))];
+        // Re-read school-scoped: a subject link carries no school of its own.
+        const extra = linkIds.length
+            ? await ClassSection.find({ _id: { $in: linkIds }, school: req.schoolId }).populate('class').lean()
+            : [];
 
-        if (!allSections.length) return ok(res, { section: null, timetable: null, entries: [], days: [] });
+        // This year's sections. Classes repeat every year — a teacher who has
+        // taken Class 1 – A four years running holds four rows with the same
+        // name — so without this the picker is a list of identical labels
+        // pointing at four different grids. A teacher whose only attachment is
+        // to an older year still gets it rather than an empty page.
+        const attached = [...own, ...extra];
+        const thisYear = activeYear
+            ? attached.filter((s) => String(s.academicYear) === String(activeYear._id))
+            : attached;
+        const allSections = thisYear.length ? thisYear : attached;
 
-        // Pick the section that has a timetable — prefer active year, fallback to any.
-        // One batched lookup per phase instead of one Timetable.findOne per section.
+        const roleOf = (sec) => (String(sec.classTeacher || '') === String(req.userId) ? 'Class Teacher'
+            : String(sec.substituteTeacher || '') === String(req.userId) ? 'Vice Class Teacher'
+                : 'Subject Teacher');
+        const listed = allSections.map((sec) => ({
+            _id:         sec._id,
+            sectionName: sec.sectionName,
+            className:   sec.class?.className || '',
+            role:        roleOf(sec),
+        }));
+
+        if (!allSections.length) {
+            return ok(res, { section: null, sections: [], timetable: null, entries: [], days: [] });
+        }
+
         let section = null;
         let tt      = null;
         const sectionIds = allSections.map((s) => s._id);
 
-        if (activeYear) {
+        // Asked for one by name: it must be one of theirs, and it is shown even
+        // when it has no timetable yet — "not built" is the honest answer, not
+        // somebody else's grid.
+        const wanted = req.query.section || req.query.sectionId;
+        if (wanted) {
+            section = allSections.find((s) => String(s._id) === String(wanted)) || null;
+            if (!section) {
+                return err(res, 'You are not attached to that section', 403);
+            }
+            tt = (activeYear && await Timetable.findOne({ section: section._id, academicYear: activeYear._id }).lean())
+                || await Timetable.findOne({ section: section._id }).lean();
+        }
+
+        // Otherwise pick the section that has a timetable — prefer active year,
+        // fallback to any. One batched lookup per phase instead of one
+        // Timetable.findOne per section.
+        if (!section && activeYear) {
             const tts = await Timetable.find({ section: { $in: sectionIds }, academicYear: activeYear._id }).lean();
             const bySection = new Map(tts.map((t) => [String(t.section), t]));
             for (const sec of allSections) {
@@ -661,7 +721,7 @@ exports.teacherClassTimetable = async (req, res) => {
                 if (found) { section = sec; tt = found; break; }
             }
         }
-        if (!tt) {
+        if (!section && !tt) {
             const tts = await Timetable.find({ section: { $in: sectionIds } }).lean();
             const bySection = new Map(tts.map((t) => [String(t.section), t]));
             for (const sec of allSections) {
@@ -686,17 +746,16 @@ exports.teacherClassTimetable = async (req, res) => {
         const school = await School.findById(req.schoolId).select('leaveSettings').lean();
         const days   = daysForSection(section, school);
 
-        const role = String(section.classTeacher || '') === String(req.userId)
-            ? 'Class Teacher'
-            : 'Substitute Teacher';
-
         ok(res, {
             section: {
                 _id:         section._id,
                 sectionName: section.sectionName,
                 className:   section.class?.className || '',
-                role,
+                role:        roleOf(section),
             },
+            // Every section they could switch to, so the page can offer the
+            // choice rather than only ever showing the one it guessed.
+            sections: listed,
             timetable: tt,
             entries,
             days,

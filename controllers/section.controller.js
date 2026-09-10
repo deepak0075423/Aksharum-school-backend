@@ -4,6 +4,7 @@ const Attendance          = require('../models/Attendance');
 const ClassAnnouncement   = require('../models/ClassAnnouncement');
 const ClassMonitor        = require('../models/ClassMonitor');
 const StudentProfile      = require('../models/StudentProfile');
+const { notify, withParents } = require('../services/notifyService');
 const AttendanceRecord    = require('../models/AttendanceRecord');
 
 const ok  = (res, d, s=200) => res.status(s).json({ success: true, data: d });
@@ -23,9 +24,12 @@ const uniqFind = (Model, ids, select) => {
  * announcements.
  *
  * Classes repeat every academic year — this school has four rows called
- * "Class 1" — so every row carries its year and the active year sorts first.
- * Rows from another year are kept rather than hidden: a section a teacher is
- * really attached to should not vanish, it just must not read as today's work.
+ * "Class 1" — and only the ACTIVE year is this teacher's current work, so
+ * everything here is filtered to it. Last year's Class 1 is not a section they
+ * take attendance for or post announcements to, and showing it next to the
+ * live one made the page read as though they held twice as many classes as
+ * they do. When the school has no active year there is nothing to filter by,
+ * so the unfiltered set stands rather than an empty page.
  *
  * The section also keeps its populated `class` object, because the documents
  * page and the mobile notification screen read `section.class.className`.
@@ -55,7 +59,14 @@ exports.getMySection = async (req, res) => {
         const extra   = linkIds.length
             ? await ClassSection.find({ _id: { $in: linkIds }, school: req.schoolId }).lean()
             : [];
-        const all = [...own, ...extra];
+
+        // This year only. Applied here, before anything is shaped, so the
+        // panels, the counts and the announcements all agree on the same set.
+        const thisYearOnly = (rows) => (activeYear
+            ? rows.filter((s) => String(s.academicYear) === String(activeYear._id))
+            : rows);
+        const mine = thisYearOnly(own);
+        const all  = [...mine, ...thisYearOnly(extra)];
 
         const [classes, years, subjects] = await Promise.all([
             uniqFind(Class,        all.map((s) => s.class),        'className classNumber'),
@@ -86,8 +97,8 @@ exports.getMySection = async (req, res) => {
             || ((a.classNumber == null ? 999 : a.classNumber) - (b.classNumber == null ? 999 : b.classNumber))
             || String(a.sectionName).localeCompare(String(b.sectionName));
 
-        const classTeacherOf = own.filter((s) => String(s.classTeacher) === me).map(shape).sort(order);
-        const viceOf         = own
+        const classTeacherOf = mine.filter((s) => String(s.classTeacher) === me).map(shape).sort(order);
+        const viceOf         = mine
             .filter((s) => String(s.substituteTeacher) === me && String(s.classTeacher) !== me)
             .map(shape).sort(order);
 
@@ -96,7 +107,7 @@ exports.getMySection = async (req, res) => {
         const subjectClasses = links
             .map((l) => {
                 const sec = secMap[String(l.section)];
-                if (!sec) return null;                          // another school's section
+                if (!sec) return null;                          // another school's, or another year's
                 const key = String(l.section) + ':' + String(l.subject);
                 if (seen.has(key)) return null;                 // same subject twice over
                 seen.add(key);
@@ -129,7 +140,12 @@ exports.getMySection = async (req, res) => {
         ok(res, {
             section: primary,
             role:    classTeacherOf.length ? 'classTeacher' : (viceOf.length ? 'vice' : null),
-            canPost: classTeacherOf.length > 0,
+            // Anyone attached to a section may post to it — a vice class
+            // teacher covering the class and a subject teacher with something
+            // to tell them both have a reason to. Taking one down is the
+            // narrower right (author, or the class teacher), which the
+            // announcement rows decide per row.
+            canPost: !!primary,
             classTeacherOf, viceOf, subjectClasses,
             monitors, announcements,
             currentYear: activeYear ? activeYear.yearName : '',
@@ -138,38 +154,200 @@ exports.getMySection = async (req, res) => {
 };
 
 /**
+ * Every section this teacher is attached to this year, and how.
+ *
+ * A teacher reaches a section three ways — class teacher, vice class teacher,
+ * subject teacher — and every per-section action below authorizes against this
+ * one list rather than re-deriving the rule. `role` is the strongest of the
+ * three, because a class teacher who also takes a subject there is still the
+ * class teacher.
+ *
+ * Year-filtered to match getMySection: last year's Class 1 is not a section
+ * anyone posts to or marks attendance for. A school with no active year cannot
+ * be filtered by one, so the unfiltered set stands.
+ */
+async function attachedSections(req) {
+    const AcademicYear = require('../models/AcademicYear');
+    const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
+
+    const [own, links, activeYear] = await Promise.all([
+        ClassSection.find({
+            school: req.schoolId,
+            $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
+        }).lean(),
+        SectionSubjectTeacher.find({ teacher: req.userId }).select('section').lean(),
+        AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean(),
+    ]);
+
+    const ownIds  = new Set(own.map((s) => String(s._id)));
+    const linkIds = [...new Set(links.map((l) => String(l.section)).filter((id) => id && !ownIds.has(id)))];
+    const extra   = linkIds.length
+        // Re-read school-scoped: a subject link carries no school of its own.
+        ? await ClassSection.find({ _id: { $in: linkIds }, school: req.schoolId }).lean()
+        : [];
+
+    const me = String(req.userId);
+    const rows = [...own, ...extra]
+        .filter((s) => !activeYear || String(s.academicYear) === String(activeYear._id))
+        .map((s) => ({
+            ...s,
+            role: String(s.classTeacher) === me ? 'classTeacher'
+                : String(s.substituteTeacher) === me ? 'vice'
+                    : 'subject',
+        }));
+    return rows;
+}
+
+/**
+ * The section a per-section action is aimed at.
+ *
+ * `section` in the query or body names it and is checked against what the
+ * teacher actually holds — never trusted. Without it the caller means "my
+ * own class", which is the section they are class teacher of, then the one
+ * they cover as vice, then anything else they are attached to.
+ */
+function pickSection(rows, wanted, allowed = null) {
+    const usable = allowed ? rows.filter((s) => allowed.includes(s.role)) : rows;
+    if (wanted) return usable.find((s) => String(s._id) === String(wanted)) || null;
+    return usable.find((s) => s.role === 'classTeacher')
+        || usable.find((s) => s.role === 'vice')
+        || usable[0]
+        || null;
+}
+
+/** How a section is named back to the client: "Class 4 (Section A)". */
+async function labelSections(req, rows) {
+    const Class = require('../models/Class');
+    const classes = await uniqFind(Class, rows.map((s) => s.class), 'className classNumber');
+    const cMap = byId(classes);
+    return rows.map((s) => {
+        const c = cMap[String(s.class)] || null;
+        const cls = c?.className || (c?.classNumber != null ? `Class ${c.classNumber}` : 'Class');
+        return {
+            _id: String(s._id),
+            sectionName: s.sectionName,
+            className: c?.className || '',
+            classNumber: c?.classNumber ?? null,
+            role: s.role,
+            label: `${cls} (Section ${s.sectionName})`,
+        };
+    });
+}
+
+/**
  * The model's text column is `message`. The web form posted `body`, which has
  * no column — the row saved with a title and no text at all, and the student's
  * class page then rendered an announcement with an empty body. Accept every
  * name the callers use and write the one the schema actually has.
+ *
+ * `section` says which class is being told. Anyone attached to a section may
+ * post to it — a vice class teacher covering the class and a subject teacher
+ * who has to tell them about tomorrow's practical both have something to say
+ * — and without it the teacher's own class is meant, which is what every
+ * caller before this parameter existed meant.
  */
 exports.createAnnouncement = async (req, res) => {
     try {
         const title   = String(req.body.title || '').trim();
         const message = String(req.body.message || req.body.content || req.body.body || '').trim();
         if (!title && !message) return err(res, 'Announcement text is required', 400);
-        const mySection = await ClassSection.findOne({ classTeacher: req.userId, school: req.schoolId }).lean();
+
+        const rows    = await attachedSections(req);
+        const wanted  = req.body.section || req.body.sectionId;
+        const target  = pickSection(rows, wanted);
         // With no section there is nothing to post to, and a sectionless
         // announcement belongs to every class and to none.
-        if (!mySection) return err(res, 'You are not the class teacher of any section', 403);
+        if (!target) {
+            return err(res, wanted
+                ? 'You are not attached to that section'
+                : 'You are not attached to any section', 403);
+        }
         const ann = await ClassAnnouncement.create({
-            section:   mySection._id,
+            section:   target._id,
             createdBy: req.userId,
             title:     title || message.slice(0, 80),
             message:   message || title,
             status:    'active',
         });
-        ok(res, ann, 201);
+
+        // An announcement nobody is told about is a note in a drawer. It goes
+        // to the students of the section and their parents — both see it on
+        // their class page, which is where the 'section' link type lands them —
+        // and to the class teacher when somebody else posted to their board.
+        const [label] = await labelSections(req, [target]);
+        const students = await studentsOfSection(target);
+        const recipients = await withParents(students);
+        if (target.classTeacher && String(target.classTeacher) !== String(req.userId)) {
+            recipients.push(String(target.classTeacher));
+        }
+        notify({
+            school:     req.schoolId,
+            sender:     req.userId,
+            senderRole: req.userRole || 'teacher',
+            title:      `📣 ${ann.title}`,
+            body:       `${ann.message}\n\nPosted to ${label?.label || 'your class'} by ${req.user?.name || 'your teacher'}.`,
+            recipients,
+            link:       { type: 'section', entityId: target._id },
+        });
+
+        ok(res, { ...ann, notified: recipients.length }, 201);
     } catch (e) { err(res, e); }
 };
+
+/**
+ * Who will actually see an announcement posted to this section.
+ *
+ * A student belongs to a section by either route — the profile's
+ * `currentSection` pointer or the section's own `enrolledStudents` roster — and
+ * the two are not always in step, which is why services/classView.js reads the
+ * pointer first and falls back to the roster. This is that rule run backwards,
+ * so the people notified are exactly the people whose class page will carry it:
+ * a student on the roster whose pointer has since moved to another section is
+ * left out, and one with no profile row at all is kept.
+ */
+async function studentsOfSection(section) {
+    const StudentProfile = require('../models/StudentProfile');
+    const roster = [...new Set((section.enrolledStudents || []).map(String))];
+
+    const profiles = await StudentProfile.find({
+        $or: [
+            { currentSection: section._id },
+            ...(roster.length ? [{ user: { $in: roster } }] : []),
+        ],
+    }).select('user currentSection').lean();
+
+    const seen = new Set(profiles.map((p) => String(p.user)));
+    const ids = new Set(profiles
+        .filter((p) => !p.currentSection || String(p.currentSection) === String(section._id))
+        .map((p) => String(p.user)));
+    for (const id of roster) if (!seen.has(id)) ids.add(id);
+    return [...ids];
+}
+
+/**
+ * Announcements have no school field, so the section is what authorizes the
+ * delete — without one the filter used to collapse to the id alone, which
+ * would reach another section's row.
+ *
+ * Now that three kinds of teacher can post, the rule for taking one down is
+ * that you wrote it, or it is on the board of a class you are the class
+ * teacher of. A subject teacher must not be able to clear the class teacher's
+ * notices off the class page.
+ */
 exports.deleteAnnouncement = async (req, res) => {
     try {
-        // Announcements have no school field — authorize via the teacher's own
-        // section. Without one the filter used to collapse to the id alone,
-        // which would delete another section's announcement.
-        const mySection = await ClassSection.findOne({ classTeacher: req.userId, school: req.schoolId }).lean();
-        if (!mySection) return err(res, 'You are not the class teacher of any section', 403);
-        await ClassAnnouncement.findOneAndDelete({ _id: req.params.id, section: mySection._id });
+        const ann = await ClassAnnouncement.findById(req.params.id).lean();
+        if (!ann) return res.json({ success: true });     // already gone
+
+        const rows = await attachedSections(req);
+        const mine = rows.find((s) => String(s._id) === String(ann.section));
+        if (!mine) return err(res, 'You are not attached to that section', 403);
+
+        const isAuthor = String(ann.createdBy) === String(req.userId);
+        if (!isAuthor && mine.role !== 'classTeacher') {
+            return err(res, 'Only the author or the class teacher can remove this announcement', 403);
+        }
+        await ClassAnnouncement.findOneAndDelete({ _id: ann._id, section: mine._id });
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };
@@ -198,18 +376,29 @@ exports.removeMonitor = async (req, res) => {
 const CAP_STATUS = { present: 'Present', absent: 'Absent', late: 'Late' };
 const capStatus  = (s) => CAP_STATUS[String(s || '').toLowerCase()] || 'Absent';
 
-const teacherSection = (req) => ClassSection.findOne({
-    school: req.schoolId,
-    $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
-}).lean();
+// Daily attendance belongs to the section, so only the two roles that own the
+// section can mark it. A subject teacher sees the class for one period and is
+// not who the day is recorded by.
+const MARKS_ATTENDANCE = ['classTeacher', 'vice'];
 
 exports.getAttendance = async (req, res) => {
     try {
         const { date } = req.query;
-        const mySection = await teacherSection(req);
+        const rows      = await attachedSections(req);
+        const markable  = rows.filter((s) => MARKS_ATTENDANCE.includes(s.role));
+        const mySection = pickSection(rows, req.query.section, MARKS_ATTENDANCE);
+        // Every section this teacher may mark travels with the answer, so the
+        // page can offer the choice instead of silently marking the first one.
+        const sections  = await labelSections(req, markable);
+
         // No section → no students. Guard against find({ currentSection: undefined })
         // which would match all rows and leak the whole school.
-        if (!mySection) return ok(res, { students: [], records: [] });
+        if (!mySection) {
+            return ok(res, {
+                students: [], records: [], sections, section: null,
+                ...(req.query.section ? { refused: 'You do not take attendance for that section' } : {}),
+            });
+        }
 
         const students = await StudentProfile.find({ currentSection: mySection._id })
             .populate('user','name').lean();
@@ -223,7 +412,10 @@ exports.getAttendance = async (req, res) => {
                 records = recs.map(r => ({ ...r, status: String(r.status || '').toLowerCase() }));
             }
         }
-        ok(res, { students, records });
+        ok(res, {
+            students, records, sections,
+            section: sections.find((x) => String(x._id) === String(mySection._id)) || null,
+        });
     } catch (e) { err(res, e); }
 };
 
@@ -232,8 +424,14 @@ exports.markAttendance = async (req, res) => {
         const { date, records } = req.body;
         if (!date || !Array.isArray(records)) return err(res, 'date and records are required', 400);
 
-        const mySection = await teacherSection(req);
-        if (!mySection) return err(res, 'No section assigned to you', 403);
+        const rows      = await attachedSections(req);
+        const wanted    = req.body.section || req.body.sectionId;
+        const mySection = pickSection(rows, wanted, MARKS_ATTENDANCE);
+        if (!mySection) {
+            return err(res, wanted
+                ? 'You do not take attendance for that section'
+                : 'No section assigned to you', 403);
+        }
 
         // Normalize to UTC midnight so the unique (section,date) index behaves
         const attendanceDate = new Date(date + 'T00:00:00.000Z');
@@ -257,7 +455,6 @@ exports.markAttendance = async (req, res) => {
                 const User = require('../models/User');
                 const School = require('../models/School');
                 const { sendAttendanceNotification } = require('../utils/sendEmail');
-                const { notify } = require('../services/notifyService');
                 const school = await School.findById(req.schoolId).select('name').lean();
                 const dateLabel = new Date(date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
                 // Batch-fetch every student profile + parent up front (one query

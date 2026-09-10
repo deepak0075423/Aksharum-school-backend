@@ -116,6 +116,27 @@ exports.update = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Designation not found' });
         }
 
+        // Deactivating is a soft delete: an inactive designation drops off the
+        // dropdown source (syncSchoolNames) and its holders fall back to the
+        // legacy permissions, which is the same silent loss of access a delete
+        // would cause. So it is refused on the same terms, with the same
+        // payload — the client shows exactly who is in the way.
+        if (req.body.isActive === false && row.isActive !== false) {
+            const teachers = await loadTeachers(schoolId, row.name);
+            if (teachers.length > 0) {
+                const n = teachers.length;
+                return res.status(400).json({
+                    success: false,
+                    code: 'DESIGNATION_IN_USE',
+                    action: 'deactivate',
+                    message: `Cannot deactivate "${row.name}" — ${n} teacher${n === 1 ? '' : 's'} still ${n === 1 ? 'has' : 'have'} this designation. Reassign ${n === 1 ? 'them' : 'them all'} to another designation first.`,
+                    designation: row.name,
+                    teacherCount: n,
+                    teachers,
+                });
+            }
+        }
+
         const update = {};
         let renamed = 0;
 
@@ -176,6 +197,8 @@ exports.updateMatrix = async (req, res) => {
         const byId = new Map(rows.map((r) => [String(r._id), r]));
         let saved = 0;
 
+        const heldBack = [];   // deactivations refused because teachers still hold them
+
         for (const item of items) {
             const row = byId.get(String(item._id));
             if (!row) continue;
@@ -185,11 +208,21 @@ exports.updateMatrix = async (req, res) => {
             });
             const update = { permissions: merged };
             if (item.isActive !== undefined) update.isActive = !!item.isActive;
+            // Same rule as the single update — but one blocked row must not
+            // throw away the permission edits made to every other row, so the
+            // deactivation alone is dropped and reported back.
+            if (update.isActive === false && row.isActive !== false) {
+                const held = await svc.countTeachers(schoolId, row.name);
+                if (held > 0) {
+                    delete update.isActive;
+                    heldBack.push({ _id: String(row._id), name: row.name, teacherCount: held });
+                }
+            }
             await Designation.findByIdAndUpdate(row._id, { $set: update });
             saved += 1;
         }
         await svc.invalidate(schoolId);
-        jsonOk(res, { saved });
+        jsonOk(res, { saved, heldBack });
     } catch (err) { jsonErr(res, err); }
 };
 

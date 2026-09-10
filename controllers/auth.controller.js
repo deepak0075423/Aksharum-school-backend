@@ -206,6 +206,17 @@ exports.magicLogin = async (req, res) => {
             { new: false },
         ).populate('school');
         if (!user) return res.status(400).json({ success: false, message: 'Invalid or expired magic link' });
+        // The link may have been issued while the account was still live. It is
+        // burned above either way — a deactivated account must not be able to
+        // retry it — but the same two gates the password login applies still
+        // decide whether anyone gets in.
+        if (!user.isActive) {
+            return res.status(403).json({ success: false, message: 'Account disabled' });
+        }
+        const locked = schoolLockout(user);
+        if (locked) {
+            return res.status(403).json({ success: false, code: locked.code, message: locked.message });
+        }
         const jwtToken = signToken(user);
         const refresh  = signRefresh(user._id);
         res.json({

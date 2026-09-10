@@ -223,6 +223,9 @@ router.get('/sections/:sectionId/timetable/download',  timetableGuard, timetable
 // ── Subjects ────────────────────────────────────────────────────────────────
 router.get('/subjects',          guard, subjectCtrl.getSubjects);
 router.post('/subjects',         guard, subjectCtrl.createSubject);
+// One subject with everywhere it is used — registered after the bare list so
+// '/subjects' is not swallowed, and before ':id' on the write verbs.
+router.get('/subjects/:id',      guard, subjectCtrl.getSubject);
 router.put('/subjects/:id',      guard, subjectCtrl.updateSubject);
 router.delete('/subjects/:id',   guard, subjectCtrl.deleteSubject);
 
@@ -342,6 +345,10 @@ router.get('/results/exams/:id/result',               resultGuard, formalExamCtr
 router.get('/results/sections/:sectionId/subjects',   resultGuard, formalExamCtrl.adminGetSectionSubjects);
 
 // ── Leave ─────────────────────────────────────────────────────────────────────
+// The staff list every leave picker draws from. It is here rather than reusing
+// /admin/teachers because that one is school-admin-only, and a teacher holding
+// ADMIN on the leave module reaches these screens too.
+router.get('/leave/employees',                     leaveGuard, leaveCtrl.adminGetEmployees);
 router.get('/leave/types',                         leaveGuard, leaveCtrl.adminGetLeaveTypes);
 router.post('/leave/types',                        leaveGuard, leaveCtrl.adminCreateLeaveType);
 router.put('/leave/types/:id',                     leaveGuard, leaveCtrl.adminUpdateLeaveType);

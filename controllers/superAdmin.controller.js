@@ -647,8 +647,26 @@ exports.downloadStudentTemplate = (req, res) => {
 
 exports.generateLoginLink = async (req, res) => {
     try {
-        const user = await User.findById(req.params.id).lean();
+        const user = await User.findById(req.params.id).populate('school', 'name isActive').lean();
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        // A magic link is a way past the password, not past the account being
+        // switched off — issuing one for a disabled account would hand back
+        // exactly the access the deactivation withdrew. Same for a whole school
+        // that has been deactivated, which login already refuses.
+        if (!user.isActive) {
+            return res.status(400).json({
+                success: false,
+                code: 'USER_INACTIVE',
+                message: `${user.name || 'This account'} is deactivated — a login link would let them straight back in. Activate the account first.`,
+            });
+        }
+        if (user.role !== 'super_admin' && user.school && user.school.isActive === false) {
+            return res.status(400).json({
+                success: false,
+                code: 'SCHOOL_INACTIVE',
+                message: `${user.school.name || 'Their school'} is deactivated, so nobody in it can sign in. Activate the school first.`,
+            });
+        }
         const token   = crypto.randomBytes(32).toString('hex');
         const expires = new Date(Date.now() + 24 * 60 * 60 * 1000);
         await User.findByIdAndUpdate(req.params.id, {

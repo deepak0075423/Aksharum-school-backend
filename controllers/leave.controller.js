@@ -4,6 +4,7 @@ const LeaveApplication = require('../models/LeaveApplication');
 const LeaveBalance     = require('../models/LeaveBalance');
 const School           = require('../models/School');
 const User             = require('../models/User');
+const TeacherProfile   = require('../models/TeacherProfile');
 const AcademicYear     = require('../models/AcademicYear');
 const XLSX             = require('xlsx');
 const path             = require('path');
@@ -11,6 +12,7 @@ const { notify, schoolAdminIds } = require('../services/notifyService');
 const { resolvePage } = require('../utils/focusPage');
 const compOff          = require('../services/compOffService');
 const leavePolicy      = require('../services/leavePolicyService');
+const designations     = require('../services/designationService');
 // Status change + balance move + ledger row, as one transaction under one lock.
 const { commitTransition, recordAdjustments } = require('../services/leaveBalanceTx');
 // Cross-module effects. Each one is gated on the target module's own flag, so a
@@ -129,6 +131,47 @@ async function ensureBalance(teacherId, schoolId, leaveTypeId, academicYear) {
         { upsert: true, new: true }
     );
 }
+
+// ── Admin: the people leave is administered for ──────────────────────────────
+
+/**
+ * The staff list the leave admin screens pick from.
+ *
+ * It exists because /admin/teachers is school-admin-only: a teacher whose
+ * designation grants ADMIN on the leave module reaches every leave screen and
+ * would find every teacher dropdown on them empty — apply-on-behalf,
+ * allocation, clearing, the request filter. This is the same list, behind the
+ * leave module's own guard, so the module's admin surface is self-contained.
+ */
+exports.adminGetEmployees = async (req, res) => {
+    try {
+        const users = await User.find({ school: req.schoolId, role: 'teacher', isActive: true })
+            .select('name email').sort({ name: 1 }).lean();
+        if (!users.length) return res.json({ success: true, data: [] });
+
+        // employeeId, designation and department live on TeacherProfile, and a
+        // picker that shows a name and an email alone cannot tell two Priya
+        // Sharmas apart.
+        const profiles = await TeacherProfile.find({ user: { $in: users.map((u) => String(u._id)) } })
+            .select('user employeeId designation department').lean();
+        const byUser = new Map(profiles.map((p) => [String(p.user), p]));
+
+        res.json({
+            success: true,
+            data: users.map((u) => {
+                const p = byUser.get(String(u._id));
+                return {
+                    _id: String(u._id),
+                    name: u.name,
+                    email: u.email,
+                    employeeId:  p?.employeeId  || '',
+                    designation: p?.designation || '',
+                    department:  p?.department  || '',
+                };
+            }),
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
 
 // ── Admin: Leave Types ────────────────────────────────────────────────────────
 
@@ -425,16 +468,17 @@ exports.teacherGetPolicies = async (req, res) => {
 exports.teacherGetApprovals = async (req, res) => {
     try {
         const { status = 'pending' } = req.query;
-        const [policies, designation] = await Promise.all([
+        const [policies, designation, moduleAdmin] = await Promise.all([
             leavePolicy.getAllPolicies(req.schoolId),
             // Resolved once and reused — canApprove would otherwise reload the
             // same profile for every leave type in the school.
             leavePolicy.designationOf(req.userId, req.schoolId),
+            designations.isModuleAdmin(req, 'leave'),
         ]);
 
         const mine = [];
         for (const p of policies) {
-            if (await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, p, designation)) {
+            if (await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, p, { designation, moduleAdmin })) {
                 mine.push(p.leaveType._id);
             }
         }
@@ -775,7 +819,8 @@ exports.adminApproveRequest = async (req, res) => {
         // reaches this same handler through the teacher router.
         const policy = await leavePolicy.getPolicy(req.schoolId, app.leaveType);
         if (!policy) return res.status(404).json({ success: false, message: 'Leave type not found' });
-        if (!await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, policy))
+        const moduleAdmin = await designations.isModuleAdmin(req, 'leave');
+        if (!await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, policy, { moduleAdmin }))
             return res.status(403).json({ success: false, message: 'You are not an approver for this leave type' });
 
         const already = (app.approvals || []).some(a => String(a.by) === String(req.userId));
@@ -874,7 +919,8 @@ exports.adminRejectRequest = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Cannot reject in current status' });
 
         const policy = await leavePolicy.getPolicy(req.schoolId, app.leaveType);
-        if (policy && !await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, policy))
+        const moduleAdmin = await designations.isModuleAdmin(req, 'leave');
+        if (policy && !await leavePolicy.canApprove(req.userId, req.userRole, req.schoolId, policy, { moduleAdmin }))
             return res.status(403).json({ success: false, message: 'You are not an approver for this leave type' });
 
         app.status      = 'rejected';

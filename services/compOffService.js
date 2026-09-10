@@ -369,10 +369,18 @@ function snapshotPolicy(policy) {
 
 // ── Approver RBAC ─────────────────────────────────────────────────────────────
 
-/** May this user sign off comp off requests for this school? */
-async function canApprove(userId, userRole, schoolId, policy) {
+/**
+ * May this user sign off comp off requests for this school?
+ *
+ * `moduleAdmin` is true when the caller holds ADMINISTRATIVE access to the leave
+ * module (comp off lives inside it). "Admin" in an approval mode means an
+ * administrator of leave, not the school_admin role — a designation granting
+ * admin on leave puts a teacher on the module's admin screens, and without this
+ * every action on them is refused.
+ */
+async function canApprove(userId, userRole, schoolId, policy, moduleAdmin = false) {
     const mode = policy.approval.mode;
-    const isAdmin = userRole === 'school_admin';
+    const isAdmin = userRole === 'school_admin' || moduleAdmin === true;
     if (mode === 'admin')       return isAdmin;
     if (mode === 'both'  && isAdmin) return true;
 
@@ -706,11 +714,11 @@ async function submitDraft(request, ctx, { reason, compOffDays } = {}) {
  * Record one sign-off. Credit happens only when the last required level lands —
  * a first-of-two approval leaves the balance untouched.
  */
-async function approveRequest(request, ctx, { actorId, actorName, actorRole, comment = '' }) {
+async function approveRequest(request, ctx, { actorId, actorName, actorRole, moduleAdmin = false, comment = '' }) {
     if (request.status !== 'pending') {
         return { ok: false, message: 'Only pending Comp Off requests can be approved' };
     }
-    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy);
+    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin);
     if (!allowed) return { ok: false, message: 'You are not an approver for Comp Off requests' };
 
     const already = (request.approvals || []).some(a => String(a.by) === String(actorId));
@@ -759,11 +767,11 @@ async function approveRequest(request, ctx, { actorId, actorName, actorRole, com
     return { ok: true, request, credited: credit.credited };
 }
 
-async function rejectRequest(request, ctx, { actorId, actorRole, comment = '' }) {
+async function rejectRequest(request, ctx, { actorId, actorRole, moduleAdmin = false, comment = '' }) {
     if (!['pending', 'draft'].includes(request.status)) {
         return { ok: false, message: 'Only pending Comp Off requests can be rejected' };
     }
-    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy);
+    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin);
     if (!allowed) return { ok: false, message: 'You are not an approver for Comp Off requests' };
 
     request.status       = 'rejected';

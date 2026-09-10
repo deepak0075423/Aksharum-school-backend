@@ -267,6 +267,25 @@ async function requestAccess(req) {
 
 const meets = (level, required) => RANK[level || NONE] >= RANK[required || USER];
 
+/**
+ * Does this request carry ADMINISTRATIVE access to `moduleKey`?
+ *
+ * The question a module's own rules should ask when they mean "an administrator
+ * of this module". Testing `userRole === 'school_admin'` is the pre-designation
+ * spelling of it, and it shuts out exactly the teachers a designation was
+ * configured to let in — they reach the module's admin screens through
+ * allowModuleAdmin() and are then refused by the rule underneath.
+ *
+ * School enablement is already folded in by resolveRequestAccess, so a module
+ * the school has switched off is never administrative for anybody.
+ */
+async function isModuleAdmin(req, moduleKey) {
+    if (!isModuleKey(moduleKey)) return false;
+    if (!req?.schoolId && req?.userRole !== 'super_admin') return false;
+    const access = await requestAccess(req);
+    return access?.permissions?.[moduleKey] === ADMIN;
+}
+
 // ── Management (CRUD used by the designation controller) ─────────────────────
 
 // Seeds one row per name in School.designations the first time a school opens
@@ -395,7 +414,7 @@ module.exports = {
     ADMIN, USER, NONE, LEVELS, RANK, DEFAULT_DESIGNATIONS, CACHE_TTL,
     sanitizePermissions, defaultPermissionsFor, emptyPermissions, gate,
     getSnapshot, invalidate, resolveDesignation, resolveFromSnapshot,
-    requestAccess, resolveRequestAccess, meets, teacherDesignation,
+    requestAccess, resolveRequestAccess, meets, isModuleAdmin, teacherDesignation,
     invalidateUser, invalidateUsers,
     ensureSeeded, listWithPermissions, renameProfiles, countTeachers,
     teacherCountsByDesignation, holderCountsByDesignation, syncSchoolNames,

@@ -14,6 +14,7 @@ const User           = require('../models/User');
 const TeacherProfile = require('../models/TeacherProfile');
 const XLSX           = require('xlsx');
 const compOff        = require('../services/compOffService');
+const designations   = require('../services/designationService');
 const { getActiveAcademicYearLabel, remainingOf, utcMidnight } = require('../utils/leaveDays');
 const { resolvePage } = require('../utils/focusPage');
 
@@ -95,7 +96,10 @@ exports.myCompOff = async (req, res) => {
             balanceFor(req.userId, ctx),
         ]);
 
-        const isApprover = await compOff.canApprove(req.userId, req.userRole, req.schoolId, ctx.policy);
+        const isApprover = await compOff.canApprove(
+            req.userId, req.userRole, req.schoolId, ctx.policy,
+            await designations.isModuleAdmin(req, 'leave'),
+        );
 
         ok(res, {
             enabled: true,
@@ -263,6 +267,7 @@ exports.listRequests = async (req, res) => {
         const { page: effectivePage, focusFound } =
             await resolvePage(CompOffRequest, filter, sort, +limit, focus, page);
 
+        const moduleAdmin = await designations.isModuleAdmin(req, 'leave');
         const [items, total, isApprover] = await Promise.all([
             CompOffRequest.find(filter)
                 .populate('teacher', 'name email')
@@ -273,7 +278,7 @@ exports.listRequests = async (req, res) => {
                 .limit(+limit)
                 .lean(),
             CompOffRequest.countDocuments(filter),
-            compOff.canApprove(req.userId, req.userRole, req.schoolId, ctx.policy),
+            compOff.canApprove(req.userId, req.userRole, req.schoolId, ctx.policy, moduleAdmin),
         ]);
 
         ok(res, {
@@ -296,6 +301,9 @@ exports.approve = async (req, res) => {
             actorId:   req.userId,
             actorName: req.user?.name,
             actorRole: req.userRole,
+            // A designation granting admin on the leave module makes a teacher
+            // an administrator of comp off too — it lives inside leave.
+            moduleAdmin: await designations.isModuleAdmin(req, 'leave'),
             comment:   req.body.adminComment || req.body.comment || '',
         });
         if (!result.ok) return bad(res, result.message, result.message?.includes('not an approver') ? 403 : 400);
@@ -318,6 +326,7 @@ exports.reject = async (req, res) => {
 
         const result = await compOff.rejectRequest(request, ctx, {
             actorId: req.userId, actorRole: req.userRole,
+            moduleAdmin: await designations.isModuleAdmin(req, 'leave'),
             comment: req.body.adminComment || req.body.comment || '',
         });
         if (!result.ok) return bad(res, result.message, result.message?.includes('not an approver') ? 403 : 400);
