@@ -1,6 +1,7 @@
 'use strict';
 const Holiday      = require('../models/Holiday');
 const AcademicYear = require('../models/AcademicYear');
+const Class        = require('../models/Class');
 const XLSX         = require('xlsx');
 
 const School = require('../models/School');
@@ -530,14 +531,98 @@ async function getApplicableHolidays(req, res) {
             return true;
         });
 
-        res.json({ success: true, data: visible });
+        // The school's own type list travels with the holidays. A reader has to
+        // name and colour a type the same way the admin screen does, and the
+        // types endpoint is admin-only — so teacher and student views used to
+        // fall back to a hardcoded list of four that no school actually had.
+        res.json({ success: true, data: visible, types: await schoolHolidayTypes(req.schoolId) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 }
 
 exports.adminGetMyHolidays = getApplicableHolidays;
 exports.teacherGetHolidays = getApplicableHolidays;
 exports.studentGetHolidays = getApplicableHolidays;
-exports.parentGetHolidays  = getApplicableHolidays;
+
+/**
+ * A parent's holidays, told per child.
+ *
+ * The old version read `StudentProfile.findOne({ parent })` — **the first child
+ * only**. A parent with two children in different classes saw one child's
+ * class holidays and none of the other's, with nothing on screen to say a
+ * second child existed.
+ *
+ * Every child is collected, and each holiday says which of them it is for:
+ * a school-wide day covers all of them, a class day only the children in that
+ * class. The page can then show one child at a time, or all of them together
+ * with each day labelled.
+ */
+exports.parentGetHolidays = async (req, res) => {
+    try {
+        const ClassSection   = require('../models/ClassSection');
+        const StudentProfile = require('../models/StudentProfile');
+        const User           = require('../models/User');
+
+        const filter = { school: req.schoolId };
+        const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
+        if (activeYear) filter.academicYear = { $in: [activeYear._id, null] };
+
+        const profiles = await StudentProfile.find({ parent: req.userId, school: req.schoolId })
+            .select('user currentSection').lean();
+
+        // Read by hand rather than through populate: on this model it hands back
+        // the bare id, so `profile.user.name` is quietly undefined — which is why
+        // the child list has to be looked up itself.
+        const kidIds = [...new Set(profiles.map((p) => p.user).filter(Boolean).map(String))];
+        const kidUsers = kidIds.length
+            ? await User.find({ _id: { $in: kidIds }, school: req.schoolId }).select('name').lean()
+            : [];
+        const nameOf = Object.fromEntries(kidUsers.map((u) => [String(u._id), u.name]));
+
+        // A child belongs to a class by either route — the section's roster or
+        // the profile's own pointer — and the two are not always in step.
+        const children = [];
+        for (const p of profiles) {
+            const id = p.user ? String(p.user) : '';
+            if (!id || !nameOf[id]) continue;
+            const orConds = [{ enrolledStudents: id }];
+            if (p.currentSection) orConds.push({ _id: p.currentSection });
+            const sections = await ClassSection.find({ $or: orConds }, 'class sectionName').lean();
+
+            const classIds = [...new Set(sections.map((s) => s.class).filter(Boolean).map(String))];
+            const named = await Class.findOne({ _id: { $in: classIds } }).select('className').lean();
+            const section = sections.find((s) => s.sectionName);
+            children.push({
+                _id: id,
+                name: nameOf[id],
+                className: [named?.className, section?.sectionName].filter(Boolean).join(' '),
+                classIds,
+            });
+        }
+
+        const everyone = children.map((c) => c._id);
+        const holidays = await Holiday.find(filter).sort({ startDate: 1 }).lean();
+
+        const visible = [];
+        for (const h of holidays) {
+            const scope = h.applicability?.scope || 'all';
+            if (scope === 'specific_departments') continue;   // staff days; not a parent's business
+            if (scope === 'specific_classes') {
+                const on = (h.applicability?.classes || []).map(String);
+                const who = children.filter((c) => c.classIds.some((id) => on.includes(id))).map((c) => c._id);
+                if (who.length) visible.push({ ...h, forChildren: who });
+                continue;
+            }
+            visible.push({ ...h, forChildren: everyone });
+        }
+
+        res.json({
+            success: true,
+            data: visible,
+            children: children.map(({ classIds, ...c }) => c),
+            types: await schoolHolidayTypes(req.schoolId),
+        });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
 
 // ── Teacher: class-specific holidays for their assigned classes ───────────────
 // Separate endpoint — shows class-specific holidays for classes the teacher is
@@ -571,8 +656,9 @@ exports.teacherGetClassHolidays = async (req, res) => {
             subjectSections.forEach(s => { if (s.class) teacherClassIds.add(s.class.toString()); });
         }
 
+        const types = await schoolHolidayTypes(req.schoolId);
         if (teacherClassIds.size === 0) {
-            return res.json({ success: true, data: [] });
+            return res.json({ success: true, data: [], types, classes: [] });
         }
 
         const classHolidays = await Holiday.find({
@@ -584,7 +670,33 @@ exports.teacherGetClassHolidays = async (req, res) => {
             .sort({ startDate: 1 })
             .lean();
 
-        res.json({ success: true, data: classHolidays });
+        // Only the teacher's own classes are named, even when a holiday also
+        // covers classes they have nothing to do with — the filter above the
+        // list offers what they teach, not the whole school.
+        const mine = new Set([...teacherClassIds]);
+        const rows = await Class.find({ _id: { $in: [...mine] } })
+            .select('className classNumber').sort({ classNumber: 1 }).lean();
+
+        // Classes repeat across academic years, so one teacher's sections can
+        // point at three different rows all called "Class 1". The filter offers
+        // the *name* once, and matches on the name, or picking it would find the
+        // holidays hung on one of those rows and quietly miss the others.
+        const names = [...new Set(rows.map((c) => c.className).filter(Boolean))];
+
+        res.json({
+            success: true,
+            data: classHolidays.map((h) => ({
+                ...h,
+                // Which of the named classes are the reader's own; the rest are
+                // other people's and are counted rather than listed.
+                myClasses: [...new Set((h.applicability?.classes || [])
+                    .filter((c) => mine.has(String(c._id)))
+                    .map((c) => c.className)
+                    .filter(Boolean))],
+            })),
+            types,
+            classes: names,
+        });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
