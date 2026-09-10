@@ -80,10 +80,11 @@ exports.getDashboard = async (req, res) => {
         // numbers that barely move. One grouped query, cached briefly per
         // school — the recent-activity list below stays live.
         const redis = getCacheRedis();
-        // v3: the tiles gained their period comparisons, and the payload gained
-        // the category split and the weekly circulation series — a cached v2
-        // body would keep serving a dashboard missing half its panels.
-        const key   = `lib:dash:v3:${req.schoolId}`;
+        // v4: the tiles gained their period comparisons, the payload gained the
+        // category split and the weekly circulation series, and v4 added the
+        // reader counts — a cached older body would keep serving a dashboard
+        // missing panels the page now expects to find.
+        const key   = `lib:dash:v4:${req.schoolId}`;
         let tiles = null;
         if (redis) {
             try {
@@ -126,7 +127,14 @@ exports.getDashboard = async (req, res) => {
                       AND "dueDate" < now() - interval '7 days'
                       AND ("returnDate" IS NULL OR "returnDate" > now() - interval '7 days'))                                     AS "overdueLastWeek",
                    (SELECT count(*) FROM "${LibraryReservation.tableName}" WHERE "school" = $1
-                      AND "status" = ANY($2::text[]) AND "createdAt" < now() - interval '7 days')                                 AS "reservationsLastWeek"`,
+                      AND "status" = ANY($2::text[]) AND "createdAt" < now() - interval '7 days')                                 AS "reservationsLastWeek",
+                   -- Who actually uses the library, against who could. A reader
+                   -- is somebody who has borrowed in the last year, not everyone
+                   -- holding a card.
+                   (SELECT count(DISTINCT "issuedTo") FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+                      AND "issueDate" >= now() - interval '1 year')                                                              AS "activeReaders",
+                   (SELECT count(*) FROM "${User.tableName}" WHERE "school" = $1
+                      AND "role" = ANY('{student,teacher}'::text[]) AND "isActive" IS DISTINCT FROM false)                        AS "members"`,
                     [String(req.schoolId), ACTIVE_RESERVATION],
                 ),
                 // What the collection is made of. Every book has exactly one

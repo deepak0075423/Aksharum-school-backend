@@ -14,22 +14,54 @@ const { notify } = require('../services/notifyService');
 
 // ── Student / Teacher shared endpoints ────────────────────────────────────────
 
+/**
+ * A member's own library page — their loans, fines and holds, plus the two
+ * pieces of catalogue context that are not personal at all: how big the
+ * collection is and what it is made of. Anyone allowed to browse the catalogue
+ * can already see both from Search, so they carry no privilege.
+ *
+ * Everything school-wide — other people's loans, fines across all readers —
+ * stays on GET /library/dashboard behind the module-admin guard.
+ */
 exports.getDashboard = async (req, res) => {
     try {
+        const LibraryBookCopy = require('../models/LibraryBookCopy');
+        const { query } = require('../db/pool');
+
         const policy = await getOrCreatePolicy(req.schoolId);
         await Promise.all([
             sweepOverdue(req.schoolId),
             expireStaleHolds(req.schoolId, null, { actor: req.userId, actorRole: req.userRole }),
         ]);
 
-        const [myIssuances, myFines, myReservations] = await Promise.all([
+        const [myIssuances, myFines, myReservations, counts, cats, history] = await Promise.all([
             LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, status: { $in: ACTIVE_ISSUANCE } })
-                .populate('book', 'title isbn')
+                .populate('book', 'title isbn authors category coverImage')
                 .lean(),
             LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' }).lean(),
             LibraryReservation.find({ school: req.schoolId, reservedBy: req.userId, status: { $in: ['pending','ready'] } })
                 .populate('book', 'title')
                 .lean(),
+            query(
+                `SELECT (SELECT count(*)::int FROM "${LibraryBook.tableName}"     WHERE "school" = $1) AS "totalBooks",
+                        (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}" WHERE "school" = $1) AS "totalCopies",
+                        (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}" WHERE "school" = $1
+                           AND "status" = 'available')                                                 AS "availableCopies"`,
+                [String(req.schoolId)],
+            ),
+            // Every book has exactly one category, so these sum to the title count.
+            query(
+                `SELECT COALESCE(NULLIF(btrim("category"), ''), 'Uncategorised') AS "category",
+                        count(*)::int AS "count"
+                   FROM "${LibraryBook.tableName}" WHERE "school" = $1
+                  GROUP BY 1 ORDER BY 2 DESC, 1 ASC`,
+                [String(req.schoolId)],
+            ),
+            // The member's own last few movements, returns included — the live
+            // list above only ever holds what they still have.
+            LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId })
+                .populate('book', 'title')
+                .sort({ issueDate: -1 }).limit(8).lean(),
         ]);
 
         res.json({
@@ -38,6 +70,12 @@ exports.getDashboard = async (req, res) => {
                 issuedBooks:   myIssuances,
                 pendingFines:  myFines,
                 reservations:  myReservations,
+                catalogue:     counts.rows[0] || { totalBooks: 0, totalCopies: 0, availableCopies: 0 },
+                categories:    cats.rows,
+                history:       history.map((i) => ({
+                    _id: i._id, title: i.book?.title || 'Book', status: i.status,
+                    issueDate: i.issueDate, dueDate: i.dueDate, returnDate: i.returnDate,
+                })),
                 policy:        { maxBooksPerUser: policy.maxBooksPerUser, issueDurationDays: policy.issueDurationDays },
             },
         });
