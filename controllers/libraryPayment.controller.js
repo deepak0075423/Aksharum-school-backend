@@ -79,32 +79,89 @@ async function describeFines(fines) {
 
 // ── What is owed ─────────────────────────────────────────────────────────────
 
+/**
+ * The book a fine was raised over. The charge alone does not say which book was
+ * lost or damaged, and "Damaged book — ₹500" with no title is not something a
+ * member can check against their own memory of what they borrowed.
+ */
+async function attachBooks(fines) {
+    const rows = Array.isArray(fines) ? fines : [];
+    const issuanceIds = [...new Set(rows.map((f) => f.issuance).filter(Boolean).map(String))];
+    if (!issuanceIds.length) return rows.map((f) => ({ ...f, book: null }));
+
+    const issuances = await LibraryIssuance.find({ _id: { $in: issuanceIds } })
+        .select('book issueDate dueDate returnDate').lean();
+    const books = issuances.length
+        ? await LibraryBook.find({ _id: { $in: [...new Set(issuances.map((i) => String(i.book)))] } })
+            .select('title authors isbn coverImage').lean()
+        : [];
+    const bookById = Object.fromEntries(books.map((b) => [String(b._id), b]));
+    const byIssuance = Object.fromEntries(issuances.map((i) => [String(i._id), {
+        book: bookById[String(i.book)] || null,
+        loan: { issueDate: i.issueDate, dueDate: i.dueDate, returnDate: i.returnDate },
+    }]));
+
+    return rows.map((f) => ({
+        ...f,
+        book: byIssuance[String(f.issuance)]?.book || null,
+        loan: byIssuance[String(f.issuance)]?.loan || null,
+    }));
+}
+
 exports.getMyFineSummary = async (req, res) => {
     try {
+        const AcademicYear  = require('../models/AcademicYear');
+        const { getOrCreatePolicy } = require('../services/libraryRules');
+
         const subject = await resolveSubject(req);
         if (!subject.ok) return res.status(subject.status).json({ success: false, message: subject.message });
 
-        const [school, fines] = await Promise.all([
+        const [school, fines, year, policy] = await Promise.all([
             School.findById(req.schoolId).select('paymentGateway').lean(),
             LibraryFine.find({ school: req.schoolId, user: subject.userId })
                 .sort({ createdAt: -1 }).limit(200).lean(),
+            AcademicYear.findOne({ school: req.schoolId, status: 'active' })
+                .select('yearName startDate endDate').lean(),
+            getOrCreatePolicy(req.schoolId),
         ]);
 
         const pending = fines.filter(f => f.status === 'pending');
-        const lines   = await describeFines(pending);
+        const settled = fines.filter(f => f.status !== 'pending');
+        const [pendingLines, settledLines] = await Promise.all([
+            describeFines(pending), describeFines(settled),
+        ]);
         // A part-waived fine shows what is left to pay, not what was charged.
         const owedOf  = Object.fromEntries(pending.map(f => [String(f._id), outstandingOf(f)]));
+
+        const [pendingFull, settledFull] = await Promise.all([
+            attachBooks(pending.map((f, i) => ({
+                ...f,
+                description: pendingLines[i]?.label || '',
+                outstanding: owedOf[String(f._id)] ?? 0,
+            }))),
+            attachBooks(settled.map((f, i) => ({ ...f, description: settledLines[i]?.label || '' }))),
+        ]);
 
         res.json({
             success: true,
             data: {
-                pending: pending.map((f, i) => ({
-                    ...f,
-                    description: lines[i]?.label || '',
-                    outstanding: owedOf[String(f._id)] ?? 0,
-                })),
-                settled: fines.filter(f => f.status !== 'pending'),
+                pending: pendingFull,
+                settled: settledFull,
                 outstanding: pending.reduce((sum, f) => sum + outstandingOf(f), 0),
+                // A checkout that was opened and never confirmed. The money may
+                // or may not have moved, so it is surfaced as something to
+                // follow up rather than counted as paid.
+                pendingPayments: pending.filter(f => f.gatewayOrderId).length,
+                academicYear: year || null,
+                // The rules the charges came from, so the page can state them
+                // instead of linking to a page members cannot open.
+                policy: {
+                    finePerDay:          policy.finePerDay,
+                    gracePeriodDays:     policy.gracePeriodDays,
+                    lostBookFineDays:    policy.lostBookFineDays,
+                    damagedBookFineDays: policy.damagedBookFineDays,
+                    teacherFinesEnabled: policy.teacherFinesEnabled,
+                },
                 // Whether an online payment is even offered, and with what key.
                 gateway: paymentGateway.publicGateway(school?.paymentGateway, 'library'),
                 payingFor: subject.onBehalf ? subject.userId : null,
