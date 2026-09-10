@@ -82,13 +82,41 @@ exports.getDashboard = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+// What the catalogue may be ordered by, and the column behind it. A whitelist,
+// because the value arrives from the query string.
+const SEARCH_SORTS = {
+    title_asc:  { title: 1 },
+    title_desc: { title: -1 },
+    newest:     { createdAt: -1 },
+    available:  { availableCopies: -1 },
+};
+
+/**
+ * The catalogue, as a member browses it.
+ *
+ * The response carries its own filter options (`facets`) and the four counts
+ * above the results (`summary`), so the page never has to guess which
+ * categories exist or hard-code a list that drifts from the collection. A
+ * facet with nothing behind it is simply absent, which is how the page knows
+ * not to offer the filter at all.
+ */
 exports.search = async (req, res) => {
     try {
-        const { q, category } = req.query;
+        const LibraryBookCopy = require('../models/LibraryBookCopy');
+        const { query } = require('../db/pool');
+        const { ACTIVE_RESERVATION: HELD } = require('../services/libraryRules');
+
+        const { q, category, language, subject, availability } = req.query;
         const page  = Math.max(1, Math.floor(Number(req.query.page) || 1));
         const limit = Math.min(100, Math.max(1, Math.floor(Number(req.query.limit) || 20)));
+
         const filter = { school: req.schoolId };
         if (category) filter.category = category;
+        if (language) filter.language = language;
+        if (subject)  filter.subjects = subject;
+        // "Available" is about copies on the shelf, not about the title existing.
+        if (availability === 'available') filter.availableCopies = { $gt: 0 };
+        if (availability === 'out')       filter.availableCopies = { $lte: 0 };
         if (q) filter.$or = [
             { title:     { $regex: q, $options: 'i' } },
             { authors:   { $elemMatch: { $regex: q, $options: 'i' } } },
@@ -96,20 +124,62 @@ exports.search = async (req, res) => {
             { publisher: { $regex: q, $options: 'i' } },
         ];
 
-        const [books, total] = await Promise.all([
-            LibraryBook.find(filter).sort({ title: 1 }).skip((page - 1) * limit).limit(limit).lean(),
+        const sort  = SEARCH_SORTS[req.query.sort] || SEARCH_SORTS.title_asc;
+        const books = LibraryBook.tableName;
+        const sid   = String(req.schoolId);
+
+        const [rows, total, counts, facetRows] = await Promise.all([
+            LibraryBook.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
             LibraryBook.countDocuments(filter),
+            query(
+                `SELECT (SELECT count(*)::int FROM "${books}"                      WHERE "school" = $1) AS "totalBooks",
+                        (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}"  WHERE "school" = $1
+                           AND "status" = 'available')                                                 AS "availableCopies",
+                        (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}"  WHERE "school" = $1
+                           AND "status" = 'issued')                                                    AS "issuedCopies",
+                        (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+                           AND "status" = ANY($2::text[]))                                             AS "reserved"`,
+                [sid, HELD],
+            ),
+            // Every filterable value the collection actually contains. Subjects
+            // are a jsonb array, so they are unnested rather than grouped whole.
+            query(
+                `SELECT 'category' AS "kind", btrim("category") AS "value", count(*)::int AS "count"
+                   FROM "${books}" WHERE "school" = $1 AND COALESCE(btrim("category"), '') <> '' GROUP BY 2
+                  UNION ALL
+                 SELECT 'language', btrim("language"), count(*)::int
+                   FROM "${books}" WHERE "school" = $1 AND COALESCE(btrim("language"), '') <> '' GROUP BY 2
+                  UNION ALL
+                 SELECT 'subject', btrim(s."v"), count(*)::int
+                   FROM "${books}" b,
+                        LATERAL jsonb_array_elements_text(
+                            CASE WHEN jsonb_typeof(b."subjects") = 'array' THEN b."subjects" ELSE '[]'::jsonb END
+                        ) AS s("v")
+                  WHERE b."school" = $1 AND btrim(s."v") <> '' GROUP BY 2
+                  ORDER BY 1, 3 DESC, 2 ASC`,
+                [sid],
+            ),
         ]);
 
-        // Attach user's own reservation status
-        const bookIds      = books.map(b => b._id);
-        const reservations = await LibraryReservation.find({
-            book: { $in: bookIds }, reservedBy: req.userId, status: { $in: ['pending','ready'] },
-        }).lean();
-        const resMap = Object.fromEntries(reservations.map(r => [r.book.toString(), r]));
+        // The member's own place in the queue for anything on this page.
+        const bookIds      = rows.map((b) => b._id);
+        const reservations = bookIds.length
+            ? await LibraryReservation.find({
+                book: { $in: bookIds }, reservedBy: req.userId, status: { $in: HELD },
+            }).lean()
+            : [];
+        const resMap = Object.fromEntries(reservations.map((r) => [String(r.book), r]));
 
-        const data = books.map(b => ({ ...b, myReservation: resMap[b._id.toString()] || null }));
-        res.json({ success: true, data, total, page, pages: Math.ceil(total / limit) });
+        const facets = { category: [], language: [], subject: [] };
+        facetRows.rows.forEach((f) => { if (facets[f.kind]) facets[f.kind].push({ value: f.value, count: f.count }); });
+
+        res.json({
+            success: true,
+            data:    rows.map((b) => ({ ...b, myReservation: resMap[String(b._id)] || null })),
+            total, page, pages: Math.ceil(total / limit),
+            summary: counts.rows[0] || { totalBooks: 0, availableCopies: 0, issuedCopies: 0, reserved: 0 },
+            facets,
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
