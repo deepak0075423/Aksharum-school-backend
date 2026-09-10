@@ -44,6 +44,25 @@ const LibraryBookSchema = new db.Schema({
         default: 'English',
         trim: true,
     },
+    // ── What a catalogue card carries beyond the title ───────────────────
+    // The cover is a path under /uploads; the rest are the facts a reader
+    // looks for and a librarian orders replacements by.
+    coverImage: {
+        type: String,
+        default: '',
+    },
+    subjects: {
+        type: [String],
+        default: [],
+    },
+    publishedYear: {
+        type: Number,
+        default: null,
+    },
+    pages: {
+        type: Number,
+        default: null,
+    },
     description: {
         type: String,
         default: '',

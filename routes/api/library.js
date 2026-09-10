@@ -9,7 +9,7 @@ const payCtrl  = require('../../controllers/libraryPayment.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule  = require('../../middleware/requireModule');
 const { allowModuleAdmin } = require('../../middleware/moduleAccess');
-const { uploadExcel } = require('../../middleware/upload');
+const { uploadExcel, uploadImage } = require('../../middleware/upload');
 
 const baseGuard    = [verifyToken, requirePasswordReset, requireModule('library')];
 const studentGuard = [...baseGuard, requireRole('student')];
@@ -33,6 +33,9 @@ router.get('/books/export',                 librarianGuard, libCtrl.exportBooks)
 router.get('/books/bulk-upload',           librarianGuard, libCtrl.getBulkUpload);
 router.get('/books/bulk-upload/template',  librarianGuard, libCtrl.getBulkUploadTemplate);
 router.post('/books/bulk-upload',          librarianGuard, uploadExcel.single('file'), libCtrl.bulkUpload);
+// The cover is its own call: the file needs a book to belong to, and every
+// other write here posts JSON.
+router.post('/books/:id/cover',            librarianGuard, uploadImage.single('cover'), libCtrl.uploadBookCover);
 router.get('/books/:id',                   librarianGuard, libCtrl.getBookDetail);
 // The book's history, its queue and its neighbours — read once when the page
 // opens, not again every time the copy list is paged.

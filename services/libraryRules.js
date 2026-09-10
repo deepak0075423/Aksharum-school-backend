@@ -27,7 +27,11 @@ const fmtLibDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric'
 
 // Guard rail for the "add N copies" form and the bulk-import `copies` column.
 const MAX_COPIES_PER_ADD = 100;
-const COPY_STATUSES = ['available', 'reserved', 'lost', 'damaged', 'issued'];
+// 'processing' is a copy the library owns but has not shelved yet — covering,
+// labelling, cataloguing. It is deliberately not 'available': everything that
+// lends a book asks for that word by name, so a processing copy cannot be
+// issued, reserved or promised to a queue until somebody moves it.
+const COPY_STATUSES = ['available', 'processing', 'reserved', 'lost', 'damaged', 'issued'];
 const ACTIVE_ISSUANCE = ['issued', 'overdue'];
 // A reservation that still has a claim on a copy: queued for one, or holding
 // one waiting to be collected. Anything else is finished business. The
@@ -216,10 +220,12 @@ async function checkBorrowerEligibility({ schoolId, userId, bookId, policy }) {
 }
 
 // Copies are only ever created through here, so the shape stays in one place.
-function buildCopy(schoolId, bookId, uniqueCode, userId, { condition, rackLocation, acquisitionDate, vendor, billNumber, cost } = {}) {
+function buildCopy(schoolId, bookId, uniqueCode, userId, { condition, rackLocation, acquisitionDate, vendor, billNumber, cost, status } = {}) {
     return {
         school: schoolId, book: bookId,
-        uniqueCode, status: 'available',
+        // Anything but 'available' arrives off the shelf, and the caller is
+        // responsible for not counting it in availableCopies.
+        uniqueCode, status: status === 'processing' ? 'processing' : 'available',
         condition: condition || 'new',
         rackLocation: rackLocation || '',
         acquisitionDate: acquisitionDate ? new Date(acquisitionDate) : null,

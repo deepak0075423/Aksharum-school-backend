@@ -576,7 +576,7 @@ exports.accessionRegister = async (req, res) => {
             '($3::timestamptz IS NULL OR c."acquisitionDate" <= $3)',
         ], values);
         if (req.query.status === 'written_off') w.raw('c."writtenOffAt" IS NOT NULL');
-        else w.add('c."status" = $?', ['available', 'issued', 'reserved', 'lost', 'damaged'].includes(req.query.status) ? req.query.status : '');
+        else w.add('c."status" = $?', ['available', 'processing', 'issued', 'reserved', 'lost', 'damaged'].includes(req.query.status) ? req.query.status : '');
         w.add('c."vendor" = $?', req.query.vendor);
         w.add(
             '(b."title" ILIKE $? OR b."isbn" ILIKE $? OR c."uniqueCode" ILIKE $? OR c."billNumber" ILIKE $?)',
@@ -651,7 +651,7 @@ exports.stockTake = async (req, res) => {
         const w = conditions(['c."school" = $1'], values);
         if (req.query.rack === '_none') w.raw(`COALESCE(c."rackLocation", '') = ''`);
         else w.add('c."rackLocation" = $?', req.query.rack);
-        w.add('c."status" = $?', ['available', 'issued', 'reserved', 'lost', 'damaged'].includes(req.query.status) ? req.query.status : '');
+        w.add('c."status" = $?', ['available', 'processing', 'issued', 'reserved', 'lost', 'damaged'].includes(req.query.status) ? req.query.status : '');
         w.add(
             '(b."title" ILIKE $? OR b."isbn" ILIKE $? OR c."uniqueCode" ILIKE $? OR u."name" ILIKE $?)',
             req.query.q ? like(req.query.q) : '',
@@ -1000,8 +1000,9 @@ const F = {
     copyStatus: {
         key: 'status', type: 'select', label: 'Status', all: 'All statuses',
         options: [
-            { value: 'available', label: 'Available' },
-            { value: 'issued',    label: 'Issued out' },
+            { value: 'available',  label: 'Available' },
+            { value: 'issued',     label: 'Issued out' },
+            { value: 'processing', label: 'Being processed' },
             { value: 'reserved',  label: 'Reserved' },
             { value: 'lost',      label: 'Lost' },
             { value: 'damaged',   label: 'Damaged' },
@@ -1014,6 +1015,7 @@ const F = {
         options: [
             { value: 'available',   label: 'Available' },
             { value: 'issued',      label: 'Issued out' },
+            { value: 'processing',  label: 'Being processed' },
             { value: 'reserved',    label: 'Reserved' },
             { value: 'lost',        label: 'Lost' },
             { value: 'damaged',     label: 'Damaged' },

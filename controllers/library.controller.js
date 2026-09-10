@@ -7,6 +7,8 @@ const LibraryFine        = require('../models/LibraryFine');
 const LibraryPolicy      = require('../models/LibraryPolicy');
 const LibraryAuditLog    = require('../models/LibraryAuditLog');
 const XLSX               = require('xlsx');
+const fs                 = require('fs');
+const path               = require('path');
 const User               = require('../models/User');
 const StudentProfile     = require('../models/StudentProfile');
 const pool               = require('../db/pool');
@@ -229,6 +231,11 @@ exports.getDashboard = async (req, res) => {
 const BOOK_STATUS_SQL = `CASE
     WHEN COALESCE(b."totalCopies", 0) = 0 THEN 'no_copies'
     WHEN ov."n" > 0                       THEN 'overdue'
+    -- Nothing on the shelf and nothing lent out either: the copies exist but
+    -- are still being processed. Saying "all copies out" of a book nobody has
+    -- borrowed sends a librarian looking for a borrower who does not exist.
+    WHEN COALESCE(b."availableCopies", 0) = 0 AND pc."n" > 0 AND pc."n" >= COALESCE(b."totalCopies", 0)
+                                          THEN 'processing'
     WHEN COALESCE(b."availableCopies", 0) = 0 THEN 'issued_out'
     ELSE 'available' END`;
 
@@ -274,7 +281,10 @@ exports.getBooks = async (req, res) => {
                  WHERE i."book" = b."_id" AND i."status" = 'overdue') ov ON true
             LEFT JOIN LATERAL (
                 SELECT count(*)::int AS "n" FROM "${LibraryReservation.tableName}" r
-                 WHERE r."book" = b."_id" AND r."status" = ANY($${resParam}::text[])) rs ON true`;
+                 WHERE r."book" = b."_id" AND r."status" = ANY($${resParam}::text[])) rs ON true
+            LEFT JOIN LATERAL (
+                SELECT count(*)::int AS "n" FROM "${LibraryBookCopy.tableName}" c
+                 WHERE c."book" = b."_id" AND c."status" = 'processing') pc ON true`;
         const from = fromSql(values.length + 1);
         values.push(ACTIVE_RESERVATION);
 
@@ -287,7 +297,7 @@ exports.getBooks = async (req, res) => {
         const dir     = String(req.query.sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
         const orderBy = `${sortKey === 'status' ? '"status"' : BOOK_SORTS[sortKey]} ${dir} NULLS LAST, b."title" ASC`;
 
-        const base = `SELECT b.*, ov."n" AS "overdueCount", rs."n" AS "reservedCount",
+        const base = `SELECT b.*, ov."n" AS "overdueCount", rs."n" AS "reservedCount", pc."n" AS "processingCount",
                              ${BOOK_STATUS_SQL} AS "status" ${from} WHERE ${where.join(' AND ')}`;
 
         const [rows, count, stats] = await Promise.all([
@@ -332,6 +342,7 @@ exports.getBooks = async (req, res) => {
                 total: totalBooks,
                 available:  by.available  || 0,
                 issuedOut:  by.issued_out || 0,
+                processing: by.processing || 0,
                 overdue:    by.overdue    || 0,
                 noCopies:   by.no_copies  || 0,
                 reserved:       extra.rows[0].reserved,
@@ -342,6 +353,67 @@ exports.getBooks = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * The catalogue fields that are neither text nor a list: a year somebody can
+ * mistype as 20255, a page count that cannot be negative. Both are optional —
+ * blank stays blank rather than becoming zero.
+ */
+function bibliographic(body) {
+    const out = {};
+    const year = body.publishedYear;
+    if (year !== undefined) {
+        if (year === '' || year === null) out.publishedYear = null;
+        else {
+            const n = Number(year);
+            const max = new Date().getFullYear() + 1;   // next year's editions do exist
+            if (!Number.isInteger(n) || n < 1450 || n > max)
+                return { error: `Publication year must be a whole year between 1450 and ${max}` };
+            out.publishedYear = n;
+        }
+    }
+    const pages = body.pages;
+    if (pages !== undefined) {
+        if (pages === '' || pages === null) out.pages = null;
+        else {
+            const n = Number(pages);
+            if (!Number.isInteger(n) || n < 1 || n > 20000)
+                return { error: 'Number of pages must be a whole number between 1 and 20000' };
+            out.pages = n;
+        }
+    }
+    if (body.subjects !== undefined) {
+        const list = Array.isArray(body.subjects)
+            ? body.subjects
+            : String(body.subjects).split(',');
+        out.subjects = [...new Set(list.map((t) => String(t).trim()).filter(Boolean))].slice(0, 20);
+    }
+    return { value: out };
+}
+
+/**
+ * The copy codes for a new batch: the library's own sequence, or the ones a
+ * school already has written inside its books.
+ *
+ * Typed codes never touch the counter — it only ever hands out codes nobody has
+ * used, and consuming numbers for codes it did not generate would make it lie.
+ */
+async function codesFor(schoolId, count, typed) {
+    if (!Array.isArray(typed) || !typed.length) return { codes: await reserveCopyCodes(schoolId, count) };
+
+    const codes = typed.map((c) => String(c).trim()).filter(Boolean);
+    if (codes.length !== count)
+        return { error: `Enter ${count} copy code${count === 1 ? '' : 's'} — ${codes.length} given` };
+    if (new Set(codes).size !== codes.length)
+        return { error: 'Two copies cannot share a code' };
+    const bad = codes.find((c) => c.length > 60);
+    if (bad) return { error: `Copy code "${bad.slice(0, 20)}…" is too long (max 60 characters)` };
+
+    const clash = await LibraryBookCopy.findOne({ school: schoolId, uniqueCode: { $in: codes } })
+        .select('uniqueCode').lean();
+    if (clash) return { error: `Copy code ${clash.uniqueCode} is already used by another copy` };
+    return { codes };
+}
+
 exports.createBook = async (req, res) => {
     try {
         const { title, isbn, authors, publisher, category, edition, language, description } = req.body;
@@ -350,23 +422,68 @@ exports.createBook = async (req, res) => {
         if (isbn && !isValidIsbn(isbn))
             return res.status(400).json({ success: false, message: 'ISBN must be 10 or 13 digits (hyphens and spaces are fine)' });
 
+        const extra = bibliographic(req.body);
+        if (extra.error) return res.status(400).json({ success: false, message: extra.error });
+
+        // Copies can be registered in the same breath as the title. A catalogue
+        // entry with none of them cannot be issued or reserved, and asking for
+        // them in a second dialog afterwards was a step everybody had to take
+        // and half of them forgot.
+        const count = Math.floor(Number(req.body.copies ?? 0));
+        if (!Number.isFinite(count) || count < 0 || count > MAX_COPIES_PER_ADD)
+            return res.status(400).json({ success: false, message: `Number of copies must be between 0 and ${MAX_COPIES_PER_ADD}` });
+
         const dup = await findDuplicateBook(req.schoolId, { title, isbn, edition });
         if (dup) return duplicateResponse(res, dup);
+
+        // Copies can arrive shelf-ready or still being processed. Anything but
+        // 'available' is owned but not lendable, and must not be counted in
+        // availableCopies — the counter that every issue path reads.
+        const shelved = req.body.availability !== 'processing';
+
+        // Typed codes are checked before the book exists, so a clash leaves no
+        // half-made catalogue entry behind.
+        const picked = count > 0 ? await codesFor(req.schoolId, count, req.body.copyCodes) : { codes: [] };
+        if (picked.error) return res.status(400).json({ success: false, message: picked.error });
 
         const book = await LibraryBook.create({
             school: req.schoolId, title: title.trim(), isbn: isbn || '',
             authors: authors || [], publisher: publisher || '', category: category || '',
             edition: edition || '', language: language || 'English', description: description || '',
+            coverImage: '', ...extra.value,
             createdBy: req.userId,
         });
         audit(req.schoolId, req.userId, req.userRole, 'BOOK_CREATED', 'Book', book._id, null, book.toObject());
-        res.status(201).json({ success: true, data: book });
+
+        if (count > 0) {
+            const { condition, rackLocation, acquisitionDate, vendor, billNumber, cost } = req.body;
+            const { codes } = picked;
+            await LibraryBookCopy.insertMany(codes.map((code) => buildCopy(
+                req.schoolId, book._id, code, req.userId,
+                { condition, rackLocation, acquisitionDate, vendor, billNumber, cost,
+                  status: shelved ? 'available' : 'processing' },
+            )));
+            await bumpBookCounts(book._id, { total: count, available: shelved ? count : 0 });
+            // One row for the batch, not one per copy — the same shape addCopy
+            // writes, so the audit log reads the same however copies arrived.
+            audit(req.schoolId, req.userId, req.userRole, 'COPY_ADDED', 'Book', book._id, null, {
+                count, codes: count > 1 ? `${codes[0]} … ${codes[count - 1]}` : codes[0],
+                status: shelved ? 'available' : 'processing',
+                condition: condition || 'new', rackLocation: rackLocation || '',
+                vendor: vendor || '', billNumber: billNumber || '', cost: cost || 0,
+            });
+        }
+
+        // Re-read rather than returning the document created before the copies:
+        // its counters were bumped in the database, not on this object.
+        const saved = await LibraryBook.findById(book._id).lean();
+        res.status(201).json({ success: true, data: saved || book, copies: count });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.getBookDetail = async (req, res) => {
     try {
-        //  is an id on the row; the page says who catalogued it.
+        // `createdBy` is an id on the row; the page says who catalogued it.
         const book = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId })
             .populate('createdBy', 'name').lean();
         if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
@@ -408,6 +525,37 @@ exports.getBookDetail = async (req, res) => {
  * copy code, and none of this changes when they do — a book's borrowing history
  * has nothing to say about which page of its copies is on screen.
  */
+/**
+ * The book's cover.
+ *
+ * A separate call rather than a field on create: the file needs a book to
+ * belong to, and a multipart create would make every other client that posts
+ * JSON to this endpoint deal with it. The old file is deleted once the new path
+ * is stored — a cover replaced ten times should not leave ten files behind.
+ */
+exports.uploadBookCover = async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ success: false, message: 'Choose an image first' });
+
+        const book = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!book) {
+            // The file is already on disk; a book that is not ours must not keep it.
+            fs.unlink(req.file.path, () => {});
+            return res.status(404).json({ success: false, message: 'Book not found' });
+        }
+
+        const coverImage = `/uploads/images/${req.file.filename}`;
+        await LibraryBook.updateOne({ _id: book._id }, { coverImage });
+
+        if (book.coverImage && book.coverImage !== coverImage) {
+            fs.unlink(path.join(__dirname, '..', book.coverImage), () => {});
+        }
+        audit(req.schoolId, req.userId, req.userRole, 'BOOK_UPDATED', 'Book', book._id,
+            { coverImage: book.coverImage || '' }, { coverImage });
+        res.json({ success: true, data: { coverImage } });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
 exports.getBookActivity = async (req, res) => {
     try {
         const book = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId })
@@ -508,7 +656,10 @@ exports.updateBook = async (req, res) => {
         }, old._id);
         if (dup) return duplicateResponse(res, dup);
 
-        const update = {};
+        const extra = bibliographic(req.body);
+        if (extra.error) return res.status(400).json({ success: false, message: extra.error });
+
+        const update = { ...extra.value };
         if (title       !== undefined) update.title       = title.trim();
         if (isbn        !== undefined) update.isbn        = isbn;
         if (authors     !== undefined) update.authors     = authors;
@@ -517,6 +668,10 @@ exports.updateBook = async (req, res) => {
         if (edition     !== undefined) update.edition     = edition;
         if (language    !== undefined) update.language    = language;
         if (description !== undefined) update.description = description;
+        // Clearing the cover is a deliberate empty string; the field is left
+        // alone when the form does not mention it. The file itself is replaced
+        // through /books/:id/cover, which is the only path that writes a path.
+        if (req.body.coverImage === '') update.coverImage = '';
 
         const book = await LibraryBook.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, update, { new: true }).lean();
         if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
