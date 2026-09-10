@@ -366,7 +366,9 @@ exports.createBook = async (req, res) => {
 
 exports.getBookDetail = async (req, res) => {
     try {
-        const book = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        //  is an id on the row; the page says who catalogued it.
+        const book = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId })
+            .populate('createdBy', 'name').lean();
         if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
 
         // A class-set textbook can have hundreds of copies. Ship a page of them
@@ -393,6 +395,96 @@ exports.getBookDetail = async (req, res) => {
             success: true,
             data: { ...book, copies, breakdown },
             total: copyTotal, page, pages: Math.ceil(copyTotal / limit),
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Everything about one book that is *not* its copies: who has had it, who is
+ * waiting for it, how hard it has worked, and what sits next to it on the shelf.
+ *
+ * Deliberately a second endpoint rather than more fields on `getBookDetail`.
+ * That one is re-run every time the librarian pages the copy list or types a
+ * copy code, and none of this changes when they do — a book's borrowing history
+ * has nothing to say about which page of its copies is on screen.
+ */
+exports.getBookActivity = async (req, res) => {
+    try {
+        const book = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId })
+            .select('_id title authors category').lean();
+        if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
+
+        const id = String(book._id);
+        const school = String(req.schoolId);
+        const author = (Array.isArray(book.authors) ? book.authors : []).filter(Boolean)[0] || '';
+
+        const [loans, loansTotal, reservations, statsRows, relatedRows] = await Promise.all([
+            LibraryIssuance.find({ book: book._id, school: req.schoolId })
+                .populate('issuedTo', 'name role')
+                .populate('bookCopy', 'uniqueCode')
+                .sort({ issueDate: -1 })
+                .limit(10)
+                .lean(),
+            LibraryIssuance.countDocuments({ book: book._id, school: req.schoolId }),
+            LibraryReservation.find({ book: book._id, school: req.schoolId, status: { $in: ACTIVE_RESERVATION } })
+                .populate('reservedBy', 'name role')
+                .sort({ queuePosition: 1 })
+                .lean(),
+            pool.query(
+                `SELECT count(*)::int AS "loans",
+                        count(*) FILTER (WHERE "status" = ANY($3::text[]))::int AS "out",
+                        count(*) FILTER (WHERE "status" = 'overdue')::int AS "overdue",
+                        count(DISTINCT "issuedTo")::int AS "readers",
+                        max("issueDate") AS "lastIssued"
+                   FROM "${LibraryIssuance.tableName}"
+                  WHERE "book" = $1 AND "school" = $2`,
+                [id, school, ACTIVE_ISSUANCE],
+            ),
+            // What a reader who liked this one might take next: another book by
+            // the same author first, then the rest of the same category. Authors
+            // is jsonb, so it is matched as text — see the reports controller for
+            // why jsonb_array_elements_text is the wrong tool on a nullable column.
+            pool.query(
+                `SELECT b."_id", b."title", b."authors", b."category",
+                        b."availableCopies", b."totalCopies",
+                        (CASE WHEN $4 <> '' AND COALESCE(b."authors"::text, '') ILIKE $5 THEN 1 ELSE 0 END) AS "sameAuthor"
+                   FROM "${LibraryBook.tableName}" b
+                  WHERE b."school" = $2 AND b."_id" <> $1
+                    AND ( ($3 <> '' AND b."category" = $3)
+                       OR ($4 <> '' AND COALESCE(b."authors"::text, '') ILIKE $5) )
+                  ORDER BY "sameAuthor" DESC, b."title" ASC
+                  LIMIT 4`,
+                [id, school, book.category || '', author, `%${author.replace(/[\\%_]/g, (c) => `\\${c}`)}%`],
+            ),
+        ]);
+
+        const s = statsRows.rows[0] || {};
+        res.json({
+            success: true,
+            data: {
+                // The class the borrower is in lives on their profile, not on the
+                // loan; three bounded lookups over ten rows.
+                loans: await withBorrowerClass(req.schoolId, loans),
+                loansTotal,
+                reservations,
+                stats: {
+                    loans: Number(s.loans || 0),
+                    out: Number(s.out || 0),
+                    overdue: Number(s.overdue || 0),
+                    readers: Number(s.readers || 0),
+                    lastIssued: s.lastIssued || null,
+                    waiting: reservations.length,
+                },
+                related: relatedRows.rows.map((r) => ({
+                    _id: r._id,
+                    title: r.title,
+                    authors: Array.isArray(r.authors) ? r.authors : [],
+                    category: r.category || '',
+                    availableCopies: Number(r.availableCopies || 0),
+                    totalCopies: Number(r.totalCopies || 0),
+                    sameAuthor: !!Number(r.sameAuthor),
+                })),
+            },
         });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

@@ -34,6 +34,9 @@ router.get('/books/bulk-upload',           librarianGuard, libCtrl.getBulkUpload
 router.get('/books/bulk-upload/template',  librarianGuard, libCtrl.getBulkUploadTemplate);
 router.post('/books/bulk-upload',          librarianGuard, uploadExcel.single('file'), libCtrl.bulkUpload);
 router.get('/books/:id',                   librarianGuard, libCtrl.getBookDetail);
+// The book's history, its queue and its neighbours — read once when the page
+// opens, not again every time the copy list is paged.
+router.get('/books/:id/activity',          librarianGuard, libCtrl.getBookActivity);
 router.put('/books/:id',                   librarianGuard, libCtrl.updateBook);
 router.delete('/books/:id',                librarianGuard, libCtrl.deleteBook);
 router.post('/books/bulk-delete',          librarianGuard, libCtrl.bulkDeleteBooks);
