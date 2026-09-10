@@ -1038,8 +1038,12 @@ exports.getIssueForm = async (req, res) => {
     try {
         const { bookId } = req.query;
         if (!bookId) return res.json({ success: true, data: null });
-        const book  = await LibraryBook.findOne({ _id: bookId, school: req.schoolId }).lean();
-        const copies = await LibraryBookCopy.find({ book: bookId, status: 'available' }).lean();
+        const book = await LibraryBook.findOne({ _id: bookId, school: req.schoolId }).lean();
+        // A book id from another school used to come back with `book: null` and
+        // that school's copy codes still listed underneath it — the copies query
+        // was the one place here not scoped to the caller's school.
+        if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
+        const copies = await LibraryBookCopy.find({ book: bookId, school: req.schoolId, status: 'available' }).lean();
         const policy = await getOrCreatePolicy(req.schoolId);
         res.json({ success: true, data: { book, copies, policy } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
