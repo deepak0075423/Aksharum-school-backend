@@ -2079,38 +2079,158 @@ const POLICY_NUMBERS = {
 };
 const POLICY_FLAGS = ['teacherFinesEnabled', 'allowMultipleCopiesPerUser', 'blockIssueOnPendingFine', 'blockIssueOnOverdue'];
 
+// The one piece of text on the policy: what a fine receipt number starts with.
+// It has been on the model since receipts shipped and no endpoint ever accepted
+// it, so a school could not move off "LIB" without an edit to the database.
+const RECEIPT_PREFIX = /^[A-Za-z0-9][A-Za-z0-9-]{0,7}$/;
+
+const POLICY_FIELDS = [...Object.keys(POLICY_NUMBERS), ...POLICY_FLAGS, 'receiptPrefix'];
+
+// Said once, here: the settings screen needs a name for a field when it reports
+// what changed, and the validator needs one when it refuses a value.
+const POLICY_LABELS = {
+    ...Object.fromEntries(Object.entries(POLICY_NUMBERS).map(([k, v]) => [k, v.label])),
+    teacherFinesEnabled:        'Charge late fines to teachers',
+    allowMultipleCopiesPerUser: 'Allow two copies of one title per person',
+    blockIssueOnPendingFine:    'Block borrowing while a fine is unpaid',
+    blockIssueOnOverdue:        'Block borrowing while a book is overdue',
+    receiptPrefix:              'Receipt prefix',
+};
+
+/**
+ * The model's own defaults, read off the schema rather than restated here.
+ * "Reset to default" has to mean the value a school starts with, and a second
+ * copy of these numbers would be wrong the first time one of them changed.
+ */
+const policyDefaults = () => {
+    const fields = LibraryPolicy.schema.parsed().fields;
+    return Object.fromEntries(POLICY_FIELDS.map((f) => [f, fields[f]?.default]));
+};
+
 exports.getPolicy = async (req, res) => {
     try {
         const policy = await getOrCreatePolicy(req.schoolId);
-        res.json({ success: true, data: policy });
+        // The policy stores who last changed it as an id; the screen shows a
+        // name, and used to show nothing at all.
+        let updatedBy = null;
+        if (policy.updatedBy) {
+            const u = await User.findById(policy.updatedBy).select('name role').lean().catch(() => null);
+            if (u) updatedBy = { _id: u._id, name: u.name, role: u.role };
+        }
+        res.json({
+            success: true,
+            data: policy,
+            updatedBy,
+            // The bounds travel with the policy so the form refuses what the
+            // server would refuse, in the same words, without a round trip.
+            limits: POLICY_NUMBERS,
+            defaults: policyDefaults(),
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.updatePolicy = async (req, res) => {
     try {
-        const update = { updatedBy: req.userId, updatedAt: new Date() };
+        const before = await getOrCreatePolicy(req.schoolId);
+        const update = {};
 
         // Every one of these is read on a hot path — `+'abc'` used to store NaN
         // straight into the policy and take the whole module down with it.
         for (const [field, { min, max, label }] of Object.entries(POLICY_NUMBERS)) {
             const raw = req.body[field];
-            if (raw === undefined || raw === '') continue;
+            // null means "no value sent", not zero. Number(null) is 0, so a
+            // client echoing an unset field back would quietly set the fine to
+            // nothing rather than leave it alone.
+            if (raw === undefined || raw === null || raw === '') continue;
             const n = Number(raw);
             if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max)
                 return res.status(400).json({ success: false, message: `${label} must be a whole number between ${min} and ${max}` });
             update[field] = n;
         }
         for (const field of POLICY_FLAGS) {
-            if (req.body[field] !== undefined) update[field] = !!req.body[field];
+            // Same reason as the numbers above: !!null is false, and turning a
+            // rule off is a decision, not something a missing value should do.
+            if (req.body[field] !== undefined && req.body[field] !== null) update[field] = !!req.body[field];
+        }
+        // `null` has to be skipped alongside undefined and '': a client that
+        // echoes a policy back with an unset prefix sends null, and
+        // String(null) is the four characters "NULL" — which passes the format
+        // check and gets saved, so every later receipt is numbered NULL-000123.
+        if (req.body.receiptPrefix !== undefined && req.body.receiptPrefix !== null && req.body.receiptPrefix !== '') {
+            const prefix = String(req.body.receiptPrefix).trim().toUpperCase();
+            if (!RECEIPT_PREFIX.test(prefix))
+                return res.status(400).json({
+                    success: false,
+                    message: 'Receipt prefix must be 1–8 letters, digits or dashes, starting with a letter or digit',
+                });
+            update.receiptPrefix = prefix;
+        }
+
+        // What actually moved. A save that changed nothing writes nothing: the
+        // history is a list of decisions, and a row saying a policy was updated
+        // to the values it already had is noise in it.
+        const changes = {};
+        for (const field of POLICY_FIELDS) {
+            if (!(field in update)) continue;
+            if (String(before[field] ?? '') === String(update[field] ?? '')) continue;
+            changes[field] = { from: before[field] ?? null, to: update[field] };
+        }
+        if (!Object.keys(changes).length) {
+            return res.json({ success: true, data: before, changed: 0 });
         }
 
         const policy = await LibraryPolicy.findOneAndUpdate(
             { school: req.schoolId },
-            update,
-            { upsert: true, new: true }
+            { ...update, updatedBy: req.userId, updatedAt: new Date() },
+            { upsert: true, new: true },
         ).lean();
-        audit(req.schoolId, req.userId, req.userRole, 'POLICY_UPDATED', 'Policy', policy._id, null, update);
-        res.json({ success: true, data: policy });
+
+        // Both halves of every change, so the history can say what a setting was
+        // before somebody moved it — `newValue` alone could only say what it is
+        // now, which the policy itself already says.
+        audit(
+            req.schoolId, req.userId, req.userRole, 'POLICY_UPDATED', 'Policy', policy._id,
+            Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, v.from])),
+            Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, v.to])),
+        );
+        res.json({ success: true, data: policy, changed: Object.keys(changes).length });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * What the policy used to say.
+ *
+ * Reachable by whoever may change the policy, which the audit log proper is
+ * not — that stays school_admin-only because it records what the librarians
+ * did. This records what was decided about the rules, and a module-admin
+ * teacher who can change them can see how they got here.
+ */
+exports.getPolicyHistory = async (req, res) => {
+    try {
+        const rows = await LibraryAuditLog.find({ school: req.schoolId, actionType: 'POLICY_UPDATED' })
+            .populate('user', 'name')
+            .sort({ timestamp: -1 })
+            .limit(Math.min(50, Math.max(1, Number(req.query.limit) || 20)))
+            .lean();
+
+        const data = rows.map((r) => {
+            const from = r.oldValue || {};
+            const to   = r.newValue || {};
+            return {
+                _id: r._id,
+                at: r.timestamp,
+                by: r.user?.name || '',
+                role: r.role || '',
+                // Entries written before the diff existed carry the whole update
+                // object, `updatedBy` and `updatedAt` included; only settings are
+                // shown, and a missing `from` is said as "not recorded" rather
+                // than invented.
+                changes: Object.keys(to)
+                    .filter((f) => POLICY_FIELDS.includes(f))
+                    .map((f) => ({ field: f, label: POLICY_LABELS[f] || f, from: from[f] ?? null, to: to[f] })),
+            };
+        });
+        res.json({ success: true, data });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

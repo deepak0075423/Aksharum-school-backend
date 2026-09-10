@@ -97,8 +97,11 @@ router.post('/reports/overdue/remind', librarianGuard, repCtrl.remindOverdue);
 // nav, the page loaded, and every field rendered as a dash because the fetch
 // behind it 403'd. Administering the module is precisely what the designation
 // grants, so the policy is part of it.
-router.get('/policy',     librarianGuard, libCtrl.getPolicy);
-router.put('/policy',     librarianGuard, libCtrl.updatePolicy);
+router.get('/policy',         librarianGuard, libCtrl.getPolicy);
+// What the rules used to say. Open to whoever may change them — unlike the
+// audit log below, which records what the librarians did and stays admin-only.
+router.get('/policy/history', librarianGuard, libCtrl.getPolicyHistory);
+router.put('/policy',         librarianGuard, libCtrl.updatePolicy);
 
 // The audit log stays school_admin-only: it records what the librarians did.
 router.get('/audit-log',  adminOnlyGuard, libCtrl.getAuditLog);
