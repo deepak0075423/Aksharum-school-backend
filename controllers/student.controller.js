@@ -38,15 +38,37 @@ exports.getMyClass = async (req, res) => {
         const ClassMonitor          = require('../models/ClassMonitor');
         const ClassAnnouncement     = require('../models/ClassAnnouncement');
 
+        const Class = require('../models/Class');
         const profile = await StudentProfile.findOne({ user: req.userId }).lean();
-        const section = await ClassSection.findById(profile?.currentSection)
-            .populate('class', 'className classNumber')
-            .populate('classTeacher',      'name email')
-            .populate('substituteTeacher', 'name email')
-            .populate('academicYear',      'yearName')
-            .lean();
 
-        if (!section) return res.json({ success: true, data: { profile, section: null } });
+        // A student belongs to a section by either route — the profile's pointer
+        // or the section's own roster — and the two are not always in step. The
+        // page used to read the pointer alone, so a student placed through the
+        // roster was told they had no class at all.
+        let sectionId = profile?.currentSection || null;
+        if (!sectionId) {
+            const bySection = await ClassSection.findOne({ enrolledStudents: req.userId }).select('_id').lean();
+            sectionId = bySection?._id || null;
+        }
+
+        const section = sectionId
+            ? await ClassSection.findById(sectionId)
+                .populate('class', 'className classNumber')
+                .populate('classTeacher',      'name email')
+                .populate('substituteTeacher', 'name email')
+                .populate('academicYear',      'yearName')
+                .lean()
+            : null;
+
+        if (!section) {
+            // Admitted to a class but not placed in a section yet is a real
+            // state — the class shuffle exists to resolve exactly it — so say
+            // which class, rather than "no class".
+            const cls = profile?.currentClass
+                ? await Class.findById(profile.currentClass).select('className classNumber').lean()
+                : null;
+            return res.json({ success: true, data: { profile, section: null, pendingClass: cls || null } });
+        }
 
         const [subjectTeachers, monitors, classmates, announcements] = await Promise.all([
             SectionSubjectTeacher.find({ section: section._id })
