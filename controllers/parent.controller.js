@@ -110,51 +110,85 @@ exports.getDashboard = async (req, res) => {
         res.json({ success: true, data: { parent, children, child } });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
+/**
+ * Every child's class, one entry each.
+ *
+ * A parent can have more than one child and their classes differ, so this
+ * answers per child rather than picking one. It used to run
+ * `StudentProfile.findOne({ user: { $in: childIds } })` — the first row the
+ * database happened to return — so a second child's class was invisible and
+ * nothing on the page said a second child existed.
+ *
+ * The flat keys and the top-level `student`/`section` describe the first child
+ * and stay for the mobile screens, which were written against them.
+ */
 exports.getChildClass = async (req, res) => {
     try {
         const User           = require('../models/User');
         const TeacherProfile = require('../models/TeacherProfile');
-        const ClassSubject   = require('../models/ClassSubject');
+        const { classViewFor } = require('../services/classView');
 
-        const parent   = await ParentProfile.findOne({ user: req.userId }).lean();
-        const childIds = parent?.children?.length ? parent.children : (parent?.student ? [parent.student] : []);
-        let student = childIds.length
-            ? await StudentProfile.findOne({ user: { $in: childIds } }).lean()
-            : null;
-        if (!student) student = await StudentProfile.findOne({ parent: req.userId }).lean();
+        // Two sources of truth for the link, and they drift: the parent's own
+        // children list and the student profile's `parent` pointer. Take both.
+        const parent = await ParentProfile.findOne({ user: req.userId }).lean();
+        const listed = parent?.children?.length ? parent.children : (parent?.student ? [parent.student] : []);
+        const owned  = await StudentProfile.find({ parent: req.userId, school: req.schoolId })
+            .select('user').lean();
+        const childIds = [...new Set([...listed, ...owned.map((p) => p.user)]
+            .filter(Boolean).map(String))];
 
-        const section = student?.currentSection
-            ? await ClassSection.findById(student.currentSection).populate('class classTeacher').lean()
-            : null;
+        // Scoped to this school's students, so a stale id on the parent record
+        // cannot reach into another school.
+        const childUsers = childIds.length
+            ? await User.find({ _id: { $in: childIds }, role: 'student', school: req.schoolId })
+                .select('name profileImage').lean()
+            : [];
+        childUsers.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
 
-        const childUser = student ? await User.findById(student.user).select('name').lean() : null;
+        const children = [];
+        for (const kid of childUsers) {
+            const view = await classViewFor({ studentId: kid._id, schoolId: req.schoolId });
+            const sec  = view.section;
+            children.push({
+                _id:          kid._id,
+                name:         kid.name,
+                profileImage: kid.profileImage || '',
+                className:    sec?.class?.className || view.pendingClass?.className || '',
+                sectionName:  sec?.sectionName || '',
+                rollNumber:   view.profile?.rollNumber || '',
+                admissionNo:  view.profile?.admissionNumber || '',
+                ...view,
+            });
+        }
 
+        const first = children[0] || null;
+
+        // The class teacher's designation is only read off the flat legacy
+        // shape, so it is looked up for the first child alone.
         let classTeacher = null;
-        if (section?.classTeacher) {
-            const tp = await TeacherProfile.findOne({ user: section.classTeacher._id }).select('designation').lean();
+        if (first?.section?.classTeacher) {
+            const tp = await TeacherProfile.findOne({ user: first.section.classTeacher._id })
+                .select('designation').lean();
             classTeacher = {
-                name:        section.classTeacher.name,
-                phone:       section.classTeacher.phone || '',
+                name:        first.section.classTeacher.name,
+                phone:       first.section.classTeacher.phone || '',
                 designation: tp?.designation || 'Teacher',
             };
         }
 
-        let subjects = [];
-        if (section?.class?._id) {
-            const rows = await ClassSubject.find({ class: section.class._id }).populate('subject', 'subjectName').lean();
-            subjects = rows.filter((r) => r.subject).map((r) => ({ _id: r.subject._id, name: r.subject.subjectName }));
-        }
-
-        // nested student/section kept for the mobile app; flat keys for the web page
         res.json({ success: true, data: {
-            student, section,
-            studentName: childUser?.name || '',
-            className:   section?.class?.className || '',
-            sectionName: section?.sectionName || '',
-            rollNumber:  student?.rollNumber || '',
-            admissionNo: student?.admissionNumber || '',
+            children,
+            // First child, flat — the shape the mobile screens read.
+            student:       first?.profile || null,
+            section:       first?.section || null,
+            announcements: first?.announcements || [],
+            studentName:   first?.name || '',
+            className:     first?.className || '',
+            sectionName:   first?.sectionName || '',
+            rollNumber:    first?.rollNumber || '',
+            admissionNo:   first?.admissionNo || '',
             classTeacher,
-            subjects,
+            subjects:      first?.subjects || [],
         }});
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
