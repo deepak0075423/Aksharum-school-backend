@@ -273,19 +273,34 @@ exports.requestRenewal = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * Every loan this member has ever had, newest first.
+ *
+ * The academic year rides along so the page can say "returned this year"
+ * truthfully rather than counting all of history and labelling it as the year,
+ * and the outstanding total is read from the fines themselves — a charge that
+ * was never tied to a loan would otherwise go uncounted.
+ */
 exports.getMyBooks = async (req, res) => {
     try {
+        const AcademicYear = require('../models/AcademicYear');
         await sweepOverdue(req.schoolId);
 
         const { status } = req.query;
         const filter = { school: req.schoolId, issuedTo: req.userId };
         if (status) filter.status = status;
 
-        const issuances = await LibraryIssuance.find(filter)
-            .populate('book',    'title isbn authors category')
-            .populate('bookCopy','uniqueCode')
-            .sort({ issueDate: -1 })
-            .lean();
+        const [issuances, year, fines] = await Promise.all([
+            LibraryIssuance.find(filter)
+                .populate('book',    'title isbn authors category coverImage')
+                .populate('bookCopy','uniqueCode')
+                .sort({ issueDate: -1 })
+                .lean(),
+            AcademicYear.findOne({ school: req.schoolId, status: 'active' })
+                .select('yearName startDate endDate').lean(),
+            LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' })
+                .select('amount waivedAmount paidAmount').lean(),
+        ]);
 
         const now = new Date();
         // A lost book is still a row on this list, and until now it carried
@@ -296,7 +311,12 @@ exports.getMyBooks = async (req, res) => {
             ...i,
             isOverdue: ACTIVE_ISSUANCE.includes(i.status) && now > new Date(i.dueDate),
         }));
-        res.json({ success: true, data });
+
+        const finesOutstanding = fines.reduce((sum, f) => sum + Math.max(
+            0, Number(f.amount || 0) - Number(f.waivedAmount || 0) - Number(f.paidAmount || 0),
+        ), 0);
+
+        res.json({ success: true, data, academicYear: year || null, finesOutstanding });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
