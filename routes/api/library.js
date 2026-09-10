@@ -71,6 +71,8 @@ router.delete('/reservations/:id',               librarianGuard, libCtrl.cancelR
 
 // Fines
 router.get('/fines',                   librarianGuard, libCtrl.getFines);
+router.post('/fines',                  librarianGuard, libCtrl.createFine);
+router.post('/fines/collect',          librarianGuard, libCtrl.collectFines);
 router.post('/fines/:id/collect',      librarianGuard, libCtrl.collectFine);
 router.post('/fines/:id/waive',        librarianGuard, libCtrl.waiveFine);
 

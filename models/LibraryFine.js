@@ -95,6 +95,14 @@ const LibraryFineSchema = new db.Schema({
         ref: 'User',
         default: null,
     },
+    // When it was written off. `paidAt` has always recorded the other half of
+    // this; without its counterpart "waived this month" had no date to count
+    // on. Rows waived before this field existed leave it null and are not
+    // counted in a month — nobody knows when they were.
+    waivedAt: {
+        type: Date,
+        default: null,
+    },
     waiverReason: {
         type: String,
         default: '',
