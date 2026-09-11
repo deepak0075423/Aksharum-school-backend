@@ -729,6 +729,26 @@ exports.adminEmployees = async (req, res) => {
         const users = await User.find({
             school: req.schoolId, role: { $in: ['teacher', 'school_admin'] }, isActive: true,
         }).select('name email role').sort({ name: 1 }).lean();
-        ok(res, users);
+        if (!users.length) return ok(res, []);
+
+        // employeeId, designation, department, joining date and employment type
+        // all live on TeacherProfile, never on User. The raise-comp-off dialog
+        // shows them beside the picker so an admin can see they have the right
+        // person before crediting days in their name.
+        const profiles = await TeacherProfile.find({ user: { $in: users.map((u) => String(u._id)) } })
+            .select('user employeeId designation department joiningDate employmentType').lean();
+        const byUser = new Map(profiles.map((p) => [String(p.user), p]));
+
+        ok(res, users.map((u) => {
+            const p = byUser.get(String(u._id));
+            return {
+                ...u,
+                employeeId:     p?.employeeId     || '',
+                designation:    p?.designation    || '',
+                department:     p?.department     || '',
+                joiningDate:    p?.joiningDate    || null,
+                employmentType: p?.employmentType || '',
+            };
+        }));
     } catch (e) { bad(res, e.message, 500); }
 };

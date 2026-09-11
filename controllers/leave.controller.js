@@ -207,7 +207,7 @@ exports.adminGetEmployees = async (req, res) => {
         // picker that shows a name and an email alone cannot tell two Priya
         // Sharmas apart.
         const profiles = await TeacherProfile.find({ user: { $in: users.map((u) => String(u._id)) } })
-            .select('user employeeId designation department').lean();
+            .select('user employeeId designation department joiningDate employmentType').lean();
         const byUser = new Map(profiles.map((p) => [String(p.user), p]));
 
         res.json({
@@ -221,6 +221,10 @@ exports.adminGetEmployees = async (req, res) => {
                     employeeId:  p?.employeeId  || '',
                     designation: p?.designation || '',
                     department:  p?.department  || '',
+                    // Shown beside the picker when an admin files on someone's
+                    // behalf, so they can see they have the right person.
+                    joiningDate:    p?.joiningDate    || null,
+                    employmentType: p?.employmentType || '',
                 };
             }),
         });
@@ -1130,6 +1134,7 @@ async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, t
                 allowBackdated:      policy.allowBackdated,
                 backdatedWithinDays: policy.backdatedWithinDays,
                 advanceNoticeDays:   onBehalf ? 0 : policy.advanceNoticeDays,
+                minDaysPerApplication: policy.minDaysPerApplication,
                 maxConsecutiveDays:  policy.maxConsecutiveDays,
                 halfDayAllowed:      policy.halfDayAllowed,
                 requiresDocument:    policy.requiresDocument,
@@ -2423,21 +2428,49 @@ exports.adminExportReports = async (req, res) => {
 
 exports.teacherGetMyLeaves = async (req, res) => {
     try {
-        const { status, page = 1, limit = 20 } = req.query;
+        const { status, leaveType, mode, fromDate, toDate, page = 1, limit = 20 } = req.query;
         const filter = { teacher: req.userId, school: req.schoolId };
-        if (status) filter.status = status;
+        if (status)    filter.status    = status;
+        if (leaveType) filter.leaveType = leaveType;
+        if (mode === 'half_day' || mode === 'full_day') filter.leaveMode = mode;
+        if (fromDate || toDate) {
+            filter.fromDate = {};
+            if (fromDate) filter.fromDate.$gte = new Date(fromDate);
+            if (toDate)   filter.fromDate.$lte = new Date(toDate);
+        }
 
-        const [apps, total] = await Promise.all([
+        const [apps, total, byStatus] = await Promise.all([
             LeaveApplication.find(filter)
-                .populate('leaveType', 'name code')
+                .populate('leaveType', 'name code category')
                 .populate('approvedBy','name')
                 .sort({ appliedAt: -1 })
                 .skip((+page - 1) * +limit)
                 .limit(+limit)
                 .lean(),
             LeaveApplication.countDocuments(filter),
+            // The tiles describe this teacher's whole history, so they ignore
+            // every filter — a tile that is also the filter must not move when
+            // it is pressed.
+            pool.query(
+                `SELECT "status", count(*)::int AS "n"
+                   FROM ${qt(LeaveApplication)}
+                  WHERE "teacher" = $1::uuid AND "school" = $2::uuid
+                  GROUP BY "status"`,
+                [String(req.userId), String(req.schoolId)],
+            ),
         ]);
-        res.json({ success: true, data: apps, total, page: +page, pages: Math.ceil(total / +limit) });
+
+        const stat = (k) => byStatus.rows.find((r) => r.status === k)?.n || 0;
+        res.json({
+            success: true, data: apps, total, page: +page, pages: Math.ceil(total / +limit),
+            counts: {
+                total:     byStatus.rows.reduce((n, r) => n + r.n, 0),
+                pending:   stat('pending'),
+                approved:  stat('approved'),
+                rejected:  stat('rejected'),
+                cancelled: stat('cancelled'),
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
