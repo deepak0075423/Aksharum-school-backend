@@ -8,7 +8,7 @@ const TeacherProfile   = require('../models/TeacherProfile');
 const AcademicYear     = require('../models/AcademicYear');
 const XLSX             = require('xlsx');
 const path             = require('path');
-const { notify, schoolAdminIds } = require('../services/notifyService');
+const { notify } = require('../services/notifyService');
 const { resolvePage } = require('../utils/focusPage');
 const compOff          = require('../services/compOffService');
 const leavePolicy      = require('../services/leavePolicyService');
@@ -48,6 +48,59 @@ function withReportWindow(filter, { fromDate, toDate }, academicYearRange) {
 }
 
 const isCompOffType = lt => lt?.category === 'compoff' || String(lt?.code || '').toUpperCase() === 'COMPOFF';
+
+// ── Notification audiences ───────────────────────────────────────────────────
+//
+// Two audiences, and getting them right is the whole point:
+//
+//   the person whose leave or balance moved  — always told, by name;
+//   the administrators of the leave module   — school admins PLUS every teacher
+//                                              whose designation grants ADMIN on
+//                                              leave, because that designation
+//                                              puts them on these very screens.
+//
+// Everything here is fire-and-forget. notify() never throws and never blocks
+// the response, and a failure to resolve an audience returns an empty list —
+// an admin action must not fail because a notification could not be addressed.
+
+/** Tell the leave administrators something about the module itself. */
+function notifyLeaveAdmins(req, { title, body, link, exclude = [] }) {
+    leavePolicy.leaveAdminIds(req.schoolId)
+        .then((ids) => {
+            const skip = new Set([String(req.userId), ...exclude.filter(Boolean).map(String)]);
+            const recipients = ids.filter((id) => !skip.has(String(id)));
+            if (!recipients.length) return;
+            notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title, body, recipients,
+                link: link || { type: 'leave.manage' },
+            });
+        })
+        .catch(() => {});
+}
+
+/**
+ * Tell the people whose balances an admin action just moved.
+ *
+ * Batched into one notification per recipient rather than one per balance row:
+ * an allocation run touches every teacher in the school, and five leave types
+ * would otherwise be five separate buzzes each. `notify` drops the sender, so
+ * an admin allocating to themselves is not told about their own click.
+ */
+function notifyBalanceChange(req, teacherIds, { title, body, email = false }) {
+    const ids = [...new Set((teacherIds || []).map((t) => String(t?._id ?? t)).filter(Boolean))];
+    if (!ids.length) return;
+    notify({
+        school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+        title, body, recipients: ids, email,
+        link: { type: 'leave.balance' },
+    });
+}
+
+/** "3 days" / "1 day" — the unit that appears in nearly every message below. */
+const days = (n) => `${n} day${Number(n) === 1 ? '' : 's'}`;
+
+
 
 /**
  * How many days an application actually costs.
@@ -325,6 +378,15 @@ exports.adminDeleteLeaveType = async (req, res) => {
             LeaveLedger.deleteMany({ school: req.schoolId, leaveType: req.params.id }),
             LeavePolicyRow.deleteMany({ school: req.schoolId, leaveType: req.params.id }),
         ]);
+        // Destructive and silent otherwise: every allocation of this type went
+        // with it. The other administrators find out here rather than from a
+        // teacher asking where their days went.
+        notifyLeaveAdmins(req, {
+            title: '🗑️ Leave type deleted',
+            body: `${req.user?.name || 'An administrator'} deleted the "${lt.name}" (${lt.code}) leave type. `
+                + `${balances.deletedCount || 0} allocation(s) and its rule set went with it.`,
+        });
+
         res.json({
             success: true,
             deleted: {
@@ -448,6 +510,17 @@ exports.adminUpdatePolicy = async (req, res) => {
         const result = await leavePolicy.savePolicy(req.schoolId, req.params.leaveTypeId, req.body || {}, req.userId);
         // A rejected rule is a bad request, not a missing leave type.
         if (!result.ok) return res.status(result.notFound ? 404 : 400).json({ success: false, message: result.message });
+
+        // A policy decides who may apply, who signs off and what it costs. The
+        // people who run the module have to know the rules moved under them.
+        const name = result.policy?.leaveType?.name || 'a leave type';
+        notifyLeaveAdmins(req, {
+            title: '⚙️ Leave policy updated',
+            body: `${req.user?.name || 'An administrator'} changed the rules for ${name} — eligibility, `
+                + 'limits and approval routing all follow this policy.',
+            link: { type: 'leave.manage' },
+        });
+
         res.json({ success: true, data: result.policy });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -509,7 +582,19 @@ exports.adminUpdateLeaveSettings = async (req, res) => {
         const school = await School.findByIdAndUpdate(
             req.schoolId, update, { new: true, select: 'leaveSettings' }
         ).lean();
-        res.json({ success: true, data: normalizeLeaveSettings(school.leaveSettings) });
+        const settings = normalizeLeaveSettings(school.leaveSettings);
+
+        // Saturday decides how many days a request costs, so this quietly
+        // re-prices every leave taken from here on.
+        notifyLeaveAdmins(req, {
+            title: '⚙️ Leave settings changed',
+            body: `${req.user?.name || 'An administrator'} changed how Saturdays count towards leave — `
+                + (settings.saturdayWorking
+                    ? `they are working days${settings.saturdayHalfDay ? ', counted as half a day' : ''}.`
+                    : 'they no longer count towards a leave request.'),
+        });
+
+        res.json({ success: true, data: settings });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -632,6 +717,32 @@ exports.adminApplyLeave = async (req, res) => {
                 { $inc: { pending: split.paidDays } }
             );
         }
+
+        // Filed FOR somebody. They were not in the room when it happened, so
+        // this is the only way they learn that days were spent in their name.
+        notify({
+            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '📝 Leave applied on your behalf',
+            body: `${req.user?.name || 'An administrator'} filed a ${ltDoc.name} request for you from `
+                + `${fmtDate(from)} to ${fmtDate(to)} (${days(totalDays)})`
+                + `${split.lopDays ? `, of which ${days(split.lopDays)} are loss of pay` : ''}.`
+                + `\nReason: ${reason}`
+                + '\nIt still needs the usual approval. Tell your school office if this is not right.',
+            recipients: [teacherId],
+            email: true,
+            link: { type: 'leave.mine', entityId: app._id },
+        });
+        // And the other approvers, so a request filed by one admin does not sit
+        // invisible to the rest of the queue.
+        leavePolicy.approverIds(req.schoolId, policy).then((recipients) => notify({
+            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '📋 Leave request filed on behalf',
+            body: `${req.user?.name || 'An administrator'} filed a ${ltDoc.name} request for a teacher, `
+                + `${fmtDate(from)} to ${fmtDate(to)} (${days(totalDays)}). It is waiting for a decision.`,
+            recipients,
+            link: { type: 'leave.approvals', entityId: app._id },
+        })).catch(() => {});
+
         res.status(201).json({ success: true, data: app });
     } catch (e) {
         if (e.code === 11000) return res.status(400).json({ success: false, message: 'Teacher already has a leave application for these dates' });
@@ -848,6 +959,17 @@ exports.adminApproveRequest = async (req, res) => {
                 recipients: [app.teacher],
                 link: { type: 'leave.mine', entityId: app._id },
             });
+            // A second sign-off has to come from somebody else, so somebody
+            // else has to be told it is waiting. notify() drops the sender, so
+            // the approver who just signed is not asked to sign again.
+            leavePolicy.approverIds(req.schoolId, policy).then(recipients => notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: '⏳ Leave still needs a sign-off',
+                body: `A leave request for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)} cleared level `
+                    + `${app.approvalLevel} of ${required} and is waiting on its final approval.`,
+                recipients,
+                link: { type: 'leave.approvals', entityId: app._id },
+            })).catch(() => {});
             return res.json({ success: true, data: app, pendingLevels: required - app.approvalLevel });
         }
 
@@ -1141,6 +1263,18 @@ exports.adminAllocate = async (req, res) => {
             : accrues && totalAllocated === 0
                 ? ` — ${ltPolicy.monthlyAccrual.daysPerMonth} day(s)/month will be credited automatically`
                 : '';
+
+        // Their entitlement for the year just changed. An allocation nobody is
+        // told about is a balance people discover only when they try to spend it.
+        notifyBalanceChange(req, teachers.map((t) => t._id), {
+            title: `📗 ${lt.name} allocated`,
+            body: accrues && totalAllocated === 0
+                ? `Your ${lt.name} balance for ${ay} starts at 0 and earns `
+                    + `${ltPolicy.monthlyAccrual.daysPerMonth} day(s) each month.`
+                : `You have been allocated ${days(totalAllocated)} of ${lt.name} for ${ay}`
+                    + `${prorated ? `, prorated from the full ${days(lt.annualAllocation)} because of your start date` : ''}.`,
+        });
+
         res.json({
             success: true, allocated: teachers.length, totalAllocated, prorated, accrues,
             message: `Allocated ${totalAllocated} day(s) to ${teachers.length} teacher(s)${suffix}`,
@@ -1209,6 +1343,16 @@ exports.adminClearAllocations = async (req, res) => {
 
         const daysRemoved = affected.reduce((n, b) => n + (b.totalAllocated || 0) + (b.carriedForward || 0), 0);
         const stillPending = affected.reduce((n, b) => n + (b.pending || 0), 0);
+
+        // Days were taken away. That is exactly the change somebody must not
+        // find out about by having an application refused.
+        notifyBalanceChange(req, affected.map((b) => b.teacher), {
+            title: `📕 ${lt.name} allocation cleared`,
+            body: `Your ${lt.name} allocation for ${ay} has been cleared. Leave already taken is unaffected, `
+                + 'but there is nothing left to apply against until it is allocated again.',
+            email: true,
+        });
+
         res.json({
             success: true,
             cleared: affected.length,
@@ -1316,6 +1460,31 @@ exports.adminCloseAcademicYear = async (req, res) => {
         if (ops.length) await LeaveBalance.bulkWrite(ops);
         await recordAdjustments(ledger);
 
+        // Days lapsed. The teacher who lost them is told what and how much; the
+        // administrators are told the year is shut, because it is the one leave
+        // action that cannot be undone from any screen.
+        const lapsedPer = new Map();
+        for (const row of ledger) {
+            const k = String(row.teacher);
+            lapsedPer.set(k, (lapsedPer.get(k) || 0) + row.days);
+        }
+        for (const [teacherId, total] of lapsedPer) {
+            notifyBalanceChange(req, [teacherId], {
+                title: '⌛ Unused leave lapsed',
+                body: `${academicYear} has been closed. ${days(Math.round(total * 100) / 100)} of leave you had not used `
+                    + 'have lapsed and are no longer available.',
+                email: true,
+            });
+        }
+        notifyLeaveAdmins(req, {
+            title: '📕 Academic year closed for leave',
+            body: `${req.user?.name || 'An administrator'} closed ${academicYear}. `
+                + (ops.length
+                    ? `${ops.length} balance(s) lapsed, ${Math.round(ledger.reduce((n, l) => n + l.days, 0) * 100) / 100} day(s) in total.`
+                    : 'Nothing was left to lapse.'),
+            link: { type: 'leave.balance' },
+        });
+
         res.json({
             success: true,
             academicYear,
@@ -1380,6 +1549,26 @@ exports.adminSettleEmployeeLeave = async (req, res) => {
         if (ops.length) await LeaveBalance.bulkWrite(ops);
         await recordAdjustments(ledger);
 
+        if (ops.length) {
+            const lapsed = Math.round(ledger.reduce((n, l) => n + l.days, 0) * 100) / 100;
+            const encashable = lines.filter((l) => l.encashable);
+            notifyBalanceChange(req, [teacherId], {
+                title: '📄 Leave settled on exit',
+                body: `Your leave balances for ${ay} have been finalised — ${days(lapsed)} closed out.`
+                    + (encashable.length
+                        ? `\n${encashable.map((l) => `${l.leaveType.name}: ${l.remaining} day(s) encashable`).join(', ')}. `
+                            + 'Encashment itself is settled through payroll.'
+                        : ''),
+                email: true,
+            });
+            notifyLeaveAdmins(req, {
+                title: '📄 Leave settlement completed',
+                body: `${req.user?.name || 'An administrator'} settled leave for an employee leaving — `
+                    + `${ops.length} balance(s), ${days(lapsed)} closed out for ${ay}.`,
+                link: { type: 'leave.balance' },
+            });
+        }
+
         res.json({
             success: true,
             data: { academicYear: ay, settled: true, lines },
@@ -1423,6 +1612,8 @@ async function runMonthlyAccrualForSchool(schoolId) {
 
     const now = new Date();
     let credited = 0;
+    // teacherId -> [ "Casual Leave +1", … ] for the monthly message below.
+    const earned = new Map();
 
     for (const policy of policies) {
         const lt        = policy.leaveType;
@@ -1450,18 +1641,43 @@ async function runMonthlyAccrualForSchool(schoolId) {
             const months = monthsBetween(new Date(anchorRaw), now);
             if (months < 1) continue;
 
+            const next  = Math.min(already + months * perMonth, annualCap);
+            const gained = Math.round((next - already) * 100) / 100;
             ops.push({ updateOne: {
                 filter: { _id: b._id },
                 update: { $set: {
-                    totalAllocated: Math.min(already + months * perMonth, annualCap),
+                    totalAllocated: next,
                     lastAccrualAt:  now,
                 }},
             }});
             credited += 1;
+            if (gained > 0) {
+                const line = `${lt.name} +${gained}`;
+                earned.set(String(b.teacher), [...(earned.get(String(b.teacher)) || []), line]);
+            }
         }
 
         if (ops.length) await LeaveBalance.bulkWrite(ops);
     }
+
+    // Days appeared in somebody's balance without anyone asking for them, which
+    // is the kind of change people only notice much later. One message per
+    // teacher listing every type that moved, not one per balance row.
+    //
+    // System-originated: notify() drops a senderless message and always filters
+    // the sender out of the recipients, so the teacher is deliberately both
+    // ends of their own accrual notice — the same shape comp off expiry uses.
+    for (const [teacherId, lines] of earned) {
+        notify({
+            school: schoolId, sender: teacherId, senderRole: 'system',
+            title: '📈 Monthly leave credited',
+            body: `This month's leave has been added to your balance: ${lines.join(', ')}.`,
+            recipients: [teacherId],
+            includeSender: true,
+            link: { type: 'leave.balance' },
+        });
+    }
+
     return credited;
 }
 
@@ -1521,8 +1737,9 @@ exports.adminBulkAllocateExcel = async (req, res) => {
         const teacherById    = Object.fromEntries(teachers.map(t => [t.employeeId, t]));
         const ltByCode       = Object.fromEntries(leaveTypes.map(l => [l.code, l]));
 
-        const errors = [];
-        const ops    = [];
+        const errors  = [];
+        const ops     = [];
+        const touched = new Set();
 
         rows.forEach((row, i) => {
             const lineNo = i + 2;
@@ -1545,9 +1762,18 @@ exports.adminBulkAllocateExcel = async (req, res) => {
                     upsert: true,
                 },
             });
+            touched.add(String(teacher._id));
         });
 
         if (ops.length) await LeaveBalance.bulkWrite(ops);
+
+        // One message per teacher however many rows of the sheet were theirs —
+        // a spreadsheet with five leave types each would otherwise be five.
+        notifyBalanceChange(req, [...touched], {
+            title: '📗 Leave allocation updated',
+            body: `Your leave allocation for ${ay} has been updated. Open Leave Balance to see where you stand.`,
+        });
+
         res.json({ success: true, updated: ops.length, errors: errors.length ? errors : undefined });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -1617,6 +1843,27 @@ exports.adminRunCarryForward = async (req, res) => {
         await recordAdjustments(carried);
 
         if (!processed) return res.json({ success: true, message: 'Nothing to carry forward', processed: 0 });
+
+        // Days that survived the year change. Totalled per teacher, because one
+        // teacher usually carries several types across and wants one answer.
+        const perTeacher = new Map();
+        for (const row of carried) {
+            const k = String(row.teacher);
+            perTeacher.set(k, (perTeacher.get(k) || 0) + row.days);
+        }
+        for (const [teacherId, total] of perTeacher) {
+            notifyBalanceChange(req, [teacherId], {
+                title: '🔄 Leave carried forward',
+                body: `${days(Math.round(total * 100) / 100)} of unused leave have been carried from ${fromYear} into ${toYear}.`,
+            });
+        }
+        notifyLeaveAdmins(req, {
+            title: '🔄 Carry forward complete',
+            body: `${processed} balance(s) carried from ${fromYear} to ${toYear}`
+                + `${compOffProcessed ? `, ${compOffProcessed} of them Comp Off` : ''}.`,
+            link: { type: 'leave.balance' },
+        });
+
         res.json({ success: true, processed, compOffProcessed });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -1970,13 +2217,20 @@ exports.teacherCancelLeave = async (req, res) => {
             leaveTypeId: app.leaveType, academicYear: ay,
             inc: { pending: -paidOf(app) },
         });
-        schoolAdminIds(req.schoolId).then(admins => notify({
-            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-            title: '🚫 Leave request cancelled',
-            body: `${req.user?.name || 'A teacher'} cancelled their leave request for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)}.`,
-            recipients: admins,
-            link: { type: 'leave.approvals', entityId: app._id },
-        })).catch(() => {});
+        // Whoever was going to decide it needs to know it is gone — not just the
+        // school admins, which left a designation approver or a module admin
+        // chasing a request that no longer exists.
+        leavePolicy.getPolicy(req.schoolId, app.leaveType)
+            .then((policy) => (policy
+                ? leavePolicy.approverIds(req.schoolId, policy)
+                : leavePolicy.leaveAdminIds(req.schoolId)))
+            .then(recipients => notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: '🚫 Leave request cancelled',
+                body: `${req.user?.name || 'A teacher'} cancelled their leave request for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)}.`,
+                recipients,
+                link: { type: 'leave.approvals', entityId: app._id },
+            })).catch(() => {});
         res.json({ success: true, data: app });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

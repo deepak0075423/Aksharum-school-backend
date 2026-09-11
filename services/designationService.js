@@ -111,6 +111,8 @@ function gate(permissions, moduleFlags) {
 
 const CACHE_TTL = Number(process.env.DESIGNATION_CACHE_TTL) || 60; // seconds
 const cacheKey = (schoolId) => `desig:school:${schoolId}`;
+// One list per module of who administers it — see moduleAdminIds below.
+const moduleAdminKey = (schoolId, moduleKey) => `desig:modadmin:${moduleKey}:${schoolId}`;
 
 async function loadSnapshot(schoolId) {
     const [school, rows] = await Promise.all([
@@ -151,10 +153,17 @@ async function getSnapshot(schoolId) {
 
 // Called whenever a designation is written OR the Super Admin toggles a school's
 // modules — both change what every teacher of that school may reach.
+//
+// The per-module administrator lists are derived from the same snapshot, so
+// they go with it. Dropped by name rather than by a KEYS scan: the module list
+// is fixed and known, and KEYS on a shared Redis is not something to run on
+// every designation save.
 async function invalidate(schoolId) {
     const redis = getCacheRedis();
     if (!redis || !schoolId) return;
-    try { await redis.del(cacheKey(schoolId)); } catch { /* best effort */ }
+    try {
+        await redis.del(cacheKey(schoolId), ...MODULE_KEYS.map((k) => moduleAdminKey(schoolId, k)));
+    } catch { /* best effort */ }
 }
 
 // ── Resolution ───────────────────────────────────────────────────────────────
@@ -286,6 +295,80 @@ async function isModuleAdmin(req, moduleKey) {
     return access?.permissions?.[moduleKey] === ADMIN;
 }
 
+/**
+ * Everyone who administers `moduleKey` for this school: its school admins, plus
+ * every active teacher whose designation grants ADMIN on it.
+ *
+ * The audience for a module's administrative notifications. Before this, those
+ * went to `schoolAdminIds()` alone — so a designation configured to run the
+ * leave module put a teacher on its admin screens and then never told them a
+ * request was waiting, which made the permission look broken.
+ *
+ * Two rules worth stating:
+ *  · The module being off for the school is the one case where nobody
+ *    administers it, however their designation is configured. gate() already
+ *    AND-s the flag in, so resolveFromSnapshot answers NONE and the list
+ *    empties on its own.
+ *  · A TeacherProfile outlives the user it belonged to, so the ids are joined
+ *    back to live, active teacher accounts — an orphan profile must not become
+ *    a phantom recipient.
+ *
+ * Cached for the same window as the snapshot behind it, so a change to who
+ * counts reaches this list in exactly the time it already takes to reach the
+ * route guards. A failure returns [] rather than throwing: a notification is
+ * never worth failing the request that triggered it.
+ */
+async function moduleAdminIds(schoolId, moduleKey) {
+    if (!schoolId || !isModuleKey(moduleKey)) return [];
+
+    const redis = getCacheRedis();
+    if (redis) {
+        try {
+            const hit = await redis.get(moduleAdminKey(schoolId, moduleKey));
+            if (hit) return JSON.parse(hit);
+        } catch { /* fall through to the database */ }
+    }
+
+    let ids = [];
+    try {
+        const snapshot = await getSnapshot(schoolId);
+        if (snapshot?.moduleFlags?.[moduleKey]) {
+            const [admins, profiles] = await Promise.all([
+                User.find({ school: schoolId, role: 'school_admin', isActive: true }).select('_id').lean(),
+                TeacherProfile.find({ school: schoolId }).select('user designation').lean(),
+            ]);
+
+            // One resolution per distinct designation name, not one per teacher.
+            const verdict = new Map();
+            const holders = profiles.filter((p) => {
+                const k = key(p.designation);
+                if (!verdict.has(k)) {
+                    verdict.set(k, resolveFromSnapshot(snapshot, p.designation).permissions[moduleKey] === ADMIN);
+                }
+                return verdict.get(k);
+            });
+
+            const teachers = holders.length
+                ? await User.find({
+                    _id: { $in: holders.map((p) => String(p.user)) },
+                    school: schoolId, role: 'teacher', isActive: true,
+                }).select('_id').lean()
+                : [];
+
+            ids = [...new Set([...admins, ...teachers].map((u) => String(u._id)))];
+        }
+    } catch (e) {
+        console.error(`[designations] moduleAdminIds(${moduleKey}) failed:`, e.message);
+        return [];
+    }
+
+    if (redis) {
+        try { await redis.set(moduleAdminKey(schoolId, moduleKey), JSON.stringify(ids), 'EX', CACHE_TTL); }
+        catch { /* best effort */ }
+    }
+    return ids;
+}
+
 // ── Management (CRUD used by the designation controller) ─────────────────────
 
 // Seeds one row per name in School.designations the first time a school opens
@@ -414,7 +497,7 @@ module.exports = {
     ADMIN, USER, NONE, LEVELS, RANK, DEFAULT_DESIGNATIONS, CACHE_TTL,
     sanitizePermissions, defaultPermissionsFor, emptyPermissions, gate,
     getSnapshot, invalidate, resolveDesignation, resolveFromSnapshot,
-    requestAccess, resolveRequestAccess, meets, isModuleAdmin, teacherDesignation,
+    requestAccess, resolveRequestAccess, meets, isModuleAdmin, moduleAdminIds, teacherDesignation,
     invalidateUser, invalidateUsers,
     ensureSeeded, listWithPermissions, renameProfiles, countTeachers,
     teacherCountsByDesignation, holderCountsByDesignation, syncSchoolNames,

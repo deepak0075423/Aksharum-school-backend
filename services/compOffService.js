@@ -29,7 +29,10 @@ const LeaveApplication = require('../models/LeaveApplication');
 const TeacherProfile   = require('../models/TeacherProfile');
 const School           = require('../models/School');
 const User             = require('../models/User');
-const { notify, schoolAdminIds } = require('./notifyService');
+const { notify } = require('./notifyService');
+// Comp off lives inside the leave module, so it borrows that module's idea of
+// who administers it. No cycle: leavePolicyService does not require this file.
+const leavePolicy = require('./leavePolicyService');
 const {
     normalizeLeaveSettings, isSaturdayWorking, staffHolidaysInRange,
     getActiveAcademicYearLabel, remainingOf, utcMidnight,
@@ -390,12 +393,20 @@ async function canApprove(userId, userRole, schoolId, policy, moduleAdmin = fals
     return designations.includes(profile?.designation || '');
 }
 
-/** Everyone who should see "a new comp off request needs your attention". */
+/**
+ * Everyone who should see "a new comp off request needs your attention".
+ *
+ * "Admin" here means an administrator of the LEAVE module — comp off lives
+ * inside it — not the school_admin role, which is the same rule canApprove
+ * applies. So a designation granting admin on leave is told about the queue it
+ * is allowed to work.
+ */
 async function approverIds(schoolId, policy) {
     const ids = new Set();
     const mode = policy.approval.mode;
+    const admins = () => leavePolicy.leaveAdminIds(schoolId);
     if (mode === 'admin' || mode === 'both') {
-        (await schoolAdminIds(schoolId)).forEach(id => ids.add(String(id)));
+        (await admins()).forEach(id => ids.add(String(id)));
     }
     const designations = policy.approval.approverDesignations || [];
     if ((mode === 'designation' || mode === 'both') && designations.length) {
@@ -404,7 +415,7 @@ async function approverIds(schoolId, policy) {
         }).select('user').lean();
         profiles.forEach(p => ids.add(String(p.user)));
     }
-    if (!ids.size) (await schoolAdminIds(schoolId)).forEach(id => ids.add(String(id)));
+    if (!ids.size) (await admins()).forEach(id => ids.add(String(id)));
     return [...ids];
 }
 

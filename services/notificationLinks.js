@@ -30,9 +30,24 @@ const ROUTES = {
     },
     'leave.approvals': {
         school_admin: { web: '/admin/leave?tab=requests',    mobile: '/modules/admin/leave' },
-        // A teacher only reaches an approvals queue by designation; the tab is
-        // hidden for everyone else and the page falls back to their own list.
+        // A teacher reaches an approvals queue two ways — by designation, or by
+        // holding admin on the leave module — and this one queue serves both,
+        // because teacherGetApprovals asks canApprove the same question the
+        // admin screen does. Everyone else falls back to their own list.
         teacher:      { web: '/teacher/leave?tab=approvals', mobile: '/modules/leave-approvals' },
+    },
+    // Administrative notices about the module itself — a type deleted, a policy
+    // changed, a year closed. Only ever sent to leave administrators, which is
+    // why the teacher row points into /admin: a teacher receiving one holds
+    // admin on the module, so AdminAreaGuard lets them in.
+    'leave.manage': {
+        school_admin: { web: '/admin/leave?tab=types', mobile: '/modules/admin/leave-types' },
+        teacher:      { web: '/admin/leave?tab=types', mobile: '/modules/admin/leave-types' },
+    },
+    // A balance moved — allocated, cleared, carried forward, accrued, settled.
+    'leave.balance': {
+        teacher:      { web: '/teacher/leave?tab=balance',     mobile: '/modules/leave' },
+        school_admin: { web: '/admin/leave?tab=allocations',   mobile: '/modules/admin/leave-allocations' },
     },
 
     // ── Comp off (lives inside the leave module) ─────────────────────────────

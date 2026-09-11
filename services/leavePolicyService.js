@@ -20,6 +20,9 @@ const LeaveApplication = require('../models/LeaveApplication');
 const TeacherProfile   = require('../models/TeacherProfile');
 const User             = require('../models/User');
 const { schoolAdminIds } = require('./notifyService');
+// Named `designationSvc`, not `designations`: two functions below use that
+// word for the policy's own approverDesignations list.
+const designationSvc     = require('./designationService');
 const { utcMidnight }    = require('../utils/leaveDays');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -444,12 +447,21 @@ async function designationOf(userId, schoolId) {
     return profile?.designation || '';
 }
 
-/** Everyone who should be told a new application needs their attention. */
+/**
+ * Everyone who should be told a new application needs their attention.
+ *
+ * Mirrors canApprove exactly — whoever the policy lets sign off is who gets
+ * told there is something to sign off, or the queue fills for people who never
+ * hear about it. That is why "admin" resolves through leaveAdminIds rather than
+ * schoolAdminIds: a designation granting ADMIN on the leave module makes that
+ * teacher an administrator of leave, and canApprove has treated them as one
+ * since the module-admin fix.
+ */
 async function approverIds(schoolId, policy) {
     const ids = new Set();
     const mode = policy.approval.mode;
     if (mode === 'admin' || mode === 'both') {
-        (await schoolAdminIds(schoolId)).forEach((id) => ids.add(String(id)));
+        (await leaveAdminIds(schoolId)).forEach((id) => ids.add(String(id)));
     }
     const designations = policy.approval.approverDesignations || [];
     if ((mode === 'designation' || mode === 'both') && designations.length) {
@@ -457,8 +469,23 @@ async function approverIds(schoolId, policy) {
             .select('user').lean();
         profiles.forEach((p) => ids.add(String(p.user)));
     }
-    if (!ids.size) (await schoolAdminIds(schoolId)).forEach((id) => ids.add(String(id)));
+    // Misconfigured — nobody named, or a designation nobody holds. The
+    // administrators keep the keys, the same fallback canApprove applies.
+    if (!ids.size) (await leaveAdminIds(schoolId)).forEach((id) => ids.add(String(id)));
     return [...ids];
+}
+
+/**
+ * Everyone who administers leave for this school: its school admins, plus the
+ * teachers whose designation grants ADMIN on the leave module.
+ *
+ * The audience for the module's administrative notices. Falls back to the
+ * school admins alone if the lookup fails, so a Redis or designation problem
+ * degrades to the old behaviour rather than to silence.
+ */
+async function leaveAdminIds(schoolId) {
+    const ids = await designationSvc.moduleAdminIds(schoolId, 'leave');
+    return ids.length ? ids : (await schoolAdminIds(schoolId)).map(String);
 }
 
 /** Leave types this employee is actually allowed to apply for. */
@@ -494,6 +521,7 @@ module.exports = {
     spendableFrom,
     splitPaidAndLop,
     canApprove,
+    leaveAdminIds,
     designationOf,
     approverIds,
     eligibleTypesFor,

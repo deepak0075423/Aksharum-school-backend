@@ -17,11 +17,9 @@ const LibraryPolicy      = require('../models/LibraryPolicy');
 const LibraryAuditLog    = require('../models/LibraryAuditLog');
 const User               = require('../models/User');
 const pool               = require('../db/pool');
-const TeacherProfile     = require('../models/TeacherProfile');
 const { notify, withParents } = require('./notifyService');
 const { withTransaction, lock, buildInsert } = require('./dbTx');
 const designations       = require('./designationService');
-const { getCacheRedis }  = require('../config/cacheRedis');
 
 const fmtLibDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 
@@ -521,63 +519,13 @@ async function backfillFineAmounts(schoolId) {
  * already takes to reach the route guards. No separate invalidation to keep in
  * step with designationService's.
  */
-const STAFF_TTL = designations.CACHE_TTL || 60;
-const staffCacheKey = (schoolId) => `lib:staff:${schoolId}`;
-
-async function libraryStaffIds(schoolId) {
-    if (!schoolId) return [];
-    const redis = getCacheRedis();
-    if (redis) {
-        try {
-            const hit = await redis.get(staffCacheKey(schoolId));
-            if (hit) return JSON.parse(hit);
-        } catch { /* fall through to the database */ }
-    }
-
-    let ids = [];
-    try {
-        const snapshot = await designations.getSnapshot(schoolId);
-        // The module being off for the school is the one case where nobody is
-        // library staff, however their designation is configured.
-        if (snapshot?.moduleFlags?.library) {
-            const [admins, profiles] = await Promise.all([
-                User.find({ school: schoolId, role: 'school_admin', isActive: true }).select('_id').lean(),
-                TeacherProfile.find({ school: schoolId }).select('user designation').lean(),
-            ]);
-
-            // One resolution per distinct designation name, not one per teacher.
-            const verdict = new Map();
-            const moduleAdmins = profiles.filter((p) => {
-                const key = String(p.designation || '').toLowerCase();
-                if (!verdict.has(key)) {
-                    verdict.set(key, designations.resolveFromSnapshot(snapshot, p.designation)
-                        .permissions.library === designations.ADMIN);
-                }
-                return verdict.get(key);
-            });
-
-            // A TeacherProfile outlives the user it belonged to, so the ids are
-            // joined back to live, active teacher accounts.
-            const teachers = moduleAdmins.length
-                ? await User.find({
-                    _id: { $in: moduleAdmins.map((p) => String(p.user)) },
-                    school: schoolId, role: 'teacher', isActive: true,
-                }).select('_id').lean()
-                : [];
-
-            ids = [...new Set([...admins, ...teachers].map((u) => String(u._id)))];
-        }
-    } catch (e) {
-        console.error('[library] libraryStaffIds failed:', e.message);
-        return [];   // a notification is never worth failing the request over
-    }
-
-    if (redis) {
-        try { await redis.set(staffCacheKey(schoolId), JSON.stringify(ids), 'EX', STAFF_TTL); }
-        catch { /* best effort */ }
-    }
-    return ids;
-}
+/**
+ * Delegated to designationService, which now owns "who administers this module"
+ * for every module — the derivation, the join back to live accounts, the cache
+ * and its invalidation were all identical here. The name stays because the
+ * library code reads better with it, and because every caller already uses it.
+ */
+const libraryStaffIds = (schoolId) => designations.moduleAdminIds(schoolId, 'library');
 
 /**
  * The desk's copy of a member-facing notice.
