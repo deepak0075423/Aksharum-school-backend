@@ -8,6 +8,10 @@ const LeaveTypeSchema = new db.Schema({
     },
     name: { type: String, required: true, trim: true },
     code: { type: String, required: true, trim: true, uppercase: true },
+    // What this type is for, in the admin's own words. Shown beside the type
+    // wherever it is listed, so "CL" does not have to be institutional
+    // knowledge.
+    description: { type: String, default: '', trim: true },
     // What kind of leave this is. 'compoff' switches the type over to the
     // Comp Off engine: its balance is credited only by an approved
     // CompOffRequest, never by allocation or accrual.

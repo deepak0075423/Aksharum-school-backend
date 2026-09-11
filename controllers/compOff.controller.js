@@ -7,6 +7,7 @@
  * no `LeaveBalance` write anywhere in this file: crediting is reachable only
  * through compOff.approveRequest().
  */
+const pool           = require('../db/pool');
 const CompOffRequest = require('../models/CompOffRequest');
 const LeaveLedger    = require('../models/LeaveLedger');
 const LeaveBalance   = require('../models/LeaveBalance');
@@ -281,9 +282,68 @@ exports.listRequests = async (req, res) => {
             compOff.canApprove(req.userId, req.userRole, req.schoolId, ctx.policy, moduleAdmin),
         ]);
 
+        // The screen's designation line, and the counts behind its tiles.
+        //
+        // The counts deliberately ignore every filter: they describe the
+        // school, and a tile that is also the filter must not move when it is
+        // pressed. Counted in Postgres rather than by paging the table.
+        const school = String(req.schoolId);
+        const monthStart = new Date();
+        monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
+        const prevStart = new Date(monthStart);
+        prevStart.setUTCMonth(prevStart.getUTCMonth() - 1);
+
+        const teacherIds = [...new Set(items.map((r) => r.teacher?._id && String(r.teacher._id)).filter(Boolean))];
+        const [byStatus, months, profiles] = await Promise.all([
+            pool.query(
+                `SELECT "status", count(*)::int AS "n"
+                   FROM "${CompOffRequest.tableName}"
+                  WHERE "school" = $1::uuid
+                  GROUP BY "status"`, [school]),
+            pool.query(
+                `SELECT count(*) FILTER (WHERE "appliedAt" >= $2)::int                     AS "this",
+                        count(*) FILTER (WHERE "appliedAt" >= $3 AND "appliedAt" < $2)::int AS "prev"
+                   FROM "${CompOffRequest.tableName}"
+                  WHERE "school" = $1::uuid`, [school, monthStart, prevStart]),
+            teacherIds.length
+                ? TeacherProfile.find({ user: { $in: teacherIds } })
+                    .select('user employeeId designation department').lean()
+                : Promise.resolve([]),
+        ]);
+
+        // designation lives on TeacherProfile, never on User — the populate
+        // above can only ever supply the name and the email.
+        const byUser = new Map(profiles.map((pr) => [String(pr.user), pr]));
+        items.forEach((r) => {
+            const pr = r.teacher && byUser.get(String(r.teacher._id));
+            if (r.teacher) {
+                r.teacher.employeeId  = pr?.employeeId  || '';
+                r.teacher.designation = pr?.designation || '';
+                r.teacher.department  = pr?.department  || '';
+            }
+        });
+
+        const stat = (k) => byStatus.rows.find((x) => x.status === k)?.n || 0;
+        const thisMonth = months.rows[0]?.this || 0;
+        const prevMonth = months.rows[0]?.prev || 0;
+
         ok(res, {
             enabled: true, isApprover, policy: publicPolicy(ctx.policy),
             items, total, page: effectivePage, pages: Math.ceil(total / +limit),
+            counts: {
+                total:     byStatus.rows.reduce((n, x) => n + x.n, 0),
+                draft:     stat('draft'),
+                pending:   stat('pending'),
+                approved:  stat('approved'),
+                rejected:  stat('rejected'),
+                cancelled: stat('cancelled'),
+                expired:   stat('expired'),
+                // Null rather than 0 when last month had nothing: "+100%" off a
+                // base of zero is not a fact about this month.
+                monthDeltaPct: prevMonth
+                    ? Math.round(((thisMonth - prevMonth) / prevMonth) * 100)
+                    : null,
+            },
             ...(focus ? { focusFound } : {}),
         });
     } catch (e) { bad(res, e.message, 500); }

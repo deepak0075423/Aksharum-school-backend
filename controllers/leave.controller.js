@@ -1,4 +1,5 @@
 'use strict';
+const pool             = require('../db/pool');
 const LeaveType        = require('../models/LeaveType');
 const LeaveApplication = require('../models/LeaveApplication');
 const LeaveBalance     = require('../models/LeaveBalance');
@@ -256,7 +257,7 @@ exports.adminGetLeaveTypes = async (req, res) => {
 
 exports.adminCreateLeaveType = async (req, res) => {
     try {
-        const { name, code, category, annualAllocation, monthlyAccrual, carryForward, encashable,
+        const { name, code, description, category, annualAllocation, monthlyAccrual, carryForward, encashable,
                 maxEncashableDays, maxConsecutiveDays, requiresDocument, documentRequiredAfterDays, isActive } = req.body;
         if (!name?.trim()) return res.status(400).json({ success: false, message: 'Name is required' });
         if (!code?.trim()) return res.status(400).json({ success: false, message: 'Code is required' });
@@ -276,6 +277,7 @@ exports.adminCreateLeaveType = async (req, res) => {
 
         const payload = {
             name:                       name.trim(),
+            description:                (description || '').trim(),
             category:                   resolvedCategory,
             // Comp off is earned, never allocated — force the annual figure to 0
             // so nobody can hand out comp off days through the allocation screen.
@@ -309,7 +311,7 @@ exports.adminCreateLeaveType = async (req, res) => {
 
 exports.adminUpdateLeaveType = async (req, res) => {
     try {
-        const { name, code, category, annualAllocation, monthlyAccrual, carryForward, encashable,
+        const { name, code, description, category, annualAllocation, monthlyAccrual, carryForward, encashable,
                 maxEncashableDays, maxConsecutiveDays, requiresDocument, documentRequiredAfterDays, isActive } = req.body;
 
         const existing = await LeaveType.findOne({ _id: req.params.id, school: req.schoolId }).lean();
@@ -329,6 +331,7 @@ exports.adminUpdateLeaveType = async (req, res) => {
         if (category                 !== undefined) update.category                 = nextCategory;
         if (name                     !== undefined) update.name                     = name.trim();
         if (code                     !== undefined) update.code                     = code.trim().toUpperCase();
+        if (description              !== undefined) update.description              = (description || '').trim();
         // Comp off days are earned, never allocated — keep the annual figure at 0
         if (annualAllocation         !== undefined) update.annualAllocation         = nextCategory === 'compoff' ? 0 : Number(annualAllocation);
         if (monthlyAccrual           !== undefined) update.monthlyAccrual           = monthlyAccrual;
@@ -600,22 +603,245 @@ exports.adminUpdateLeaveSettings = async (req, res) => {
 
 // ── Admin: Leave Requests ─────────────────────────────────────────────────────
 
+// ── Admin: landing overview ───────────────────────────────────────────────────
+
+/** A model's table, quoted for interpolation into raw SQL. */
+const qt = (Model) => `"${Model.tableName}"`;
+
+/**
+ * Today at UTC midnight of the *local* calendar day.
+ *
+ * Leave dates are written as `new Date(dateStr).setUTCHours(0,0,0,0)` off a
+ * local date string, so a plain `new Date()` compared against them is wrong for
+ * the hours where the two calendars disagree — 00:00–05:30 IST, when it is
+ * still yesterday in UTC and every one of today's absences would be missed.
+ */
+function localDayUTC(d = new Date()) {
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    return new Date(`${key}T00:00:00.000Z`);
+}
+
+/**
+ * Everything the leave landing page states as a figure, in one call.
+ *
+ * The tiles above the queue, the who-is-out-today list beside it and the
+ * per-type split are all counted in Postgres rather than by paging the whole
+ * application table into JavaScript: a school with three years of leave history
+ * has tens of thousands of rows, and the landing page reads five numbers off
+ * them.
+ *
+ * Everything is scoped to the active academic year — which is what the tiles
+ * say they are ("This Academic Year"), and the window the admin is actually
+ * working in. `onLeaveToday` and `upcoming` are deliberately *not*: a leave
+ * that straddles a year boundary is still someone being out of school today.
+ */
+exports.adminGetLeaveOverview = async (req, res) => {
+    try {
+        const school = String(req.schoolId);
+        const ay     = await getActiveAcademicYearLabel(req.schoolId);
+        const ayRow  = ay ? await AcademicYear.findOne({ school: req.schoolId, yearName: ay }).lean() : null;
+
+        // No academic year on record yet — count everything rather than nothing,
+        // so a school still setting itself up sees its own data.
+        const from = ayRow?.startDate ? new Date(ayRow.startDate) : new Date(0);
+        const to   = ayRow?.endDate   ? new Date(ayRow.endDate)   : new Date('2999-12-31');
+
+        const today  = localDayUTC();
+        const weekTo = new Date(today);
+        weekTo.setUTCDate(weekTo.getUTCDate() + 7);
+
+        const [byStatus, byType, outToday, soon, oldest, staff, allocated] = await Promise.all([
+            // The tiles: one row per status, with the days behind each count —
+            // "3 pending" and "31 days pending" are different sizes of problem.
+            pool.query(
+                `SELECT "status",
+                        count(*)::int                          AS "requests",
+                        coalesce(sum("totalDays"), 0)::float    AS "days",
+                        coalesce(sum("lopDays"),   0)::float    AS "lop"
+                   FROM ${qt(LeaveApplication)}
+                  WHERE "school" = $1 AND "fromDate" >= $2 AND "fromDate" <= $3
+                  GROUP BY "status"`,
+                [school, from, to],
+            ),
+            // The split behind the year's leave, for the rail. Cancelled and
+            // rejected days were never taken, so they are left out.
+            pool.query(
+                `SELECT lt."_id", lt."name", lt."code", lt."category",
+                        count(*)::int                             AS "requests",
+                        coalesce(sum(la."totalDays"), 0)::float    AS "days"
+                   FROM ${qt(LeaveApplication)} la
+                   JOIN ${qt(LeaveType)} lt ON lt."_id" = la."leaveType"
+                  WHERE la."school" = $1 AND la."fromDate" >= $2 AND la."fromDate" <= $3
+                    AND la."status" IN ('approved', 'pending')
+                  GROUP BY lt."_id", lt."name", lt."code", lt."category"
+                  ORDER BY "days" DESC, lt."name"`,
+                [school, from, to],
+            ),
+            // Who is out right now. Half days say which half, because a morning
+            // absence and an afternoon one need different cover.
+            pool.query(
+                `SELECT la."_id", la."teacher", la."toDate", la."leaveMode", la."halfDaySession",
+                        u."name", tp."employeeId",
+                        lt."name" AS "typeName", lt."code" AS "typeCode"
+                   FROM ${qt(LeaveApplication)} la
+                   JOIN ${qt(User)} u  ON u."_id"  = la."teacher"
+                   JOIN ${qt(LeaveType)} lt ON lt."_id" = la."leaveType"
+                   LEFT JOIN ${qt(TeacherProfile)} tp ON tp."user" = u."_id"
+                  WHERE la."school" = $1 AND la."status" = 'approved'
+                    AND la."fromDate" <= $2 AND la."toDate" >= $2
+                  ORDER BY u."name"`,
+                [school, today],
+            ),
+            // Approved leave that has not started yet, inside the next week.
+            pool.query(
+                `SELECT la."_id", la."fromDate", la."toDate", la."totalDays",
+                        u."name", lt."code" AS "typeCode"
+                   FROM ${qt(LeaveApplication)} la
+                   JOIN ${qt(User)} u  ON u."_id"  = la."teacher"
+                   JOIN ${qt(LeaveType)} lt ON lt."_id" = la."leaveType"
+                  WHERE la."school" = $1 AND la."status" = 'approved'
+                    AND la."fromDate" > $2 AND la."fromDate" <= $3
+                  ORDER BY la."fromDate"
+                  LIMIT 8`,
+                [school, today, weekTo],
+            ),
+            // How long the queue's oldest request has been sitting. Not windowed
+            // to the year: a request stranded since last year is the one worth
+            // saying out loud.
+            pool.query(
+                `SELECT min("appliedAt") AS "since", count(*)::int AS "n"
+                   FROM ${qt(LeaveApplication)}
+                  WHERE "school" = $1 AND "status" = 'pending'`,
+                [school],
+            ),
+            pool.query(
+                `SELECT count(*)::int AS "n"
+                   FROM ${qt(User)}
+                  WHERE "school" = $1 AND "role" = 'teacher' AND "isActive" = true`,
+                [school],
+            ),
+            // Staff who hold at least one balance row this year. The gap between
+            // this and the headcount is what the Allocations tab exists to fix.
+            pool.query(
+                `SELECT count(DISTINCT "teacher")::int AS "n"
+                   FROM ${qt(LeaveBalance)}
+                  WHERE "school" = $1 AND "academicYear" = $2`,
+                [school, ay || ''],
+            ),
+        ]);
+
+        const stat = (s) => byStatus.rows.find((r) => r.status === s) || { requests: 0, days: 0, lop: 0 };
+        const counts = {
+            total:     byStatus.rows.reduce((n, r) => n + r.requests, 0),
+            pending:   stat('pending').requests,
+            approved:  stat('approved').requests,
+            rejected:  stat('rejected').requests,
+            cancelled: stat('cancelled').requests,
+        };
+
+        const since = oldest.rows[0]?.since;
+        const staffCount = staff.rows[0]?.n || 0;
+
+        res.json({
+            success: true,
+            data: {
+                academicYear: ay || null,
+                window: ayRow?.startDate
+                    ? { startDate: ayRow.startDate, endDate: ayRow.endDate }
+                    : null,
+                counts,
+                days: {
+                    pending:  stat('pending').days,
+                    approved: stat('approved').days,
+                    lop:      stat('approved').lop,
+                },
+                // Distinct people, not applications — a morning half day and an
+                // afternoon one is one teacher out of school, not two.
+                onLeaveToday: new Set(outToday.rows.map((r) => String(r.teacher))).size,
+                out: outToday.rows.map((r) => ({
+                    _id: String(r._id), name: r.name, employeeId: r.employeeId || '',
+                    leaveType: r.typeName, code: r.typeCode, toDate: r.toDate,
+                    leaveMode: r.leaveMode, halfDaySession: r.halfDaySession,
+                })),
+                upcoming: soon.rows.map((r) => ({
+                    _id: String(r._id), name: r.name, code: r.typeCode,
+                    fromDate: r.fromDate, toDate: r.toDate, totalDays: r.totalDays,
+                })),
+                byType: byType.rows.map((r) => ({
+                    _id: String(r._id), name: r.name, code: r.code,
+                    category: r.category, requests: r.requests, days: r.days,
+                })),
+                // Days the oldest untouched request has waited, so the queue tile
+                // can say "waiting 6 days" rather than only how many there are.
+                oldestPendingDays: since
+                    ? Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 86400000))
+                    : null,
+                staff:       staffCount,
+                allocated:   allocated.rows[0]?.n || 0,
+                unallocated: Math.max(0, staffCount - (allocated.rows[0]?.n || 0)),
+            },
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+// The orders the queue can be read in. Keyed on columns of the application
+// itself — sorting by teacher name would need a join the ORM cannot express,
+// and a sort the list silently ignored would be worse than not offering it.
+const REQUEST_SORTS = {
+    recent:  { fromDate:  -1 },
+    oldest:  { fromDate:   1 },
+    applied: { appliedAt: -1 },
+    longest: { totalDays: -1 },
+};
+
 exports.adminGetRequests = async (req, res) => {
     try {
-        const { status, teacherId, leaveType, fromDate, toDate, page = 1, limit = 20, focus } = req.query;
+        const { status, teacherId, leaveType, fromDate, toDate, page = 1, limit = 20, focus,
+                q, sort: sortKey, mode } = req.query;
         const filter = { school: req.schoolId };
         if (status)    filter.status    = status;
         if (teacherId) filter.teacher   = teacherId;
         if (leaveType) filter.leaveType = leaveType;
+        if (mode === 'half_day' || mode === 'full_day') filter.leaveMode = mode;
         if (fromDate || toDate) {
             filter.fromDate = {};
             if (fromDate) filter.fromDate.$gte = new Date(fromDate);
             if (toDate)   filter.fromDate.$lte = new Date(toDate);
         }
+
+        // One search box over four columns across three tables: the teacher's
+        // name and employee id, the leave type's name and code, and the reason.
+        //
+        // The matching ids are resolved first and fed in as an $in rather than
+        // joined, because the ORM's $lookup runs in JavaScript and would pull
+        // every user and every application into memory to answer it.
+        //
+        // Wrapped in $and, not assigned to filter.$or: focusPage() sets $or on
+        // its own copy of this filter to count the rows ahead of the focused
+        // record, and would otherwise overwrite the search — placing the record
+        // on a page number worked out from an unsearched list.
+        if (q && String(q).trim()) {
+            const rx = String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const like = { $regex: rx, $options: 'i' };
+            const [users, profiles, types] = await Promise.all([
+                User.find({ school: req.schoolId, role: 'teacher', name: like }).select('_id').lean(),
+                TeacherProfile.find({ school: req.schoolId, employeeId: like }).select('user').lean(),
+                LeaveType.find({ school: req.schoolId, $or: [{ name: like }, { code: like }] }).select('_id').lean(),
+            ]);
+            const teacherIds = [...new Set([
+                ...users.map((u) => String(u._id)),
+                ...profiles.map((pr) => String(pr.user)),
+            ])];
+            const any = [{ reason: like }];
+            if (teacherIds.length) any.push({ teacher:   { $in: teacherIds } });
+            if (types.length)      any.push({ leaveType: { $in: types.map((t) => String(t._id)) } });
+            filter.$and = [{ $or: any }];
+        }
+
         // fromDate is indexed alongside (school, status); appliedAt is not, so
         // sorting on it made every page of the queue sort in memory. Newest
-        // leave first reads the same to a user.
-        const sort = { fromDate: -1 };
+        // leave first reads the same to a user, and is the default.
+        const sort = REQUEST_SORTS[sortKey] || REQUEST_SORTS.recent;
 
         // Arriving from a notification: open on the page holding that request
         // rather than page 1, where it usually is not.
@@ -633,6 +859,26 @@ exports.adminGetRequests = async (req, res) => {
                 .lean(),
             LeaveApplication.countDocuments(filter),
         ]);
+
+        // employeeId, designation and department live on TeacherProfile, never
+        // on User — the populate above asked User for an employeeId it does not
+        // have, so the id line under every teacher's name rendered empty. One
+        // query for the page's teachers, rather than a populate per row.
+        const teacherIds = [...new Set(apps.map((a) => a.teacher?._id && String(a.teacher._id)).filter(Boolean))];
+        const profiles = teacherIds.length
+            ? await TeacherProfile.find({ user: { $in: teacherIds } })
+                .select('user employeeId designation department').lean()
+            : [];
+        const byUser = new Map(profiles.map((pr) => [String(pr.user), pr]));
+        apps.forEach((a) => {
+            const pr = a.teacher && byUser.get(String(a.teacher._id));
+            if (a.teacher) {
+                a.teacher.employeeId  = pr?.employeeId  || '';
+                a.teacher.designation = pr?.designation || '';
+                a.teacher.department  = pr?.department  || '';
+            }
+        });
+
         res.json({
             success: true, data: apps, total,
             page: effectivePage, pages: Math.ceil(total / +limit),
@@ -1164,6 +1410,25 @@ exports.adminGetAllocations = async (req, res) => {
             .map(y => ({ label: academicYearLabel(y), startDate: y.startDate, endDate: y.endDate, status: y.status }))
             .filter(y => y.label)
             .sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+
+        // employeeId, designation and department live on TeacherProfile, never on
+        // User — the populate above asks User for an employeeId it does not
+        // have. One query for the teachers on this page rather than a populate
+        // per balance row.
+        const teacherIds = [...new Set(balances.map((b) => b.teacher?._id && String(b.teacher._id)).filter(Boolean))];
+        const profiles = teacherIds.length
+            ? await TeacherProfile.find({ user: { $in: teacherIds } })
+                .select('user employeeId designation department').lean()
+            : [];
+        const byUser = new Map(profiles.map((pr) => [String(pr.user), pr]));
+        balances.forEach((b) => {
+            const pr = b.teacher && byUser.get(String(b.teacher._id));
+            if (b.teacher) {
+                b.teacher.employeeId  = pr?.employeeId  || '';
+                b.teacher.designation = pr?.designation || '';
+                b.teacher.department  = pr?.department  || '';
+            }
+        });
 
         res.json({ success: true, data: balances, leaveTypes: withPolicy, academicYear: ay, academicYears });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -1872,51 +2137,153 @@ exports.adminRunCarryForward = async (req, res) => {
 
 exports.adminGetReports = async (req, res) => {
     try {
-        const { academicYear, teacherId, leaveType, status, fromDate, toDate } = req.query;
-        const ay = academicYear || await getActiveAcademicYearLabel(req.schoolId);
+        const school = String(req.schoolId);
+        const { academicYear, department, leaveType, status } = req.query;
+        const ay    = academicYear || await getActiveAcademicYearLabel(req.schoolId);
+        const years = await AcademicYear.find({ school: req.schoolId }).lean();
+        const ayRow = years.find((y) => academicYearLabel(y) === ay);
 
-        let filter = { school: req.schoolId };
-        if (teacherId) filter.teacher   = teacherId;
-        if (leaveType) filter.leaveType = leaveType;
-        if (status)    filter.status    = status;
+        // Without a year on record, report on everything rather than nothing —
+        // a school still setting itself up should still see its own figures.
+        const from = ayRow?.startDate ? new Date(ayRow.startDate) : new Date(0);
+        const to   = ayRow?.endDate   ? new Date(ayRow.endDate)   : new Date('2999-12-31');
 
-        // Bounded to the reported year unless an explicit range is given. This
-        // used to read every application the school had ever filed.
-        const ayRow = await AcademicYear.findOne({ school: req.schoolId, yearName: ay }).lean();
-        filter = withReportWindow(filter, { fromDate, toDate }, ayRow);
+        // The year before this one, for the headline's delta. Picked by date
+        // rather than by name: "2025-26" sorts before "2026-27" only by luck.
+        const prev = years
+            .filter((y) => y.endDate && new Date(y.endDate) <= from)
+            .sort((a, b) => new Date(b.endDate) - new Date(a.endDate))[0];
 
-        const [apps, balances] = await Promise.all([
-            LeaveApplication.find(filter)
-                .populate('teacher',   'name email employeeId')
-                .populate('leaveType', 'name code')
-                .sort({ appliedAt: -1 })
-                .limit(REPORT_ROW_CAP)
-                .lean(),
-            LeaveBalance.find({ school: req.schoolId, academicYear: ay, ...(teacherId ? { teacher: teacherId } : {}) })
-                .populate('teacher',   'name email employeeId')
-                .populate('leaveType', 'name code')
-                .lean(),
+        // Optional narrowing. Department lives on TeacherProfile, so it becomes
+        // a teacher-id list before it can touch the application table.
+        const params = [school, from, to];
+        let scope = '';
+        if (department) {
+            const profiles = await TeacherProfile.find({ school: req.schoolId, department })
+                .select('user').lean();
+            const ids = profiles.map((pr) => String(pr.user));
+            // An empty list must match nothing, not everything.
+            params.push(ids.length ? ids : ['00000000-0000-0000-0000-000000000000']);
+            scope += ` AND la."teacher" = ANY($${params.length}::uuid[])`;
+        }
+        if (leaveType) { params.push(leaveType); scope += ` AND la."leaveType" = $${params.length}::uuid`; }
+        if (status)    { params.push(status);    scope += ` AND la."status" = $${params.length}`; }
+
+        const WHERE = `WHERE la."school" = $1::uuid AND la."fromDate" >= $2 AND la."fromDate" <= $3${scope}`;
+
+        const [byStatus, trend, byType, perTeacher, lastYear, depts] = await Promise.all([
+            pool.query(
+                `SELECT la."status", count(*)::int AS "n", coalesce(sum(la."totalDays"),0)::float AS "days"
+                   FROM ${qt(LeaveApplication)} la ${WHERE}
+                  GROUP BY la."status"`, params),
+            // One row per month the year actually holds applications in; the
+            // months in between are filled in below so the axis has no gaps.
+            pool.query(
+                `SELECT to_char(la."fromDate" AT TIME ZONE 'UTC', 'YYYY-MM') AS "month",
+                        count(*)::int AS "n", coalesce(sum(la."totalDays"),0)::float AS "days"
+                   FROM ${qt(LeaveApplication)} la ${WHERE}
+                  GROUP BY 1 ORDER BY 1`, params),
+            pool.query(
+                `SELECT lt."_id", lt."name", lt."code",
+                        count(*)::int AS "n", coalesce(sum(la."totalDays"),0)::float AS "days"
+                   FROM ${qt(LeaveApplication)} la
+                   JOIN ${qt(LeaveType)} lt ON lt."_id" = la."leaveType" ${WHERE}
+                  GROUP BY lt."_id", lt."name", lt."code"
+                  ORDER BY "n" DESC, lt."name"`, params),
+            // The teacher table, as one row per teacher per type. Pivoted in JS
+            // because the column set is the school's own list of leave types.
+            pool.query(
+                `SELECT u."_id" AS "teacher", u."name", tp."employeeId", tp."department",
+                        la."leaveType", coalesce(sum(la."totalDays"),0)::float AS "days",
+                        count(*)::int AS "n"
+                   FROM ${qt(LeaveApplication)} la
+                   JOIN ${qt(User)} u ON u."_id" = la."teacher"
+                   LEFT JOIN ${qt(TeacherProfile)} tp ON tp."user" = u."_id" ${WHERE}
+                  GROUP BY u."_id", u."name", tp."employeeId", tp."department", la."leaveType"`, params),
+            prev
+                ? pool.query(
+                    `SELECT count(*)::int AS "n" FROM ${qt(LeaveApplication)} la
+                      WHERE la."school" = $1::uuid AND la."fromDate" >= $2 AND la."fromDate" <= $3`,
+                    [school, new Date(prev.startDate), new Date(prev.endDate)])
+                : Promise.resolve({ rows: [{ n: null }] }),
+            pool.query(
+                `SELECT DISTINCT tp."department" FROM ${qt(TeacherProfile)} tp
+                  WHERE tp."school" = $1::uuid AND tp."department" IS NOT NULL AND tp."department" <> ''
+                  ORDER BY 1`, [school]),
         ]);
 
-        const summary = balances.map(b => ({
-            teacher:        b.teacher,
-            leaveType:      b.leaveType,
-            academicYear:   b.academicYear,
-            totalAllocated: b.totalAllocated,
-            carriedForward: b.carriedForward,
-            used:           b.used,
-            pending:        b.pending,
-            expired:        b.expired || 0,
-            remaining:      remainingOf(b),
-        }));
+        const stat = (k) => byStatus.rows.find((r) => r.status === k) || { n: 0, days: 0 };
+        const totals = {
+            applications: byStatus.rows.reduce((n, r) => n + r.n, 0),
+            approved:     stat('approved').n,
+            pending:      stat('pending').n,
+            rejected:     stat('rejected').n,
+            cancelled:    stat('cancelled').n,
+            days:         byStatus.rows.reduce((n, r) => n + r.days, 0),
+        };
 
+        // Every month in the window, including the empty ones — a bar chart with
+        // months missing reads as a shorter year, not as a quieter one.
+        const seen = new Map(trend.rows.map((r) => [r.month, r]));
+        const series = [];
+        const cur = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
+        const last = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), 1));
+        // Guard the loop: a school with no academic year row has `from` at the
+        // epoch, and walking 1970→2999 a month at a time is 12,000 iterations.
+        while (cur <= last && series.length < 24) {
+            const key = `${cur.getUTCFullYear()}-${String(cur.getUTCMonth() + 1).padStart(2, '0')}`;
+            const hit = seen.get(key);
+            series.push({
+                month: key,
+                label: cur.toLocaleDateString('en-IN', { month: 'short', timeZone: 'UTC' }),
+                count: hit?.n || 0,
+                days:  hit?.days || 0,
+            });
+            cur.setUTCMonth(cur.getUTCMonth() + 1);
+        }
+
+        const teachers = new Map();
+        perTeacher.rows.forEach((r) => {
+            const id = String(r.teacher);
+            if (!teachers.has(id)) {
+                teachers.set(id, {
+                    _id: id, name: r.name, employeeId: r.employeeId || '',
+                    department: r.department || '', perType: {}, days: 0, applications: 0,
+                });
+            }
+            const t = teachers.get(id);
+            t.perType[String(r.leaveType)] = r.days;
+            t.days += r.days;
+            t.applications += r.n;
+        });
+
+        const prevCount = lastYear.rows[0]?.n;
         res.json({
             success: true,
-            data: { applications: apps, summary },
-            academicYear: ay,
-            // Tells the caller the list was cut rather than letting a truncated
-            // report look complete.
-            truncated: apps.length >= REPORT_ROW_CAP,
+            data: {
+                academicYear: ay || null,
+                window: ayRow?.startDate ? { startDate: ayRow.startDate, endDate: ayRow.endDate } : null,
+                totals,
+                lastYear: prev
+                    ? {
+                        label: academicYearLabel(prev),
+                        applications: prevCount,
+                        // Null rather than 0 when last year had nothing: "+100%"
+                        // off a base of zero is not a fact about this year.
+                        deltaPct: prevCount ? Math.round(((totals.applications - prevCount) / prevCount) * 100) : null,
+                    }
+                    : null,
+                trend: series,
+                byType: byType.rows.map((r) => ({
+                    _id: String(r._id), name: r.name, code: r.code, count: r.n, days: r.days,
+                })),
+                teachers: [...teachers.values()].sort((a, b) => a.name.localeCompare(b.name)),
+                departments: depts.rows.map((r) => r.department),
+                academicYears: years
+                    .map((y) => ({ label: academicYearLabel(y), startDate: y.startDate, status: y.status }))
+                    .filter((y) => y.label)
+                    .sort((a, b) => new Date(a.startDate) - new Date(b.startDate)),
+            },
         });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

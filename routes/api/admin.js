@@ -361,6 +361,8 @@ router.put('/leave/settings',                      leaveGuard, leaveCtrl.adminUp
 router.get('/leave/policies',                      leaveGuard, leaveCtrl.adminGetPolicies);
 router.get('/leave/policies/:leaveTypeId',         leaveGuard, leaveCtrl.adminGetPolicy);
 router.put('/leave/policies/:leaveTypeId',         leaveGuard, leaveCtrl.adminUpdatePolicy);
+// The landing page's figures — the tiles, who is out today, the per-type split.
+router.get('/leave/overview',                      leaveGuard, leaveCtrl.adminGetLeaveOverview);
 router.get('/leave/requests',                      leaveGuard, leaveCtrl.adminGetRequests);
 router.post('/leave/requests',                     leaveGuard, uploadLeaveDoc.single('document'), leaveCtrl.adminApplyLeave);
 router.get('/leave/balance',                       leaveGuard, leaveCtrl.adminGetTeacherBalance);
