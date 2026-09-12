@@ -205,7 +205,7 @@ exports.reserve = async (req, res) => {
                 : `You are number ${reservation.queuePosition} in the queue for "${book.title}". We will let you know when it is ready.`,
             recipients: [req.userId],
             includeSender: true,
-            link: { type: 'library.reservations' },
+            link: { type: 'library.reservations', entityId: reservation._id },
         });
 
         // A reservation is placed by the member, so nobody at the desk has seen
@@ -218,7 +218,7 @@ exports.reserve = async (req, res) => {
             body: readyNow
                 ? `${member?.name || 'A member'} reserved "${book.title}" — a copy is free, set it aside before ${fmtLibDate(reservation.expiresAt)}.`
                 : `${member?.name || 'A member'} joined the queue for "${book.title}" at position ${reservation.queuePosition}.`,
-            link: { type: 'library.manage.reservations' },
+            link: { type: 'library.manage.reservations', entityId: reservation._id },
         });
 
         res.status(201).json({ success: true, data: reservation });
@@ -247,7 +247,7 @@ exports.cancelReservation = async (req, res) => {
                 schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
                 title: '🔖 Held copy released',
                 body: `${who?.name || 'A member'} cancelled their hold on "${book?.title || 'a book'}" — the copy can go back on the shelf.`,
-                link: { type: 'library.manage.reservations' },
+                link: { type: 'library.manage.reservations', entityId: reservation._id },
             });
         }
         res.json({ success: true });

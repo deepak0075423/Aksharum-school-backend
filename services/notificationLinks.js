@@ -322,6 +322,11 @@ function resolve(link, role, receiptId = null) {
     let mobile = fill(target.mobile, values);
     if (web.includes('{') || mobile.includes('{')) return fallback;
 
+    // Which params the path itself swallowed — the rest are forwarded below.
+    const templateKeys = new Set(
+        [...String(target.web + target.mobile).matchAll(/\{(\w+)\}/g)].map((m) => m[1]),
+    );
+
     // Most destinations are lists — the leave queue, the regularization
     // requests, the substitutions. Landing on the list is only half the job;
     // `focus` names the row this notification is about so the page can scroll
@@ -330,6 +335,19 @@ function resolve(link, role, receiptId = null) {
     if (link.entityId && !/\{id\}/.test(target.web + target.mobile)) {
         web    = withParam(web, 'focus', link.entityId);
         mobile = withParam(mobile, 'focus', link.entityId);
+    }
+
+    // Naming the row is not enough when the page opens on a slice that does not
+    // contain it. The substitutions board opens on today: a notification about
+    // a cover on the 20th lands on a board that will never render that row, and
+    // the highlight waits for something that cannot arrive. So any param the
+    // path did not consume is forwarded as a query parameter, which is how a
+    // notification says *which day, which tab* to open as well as which row.
+    // Pages that do not read a given key simply ignore it.
+    for (const [key, value] of Object.entries(link.params || {})) {
+        if (templateKeys.has(key) || value == null || value === '') continue;
+        web    = withParam(web, key, value);
+        mobile = withParam(mobile, key, value);
     }
 
     return {
@@ -376,6 +394,141 @@ function normalize(link) {
 }
 
 /** Every destination this build knows — used by the link self-test script. */
+
+// ── What a notification is about, and how much it wants ──────────────────────
+/**
+ * The same registry, asked two more questions.
+ *
+ * A reader with two hundred notifications needs to narrow them, and the two
+ * things they narrow by are *which part of the school this came from* and *does
+ * it want something from me*. Neither was ever stored: a notification carries a
+ * destination, and the destination already says both. `leave.approvals` is the
+ * leave module, and it is a queue somebody is waiting in.
+ *
+ * So both are derived from link.type here rather than written by 89 call sites,
+ * and the inbox query derives them the same way — moduleSql()/prioritySql()
+ * below emit the same mapping as SQL, so filtering and sorting in Postgres can
+ * never disagree with what the row displays.
+ *
+ * `priority` on the Notification overrides the derived value, and is what the
+ * admin's own Send dialog writes: a person broadcasting a message knows how
+ * urgent it is, and nothing in a hand-typed announcement can tell us.
+ */
+
+// The module a link type belongs to. Several types share one: comp off is part
+// of leave, substitutions are part of the timetable.
+const MODULE_OF = {
+    leave: 'leave', compoff: 'leave',
+    attendance: 'attendance',
+    fees: 'fees',
+    payroll: 'payroll',
+    library: 'library',
+    results: 'results',
+    timetable: 'timetable', substitutions: 'timetable',
+    holidays: 'calendar',
+    inventory: 'inventory',
+    transport: 'transport',
+    hostel: 'hostel',
+    video: 'video',
+    feedback: 'feedback',
+    section: 'academics',
+};
+
+const MODULE_LABELS = {
+    leave: 'Leave', attendance: 'Attendance', fees: 'Fees', payroll: 'Payroll',
+    library: 'Library', results: 'Results', timetable: 'Timetable',
+    calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
+    hostel: 'Hostel', video: 'Videos', feedback: 'Feedback',
+    academics: 'Academics', general: 'General',
+};
+
+// Somebody is waiting on the reader, or money is owed. These are the ones that
+// should still be visible after a filter down to "High".
+const HIGH_TYPES = [
+    'leave.approvals', 'compoff.approvals',
+    'attendance.regularizations', 'attendance.corrections',
+    'inventory.requests', 'transport.requests', 'video.approvals',
+    'feedback.pending', 'feedback.form',
+    'fees.mine', 'library.myfines', 'library.manage.fines', 'library.fines',
+    'substitutions',
+];
+
+// Nothing is being asked and nothing has changed for the reader personally —
+// the school's calendar moved, a video was published, a timetable was redrawn.
+const LOW_TYPES = [
+    'holidays', 'section', 'timetable', 'timetable.section',
+    'video.list', 'video.item', 'feedback.campaign',
+];
+
+const PRIORITIES = ['high', 'medium', 'low'];
+
+/** The module key for a stored link — 'general' when it names no destination. */
+function moduleOf(link) {
+    const type = (typeof link === 'string' ? link : link?.type) || '';
+    if (!type) return 'general';
+    return MODULE_OF[type.split('.')[0]] || 'general';
+}
+
+/** The module's name as a reader would say it. */
+function moduleLabel(key) {
+    return MODULE_LABELS[key] || MODULE_LABELS.general;
+}
+
+/** Every module a notification can come from, for the inbox's filter. */
+const MODULE_OPTIONS = [...new Set(Object.values(MODULE_OF)), 'general']
+    .map((key) => ({ value: key, label: moduleLabel(key) }));
+
+/**
+ * How loud a notification is, when nobody said.
+ * A stored `priority` always wins — see priorityOf().
+ */
+function derivedPriority(link) {
+    const type = (typeof link === 'string' ? link : link?.type) || '';
+    if (HIGH_TYPES.includes(type)) return 'high';
+    if (!type || LOW_TYPES.includes(type)) return 'low';
+    return 'medium';
+}
+
+function priorityOf(notification) {
+    const stored = notification?.priority;
+    if (PRIORITIES.includes(stored)) return stored;
+    return derivedPriority(notification?.link);
+}
+
+// ── The same two rules, as SQL ───────────────────────────────────────────────
+// The inbox pages, filters and sorts in Postgres, so the mapping has to exist
+// there too. Generated from the tables above rather than written out a second
+// time, so the two cannot drift apart.
+
+const sqlList = (values) => values.map((v) => `'${v}'`).join(', ');
+
+/** SQL expression for the module key of a notification row. `col` is its jsonb link column. */
+function moduleSql(col = 'n.link') {
+    const whens = Object.entries(MODULE_OF)
+        .map(([prefix, key]) => `WHEN '${prefix}' THEN '${key}'`)
+        .join(' ');
+    return `(CASE split_part(COALESCE(${col}->>'type', ''), '.', 1) ${whens} ELSE 'general' END)`;
+}
+
+/** SQL expression for a notification's priority, stored value first. */
+function prioritySql(linkCol = 'n.link', priorityCol = 'n.priority') {
+    return `(CASE
+        WHEN ${priorityCol} IN (${sqlList(PRIORITIES)}) THEN ${priorityCol}
+        WHEN COALESCE(${linkCol}->>'type', '') IN (${sqlList(HIGH_TYPES)}) THEN 'high'
+        WHEN COALESCE(${linkCol}->>'type', '') IN (${sqlList(LOW_TYPES)}) THEN 'low'
+        WHEN COALESCE(${linkCol}->>'type', '') = '' THEN 'low'
+        ELSE 'medium' END)`;
+}
+
+/** Sorts high above low, for ORDER BY — a text sort would put "low" first. */
+function priorityRankSql(linkCol = 'n.link', priorityCol = 'n.priority') {
+    return `(CASE ${prioritySql(linkCol, priorityCol)} WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END)`;
+}
+
 const LINK_TYPES = Object.keys(ROUTES);
 
-module.exports = { resolve, normalize, webUrl, receiptUrl, appUrl, LINK_TYPES, ROUTES, INBOX };
+module.exports = {
+    resolve, normalize, webUrl, receiptUrl, appUrl, LINK_TYPES, ROUTES, INBOX,
+    moduleOf, moduleLabel, MODULE_OPTIONS, PRIORITIES, priorityOf, derivedPriority,
+    moduleSql, prioritySql, priorityRankSql,
+};

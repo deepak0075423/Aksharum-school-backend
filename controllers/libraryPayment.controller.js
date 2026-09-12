@@ -262,7 +262,7 @@ exports.confirmFinePayment = async (req, res) => {
             body: `A library fine of ₹${total.toLocaleString('en-IN')} has been paid online.\nReceipt: ${receiptNumber}`,
             recipients: await borrowerAudience({ issuedTo: subject.userId, issuedToRole: payer?.role || '' }),
             includeSender: true,
-            link: { type: 'library.myfines' },
+            link: { type: 'library.myfines', entityId: fines.length === 1 ? fines[0]._id : null },
         });
         // Money arriving without anyone at the counter: the desk finds out here
         // or not at all.
@@ -272,7 +272,7 @@ exports.confirmFinePayment = async (req, res) => {
             title: '💳 Library fine paid online',
             body: `${member?.name || 'A member'} paid ₹${total.toLocaleString('en-IN')} online`
                 + ` against ${fines.length} fine${fines.length === 1 ? '' : 's'}. Receipt: ${receiptNumber}.`,
-            link: { type: 'library.manage.fines' },
+            link: { type: 'library.manage.fines', entityId: fines.length === 1 ? fines[0]._id : null },
             exclude: [req.userId],
         });
 

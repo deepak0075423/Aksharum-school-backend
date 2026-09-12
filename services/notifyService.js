@@ -91,13 +91,18 @@ function _emailHtml({ school, recipientName, title, body, openUrl }) {
  * @param {Object}   [opts.link]      Where it takes the reader — { type, entityId?, params? }.
  *                                    See services/notificationLinks for the types.
  *                                    Omitted, the notification opens on itself.
+ * @param {String}  [opts.priority]  'high' | 'medium' | 'low'. Leave it unset —
+ *                                    the destination already says how urgent a
+ *                                    module's notification is, and notificationLinks
+ *                                    derives it. Pass one only when the same link
+ *                                    type carries both routine and urgent news.
  */
 function notify(opts) {
     setImmediate(() => _notify(opts).catch(e =>
         console.error('[notify] failed:', e.message)));
 }
 
-async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false, link = null }) {
+async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false, link = null, priority = null }) {
     if (!sender || !title || !body) return;
 
     const ids = [...new Set(
@@ -117,6 +122,7 @@ async function _notify({ school, sender, senderRole, title, body, recipients = [
         channels:   { inApp: true, email: !!email },
         target:     { type: 'individual' },
         link:       notificationLinks.normalize(link) || undefined,
+        priority:   notificationLinks.PRIORITIES.includes(priority) ? priority : null,
         recipientCount: ids.length,
     });
 

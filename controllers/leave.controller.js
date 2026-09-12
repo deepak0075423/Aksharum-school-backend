@@ -525,7 +525,9 @@ exports.adminUpdatePolicy = async (req, res) => {
             title: '⚙️ Leave policy updated',
             body: `${req.user?.name || 'An administrator'} changed the rules for ${name} — eligibility, `
                 + 'limits and approval routing all follow this policy.',
-            link: { type: 'leave.manage' },
+            // Names the leave type, so following this lands on that row of the
+            // types tab rather than on the tab.
+            link: { type: 'leave.manage', entityId: req.params.leaveTypeId },
         });
 
         res.json({ success: true, data: result.policy });

@@ -43,6 +43,11 @@ const NotificationSchema = new db.Schema({
         entityId: { type: String, default: null }, // the record it is about
         params:   { type: db.Types.JSON, default: null },
     },
+    // How loud this one is. Set by hand when a person writes the notification —
+    // the admin's Send dialog asks — and left null by the modules, which is not
+    // a gap: services/notificationLinks derives a priority from the destination,
+    // and a stored value here simply overrides it.
+    priority: { type: String, enum: ['high', 'medium', 'low'], default: null },
     recipientCount: { type: Number, default: 0 },
     emailSent:      { type: Boolean, default: false },
 }, { timestamps: true });

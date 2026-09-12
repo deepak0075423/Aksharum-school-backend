@@ -1001,14 +1001,14 @@ exports.markCopyStatus = async (req, res) => {
                         title: status === 'lost' ? '📕 Lost book charge' : '📙 Damaged book charge',
                         body: `A charge of ₹${amount} has been raised for "${bookDoc?.title || 'a library book'}" (copy ${copy.uniqueCode}).`,
                         recipients: await audienceForUser(req.schoolId, last.issuedTo),
-                        link: { type: 'library.myfines' },
+                        link: { type: 'library.myfines', entityId: fine._id },
                     });
                     notifyLibraryStaff({
                         schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
                         title: status === 'lost' ? '📕 Lost book charge raised' : '📙 Damaged book charge raised',
                         body: `Copy ${copy.uniqueCode} of "${bookDoc?.title || 'a library book'}" was marked ${status}`
                             + ` and a ₹${amount} charge was raised against its last borrower.`,
-                        link: { type: 'library.manage.fines' },
+                        link: { type: 'library.manage.fines', entityId: fine._id },
                     });
                 }
             }
@@ -1290,13 +1290,13 @@ exports.issueBook = async (req, res) => {
             title: '📚 Book issued to you',
             body: `"${book.title}" has been issued to you. Due date: ${fmtLibDate(computedDue)}.`,
             recipients: [userId],
-            link: { type: 'library.mybooks' },
+            link: { type: 'library.mybooks', entityId: issuance._id },
         });
         notifyLibraryStaff({
             schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '📚 Book issued',
             body: `"${book.title}" was issued to ${eligible.user.name || 'a member'}, due ${fmtLibDate(computedDue)}.`,
-            link: { type: 'library.manage.circulation' },
+            link: { type: 'library.manage.circulation', entityId: issuance._id },
         });
         res.status(201).json({ success: true, data: issuance });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -1392,7 +1392,9 @@ exports.returnBook = async (req, res) => {
             body: `${condition === 'good' ? 'Return' : `A ${condition} copy`} of "${bookDoc?.title || 'a book'}" has been recorded.${fine ? ` A fine of ₹${fine.amount} was applied.` : ''}`,
             // A fine is the parents' business too; a clean return is not.
             recipients: fine ? await borrowerAudience(issuance) : [issuance.issuedTo],
-            link: { type: fine ? 'library.myfines' : 'library.mybooks' },
+            // Whichever record this return actually produced.
+            link: fine ? { type: 'library.myfines', entityId: fine._id }
+                       : { type: 'library.mybooks', entityId: issuance._id },
         });
         const borrower = await User.findById(issuance.issuedTo).select('name').lean().catch(() => null);
         notifyLibraryStaff({
@@ -1402,7 +1404,8 @@ exports.returnBook = async (req, res) => {
                  : '📚 Book returned',
             body: `"${bookDoc?.title || 'A book'}" from ${borrower?.name || 'a member'} was recorded as ${condition}.`
                 + (fine ? ` A ₹${fine.amount} ${fine.fineType.replace(/_/g, ' ')} charge was raised.` : ''),
-            link: { type: fine ? 'library.manage.fines' : 'library.manage.circulation' },
+            link: fine ? { type: 'library.manage.fines', entityId: fine._id }
+                       : { type: 'library.manage.circulation', entityId: issuance._id },
         });
 
         res.json({ success: true, data: { issuance, fine } });
@@ -1710,7 +1713,7 @@ exports.createReservation = async (req, res) => {
                 ? `"${book.title}" is being held for you. Collect it before ${fmtLibDate(reservation.expiresAt)}.`
                 : `You are number ${reservation.queuePosition} in the queue for "${book.title}". We will let you know when it is ready.`,
             recipients: [userId],
-            link: { type: 'library.reservations' },
+            link: { type: 'library.reservations', entityId: reservation._id },
         });
 
         res.status(201).json({ success: true, data: reservation });
@@ -1868,13 +1871,13 @@ exports.markReservationReady = async (req, res) => {
             title: '🔖 Reserved book available',
             body: `"${book?.title || 'A book'}" you reserved is ready for pickup. Collect it before ${fmtLibDate(res_.expiresAt)}.`,
             recipients: [res_.reservedBy],
-            link: { type: 'library.reservations' },
+            link: { type: 'library.reservations', entityId: res_._id },
         })).catch(() => {});
         notifyLibraryStaff({
             schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '🔖 Reservation ready for collection',
             body: `A reserved copy is now being held for collection until ${fmtLibDate(res_.expiresAt)}.`,
-            link: { type: 'library.manage.reservations' },
+            link: { type: 'library.manage.reservations', entityId: res_._id },
         });
         res.json({ success: true, data: res_ });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -1900,14 +1903,14 @@ exports.cancelReservation = async (req, res) => {
             body: `Your reservation for "${cancelledBook?.title || 'a book'}" has been cancelled by the library.`
                 + (req.body?.reason ? `\nReason: ${String(req.body.reason).trim()}` : ''),
             recipients: [reservation.reservedBy],
-            link: { type: 'library.reservations' },
+            link: { type: 'library.reservations', entityId: reservation._id },
         });
         notifyLibraryStaff({
             schoolId: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '🚫 Reservation cancelled',
             body: `A reservation for "${cancelledBook?.title || 'a book'}" was cancelled by the library.`
                 + (req.body?.reason ? `\nReason: ${String(req.body.reason).trim()}` : ''),
-            link: { type: 'library.manage.reservations' },
+            link: { type: 'library.manage.reservations', entityId: reservation._id },
         });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -2168,7 +2171,7 @@ exports.createFine = async (req, res) => {
             body: `A ₹${fine.amount} fine has been raised against "${issuance.book?.title || 'a library book'}"`
                 + `${reason?.trim() ? ` — ${reason.trim()}` : ''}.`,
             recipients: [sid(issuance.issuedTo)],
-            link: { type: 'library.fines' },
+            link: { type: 'library.myfines', entityId: fine._id },
         });
 
         res.status(201).json({ success: true, data: fine });
@@ -2212,14 +2215,14 @@ async function takeFinePayment(schoolId, fineId, { actorId, actorRole }) {
         title: '💳 Library fine paid',
         body: `A library fine payment of ₹${owed} has been recorded. Thank you.\nReceipt: ${receiptNumber}`,
         recipients: await audienceForUser(schoolId, fine.user),
-        link: { type: 'library.myfines' },
+        link: { type: 'library.myfines', entityId: fine._id },
     });
     const payer = await User.findById(fine.user).select('name').lean().catch(() => null);
     notifyLibraryStaff({
         schoolId, sender: actorId, senderRole: actorRole,
         title: '💵 Library fine collected at the counter',
         body: `₹${owed} was collected from ${payer?.name || 'a member'} against receipt ${receiptNumber}.`,
-        link: { type: 'library.manage.fines' },
+        link: { type: 'library.manage.fines', entityId: fine._id },
     });
     return { ok: true, fine, collected: owed, receiptNumber };
 }
@@ -2308,7 +2311,7 @@ exports.waiveFine = async (req, res) => {
                 ? `₹${waive} of a ₹${fine.amount} library fine has been waived. ₹${stillOwed} is still to pay.\nReason: ${reason.trim()}`
                 : `A library fine of ₹${fine.amount} has been waived in full.\nReason: ${reason.trim()}`,
             recipients: await audienceForUser(req.schoolId, fine.user),
-            link: { type: 'library.myfines' },
+            link: { type: 'library.myfines', entityId: fine._id },
         });
         const waivedFor = await User.findById(fine.user).select('name').lean().catch(() => null);
         notifyLibraryStaff({
@@ -2317,7 +2320,7 @@ exports.waiveFine = async (req, res) => {
             body: `₹${waive} of a ₹${fine.amount} fine for ${waivedFor?.name || 'a member'} was written off`
                 + (stillOwed > 0 ? `, leaving ₹${stillOwed} to pay.` : ' in full.')
                 + `\nReason: ${reason.trim()}`,
-            link: { type: 'library.manage.fines' },
+            link: { type: 'library.manage.fines', entityId: fine._id },
         });
         res.json({ success: true, data: { ...fine.toObject?.() ?? fine, outstanding: stillOwed } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }

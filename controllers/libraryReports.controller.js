@@ -951,7 +951,7 @@ exports.remindOverdue = async (req, res) => {
                 body: `"${loan.book?.title || 'A library book'}" was due on ${fmtLibDate(loan.dueDate)}`
                     + ` and is ${days} day${days === 1 ? '' : 's'} overdue. Please return it at the library counter.`,
                 recipients: await borrowerAudience(loan),
-                link: { type: 'library.mybooks' },
+                link: { type: 'library.mybooks', entityId: loan._id },
             });
             audit(req.schoolId, req.user._id, req.user.role, 'OVERDUE_REMINDER_SENT', 'Issuance', loan._id, null, {
                 dueDate: loan.dueDate, daysLate: days,
