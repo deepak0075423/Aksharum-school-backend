@@ -7,6 +7,7 @@ const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
 const docCtrl        = require('../../controllers/document.controller');
+const docViewer      = require('../../controllers/documentViewer.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
@@ -37,7 +38,7 @@ router.get('/results/class-tests', resultGuard, classTestCtrl.parentGetClassTest
 router.get('/results/:resultId',   resultGuard, formalExamCtrl.parentGetResultDetail);
 
 // Documents
-router.get('/documents',      docGuard, docCtrl.parentGetDocuments);
+router.get('/documents',      docGuard, docViewer.parentGetDocuments);
 router.get('/documents/:id',  docGuard, docCtrl.parentGetDocument);
 
 // Holidays

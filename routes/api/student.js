@@ -6,6 +6,7 @@ const attendanceCtrl = require('../../controllers/attendance.controller');
 const timetableCtrl  = require('../../controllers/timetable.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const docCtrl        = require('../../controllers/document.controller');
+const docViewer      = require('../../controllers/documentViewer.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
@@ -47,7 +48,7 @@ router.post('/exams/:id/submit',         examGuard, examCtrl.submitExam);
 router.get('/exams/:id/result',          examGuard, examCtrl.getStudentResult);
 
 // Documents
-router.get('/documents',              docGuard, docCtrl.studentGetDocuments);
+router.get('/documents',              docGuard, docViewer.studentGetDocuments);
 router.get('/documents/:id',          docGuard, docCtrl.studentGetDocument);
 router.post('/documents/:id/submit',  docGuard, uploadDocument.array('files', 5), docCtrl.studentSubmitAssignment);
 

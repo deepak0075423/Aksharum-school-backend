@@ -13,6 +13,8 @@ const classTestCtrl  = require('../../controllers/classTest.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
 const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
+const docViewer      = require('../../controllers/documentViewer.controller');
+const docDetail      = require('../../controllers/documentDetail.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
@@ -137,13 +139,34 @@ router.get('/document-categories', docGuard, async (req, res) => {
 });
 
 // ── Documents ─────────────────────────────────────────────────────────────────
-router.get('/documents',                             docGuard, docCtrl.teacherGetDocuments);
+router.get('/documents',                             docGuard, docViewer.teacherGetDocuments);
 router.post('/documents',                            docGuard, uploadDocument.array('files', 10), docCtrl.teacherUpload);
 router.get('/documents/:id',                         docGuard, docCtrl.teacherGetDocument);
 router.put('/documents/:id',                         docGuard, uploadDocument.array('files', 10), docCtrl.teacherEditDocument);
 router.delete('/documents/:id',                      docGuard, docCtrl.teacherDeleteDocument);
 router.get('/documents/:id/submissions',             docGuard, docCtrl.teacherGetSubmissions);
 router.post('/documents/submissions/:submissionId/review', docGuard, docCtrl.teacherReviewSubmission);
+
+// ── One document, opened ──────────────────────────────────────────────────────
+// The same four tabs the admin gets, behind an access check: a teacher reads
+// anything shared with them and only writes against what they set themselves.
+const canRead = docDetail.teacherDocumentAccess('read');
+const canOwn  = docDetail.teacherDocumentAccess('own');
+
+router.get('/documents/:id/assignment',           docGuard, canRead, docDetail.getAssignment);
+router.get('/documents/:id/assignment/analytics', docGuard, canRead, docDetail.getAssignmentAnalytics);
+router.get('/documents/:id/comments',             docGuard, canRead, docDetail.listComments);
+router.post('/documents/:id/comments',            docGuard, canRead, uploadDocument.array('files', 4), docDetail.addComment);
+
+router.post('/documents/:id/submissions/:studentId/review', docGuard, canOwn, docDetail.reviewSubmission);
+router.post('/documents/:id/remind',              docGuard, canOwn, docDetail.remindPending);
+router.post('/documents/:id/duplicate',           docGuard, canOwn, docDetail.duplicate);
+
+// Editing and deleting a comment are guarded by authorship inside the handler,
+// so they need no document-level check of their own.
+router.patch('/documents/comments/:commentId',     docGuard, docDetail.updateComment);
+router.delete('/documents/comments/:commentId',    docGuard, docDetail.deleteComment);
+router.post('/documents/comments/:commentId/like', docGuard, docDetail.toggleLike);
 
 // ── Holidays ──────────────────────────────────────────────────────────────────
 router.get('/holidays',        holidayGuard, holidayCtrl.teacherGetHolidays);

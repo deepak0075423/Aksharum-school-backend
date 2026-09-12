@@ -7,6 +7,14 @@ const ParentProfile        = require('../models/ParentProfile');
 const ClassSection         = require('../models/ClassSection');
 const Class                = require('../models/Class');
 const SectionSubjectTeacher= require('../models/SectionSubjectTeacher');
+const DocumentCategory     = require('../models/DocumentCategory');
+const AcademicYear         = require('../models/AcademicYear');
+const DocumentComment      = require('../models/DocumentComment');
+const User                 = require('../models/User');
+const pool                 = require('../db/pool');
+
+/** Table name, quoted — the raw-SQL reads below take their names from the models. */
+const qt = (Model) => `"${Model.tableName}"`;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -55,47 +63,425 @@ async function canStudentViewDocument(doc, studentId, schoolId) {
 }
 
 // ── Admin: Documents ──────────────────────────────────────────────────────────
+//
+// The landing page reads the whole shelf: four figures over the school, a set
+// of filters that have to be answered from every row rather than the current
+// page, and a list that joins the uploader and whoever each document was
+// shared with. All of that is counted in Postgres.
+//
+// It is written as SQL rather than through the ORM because the ORM's populate
+// runs its $lookup in JavaScript (see db/aggregate.js) — resolving the class
+// and section names behind `targetClasses`/`targetSections` that way pulls both
+// tables into the process for every page of twenty rows.
+
+/** Shared-with labels for one row, as an array Postgres builds in the join. */
+const SHARED_LABELS = `
+  LEFT JOIN LATERAL (
+    SELECT array_agg(x.label ORDER BY x.ord, x.label) AS labels
+      FROM (
+        SELECT c."classNumber" AS ord, c."className" AS label
+          FROM jsonb_array_elements_text(COALESCE(d."targetClasses", '[]'::jsonb)) t(id)
+          JOIN ${qt(Class)} c ON c."_id" = t.id::uuid
+      ) x
+  ) cls ON true
+  LEFT JOIN LATERAL (
+    SELECT array_agg(x.label ORDER BY x.ord, x.label) AS labels
+      FROM (
+        SELECT c."classNumber" AS ord,
+               c."className" || ' - ' || s."sectionName" AS label
+          FROM jsonb_array_elements_text(COALESCE(d."targetSections", '[]'::jsonb)) t(id)
+          JOIN ${qt(ClassSection)} s ON s."_id" = t.id::uuid
+          JOIN ${qt(Class)} c        ON c."_id" = s."class"
+      ) x
+  ) sec ON true
+  LEFT JOIN LATERAL (
+    SELECT array_agg(u2."name" ORDER BY u2."name") AS labels
+      FROM jsonb_array_elements_text(COALESCE(d."targetUsers", '[]'::jsonb)) t(id)
+      JOIN ${qt(User)} u2 ON u2."_id" = t.id::uuid
+  ) usr ON true`;
+
+const LIST_SORTS = {
+    newest:  'd."createdAt" DESC NULLS LAST',
+    oldest:  'd."createdAt" ASC NULLS LAST',
+    title:   'lower(d."title") ASC',
+    title_z: 'lower(d."title") DESC',
+    type:    'd."docType" ASC, d."createdAt" DESC',
+    due:     'd."dueDate" ASC NULLS LAST, d."createdAt" DESC',
+};
+
+/** The tab strip: a fixed taxonomy, so the same tabs mean the same thing everywhere. */
+const TAB_TYPES = {
+    assignments: ['assignment'],
+    notices:     ['notice', 'circular'],
+    study:       ['study_material'],
+};
+
+/** Which target types count as "shared with a class" / "shared with teachers". */
+const CLASS_TARGETS   = ['class', 'class_sections'];
+const TEACHER_TARGETS = ['all_teachers', 'specific_teachers'];
+
+/**
+ * Everything the admin's filter bar can narrow the list by, as a WHERE clause.
+ * Shared by the list and its total so the two can never disagree.
+ */
+function listWhere(req) {
+    const params = [String(req.schoolId)];
+    const where  = ['d."school" = $1'];
+    const q      = req.query;
+
+    // Archived is a state, not a kind: it is its own view rather than a filter
+    // layered on top of the tabs, and nothing archived shows in the other four.
+    where.push(`COALESCE(d."isArchived", false) = ${q.tab === 'archived' ? 'true' : 'false'}`);
+
+    const types = TAB_TYPES[q.tab];
+    if (types) { params.push(types); where.push(`d."docType" = ANY($${params.length}::text[])`); }
+
+    if (q.category)     { params.push(String(q.category));     where.push(`d."category" = $${params.length}`); }
+    if (q.docType)      { params.push(String(q.docType));      where.push(`d."docType" = $${params.length}`); }
+    if (q.academicYear) { params.push(String(q.academicYear)); where.push(`d."academicYear" = $${params.length}::uuid`); }
+
+    if (q.target === 'classes') {
+        params.push(CLASS_TARGETS);   where.push(`d."targetType" = ANY($${params.length}::text[])`);
+    } else if (q.target === 'teachers') {
+        params.push(TEACHER_TARGETS); where.push(`d."targetType" = ANY($${params.length}::text[])`);
+    } else if (q.target) {
+        params.push(String(q.target)); where.push(`d."targetType" = $${params.length}`);
+    }
+
+    if (q.assignment === 'yes') where.push('COALESCE(d."isAssignment", false) = true');
+    if (q.assignment === 'no')  where.push('COALESCE(d."isAssignment", false) = false');
+
+    const search = String(q.search || '').trim();
+    if (search) {
+        params.push(`%${search}%`);
+        // Title, the line under it and the school's own filing label — the three
+        // things visible in the row someone is trying to find again.
+        where.push(`(d."title" ILIKE $${params.length}
+                     OR d."description" ILIKE $${params.length}
+                     OR d."category" ILIKE $${params.length})`);
+    }
+
+    return { params, clause: where.join(' AND ') };
+}
 
 exports.adminGetDocuments = async (req, res) => {
     try {
-        const { category, isArchived, page = 1, limit = 20, search } = req.query;
-        const filter = { school: req.schoolId };
-        if (category)              filter.category   = category;
-        if (isArchived !== undefined) filter.isArchived = isArchived === 'true';
-        else filter.isArchived = false;
-        if (search) filter.title = { $regex: search, $options: 'i' };
+        const page  = Math.max(1, Math.floor(Number(req.query.page) || 1));
+        const limit = Math.min(100, Math.max(1, Math.floor(Number(req.query.limit) || 10)));
+        const order = LIST_SORTS[req.query.sort] || LIST_SORTS.newest;
 
-        const [docs, total] = await Promise.all([
-            Document.find(filter)
-                .populate('uploadedBy', 'name email')
-                .populate('targetClasses', 'className classNumber')
-                .populate('targetSections', 'sectionName')
-                .sort({ createdAt: -1 })
-                .skip((+page - 1) * +limit)
-                .limit(+limit)
-                .lean(),
-            Document.countDocuments(filter),
+        const { params, clause } = listWhere(req);
+        const rowParams = [...params, limit, (page - 1) * limit];
+
+        const [rows, count] = await Promise.all([
+            pool.query(
+                `SELECT d."_id", d."title", d."description", d."category", d."docType",
+                        d."targetType", d."isAssignment", d."dueDate", d."allowSubmission",
+                        d."marksEnabled", d."totalMarks", d."tags", d."files",
+                        d."currentVersion", d."isArchived", d."createdAt", d."updatedAt",
+                        d."academicYear", d."targetClasses", d."targetSections", d."targetUsers",
+                        u."_id"  AS "uploaderId",
+                        u."name" AS "uploaderName",
+                        u."role" AS "uploaderRole",
+                        u."profileImage" AS "uploaderPhoto",
+                        ay."yearName" AS "academicYearName",
+                        cls.labels AS "classLabels",
+                        sec.labels AS "sectionLabels",
+                        usr.labels AS "userLabels"
+                   FROM ${qt(Document)} d
+                   LEFT JOIN ${qt(User)} u          ON u."_id"  = d."uploadedBy"
+                   LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = d."academicYear"
+                   ${SHARED_LABELS}
+                  WHERE ${clause}
+                  ORDER BY ${order}
+                  LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+                rowParams,
+            ),
+            pool.query(`SELECT count(*)::int AS n FROM ${qt(Document)} d WHERE ${clause}`, params),
         ]);
-        res.json({ success: true, data: docs, total, page: +page, pages: Math.ceil(total / +limit) });
+
+        const total = count.rows[0]?.n || 0;
+        res.json({
+            success: true,
+            data:  rows.rows.map(shapeRow),
+            total,
+            page,
+            limit,
+            pages: Math.max(1, Math.ceil(total / limit)),
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * One row, in the shape the page reads.
+ *
+ * `sharedWith` is resolved here rather than in the browser: the same sentence
+ * appears in the table, in the drawer and in the grid card, and three copies of
+ * "how do I turn a targetType into words" is three chances to disagree.
+ */
+function shapeRow(r) {
+    const classes  = r.classLabels   || [];
+    const sections = r.sectionLabels || [];
+    const people   = r.userLabels    || [];
+
+    const shared = (() => {
+        switch (r.targetType) {
+            case 'whole_school':      return { icon: 'school',  label: 'Whole School', items: [] };
+            case 'all_teachers':      return { icon: 'users',   label: 'All Teachers', items: [] };
+            case 'specific_teachers': return {
+                icon: 'user',
+                label: people.length === 1 ? people[0] : `${people.length} Teachers`,
+                items: people,
+            };
+            case 'class':             return {
+                icon: 'layers',
+                label: classes[0] || 'No class selected',
+                items: classes,
+            };
+            case 'class_sections':    return {
+                icon: 'layers',
+                label: sections[0] || 'No section selected',
+                items: sections,
+            };
+            default:                  return { icon: 'files', label: r.targetType || '—', items: [] };
+        }
+    })();
+
+    const files = Array.isArray(r.files) ? r.files : [];
+    return {
+        _id: r._id,
+        title: r.title,
+        description: r.description || '',
+        category: r.category || '',
+        docType: r.docType || 'other',
+        targetType: r.targetType,
+        targetClasses:  r.targetClasses  || [],
+        targetSections: r.targetSections || [],
+        targetUsers:    r.targetUsers    || [],
+        sharedWith: { ...shared, extra: Math.max(0, shared.items.length - 1) },
+        isAssignment: !!r.isAssignment,
+        allowSubmission: !!r.allowSubmission,
+        marksEnabled: !!r.marksEnabled,
+        totalMarks: r.totalMarks,
+        dueDate: r.dueDate,
+        tags: Array.isArray(r.tags) ? r.tags : [],
+        files,
+        fileCount: files.length,
+        fileSize: files.reduce((n, f) => n + (Number(f.fileSize) || 0), 0),
+        currentVersion: r.currentVersion || 1,
+        isArchived: !!r.isArchived,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+        academicYear: r.academicYear,
+        academicYearName: r.academicYearName || null,
+        uploadedBy: r.uploaderId
+            ? { _id: r.uploaderId, name: r.uploaderName, role: r.uploaderRole, photo: r.uploaderPhoto }
+            : null,
+    };
+}
+
+/**
+ * The four tiles, the tab counts and the options behind every dropdown.
+ *
+ * The tiles state where the school stands *now* and how that compares with
+ * where it stood at the end of last month — a percentage, so a school with 24
+ * documents and one with 2,400 read the same way. The comparison is against the
+ * total as it was then, not against last month's uploads: the tile says "Total
+ * Documents", and a delta measured off a different quantity than the number
+ * beside it is a lie told in small type.
+ *
+ * Everything here ignores the filter bar. The summary describes the school, and
+ * switching a filter must not make the figures above the list move.
+ */
+exports.adminGetDocumentOverview = async (req, res) => {
+    try {
+        const school = String(req.schoolId);
+        const now    = new Date();
+        // First instant of this month, in the server's own calendar — the same
+        // boundary a human means by "last month".
+        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+        const [totals, tabs, cats, years, unfiled] = await Promise.all([
+            pool.query(
+                `SELECT COALESCE(d."isArchived", false)              AS "archived",
+                        count(*)::int                                AS "n",
+                        count(*) FILTER (WHERE d."createdAt" < $2)::int AS "before"
+                   FROM ${qt(Document)} d
+                  WHERE d."school" = $1
+                  GROUP BY 1`,
+                [school, monthStart],
+            ),
+            pool.query(
+                `SELECT d."docType",
+                        COALESCE(d."isAssignment", false) AS "isAssignment",
+                        d."targetType",
+                        count(*)::int                                   AS "n",
+                        count(*) FILTER (WHERE d."createdAt" < $2)::int AS "before"
+                   FROM ${qt(Document)} d
+                  WHERE d."school" = $1 AND COALESCE(d."isArchived", false) = false
+                  GROUP BY 1, 2, 3`,
+                [school, monthStart],
+            ),
+            // The school's own filing labels, plus anything in use that has since
+            // been removed from the master list — a filter that cannot reach a
+            // row visible in the table is worse than no filter.
+            pool.query(
+                `SELECT name, count(d."_id")::int AS "n"
+                   FROM (
+                     SELECT "name" FROM ${qt(DocumentCategory)}
+                      WHERE "school" = $1 AND COALESCE("isActive", true)
+                     UNION
+                     SELECT DISTINCT "category" FROM ${qt(Document)}
+                      WHERE "school" = $1 AND "category" IS NOT NULL AND "category" <> ''
+                   ) c(name)
+                   LEFT JOIN ${qt(Document)} d
+                     ON d."school" = $1 AND d."category" = c.name
+                    AND COALESCE(d."isArchived", false) = false
+                  GROUP BY name
+                  ORDER BY lower(name)`,
+                [school],
+            ),
+            pool.query(
+                `SELECT ay."_id", ay."yearName", ay."status", ay."startDate",
+                        count(d."_id")::int AS "n"
+                   FROM ${qt(AcademicYear)} ay
+                   LEFT JOIN ${qt(Document)} d
+                     ON d."academicYear" = ay."_id" AND COALESCE(d."isArchived", false) = false
+                  WHERE ay."school" = $1
+                  GROUP BY ay."_id", ay."yearName", ay."status", ay."startDate"
+                  ORDER BY ay."startDate" DESC NULLS LAST`,
+                [school],
+            ),
+            // Documents filed against no year at all — uploaded before the field
+            // existed, or while the school had no active year.
+            pool.query(
+                `SELECT count(*)::int AS "n"
+                   FROM ${qt(Document)} d
+                  WHERE d."school" = $1 AND d."academicYear" IS NULL
+                    AND COALESCE(d."isArchived", false) = false`,
+                [school],
+            ),
+        ]);
+
+        const live     = totals.rows.find((r) => r.archived === false) || { n: 0, before: 0 };
+        const archived = totals.rows.find((r) => r.archived === true)  || { n: 0, before: 0 };
+
+        const sum = (pick) => tabs.rows.reduce(
+            (a, r) => (pick(r) ? { n: a.n + r.n, before: a.before + r.before } : a),
+            { n: 0, before: 0 },
+        );
+
+        const tile = ({ n, before }) => ({
+            value: n,
+            // A school that had nothing last month has no percentage to show —
+            // "↑ ∞%" is not a figure. The page prints the raw count instead.
+            change: before > 0 ? Math.round(((n - before) / before) * 100) : null,
+            added:  n - before,
+        });
+
+        const byClass   = sum((r) => CLASS_TARGETS.includes(r.targetType));
+        const byTeacher = sum((r) => TEACHER_TARGETS.includes(r.targetType));
+
+        res.json({
+            success: true,
+            data: {
+                tiles: {
+                    total:       tile(live),
+                    classes:     tile(byClass),
+                    teachers:    tile(byTeacher),
+                    assignments: tile(sum((r) => r.isAssignment)),
+                },
+                counts: {
+                    all:         live.n,
+                    assignments: sum((r) => TAB_TYPES.assignments.includes(r.docType)).n,
+                    notices:     sum((r) => TAB_TYPES.notices.includes(r.docType)).n,
+                    study:       sum((r) => TAB_TYPES.study.includes(r.docType)).n,
+                    archived:    archived.n,
+                },
+                categories:   cats.rows.map((r) => ({ name: r.name, count: r.n })),
+                academicYears: years.rows.map((r) => ({
+                    _id: r._id, name: r.yearName, status: r.status, count: r.n,
+                })),
+                unfiledYear: unfiled.rows[0]?.n || 0,
+            },
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * The year a document is filed under.
+ *
+ * The school's active year, or — when none is marked active — the year whose
+ * window the upload date falls inside. Returns null rather than guessing when
+ * neither answers, so an unfiled document stays visibly unfiled instead of
+ * being quietly parked in the wrong year.
+ */
+async function currentAcademicYearId(schoolId, at = new Date()) {
+    const active = await AcademicYear.findOne({ school: schoolId, status: 'active' }).lean();
+    if (active) return active._id;
+    const covering = await AcademicYear.findOne({
+        school: schoolId,
+        startDate: { $lte: at },
+        endDate:   { $gte: at },
+    }).lean();
+    return covering?._id || null;
+}
+
+const ASSIGNMENT_TYPES = ['homework', 'classwork', 'project', 'practice', 'lab', 'reading'];
+
+/**
+ * The question breakdown, as the form posts it — `[{label, maxMarks}]`.
+ *
+ * Labels are trimmed and de-duplicated because they are the key the marks are
+ * later stored against: two questions both called "Q1" would have one set of
+ * scores between them.
+ */
+function parseQuestions(raw) {
+    let list;
+    try { list = JSON.parse(raw || '[]'); } catch { return []; }
+    if (!Array.isArray(list)) return [];
+    const seen = new Set();
+    return list
+        .map((q) => ({
+            label: String(q?.label ?? '').trim(),
+            maxMarks: q?.maxMarks === '' || q?.maxMarks == null ? null : Number(q.maxMarks),
+        }))
+        .filter((q) => {
+            if (!q.label || seen.has(q.label.toLowerCase())) return false;
+            seen.add(q.label.toLowerCase());
+            return true;
+        })
+        .map((q) => ({ ...q, maxMarks: Number.isFinite(q.maxMarks) ? q.maxMarks : null }))
+        .slice(0, 30);
+}
+
+/** One of the fixed kinds, falling back to the assignment flag then "other". */
+function normalizeDocType(value, isAssignment) {
+    const allowed = ['notice', 'circular', 'study_material', 'assignment', 'other'];
+    const v = String(value || '').trim();
+    if (allowed.includes(v)) return v;
+    return isAssignment ? 'assignment' : 'other';
+}
+
 exports.adminUpload = async (req, res) => {
     try {
-        const { title, description, category, targetType, targetClasses, targetSections,
+        const { title, description, category, docType, subject, assignmentType,
+                questions, targetType, targetClasses, targetSections,
                 targetUsers, isAssignment, dueDate, allowSubmission, marksEnabled, totalMarks, tags } = req.body;
 
         if (!title?.trim())  return res.status(400).json({ success: false, message: 'Title is required' });
         if (!category)       return res.status(400).json({ success: false, message: 'Category is required' });
         if (!targetType)     return res.status(400).json({ success: false, message: 'Target type is required' });
 
-        const files = buildFileObjects(req.files);
+        const files    = buildFileObjects(req.files);
+        const assigned = !!isAssignment && isAssignment !== 'false';
 
         const doc = await Document.create({
             school: req.schoolId,
             title:  title.trim(),
             description: description || '',
             category,
+            docType: normalizeDocType(docType, assigned),
             files,
             uploadedBy:   req.userId,
             uploaderRole: 'school_admin',
@@ -104,11 +490,17 @@ exports.adminUpload = async (req, res) => {
             targetSections: JSON.parse(targetSections || '[]'),
             targetUsers:    JSON.parse(targetUsers    || '[]'),
             tags: JSON.parse(tags || '[]'),
-            isAssignment:    !!isAssignment,
+            subject: subject || '',
+            academicYear:    await currentAcademicYearId(req.schoolId),
+            isAssignment:    assigned,
+            assignmentType:  assigned && ASSIGNMENT_TYPES.includes(assignmentType) ? assignmentType : 'homework',
+            questions:       assigned ? parseQuestions(questions) : [],
             dueDate:         dueDate ? new Date(dueDate) : null,
-            allowSubmission: isAssignment ? allowSubmission !== false : false,
-            marksEnabled:    !!marksEnabled,
-            totalMarks:      marksEnabled ? Number(totalMarks) : null,
+            allowSubmission: assigned ? allowSubmission !== false : false,
+            // Marks are what makes an assignment gradeable, so a total given
+            // without the flag still counts — the form has one field, not two.
+            marksEnabled:    assigned && (marksEnabled === 'true' || marksEnabled === true || Number(totalMarks) > 0),
+            totalMarks:      Number(totalMarks) > 0 ? Number(totalMarks) : null,
         });
         res.status(201).json({ success: true, data: doc });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -129,8 +521,9 @@ exports.adminEditDocument = async (req, res) => {
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId });
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
 
-        const { title, description, category, targetType, targetClasses, targetSections,
-                targetUsers, dueDate, marksEnabled, totalMarks, tags } = req.body;
+        const { title, description, category, docType, subject, assignmentType, questions,
+                targetType, targetClasses, targetSections,
+                targetUsers, isAssignment, dueDate, marksEnabled, totalMarks, tags, academicYear } = req.body;
 
         if (title !== undefined)      doc.title       = title.trim();
         if (description !== undefined)doc.description = description;
@@ -141,8 +534,35 @@ exports.adminEditDocument = async (req, res) => {
         if (targetUsers    !== undefined) doc.targetUsers    = JSON.parse(targetUsers);
         if (tags !== undefined) doc.tags = JSON.parse(tags);
         if (dueDate !== undefined)    doc.dueDate     = dueDate ? new Date(dueDate) : null;
-        if (marksEnabled !== undefined) doc.marksEnabled = !!marksEnabled;
-        if (totalMarks !== undefined) doc.totalMarks  = Number(totalMarks);
+        if (subject !== undefined)    doc.subject     = subject;
+        if (totalMarks !== undefined) {
+            doc.totalMarks   = Number(totalMarks) > 0 ? Number(totalMarks) : null;
+            doc.marksEnabled = doc.totalMarks != null;
+        }
+        if (assignmentType !== undefined && ASSIGNMENT_TYPES.includes(assignmentType)) {
+            doc.assignmentType = assignmentType;
+        }
+        if (questions !== undefined) doc.questions = parseQuestions(questions);
+        if (academicYear !== undefined) doc.academicYear = academicYear || null;
+        if (isAssignment !== undefined) {
+            doc.isAssignment = !!isAssignment && isAssignment !== 'false';
+            if (!doc.isAssignment) {
+                doc.dueDate = null;
+                doc.allowSubmission = false;
+                // Nothing left to grade or to break into questions.
+                doc.questions = [];
+                doc.marksEnabled = false;
+                doc.totalMarks = null;
+            }
+        }
+        // Read after the flag above, so "not an assignment any more" cannot be
+        // left holding docType 'assignment'.
+        if (docType !== undefined || isAssignment !== undefined) {
+            doc.docType = normalizeDocType(
+                docType !== undefined ? docType : doc.docType,
+                doc.isAssignment,
+            );
+        }
 
         if (req.files?.length) {
             doc.files = buildFileObjects(req.files);
@@ -157,16 +577,25 @@ exports.adminDeleteDocument = async (req, res) => {
     try {
         const doc = await Document.findOneAndDelete({ _id: req.params.id, school: req.schoolId });
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        await AssignmentSubmission.deleteMany({ document: doc._id });
+        // Nothing cascades in the database, so everything hanging off the
+        // document goes here — the submissions against it and the discussion
+        // about it. Orphaned rows are invisible until somebody counts them.
+        await Promise.all([
+            AssignmentSubmission.deleteMany({ document: doc._id }),
+            DocumentComment.deleteMany({ document: doc._id }),
+        ]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.adminArchiveDocument = async (req, res) => {
     try {
+        // The one endpoint puts a document away and takes it back out — an
+        // archived document with no route back is a deleted one with extra steps.
+        const archive = req.body?.archived === undefined ? true : !!req.body.archived;
         const doc = await Document.findOneAndUpdate(
             { _id: req.params.id, school: req.schoolId },
-            { isArchived: true },
+            { isArchived: archive },
             { new: true }
         ).lean();
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
@@ -178,7 +607,8 @@ exports.adminBulkArchive = async (req, res) => {
     try {
         const { ids } = req.body;
         if (!ids?.length) return res.status(400).json({ success: false, message: 'ids are required' });
-        await Document.updateMany({ _id: { $in: ids }, school: req.schoolId }, { isArchived: true });
+        const archive = req.body.archived === undefined ? true : !!req.body.archived;
+        await Document.updateMany({ _id: { $in: ids }, school: req.schoolId }, { isArchived: archive });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -188,7 +618,10 @@ exports.adminBulkDelete = async (req, res) => {
         const { ids } = req.body;
         if (!ids?.length) return res.status(400).json({ success: false, message: 'ids are required' });
         await Document.deleteMany({ _id: { $in: ids }, school: req.schoolId });
-        await AssignmentSubmission.deleteMany({ document: { $in: ids } });
+        await Promise.all([
+            AssignmentSubmission.deleteMany({ document: { $in: ids } }),
+            DocumentComment.deleteMany({ document: { $in: ids } }),
+        ]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
@@ -255,7 +688,7 @@ exports.teacherGetDocuments = async (req, res) => {
 
 exports.teacherUpload = async (req, res) => {
     try {
-        const { title, description, category, sectionId, isAssignment, dueDate,
+        const { title, description, category, docType, sectionId, isAssignment, dueDate,
                 allowSubmission, marksEnabled, totalMarks, tags } = req.body;
 
         if (!title?.trim())  return res.status(400).json({ success: false, message: 'Title is required' });
@@ -269,12 +702,16 @@ exports.teacherUpload = async (req, res) => {
             title:  title.trim(),
             description: description || '',
             category,
+            // Stamped here too, so a teacher's upload lands on the admin's tabs
+            // and year filter alongside everything else.
+            docType: normalizeDocType(docType, !!isAssignment && isAssignment !== 'false'),
             files,
             uploadedBy:   req.userId,
             uploaderRole: 'teacher',
             targetType:   'class_sections',
             targetSections: [sectionId],
             tags: JSON.parse(tags || '[]'),
+            academicYear:    await currentAcademicYearId(req.schoolId),
             isAssignment:    !!isAssignment,
             dueDate:         dueDate ? new Date(dueDate) : null,
             allowSubmission: isAssignment ? allowSubmission !== false : false,

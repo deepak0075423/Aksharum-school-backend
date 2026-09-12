@@ -59,6 +59,23 @@ const AssignmentSubmissionSchema = new db.Schema({
         type: String,
         default: '',
     },
+
+    /**
+     * Marks per question, when the assignment defines questions —
+     * `[{ label: 'Q1', score: 8 }, …]`.
+     *
+     * The labels are copied from the assignment rather than referenced, so
+     * renaming a question later cannot silently re-attribute marks already
+     * awarded. `marks` above stays the total and remains the field everything
+     * else reads; this only ever explains it.
+     */
+    questionScores: {
+        type: [new db.Schema({
+            label: { type: String, required: true },
+            score: { type: Number, default: null },
+        }, { _id: false })],
+        default: [],
+    },
 }, { timestamps: true });
 
 AssignmentSubmissionSchema.index({ document: 1, student: 1 }, { unique: true });

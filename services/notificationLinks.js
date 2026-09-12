@@ -256,6 +256,22 @@ const ROUTES = {
         student:      { web: '/student/feedback',              mobile: '/modules/feedback' },
     },
 
+    // ── Documents ────────────────────────────────────────────────────────────
+    // One document, opened on its own page. Students and parents have no such
+    // page — their list IS the destination, and {id} there becomes ?focus=.
+    'documents.item': {
+        school_admin: { web: '/admin/documents/{id}',  mobile: '/modules/admin/documents' },
+        teacher:      { web: '/teacher/documents',     mobile: '/modules/documents' },
+        student:      { web: '/student/documents',     mobile: '/modules/documents' },
+        parent:       { web: '/parent/documents',      mobile: '/modules/documents' },
+    },
+    'documents.list': {
+        school_admin: { web: '/admin/documents',   mobile: '/modules/admin/documents' },
+        teacher:      { web: '/teacher/documents', mobile: '/modules/documents' },
+        student:      { web: '/student/documents', mobile: '/modules/documents' },
+        parent:       { web: '/parent/documents',  mobile: '/modules/documents' },
+    },
+
     // ── Class / section ──────────────────────────────────────────────────────
     'section': {
         school_admin: { web: '/admin/sections/{id}', mobile: '/modules/admin/section-detail?id={id}' },
@@ -432,6 +448,7 @@ const MODULE_OF = {
     video: 'video',
     feedback: 'feedback',
     section: 'academics',
+    documents: 'documents',
 };
 
 const MODULE_LABELS = {
@@ -439,7 +456,7 @@ const MODULE_LABELS = {
     library: 'Library', results: 'Results', timetable: 'Timetable',
     calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
     hostel: 'Hostel', video: 'Videos', feedback: 'Feedback',
-    academics: 'Academics', general: 'General',
+    academics: 'Academics', documents: 'Documents', general: 'General',
 };
 
 // Somebody is waiting on the reader, or money is owed. These are the ones that
@@ -451,6 +468,7 @@ const HIGH_TYPES = [
     'feedback.pending', 'feedback.form',
     'fees.mine', 'library.myfines', 'library.manage.fines', 'library.fines',
     'substitutions',
+    'documents.item',
 ];
 
 // Nothing is being asked and nothing has changed for the reader personally —

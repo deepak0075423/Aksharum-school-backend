@@ -15,6 +15,7 @@ const formalExamCtrl = require('../../controllers/formalExam.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
 const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
+const docDetail      = require('../../controllers/documentDetail.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
@@ -437,6 +438,9 @@ router.delete('/document-categories/:id', docGuard, async (req, res) => {
 router.get('/documents',                              docGuard, docCtrl.adminGetDocuments);
 router.post('/documents',                             docGuard, uploadDocument.array('files', 10), docCtrl.adminUpload);
 router.get('/documents/audit',                        docGuard, docCtrl.adminGetAuditLog);
+// Before '/documents/:id' — Express matches in order, and 'overview' would
+// otherwise be read as a document id and 404.
+router.get('/documents/overview',                     docGuard, docCtrl.adminGetDocumentOverview);
 router.post('/documents/bulk-archive',                docGuard, docCtrl.adminBulkArchive);
 router.delete('/documents/bulk-delete',               docGuard, docCtrl.adminBulkDelete);
 router.get('/documents/:id',                          docGuard, docCtrl.adminGetDocument);
@@ -444,6 +448,22 @@ router.put('/documents/:id',                          docGuard, uploadDocument.a
 router.delete('/documents/:id',                       docGuard, docCtrl.adminDeleteDocument);
 router.post('/documents/:id/archive',                 docGuard, docCtrl.adminArchiveDocument);
 router.post('/documents/:docId/versions/:versionId/restore', docGuard, docCtrl.adminRestoreVersion);
+
+// ── One document, opened ──────────────────────────────────────────────────────
+// The four tabs of the detail page. Registered after the collection routes above
+// so '/documents/overview' and '/documents/audit' are still matched as words
+// rather than swallowed by ':id'.
+router.get('/documents/:id/assignment',            docGuard, docDetail.getAssignment);
+router.get('/documents/:id/assignment/analytics',  docGuard, docDetail.getAssignmentAnalytics);
+router.post('/documents/:id/submissions/:studentId/review', docGuard, docDetail.reviewSubmission);
+router.post('/documents/:id/remind',               docGuard, docDetail.remindPending);
+router.post('/documents/:id/duplicate',            docGuard, docDetail.duplicate);
+
+router.get('/documents/:id/comments',              docGuard, docDetail.listComments);
+router.post('/documents/:id/comments',             docGuard, uploadDocument.array('files', 4), docDetail.addComment);
+router.patch('/documents/comments/:commentId',     docGuard, docDetail.updateComment);
+router.delete('/documents/comments/:commentId',    docGuard, docDetail.deleteComment);
+router.post('/documents/comments/:commentId/like', docGuard, docDetail.toggleLike);
 
 // ── Holidays ──────────────────────────────────────────────────────────────────
 router.get('/holiday-types',       holidayGuard, holidayCtrl.getHolidayTypes);
