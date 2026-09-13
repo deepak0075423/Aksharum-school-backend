@@ -176,6 +176,7 @@ exports.adminGetDocuments = async (req, res) => {
         const [rows, count] = await Promise.all([
             pool.query(
                 `SELECT d."_id", d."title", d."description", d."category", d."docType",
+                        d."subject", d."assignmentType", d."questions",
                         d."targetType", d."isAssignment", d."dueDate", d."allowSubmission",
                         d."marksEnabled", d."totalMarks", d."tags", d."files",
                         d."currentVersion", d."isArchived", d."createdAt", d."updatedAt",
@@ -254,6 +255,12 @@ function shapeRow(r) {
         description: r.description || '',
         category: r.category || '',
         docType: r.docType || 'other',
+        // Carried on the row, not just on the single-document read: the edit
+        // form is opened from the list, and a field the list leaves out is a
+        // field that silently empties itself when the document is saved again.
+        subject: r.subject || '',
+        assignmentType: r.assignmentType || null,
+        questions: Array.isArray(r.questions) ? r.questions : [],
         targetType: r.targetType,
         targetClasses:  r.targetClasses  || [],
         targetSections: r.targetSections || [],
@@ -686,16 +693,51 @@ exports.teacherGetDocuments = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * The sections a teacher may actually share to, checked against the ones they
+ * stand in front of.
+ *
+ * This used to be taken on trust: whatever `sectionId` the form posted was
+ * written straight onto the document, so any teacher could put a notice in
+ * front of any class in the school by editing one field in the request. The
+ * only sections that count are the ones they are class teacher, substitute or
+ * subject teacher for.
+ */
+async function ownSections(req, raw) {
+    let wanted;
+    try {
+        wanted = Array.isArray(raw) ? raw : JSON.parse(raw || '[]');
+    } catch { wanted = raw ? [String(raw)] : []; }
+    wanted = [...new Set((Array.isArray(wanted) ? wanted : [wanted]).map(String).filter(Boolean))];
+    if (!wanted.length) return { ok: false, message: 'Choose at least one section' };
+
+    const { teacherReach } = require('./documentViewer.controller');
+    // `postable`, not `sections`: reading reaches back across years, sharing
+    // only ever goes to this year's rows — the ones the picker offered.
+    const mine = new Set((await teacherReach(req.userId, req.schoolId)).postable.map(String));
+    const bad  = wanted.filter((id) => !mine.has(id));
+    if (bad.length) {
+        return { ok: false, message: 'You can only share with sections you teach' };
+    }
+    return { ok: true, sections: wanted };
+}
+
 exports.teacherUpload = async (req, res) => {
     try {
-        const { title, description, category, docType, sectionId, isAssignment, dueDate,
+        const { title, description, category, docType, subject, assignmentType, questions,
+                sectionId, sectionIds, isAssignment, dueDate,
                 allowSubmission, marksEnabled, totalMarks, tags } = req.body;
 
         if (!title?.trim())  return res.status(400).json({ success: false, message: 'Title is required' });
         if (!category)       return res.status(400).json({ success: false, message: 'Category is required' });
-        if (!sectionId)      return res.status(400).json({ success: false, message: 'sectionId is required' });
 
-        const files = buildFileObjects(req.files);
+        // `sectionIds` is the array the form posts; `sectionId` is the single
+        // value older callers send, and still works.
+        const target = await ownSections(req, sectionIds !== undefined ? sectionIds : sectionId);
+        if (!target.ok) return res.status(400).json({ success: false, message: target.message });
+
+        const files    = buildFileObjects(req.files);
+        const assigned = !!isAssignment && isAssignment !== 'false';
 
         const doc = await Document.create({
             school: req.schoolId,
@@ -704,19 +746,25 @@ exports.teacherUpload = async (req, res) => {
             category,
             // Stamped here too, so a teacher's upload lands on the admin's tabs
             // and year filter alongside everything else.
-            docType: normalizeDocType(docType, !!isAssignment && isAssignment !== 'false'),
+            docType: normalizeDocType(docType, assigned),
+            subject: subject || '',
             files,
             uploadedBy:   req.userId,
             uploaderRole: 'teacher',
+            // One document across every section it was set for, not a copy per
+            // section — a teacher who takes 9-A and 9-B sets the homework once
+            // and marks it in one place.
             targetType:   'class_sections',
-            targetSections: [sectionId],
+            targetSections: target.sections,
             tags: JSON.parse(tags || '[]'),
             academicYear:    await currentAcademicYearId(req.schoolId),
-            isAssignment:    !!isAssignment,
+            isAssignment:    assigned,
+            assignmentType:  assigned && ASSIGNMENT_TYPES.includes(assignmentType) ? assignmentType : 'homework',
+            questions:       assigned ? parseQuestions(questions) : [],
             dueDate:         dueDate ? new Date(dueDate) : null,
-            allowSubmission: isAssignment ? allowSubmission !== false : false,
-            marksEnabled:    !!marksEnabled,
-            totalMarks:      marksEnabled ? Number(totalMarks) : null,
+            allowSubmission: assigned ? allowSubmission !== 'false' : false,
+            marksEnabled:    assigned && (marksEnabled === 'true' || marksEnabled === true || Number(totalMarks) > 0),
+            totalMarks:      Number(totalMarks) > 0 ? Number(totalMarks) : null,
         });
         res.status(201).json({ success: true, data: doc });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -737,12 +785,45 @@ exports.teacherEditDocument = async (req, res) => {
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId, uploadedBy: req.userId });
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
 
-        const { title, description, dueDate, marksEnabled, totalMarks } = req.body;
-        if (title !== undefined)      doc.title       = title.trim();
-        if (description !== undefined)doc.description = description;
-        if (dueDate !== undefined)    doc.dueDate     = dueDate ? new Date(dueDate) : null;
-        if (marksEnabled !== undefined) doc.marksEnabled = !!marksEnabled;
-        if (totalMarks !== undefined) doc.totalMarks  = Number(totalMarks);
+        const { title, description, category, docType, subject, assignmentType, questions,
+                sectionIds, isAssignment, dueDate, marksEnabled, totalMarks } = req.body;
+
+        if (title !== undefined)       doc.title       = title.trim();
+        if (description !== undefined) doc.description = description;
+        if (category !== undefined)    doc.category    = category;
+        if (subject !== undefined)     doc.subject     = subject;
+
+        if (sectionIds !== undefined) {
+            const target = await ownSections(req, sectionIds);
+            if (!target.ok) return res.status(400).json({ success: false, message: target.message });
+            doc.targetSections = target.sections;
+        }
+
+        if (isAssignment !== undefined) {
+            doc.isAssignment = !!isAssignment && isAssignment !== 'false';
+            if (!doc.isAssignment) {
+                doc.dueDate = null;
+                doc.allowSubmission = false;
+                doc.questions = [];
+                doc.marksEnabled = false;
+                doc.totalMarks = null;
+            }
+        }
+        // After the flag, so "not an assignment any more" cannot keep the type.
+        if (docType !== undefined || isAssignment !== undefined) {
+            doc.docType = normalizeDocType(docType !== undefined ? docType : doc.docType, doc.isAssignment);
+        }
+        if (assignmentType !== undefined && ASSIGNMENT_TYPES.includes(assignmentType)) {
+            doc.assignmentType = assignmentType;
+        }
+        if (questions !== undefined && doc.isAssignment) doc.questions = parseQuestions(questions);
+
+        if (dueDate !== undefined && doc.isAssignment) doc.dueDate = dueDate ? new Date(dueDate) : null;
+        if (totalMarks !== undefined && doc.isAssignment) {
+            doc.totalMarks   = Number(totalMarks) > 0 ? Number(totalMarks) : null;
+            doc.marksEnabled = doc.totalMarks != null;
+        }
+
         if (req.files?.length) {
             doc.files = buildFileObjects(req.files);
             doc.currentVersion = (doc.currentVersion || 1) + 1;

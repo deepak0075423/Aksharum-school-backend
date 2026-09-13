@@ -124,6 +124,11 @@ function shapeDoc(r) {
         docType: r.docType || 'other',
         subject: r.subject || '',
         targetType: r.targetType,
+        // The ids as well as the sentence: the sentence is for reading, and the
+        // teacher's edit form needs the ids to tick the sections back on. Left
+        // out, the form opened with nothing selected and then refused to save.
+        targetSections: ids(r.targetSections),
+        targetClasses:  ids(r.targetClasses),
         sharedWith: sharedWith(r),
         isAssignment: !!r.isAssignment,
         assignmentType: r.assignmentType || null,
@@ -407,14 +412,32 @@ function worstState(perChild) {
 
 // ── Teacher ──────────────────────────────────────────────────────────────────
 
-/** The sections a teacher stands in front of, and the classes those belong to. */
+/**
+ * The sections a teacher stands in front of.
+ *
+ * Two different answers come out of this, and conflating them is a bug either
+ * way:
+ *
+ *   • `sections` / `classes` — everything, across every year on record. This is
+ *     what decides whether a teacher may READ a document, and a document filed
+ *     under last year is still theirs to open.
+ *   • `postable` / `list` — only this year's, one row per section. A class row
+ *     exists once per academic year, so a teacher of "Class 9 - A" holds four
+ *     of them; offering all four in a picker asks them to choose between four
+ *     chips with the same name, and sharing to a closed year reaches nobody.
+ *
+ * With no year marked active the two collapse — a school still setting itself
+ * up must not be locked out of sharing.
+ */
 async function teacherReach(teacherId, schoolId) {
     const { rows } = await pool.query(
         `SELECT DISTINCT s."_id" AS "section", s."class",
                 c."className" || ' - ' || s."sectionName" AS "label",
-                c."classNumber"
+                c."classNumber", s."sectionName",
+                (ay."status" = 'active') AS "current"
            FROM ${qt(ClassSection)} s
-           JOIN ${qt(Class)} c ON c."_id" = s."class"
+           JOIN ${qt(Class)} c            ON c."_id"  = s."class"
+           LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = c."academicYear"
           WHERE s."school" = $1
             AND ( s."classTeacher" = $2
                OR s."substituteTeacher" = $2
@@ -422,12 +445,27 @@ async function teacherReach(teacherId, schoolId) {
           ORDER BY c."classNumber", "label"`,
         [String(schoolId), String(teacherId)],
     );
+
+    const current = rows.filter((r) => r.current);
+    // One chip per section name even so: two rows of the same year would be a
+    // data fault, and a duplicate chip is unpickable either way.
+    const pick = [];
+    const seen = new Set();
+    for (const r of (current.length ? current : rows)) {
+        if (seen.has(r.label)) continue;
+        seen.add(r.label);
+        pick.push(r);
+    }
+
     return {
         sections: ids(rows.map((r) => r.section)),
         classes:  [...new Set(ids(rows.map((r) => r.class)))],
-        list:     rows.map((r) => ({ _id: r.section, label: r.label })),
+        postable: ids(pick.map((r) => r.section)),
+        list:     pick.map((r) => ({ _id: r.section, label: r.label })),
     };
 }
+
+exports.teacherReach = teacherReach;
 
 exports.teacherGetDocuments = async (req, res) => {
     try {
