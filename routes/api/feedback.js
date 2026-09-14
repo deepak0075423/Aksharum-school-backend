@@ -73,6 +73,10 @@ router.get('/meta',                     analyticsGuard, admin.getMeta);
 
 // ══ ADMIN (configuration & management) ═══════════════════════════════════════
 // Campaigns
+// The create/edit form's pickers — current academic year only (see
+// currentYearScope in the controller). Not under /campaigns/ so it can never
+// be read as a campaign id.
+router.get   ('/campaign-options',             adminGuard, admin.getCampaignOptions);
 router.get   ('/campaigns',                    adminGuard, admin.getCampaigns);
 router.post  ('/campaigns',                    adminGuard, admin.createCampaign);
 router.get   ('/campaigns/:id',                adminGuard, admin.getCampaign);

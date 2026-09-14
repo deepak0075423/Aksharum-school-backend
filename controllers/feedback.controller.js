@@ -37,6 +37,7 @@ const TeacherProfile        = require('../models/TeacherProfile');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 
 const fb = require('../services/feedbackService');
+const pool = require('../db/pool');
 const { notify, schoolAdminIds } = require('../services/notifyService');
 const { buildFeedbackReportPDF } = require('../utils/feedbackReportPdf');
 
@@ -256,8 +257,18 @@ exports.getQuestions = async (req, res) => {
         ]);
         const catMap = new Map(categories.map((c) => [sid(c._id), c.name]));
 
-        const optionRows = await FeedbackQuestionOption.find({ question: { $in: rows.map((r) => r._id) } })
-            .sort({ displayOrder: 1 }).lean();
+        const qIds = rows.map((r) => sid(r._id));
+        const [optionRows, answeredRows] = await Promise.all([
+            FeedbackQuestionOption.find({ question: { $in: rows.map((r) => r._id) } }).sort({ displayOrder: 1 }).lean(),
+            // Which of these have ever been answered. updateQuestion refuses to
+            // change an answered question's type, options or scoring, so the form
+            // needs to know before the admin edits them, not after Save fails.
+            // DISTINCT over an id list, never a scan of every response row.
+            qIds.length
+                ? pool.query('SELECT DISTINCT "question" FROM "feedbackresponses" WHERE "question" = ANY($1::uuid[])', [qIds])
+                : { rows: [] },
+        ]);
+        const answeredSet = new Set(answeredRows.rows.map((r) => sid(r.question)));
         const optsByQ = optionRows.reduce((acc, o) => {
             (acc[sid(o.question)] = acc[sid(o.question)] || []).push(o);
             return acc;
@@ -268,6 +279,7 @@ exports.getQuestions = async (req, res) => {
                 ...q,
                 categoryName: catMap.get(sid(q.category)) || '',
                 options: optsByQ[sid(q._id)] || [],
+                answered: answeredSet.has(sid(q._id)),
             })),
             page, limit, total, pages: Math.max(1, Math.ceil(total / limit)),
         });
@@ -298,7 +310,9 @@ exports.createQuestion = async (req, res) => {
             questionType,
             feedbackType: ['student_teacher', 'parent_teacher', 'any'].includes(req.body.feedbackType) ? req.body.feedbackType : 'any',
             isRequired: bool(req.body.isRequired, true),
-            includeInScore: bool(req.body.includeInScore, !['text', 'checkbox', 'multiple_choice'].includes(questionType)),
+            // Trusted from the form only for a type that has something to average.
+            includeInScore: !['text', 'checkbox', 'multiple_choice'].includes(questionType)
+                && bool(req.body.includeInScore, true),
             helpText: str(req.body.helpText, 300),
             maxLength: Math.min(2000, Math.max(50, int(req.body.maxLength, 1000))),
             displayOrder: int(req.body.displayOrder, 0),
@@ -536,8 +550,162 @@ exports.getCampaign = async (req, res) => {
                 _id: sid(q._id), question: sid(q.question), questionText: q.questionText,
                 questionType: q.questionType, categoryName: q.categoryName,
                 isRequired: q.isRequired, displayOrder: q.displayOrder,
+                // Both are on the snapshot and both are needed to read it: the
+                // help line is what the student actually saw under the question,
+                // and includeInScore is the difference between a question that
+                // produced the rating and one that only collected an opinion.
+                helpText: q.helpText || '', includeInScore: !!q.includeInScore,
                 options: q.options || [],
             })),
+        });
+    } catch (e) { fail(res, e); }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  CURRENT ACADEMIC YEAR — a campaign always belongs to it
+// ═════════════════════════════════════════════════════════════════════════════
+/**
+ * Everything a campaign may target, for the year the school is working in.
+ *
+ * A campaign has no year of its own to choose: assignments are generated from
+ * the sections of the campaign's year, so a campaign in any other year either
+ * reaches nobody or — with no year at all — reaches every year's sections at
+ * once. The server therefore decides the year, and every target id is checked
+ * against it rather than trusted from the form.
+ */
+async function currentYearScope(schoolId) {
+    const year = await fb.activeAcademicYear(schoolId);
+    if (!year) return { year: null };
+    const yearId = sid(year._id);
+
+    const [classes, sections, subjects] = await Promise.all([
+        Class.find({ school: schoolId, academicYear: yearId, status: 'active' })
+            .select('className classNumber').sort({ classNumber: 1 }).lean(),
+        ClassSection.find({ school: schoolId, academicYear: yearId, status: 'active' })
+            .select('sectionName class enrolledStudents').lean(),
+        Subject.find({ school: schoolId, academicYear: yearId })
+            .select('subjectName subjectCode').sort({ subjectName: 1 }).lean(),
+    ]);
+    const sectionIds = sections.map((x) => sid(x._id));
+    const links = sectionIds.length
+        ? await SectionSubjectTeacher.find({ section: { $in: sectionIds } }).select('section subject teacher').lean()
+        : [];
+
+    return {
+        year, yearId, classes, sections, subjects, links,
+        classIds:   new Set(classes.map((x) => sid(x._id))),
+        sectionIds: new Set(sectionIds),
+        subjectIds: new Set(subjects.map((x) => sid(x._id))),
+        // A teacher "of this year" is one who teaches a section of it. Anyone
+        // else would produce no assignments, so they are not a target at all.
+        teacherIds: new Set(links.map((l) => sid(l.teacher)).filter(Boolean)),
+    };
+}
+
+/**
+ * Put a campaign body in the current year and drop any target that is not of
+ * it. Returns how many targets were dropped, or an error when the school has no
+ * active year — a campaign with no year would target every year's sections.
+ */
+function homeToYear(body, scope) {
+    if (!scope.year) {
+        return { error: 'There is no active academic year. Set one in Academic Years before running feedback.' };
+    }
+    body.academicYear = scope.yearId;
+    let dropped = 0;
+    const keep = (list, set) => {
+        const ids = (list || []).map(sid);
+        const kept = ids.filter((id) => set.has(id));
+        dropped += ids.length - kept.length;
+        return kept;
+    };
+    body.targetClasses  = keep(body.targetClasses,  scope.classIds);
+    body.targetSections = keep(body.targetSections, scope.sectionIds);
+    body.targetSubjects = keep(body.targetSubjects, scope.subjectIds);
+    body.targetTeachers = keep(body.targetTeachers, scope.teacherIds);
+    return { dropped };
+}
+
+/**
+ * The campaign form's pickers, all of the current year, plus the section →
+ * subject → teacher links so the form can say how many students a targeting
+ * choice will actually reach before anybody presses Activate. The reach it
+ * computes mirrors fb.generateAssignments exactly.
+ */
+exports.getCampaignOptions = async (req, res) => {
+    try {
+        const school = req.schoolId;
+        const scope = await currentYearScope(school);
+
+        const [templates, settings] = await Promise.all([
+            FeedbackTemplate.find({ school, status: 'active' }).sort({ isDefault: -1, name: 1 }).lean(),
+            fb.getSettings(school),
+        ]);
+        const qIds = [...new Set(templates.flatMap((t) => (t.questions || []).map((q) => sid(q.question))))];
+        const [questions, cats] = await Promise.all([
+            qIds.length ? FeedbackQuestion.find({ _id: { $in: qIds }, school }).select('includeInScore category questionText').lean() : [],
+            FeedbackCategory.find({ school }).select('name').lean(),
+        ]);
+        const qMap = new Map(questions.map((q) => [sid(q._id), q]));
+        const catName = new Map(cats.map((c) => [sid(c._id), c.name]));
+
+        const templateRows = templates.map((t) => {
+            const qs = (t.questions || []).map((q) => qMap.get(sid(q.question))).filter(Boolean);
+            return {
+                _id: sid(t._id), name: t.name, description: t.description || '', isDefault: !!t.isDefault,
+                questionCount: qs.length,
+                scoredCount: qs.filter((q) => q.includeInScore).length,
+                categories: [...new Set(qs.map((q) => catName.get(sid(q.category))).filter(Boolean))],
+                sample: qs.slice(0, 3).map((q) => q.questionText),
+            };
+        });
+
+        const base = {
+            academicYear: null, classes: [], sections: [], subjects: [], teachers: [], links: [],
+            templates: templateRows,
+            defaults: {
+                isAnonymous: settings?.defaultAnonymous !== false,
+                minimumResponses: settings?.defaultMinimumResponses ?? 5,
+                campaignDays: settings?.defaultCampaignDays ?? 14,
+                reminderIntervalDays: settings?.reminderIntervalDays ?? 3,
+            },
+        };
+        if (!scope.year) return ok(res, base);
+
+        const teacherIds = [...scope.teacherIds];
+        const [users, profiles] = await Promise.all([
+            teacherIds.length ? User.find({ _id: { $in: teacherIds }, school, role: 'teacher' }).select('name').lean() : [],
+            teacherIds.length ? TeacherProfile.find({ user: { $in: teacherIds } }).select('user department designation').lean() : [],
+        ]);
+        const prof = new Map(profiles.map((x) => [sid(x.user), x]));
+        const className = new Map(scope.classes.map((c) => [sid(c._id), c.className]));
+        const validTeacher = new Set(users.map((u) => sid(u._id)));
+
+        ok(res, {
+            ...base,
+            academicYear: {
+                _id: scope.yearId, yearName: scope.year.yearName,
+                startDate: scope.year.startDate, endDate: scope.year.endDate,
+            },
+            classes: scope.classes.map((c) => ({ _id: sid(c._id), className: c.className, classNumber: c.classNumber })),
+            sections: scope.sections
+                .map((x) => ({
+                    _id: sid(x._id), sectionName: x.sectionName, class: sid(x.class),
+                    className: className.get(sid(x.class)) || '',
+                    students: (x.enrolledStudents || []).filter(Boolean).length,
+                }))
+                .filter((x) => x.className)
+                .sort((a, b) => a.className.localeCompare(b.className, 'en', { numeric: true })
+                    || a.sectionName.localeCompare(b.sectionName)),
+            subjects: scope.subjects.map((x) => ({ _id: sid(x._id), subjectName: x.subjectName, subjectCode: x.subjectCode || '' })),
+            teachers: users.map((u) => ({
+                _id: sid(u._id), name: u.name,
+                department: prof.get(sid(u._id))?.department || '',
+                designation: prof.get(sid(u._id))?.designation || '',
+            })).sort((a, b) => a.name.localeCompare(b.name)),
+            links: scope.links
+                .filter((l) => validTeacher.has(sid(l.teacher)))
+                .map((l) => ({ section: sid(l.section), subject: sid(l.subject), teacher: sid(l.teacher) })),
         });
     } catch (e) { fail(res, e); }
 };
@@ -584,10 +752,8 @@ exports.createCampaign = async (req, res) => {
         const err  = validateCampaign(body);
         if (err) return bad(res, err);
 
-        if (!body.academicYear) {
-            const y = await fb.activeAcademicYear(req.schoolId);
-            body.academicYear = y ? sid(y._id) : null;
-        }
+        const homed = homeToYear(body, await currentYearScope(req.schoolId));
+        if (homed.error) return bad(res, homed.error, 409);
 
         // Question list: explicit ids, or everything on a template.
         let questionSpecs = (req.body.questions || []).map((q, i) => ({
@@ -630,6 +796,16 @@ exports.updateCampaign = async (req, res) => {
         const err  = validateCampaign(body);
         if (err) return bad(res, err);
 
+        // The form never sends a year. A draft has generated nothing yet, so it
+        // simply lives in the current year; a scheduled campaign already has
+        // assignments from its own year's sections and keeps that year.
+        if (c.status === 'draft') {
+            const homed = homeToYear(body, await currentYearScope(req.schoolId));
+            if (homed.error) return bad(res, homed.error, 409);
+        } else {
+            body.academicYear = c.academicYear;
+        }
+
         // Once live, only the safe knobs move — retargeting a running campaign
         // would orphan submissions already collected.
         const live = c.status === 'active';
@@ -665,22 +841,30 @@ exports.duplicateCampaign = async (req, res) => {
         if (!c) return bad(res, 'Campaign not found.', 404);
 
         const questions = await FeedbackCampaignQuestion.find({ campaign: c._id }).sort({ displayOrder: 1 }).lean();
+        // Re-running last term's drive this year is the usual reason to
+        // duplicate, so the copy is of the current year and keeps only the
+        // targets that still exist in it — last year's section ids target nothing.
+        const targets = {
+            targetClasses: c.targetClasses, targetSections: c.targetSections,
+            targetSubjects: c.targetSubjects, targetTeachers: c.targetTeachers,
+        };
+        const homed = homeToYear(targets, await currentYearScope(req.schoolId));
+        if (homed.error) return bad(res, homed.error, 409);
         const copy = await FeedbackCampaign.create({
             school: c.school,
             name: str(req.body.name, 150) || `${c.name} (Copy)`,
-            academicYear: c.academicYear, term: c.term, feedbackType: c.feedbackType,
+            term: c.term, feedbackType: c.feedbackType,
             description: c.description, instructions: c.instructions,
             startDate: c.startDate, endDate: c.endDate,
             isAnonymous: c.isAnonymous, minimumResponses: c.minimumResponses,
-            targetClasses: c.targetClasses, targetSections: c.targetSections,
-            targetSubjects: c.targetSubjects, targetTeachers: c.targetTeachers,
+            ...targets,
             allowResubmission: c.allowResubmission,
             reminderEnabled: c.reminderEnabled, reminderIntervalDays: c.reminderIntervalDays,
             status: 'draft', createdBy: req.userId,
         });
         await fb.snapshotQuestions(copy, questions.map((q, i) => ({ question: q.question, displayOrder: i, isRequired: q.isRequired })));
         await fb.logAudit(req, 'duplicate', 'Campaign', copy._id, `Duplicated campaign "${c.name}"`, { campaign: copy._id });
-        ok(res, copy);
+        ok(res, { ...copy.toObject?.() ?? copy, droppedTargets: homed.dropped });
     } catch (e) { fail(res, e); }
 };
 
@@ -694,6 +878,17 @@ exports.activateCampaign = async (req, res) => {
 
         const questionCount = await FeedbackCampaignQuestion.countDocuments({ campaign: c._id });
         if (!questionCount) return bad(res, 'Add at least one question before activating.', 409);
+
+        // A draft made last year is activated in this one. Generating from its
+        // stored year would ask students about sections that have moved on.
+        if (c.status === 'draft') {
+            const homed = homeToYear(c, await currentYearScope(req.schoolId));
+            if (homed.error) return bad(res, homed.error, 409);
+            await FeedbackCampaign.updateOne({ _id: c._id }, { $set: {
+                academicYear: c.academicYear, targetClasses: c.targetClasses, targetSections: c.targetSections,
+                targetSubjects: c.targetSubjects, targetTeachers: c.targetTeachers,
+            } });
+        }
 
         const now = new Date();
         const scheduled = new Date(c.startDate) > now;
@@ -1003,6 +1198,7 @@ exports.getDashboard = async (req, res) => {
         let departments = [];
         let categories  = [];
         let trend       = [];
+        const ratingDistribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
 
         if (focus) {
             const assignments = await FeedbackAssignment.find({ campaign: focus._id })
@@ -1080,6 +1276,16 @@ exports.getDashboard = async (req, res) => {
 
             categories = fb.aggregate(assignments, 0).categories;
 
+            // How the submitted ratings are spread across the five bands.
+            // Aggregated across every teacher at once, so it is school-wide and
+            // identifies nobody — which is why it needs no privacy gate while
+            // the per-teacher figures beside it do.
+            for (const a of assignments) {
+                if (a.status !== 'submitted' || a.overallRating == null) continue;
+                const band = Math.min(5, Math.max(1, Math.round(Number(a.overallRating))));
+                ratingDistribution[band] += 1;
+            }
+
             trend = [...campaigns]
                 .filter((c) => (c.stats?.ratingCount || 0) > 0)
                 .sort((a, b) => new Date(a.startDate) - new Date(b.startDate))
@@ -1111,6 +1317,7 @@ exports.getDashboard = async (req, res) => {
             teachers: teacherRows,
             departments,
             categories,
+            ratingDistribution,
             trend,
         });
     } catch (e) { fail(res, e); }
@@ -1287,6 +1494,10 @@ async function buildReport(req) {
     let rows = [];
     if (type === 'teacher') {
         rows = group((a) => sid(a.teacher), (k, r, agg) => ({
+            // Not a column, so it never reaches a CSV/XLSX/PDF — those flatten
+            // through `columns`. It is here so the on-screen table can link a
+            // row through to that teacher's drill-down.
+            _id: k,
             teacher: tMap.get(k)?.name || 'Teacher',
             employeeId: pMap.get(k)?.employeeId || '',
             department: pMap.get(k)?.department || '',
