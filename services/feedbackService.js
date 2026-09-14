@@ -553,21 +553,34 @@ function aggregate(assignments, minimumResponses = 0) {
     }
 
     const rated = submitted.filter((a) => a.overallRating != null);
-    const catAcc = new Map();  // categoryId → { name, sum, count }
+    const catAcc = new Map();  // categoryId → { name, sum, count, students }
     for (const a of submitted) {
         const scores = a.categoryScores || {};
         for (const [cid, v] of Object.entries(scores)) {
             if (!v || v.count == null) continue;
-            const cur = catAcc.get(cid) || { name: v.name || 'Category', sum: 0, count: 0 };
+            const cur = catAcc.get(cid) || { name: v.name || 'Category', sum: 0, count: 0, students: 0 };
             cur.sum   += Number(v.sum) || 0;
             cur.count += Number(v.count) || 0;
+            if (Number(v.count) > 0) cur.students += 1;
             if (v.name) cur.name = v.name;
             catAcc.set(cid, cur);
         }
     }
 
+    // The floor applies to every figure, not just the campaign total. A category
+    // made only of optional questions can be answered by two students while the
+    // campaign has thirty — its average would then be those two students'. So a
+    // category needs `minimumResponses` distinct STUDENTS of its own (`count` is
+    // answers, which a multi-question category inflates).
     const categories = [...catAcc.entries()]
-        .map(([id, v]) => ({ _id: id, name: v.name, average: v.count ? round1(v.sum / v.count) : null, answers: v.count }))
+        .map(([id, v]) => {
+            const withheld = !!minimumResponses && v.students < minimumResponses;
+            return {
+                _id: id, name: v.name, answers: v.count, students: v.students,
+                average: withheld || !v.count ? null : round1(v.sum / v.count),
+                withheld,
+            };
+        })
         .sort((a, b) => (b.average ?? 0) - (a.average ?? 0));
 
     return {
@@ -583,6 +596,33 @@ function aggregate(assignments, minimumResponses = 0) {
         strengths:   categories.filter((c) => c.average != null && c.average >= 4).slice(0, 3),
         improvements: [...categories].reverse().filter((c) => c.average != null && c.average < 4).slice(0, 3),
     };
+}
+
+/**
+ * Stops a hidden slice being worked out by subtraction.
+ *
+ * Every slice is gated by the floor on its own, but slices of one total are not
+ * independent: if the teacher can see the campaign average (10 responses) and
+ * section A (6), section B's hidden 4 is simply total − A. So after the floor,
+ * the POOL of everything hidden — locked slices plus responses that belong to no
+ * slice — must itself be empty or at least `minimumResponses`. While it is not,
+ * the smallest still-visible slice is withheld too and added to the pool.
+ *
+ * Mutates and returns `slices` ({ responses, rating, locked }); a slice hidden
+ * this way is marked `protectsOthers` so the screen can say why.
+ */
+function suppressComplements(slices, totalResponses, minimumResponses) {
+    if (!minimumResponses) return slices;
+    const shown = slices.filter((x) => !x.locked).sort((a, b) => a.responses - b.responses);
+    let hidden = totalResponses - shown.reduce((n, x) => n + x.responses, 0);
+    while (hidden > 0 && hidden < minimumResponses && shown.length) {
+        const x = shown.shift();
+        x.locked = true;
+        x.rating = null;
+        x.protectsOthers = true;
+        hidden += x.responses;
+    }
+    return slices;
 }
 
 // Computes the per-assignment scores written at submit time.
@@ -626,6 +666,29 @@ function submissionBlockReason(campaign, now = new Date()) {
 
 // Campaign end dates are inclusive — a campaign ending "17 Aug" accepts
 // submissions until 17 Aug 23:59 local time.
+/**
+ * "Class 9 A" for each section id.
+ *
+ * Two plain lookups rather than populate('class'): on this ORM that populate
+ * silently hands back the bare class id for some sections (seen on real data),
+ * which rendered a child's class as just "A".
+ */
+async function sectionLabels(sectionIds) {
+    const ClassSection = require('../models/ClassSection');
+    const Class = require('../models/Class');
+    const ids = [...new Set((sectionIds || []).map(sid).filter(Boolean))];
+    if (!ids.length) return new Map();
+    const sections = await ClassSection.find({ _id: { $in: ids } }).select('sectionName class').lean();
+    const classIds = [...new Set(sections.map((x) => sid(x.class)).filter(Boolean))];
+    const classes = classIds.length ? await Class.find({ _id: { $in: classIds } }).select('className').lean() : [];
+    const cName = new Map(classes.map((c) => [sid(c._id), c.className]));
+    return new Map(sections.map((x) => [sid(x._id), {
+        label: `${cName.get(sid(x.class)) || ''} ${x.sectionName}`.trim(),
+        className: cName.get(sid(x.class)) || '',
+        sectionName: x.sectionName,
+    }]));
+}
+
 function endOfDay(d) {
     const dt = new Date(d);
     return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate(), 23, 59, 59, 999);
@@ -639,10 +702,10 @@ module.exports = {
     // constants
     DEFAULT_CATEGORIES, DEFAULT_QUESTIONS, DEFAULT_TEMPLATE_NAME, PRINCIPAL_DESIGNATIONS,
     // helpers
-    sid, round1, round2, pct, idSet, endOfDay,
+    sid, round1, round2, pct, idSet, endOfDay, sectionLabels,
     // services
     logAudit, getSettings, isPrincipal, resolveAccess, seedDefaults,
     snapshotQuestions, generateAssignments, bulkInsertAssignments,
     lockSubmission, incrementCampaignStats, refreshCampaignStats, campaignSummary,
-    aggregate, scoreSubmission, submissionBlockReason, activeAcademicYear,
+    aggregate, suppressComplements, scoreSubmission, submissionBlockReason, activeAcademicYear,
 };

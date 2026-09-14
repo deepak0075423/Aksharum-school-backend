@@ -16,7 +16,6 @@ const FeedbackResponse         = require('../models/FeedbackResponse');
 const FeedbackSelectedOption   = require('../models/FeedbackSelectedOption');
 const User                     = require('../models/User');
 const Subject                  = require('../models/Subject');
-const ClassSection             = require('../models/ClassSection');
 const TeacherProfile           = require('../models/TeacherProfile');
 
 const fb = require('../services/feedbackService');
@@ -37,7 +36,7 @@ function shapeCard(a, campaignsById) {
     return {
         _id:         sid(a._id),
         status:      a.status,
-        teacher:     { _id: sid(a.teacher), name: a.teacherName || '', designation: a.teacherDesignation || '' },
+        teacher:     { _id: sid(a.teacher), name: a.teacherName || '', designation: a.teacherDesignation || '', photo: a.teacherPhoto || '' },
         subject:     a.subjectName || '',
         className:   a.className   || '',
         sectionName: a.sectionName || '',
@@ -55,23 +54,22 @@ async function decorate(rows) {
     const subjectIds = [...new Set(rows.map((r) => sid(r.subject)).filter(Boolean))];
     const sectionIds = [...new Set(rows.map((r) => sid(r.section)).filter(Boolean))];
 
-    const [teachers, subjects, sections] = await Promise.all([
+    const [teachers, subjects, secMap] = await Promise.all([
         teacherIds.length ? User.find({ _id: { $in: teacherIds } }).select('name profileImage').lean() : [],
         subjectIds.length ? Subject.find({ _id: { $in: subjectIds } }).select('subjectName').lean() : [],
-        sectionIds.length ? ClassSection.find({ _id: { $in: sectionIds } })
-            .select('sectionName class').populate('class', 'className').lean() : [],
+        fb.sectionLabels(sectionIds),
     ]);
 
     const tMap = new Map(teachers.map((t) => [sid(t._id), t]));
     const sMap = new Map(subjects.map((s) => [sid(s._id), s]));
-    const secMap = new Map(sections.map((s) => [sid(s._id), s]));
 
     for (const r of rows) {
         r.teacherName = tMap.get(sid(r.teacher))?.name || 'Teacher';
+        r.teacherPhoto = tMap.get(sid(r.teacher))?.profileImage || '';
         r.subjectName = sMap.get(sid(r.subject))?.subjectName || '';
         const sec = secMap.get(sid(r.section));
         r.sectionName = sec?.sectionName || '';
-        r.className   = sec?.class?.className || '';
+        r.className   = sec?.className || '';
     }
     return rows;
 }
@@ -114,6 +112,28 @@ exports.getCompleted = async (req, res) => {
         const campaigns = await loadCampaigns(rows);
         await decorate(rows);
         ok(res, rows.map((r) => shapeCard(r, campaigns)));
+    } catch (e) { fail(res, e); }
+};
+
+// Missed = never submitted, on a campaign that can no longer take it: closed,
+// archived, or past its deadline. Kept apart from "pending" so the to-do list
+// only ever holds things the student can still do.
+exports.getMissed = async (req, res) => {
+    try {
+        const rows = await FeedbackAssignment.find({
+            student: req.userId,
+            status:  { $in: ['pending', 'in_progress', 'expired'] },
+        }).sort({ assignedAt: -1 }).limit(200).lean();
+        const campaigns = await loadCampaigns(rows);
+        const now = new Date();
+        const missed = rows.filter((r) => {
+            const c = campaigns.get(sid(r.campaign));
+            if (!c) return false;
+            if (['closed', 'archived'].includes(c.status)) return true;
+            return c.status === 'active' && c.endDate && now > fb.endOfDay(c.endDate);
+        });
+        await decorate(missed);
+        ok(res, missed.map((r) => ({ ...shapeCard(r, campaigns), status: 'missed' })));
     } catch (e) { fail(res, e); }
 };
 
@@ -174,7 +194,7 @@ exports.getForm = async (req, res) => {
             assignment: {
                 _id: sid(a._id),
                 status: a.status === 'pending' ? 'in_progress' : a.status,
-                teacher: { name: a.teacherName, designation: profile?.designation || 'Teacher' },
+                teacher: { name: a.teacherName, designation: profile?.designation || 'Teacher', photo: a.teacherPhoto || '' },
                 subject: a.subjectName,
                 className: a.className,
                 sectionName: a.sectionName,
@@ -390,7 +410,7 @@ exports.getSubmission = async (req, res) => {
                 _id: sid(a._id),
                 submittedAt: a.submittedAt,
                 overallRating: a.overallRating,
-                teacher: { name: a.teacherName },
+                teacher: { name: a.teacherName, photo: a.teacherPhoto || '' },
                 subject: a.subjectName,
                 className: a.className,
                 sectionName: a.sectionName,

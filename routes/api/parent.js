@@ -9,6 +9,7 @@ const classTestCtrl  = require('../../controllers/classTest.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const docViewer      = require('../../controllers/documentViewer.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
+const feedbackParent = require('../../controllers/feedbackParent.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
@@ -19,6 +20,7 @@ const examGuard        = [...guard, requireModule('aptitudeExam')];
 const resultGuard      = [...guard, requireModule('result')];
 const docGuard         = [...guard, requireModule('document')];
 const holidayGuard     = [...guard, requireModule('holiday')];
+const feedbackGuard    = [...guard, requireModule('feedback')];
 
 router.get('/dashboard',   guard, parentCtrl.getDashboard);
 router.get('/child-class', guard, parentCtrl.getChildClass);
@@ -43,5 +45,9 @@ router.get('/documents/:id',  docGuard, docCtrl.parentGetDocument);
 
 // Holidays
 router.get('/holidays', holidayGuard, holidayCtrl.parentGetHolidays);
+
+// Teacher feedback — each child's progress through open campaigns. Status only:
+// what a child answered is never readable by a parent.
+router.get('/feedback', feedbackGuard, feedbackParent.getChildrenFeedback);
 
 module.exports = router;

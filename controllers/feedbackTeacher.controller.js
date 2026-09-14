@@ -3,11 +3,13 @@
 //  Teacher Feedback — the teacher's own view (spec §14, §15).
 //
 //  PRIVACY: this controller only ever reads its own teacher id (req.userId) and
-//  never selects a student column. Aggregates are withheld until the campaign's
-//  minimum-response threshold is met, and raw comments are additionally gated on
-//  the school setting. A teacher therefore cannot: see another teacher's
-//  numbers, see who said what, or infer an individual from a two-response
-//  average.
+//  never selects a student column. Every figure is withheld below the
+//  campaign's minimum-response floor — the campaign total, each category, each
+//  question, each subject / section slice — and slices are additionally
+//  protected against subtraction (fb.suppressComplements). Raw comments are
+//  gated on the school setting too. A teacher therefore cannot: see another
+//  teacher's numbers, see who said what, or recover a small group's average by
+//  taking one visible figure away from another.
 // ─────────────────────────────────────────────────────────────────────────────
 const FeedbackCampaign       = require('../models/FeedbackCampaign');
 const FeedbackAssignment     = require('../models/FeedbackAssignment');
@@ -15,7 +17,6 @@ const FeedbackResponse       = require('../models/FeedbackResponse');
 const FeedbackSelectedOption = require('../models/FeedbackSelectedOption');
 const FeedbackCampaignQuestion = require('../models/FeedbackCampaignQuestion');
 const Subject                = require('../models/Subject');
-const ClassSection           = require('../models/ClassSection');
 
 const fb = require('../services/feedbackService');
 
@@ -37,6 +38,42 @@ async function visibleCampaigns(schoolId, settings) {
         .sort({ startDate: -1 }).lean();
 }
 
+const shapeCampaign = (c) => ({
+    _id: sid(c._id), name: c.name, term: c.term, status: c.status,
+    startDate: c.startDate, endDate: c.endDate, isAnonymous: !!c.isAnonymous,
+    minimumResponses: c.minimumResponses,
+});
+
+/**
+ * Group assignments by a key, gate each group by the floor, then protect the
+ * groups against subtraction from the total. The same function feeds the
+ * breakdown tables and decides which filtered trend points may be shown, so the
+ * two screens can never disagree about what is visible.
+ */
+function slicesBy(assignments, keyOf, nameOf, minimum) {
+    const buckets = {};
+    for (const a of assignments) {
+        const k = keyOf(a);
+        if (!k) continue;
+        (buckets[k] = buckets[k] || []).push(a);
+    }
+    const slices = Object.entries(buckets).map(([k, rows]) => {
+        const agg = fb.aggregate(rows, minimum);
+        return {
+            _id: k,
+            name: nameOf ? nameOf(k) : k,
+            assigned: rows.length,
+            responses: agg.responses,
+            responseRate: fb.pct(agg.responses, rows.length),
+            rating: agg.locked ? null : agg.averageRating,
+            locked: agg.locked,
+        };
+    });
+    const total = assignments.filter((a) => a.status === 'submitted').length;
+    fb.suppressComplements(slices, total, minimum);
+    return slices.sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1));
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  DASHBOARD
 // ═════════════════════════════════════════════════════════════════════════════
@@ -53,10 +90,22 @@ exports.getDashboard = async (req, res) => {
             : campaigns[0];
         if (!wanted) return bad(res, 'Campaign not found.', 404);
 
-        const assignments = await FeedbackAssignment.find({ campaign: wanted._id, teacher: req.userId })
-            .select('status overallRating categoryScores subject section hasComment').lean();
+        // The campaign before this one, for the "since last time" comparison.
+        const previousCampaign = campaigns
+            .filter((c) => new Date(c.startDate) < new Date(wanted.startDate))
+            .sort((a, b) => new Date(b.startDate) - new Date(a.startDate))[0] || null;
+
+        const [assignments, previousRows] = await Promise.all([
+            FeedbackAssignment.find({ campaign: wanted._id, teacher: req.userId })
+                .select('status overallRating categoryScores subject section hasComment').lean(),
+            previousCampaign
+                ? FeedbackAssignment.find({ campaign: previousCampaign._id, teacher: req.userId })
+                    .select('status overallRating categoryScores').lean()
+                : [],
+        ]);
 
         const agg = fb.aggregate(assignments, wanted.minimumResponses);
+        const prevAgg = previousCampaign ? fb.aggregate(previousRows, previousCampaign.minimumResponses) : null;
         const summary = {
             assigned:     assignments.length,
             responses:    agg.responses,
@@ -80,7 +129,7 @@ exports.getDashboard = async (req, res) => {
                 FeedbackSelectedOption.find({ campaign: wanted._id, teacher: req.userId })
                     .select('campaignQuestion optionText').lean(),
                 FeedbackCampaignQuestion.find({ campaign: wanted._id })
-                    .select('questionText questionType displayOrder includeInScore').sort({ displayOrder: 1 }).lean(),
+                    .select('questionText questionType displayOrder includeInScore categoryName').sort({ displayOrder: 1 }).lean(),
                 FeedbackResponse.find({ campaign: wanted._id, teacher: req.userId, includeInScore: true })
                     .select('campaignQuestion ratingValue').lean(),
             ]);
@@ -114,25 +163,33 @@ exports.getDashboard = async (req, res) => {
                 cur.sum += Number(r.ratingValue); cur.count += 1;
                 perQ[k] = cur;
             }
+            // A student answers a question once, so `answers` is a head count —
+            // and an optional question answered by two students is those two
+            // students' rating. The floor applies per question.
             questionBreakdown = cqs
                 .filter((q) => perQ[sid(q._id)])
-                .map((q) => ({
-                    question: q.questionText,
-                    average: fb.round1(perQ[sid(q._id)].sum / perQ[sid(q._id)].count),
-                    answers: perQ[sid(q._id)].count,
-                }));
+                .map((q) => {
+                    const { sum, count } = perQ[sid(q._id)];
+                    const withheld = count < wanted.minimumResponses;
+                    return {
+                        question: q.questionText,
+                        category: q.categoryName || '',
+                        average: withheld ? null : fb.round1(sum / count),
+                        answers: count,
+                        withheld,
+                    };
+                });
         }
 
         ok(res, {
-            campaigns: campaigns.map((c) => ({
-                _id: sid(c._id), name: c.name, term: c.term, status: c.status,
-                startDate: c.startDate, endDate: c.endDate,
-            })),
-            campaign: {
-                _id: sid(wanted._id), name: wanted.name, term: wanted.term, status: wanted.status,
-                startDate: wanted.startDate, endDate: wanted.endDate, isAnonymous: !!wanted.isAnonymous,
-            },
+            campaigns: campaigns.map(shapeCampaign),
+            campaign: shapeCampaign(wanted),
             summary,
+            previous: previousCampaign ? {
+                _id: sid(previousCampaign._id), name: previousCampaign.name, term: previousCampaign.term,
+                averageRating: prevAgg.locked ? null : prevAgg.averageRating,
+                responses: prevAgg.responses,
+            } : null,
             categories:  agg.categories,
             strengths:   agg.strengths || [],
             improvements: agg.improvements || [],
@@ -150,6 +207,8 @@ exports.getDashboard = async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 //  TRENDS (spec §15)
 // ═════════════════════════════════════════════════════════════════════════════
+const TREND_DIMENSIONS = ['subject', 'section', 'class'];
+
 exports.getTrends = async (req, res) => {
     try {
         const settings = await fb.getSettings(req.schoolId);
@@ -157,19 +216,25 @@ exports.getTrends = async (req, res) => {
             return ok(res, { points: [], categories: [], disabled: true });
         }
 
+        // One slice at a time. Two filters together are an intersection, and
+        // intersections combined with the single-dimension views are exactly how
+        // a small group gets isolated.
+        const given = TREND_DIMENSIONS.filter((d) => req.query[d]);
+        if (given.length > 1) return bad(res, 'Filter by one of subject, section or class at a time.');
+        const dim = given[0] || null;
+        const key = dim ? String(req.query[dim]) : null;
+
         let campaigns = await visibleCampaigns(req.schoolId, settings);
         if (req.query.academicYear) {
             campaigns = campaigns.filter((c) => sid(c.academicYear) === String(req.query.academicYear));
         }
-        if (!campaigns.length) return ok(res, { points: [], categories: [] });
+        if (!campaigns.length) return ok(res, { points: [], categories: [], filters: await filterOptions(req), dimension: dim });
 
-        const filter = { campaign: { $in: campaigns.map((c) => c._id) }, teacher: req.userId };
-        if (req.query.subject) filter.subject = req.query.subject;
-        if (req.query.section) filter.section = req.query.section;
-        if (req.query.class)   filter.class   = req.query.class;
-
-        const assignments = await FeedbackAssignment.find(filter)
-            .select('campaign status overallRating categoryScores').lean();
+        // Always the teacher's WHOLE result set: a filtered point is shown only if
+        // its slice survives protection within its own campaign's partition.
+        const assignments = await FeedbackAssignment.find({
+            campaign: { $in: campaigns.map((c) => c._id) }, teacher: req.userId,
+        }).select('campaign status overallRating categoryScores subject section class').lean();
 
         const byCampaign = assignments.reduce((acc, a) => {
             (acc[sid(a.campaign)] = acc[sid(a.campaign)] || []).push(a);
@@ -178,32 +243,47 @@ exports.getTrends = async (req, res) => {
 
         // Chronological, oldest first — a trend line reads left to right.
         const ordered = [...campaigns].sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+        const catNames = new Map();
+        const series = {};
+
         const points = ordered.map((c) => {
-            const agg = fb.aggregate(byCampaign[sid(c._id)] || [], c.minimumResponses);
+            const rows = byCampaign[sid(c._id)] || [];
+            const min = c.minimumResponses;
+            let chosen = rows;
+            let protectedHidden = false;
+
+            if (dim) {
+                chosen = rows.filter((r) => sid(r[dim]) === key);
+                const slice = slicesBy(rows, (r) => sid(r[dim]), null, min).find((x) => x._id === key);
+                protectedHidden = !!slice?.protectsOthers;
+            }
+
+            const agg = fb.aggregate(chosen, min);
+            const locked = agg.locked || protectedHidden;
+            if (!locked) {
+                for (const cat of agg.categories) {
+                    if (cat.average == null) continue;
+                    catNames.set(cat._id, cat.name);
+                    (series[cat._id] = series[cat._id] || []).push({ label: c.term || c.name, value: cat.average });
+                }
+            }
             return {
                 campaignId: sid(c._id),
                 label: c.term || c.name,
                 name: c.name,
                 date: c.startDate,
-                rating: agg.locked ? null : agg.averageRating,
+                status: c.status,
+                rating: locked ? null : agg.averageRating,
                 responses: agg.responses,
-                locked: agg.locked,
+                assigned: chosen.length,
+                minimumResponses: min,
+                locked,
+                reason: agg.locked ? (agg.responses === 0 ? 'none' : 'floor') : protectedHidden ? 'protect' : null,
             };
-        });
-
-        // Category movement across the same campaigns.
-        const catNames = new Map();
-        const series = {};
-        for (const c of ordered) {
-            const agg = fb.aggregate(byCampaign[sid(c._id)] || [], c.minimumResponses);
-            if (agg.locked) continue;
-            for (const cat of agg.categories) {
-                catNames.set(cat._id, cat.name);
-                (series[cat._id] = series[cat._id] || []).push({ label: c.term || c.name, value: cat.average });
-            }
-        }
+        }).filter((p) => p.assigned > 0);
 
         ok(res, {
+            dimension: dim,
             points,
             categories: [...catNames.entries()].map(([id, name]) => ({ _id: id, name, points: series[id] || [] })),
             filters: await filterOptions(req),
@@ -218,25 +298,24 @@ async function filterOptions(req) {
         .select('subject section class').lean();
     const subjectIds = [...new Set(rows.map((r) => sid(r.subject)).filter(Boolean))];
     const sectionIds = [...new Set(rows.map((r) => sid(r.section)).filter(Boolean))];
-    const [subjects, sections] = await Promise.all([
+    const [subjects, labels] = await Promise.all([
         subjectIds.length ? Subject.find({ _id: { $in: subjectIds } }).select('subjectName').lean() : [],
-        sectionIds.length ? ClassSection.find({ _id: { $in: sectionIds } })
-            .select('sectionName class').populate('class', 'className').lean() : [],
+        fb.sectionLabels(sectionIds),
     ]);
     return {
         subjects: subjects.map((s) => ({ _id: sid(s._id), name: s.subjectName })),
-        sections: sections.map((s) => ({ _id: sid(s._id), name: `${s.class?.className || ''} ${s.sectionName}`.trim() })),
+        sections: [...labels.entries()].map(([id, v]) => ({ _id: id, name: v.label })),
     };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  MY FEEDBACK — subject-wise / class-wise cut of the teacher's own results
+//  BREAKDOWN — subject-wise / section-wise cut of the teacher's own results
 // ═════════════════════════════════════════════════════════════════════════════
 exports.getBreakdown = async (req, res) => {
     try {
         const settings  = await fb.getSettings(req.schoolId);
         const campaigns = await visibleCampaigns(req.schoolId, settings);
-        if (!campaigns.length) return ok(res, { bySubject: [], bySection: [], campaign: null });
+        if (!campaigns.length) return ok(res, { bySubject: [], bySection: [], campaign: null, campaigns: [] });
 
         const wanted = req.query.campaignId
             ? campaigns.find((c) => sid(c._id) === String(req.query.campaignId))
@@ -248,42 +327,29 @@ exports.getBreakdown = async (req, res) => {
 
         const subjectIds = [...new Set(assignments.map((a) => sid(a.subject)).filter(Boolean))];
         const sectionIds = [...new Set(assignments.map((a) => sid(a.section)).filter(Boolean))];
-        const [subjects, sections] = await Promise.all([
+        const [subjects, labels] = await Promise.all([
             subjectIds.length ? Subject.find({ _id: { $in: subjectIds } }).select('subjectName').lean() : [],
-            sectionIds.length ? ClassSection.find({ _id: { $in: sectionIds } })
-                .select('sectionName class').populate('class', 'className').lean() : [],
+            fb.sectionLabels(sectionIds),
         ]);
         const subjMap = new Map(subjects.map((s) => [sid(s._id), s.subjectName]));
-        const secMap  = new Map(sections.map((s) => [sid(s._id), `${s.class?.className || ''} ${s.sectionName}`.trim()]));
+        const secMap  = new Map([...labels.entries()].map(([id, v]) => [id, v.label]));
 
-        // Each slice carries the SAME minimum-response floor, so slicing a
-        // cohort thin can never be used to isolate one respondent.
-        const group = (keyOf, nameOf) => {
-            const buckets = {};
-            for (const a of assignments) {
-                const k = keyOf(a);
-                if (!k) continue;
-                (buckets[k] = buckets[k] || []).push(a);
-            }
-            return Object.entries(buckets).map(([k, rows]) => {
-                const agg = fb.aggregate(rows, wanted.minimumResponses);
-                return {
-                    _id: k,
-                    name: nameOf(k),
-                    assigned: rows.length,
-                    responses: agg.responses,
-                    responseRate: fb.pct(agg.responses, rows.length),
-                    rating: agg.locked ? null : agg.averageRating,
-                    locked: agg.locked,
-                };
-            }).sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1));
-        };
-
+        const overall = fb.aggregate(assignments, wanted.minimumResponses);
         ok(res, {
-            campaign: { _id: sid(wanted._id), name: wanted.name, term: wanted.term, status: wanted.status },
-            campaigns: campaigns.map((c) => ({ _id: sid(c._id), name: c.name, term: c.term, status: c.status })),
-            bySubject: group((a) => sid(a.subject), (k) => subjMap.get(k) || 'Subject'),
-            bySection: group((a) => sid(a.section), (k) => secMap.get(k) || 'Section'),
+            campaign: shapeCampaign(wanted),
+            campaigns: campaigns.map(shapeCampaign),
+            summary: {
+                assigned: assignments.length,
+                responses: overall.responses,
+                responseRate: fb.pct(overall.responses, assignments.length),
+                averageRating: overall.locked ? null : overall.averageRating,
+                locked: overall.locked,
+                minimumResponses: wanted.minimumResponses,
+            },
+            bySubject: slicesBy(assignments, (a) => sid(a.subject), (k) => subjMap.get(k) || 'Subject', wanted.minimumResponses),
+            bySection: slicesBy(assignments, (a) => sid(a.section), (k) => secMap.get(k) || 'Section', wanted.minimumResponses),
         });
     } catch (e) { fail(res, e); }
 };
+
+exports._internal = { slicesBy };

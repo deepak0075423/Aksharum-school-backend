@@ -55,6 +55,7 @@ const submitLimiter = rateLimit({
 router.get ('/student/summary',                studentGuard, student.getSummary);
 router.get ('/student/pending',                studentGuard, student.getPending);
 router.get ('/student/completed',              studentGuard, student.getCompleted);
+router.get ('/student/missed',                 studentGuard, student.getMissed);
 router.get ('/student/assignments/:id',        studentGuard, student.getForm);
 router.get ('/student/assignments/:id/submission', studentGuard, student.getSubmission);
 router.post('/student/assignments/:id/submit', studentGuard, submitLimiter, student.submit);
