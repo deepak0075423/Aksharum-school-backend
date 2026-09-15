@@ -381,9 +381,53 @@ async function tagChildren(rows, req) {
     }
 }
 
+/**
+ * A parent's mailbox, narrowed to one child.
+ *
+ * Nothing on a notification names the child it is about, but a message about a
+ * student goes to that student as well as their parents — so child A's view is
+ * every notification A also holds a receipt for, plus every one that none of
+ * the parent's children hold (a notice to parents, a school-wide message),
+ * which belongs to every child's view. The same rule tags the dashboard inbox.
+ *
+ * `?child=` (or `child` in the body) is matched against the parent's own
+ * children and ignored otherwise — the query only ever reads the caller's own
+ * receipts, so an unknown id narrows nothing rather than reaching anyone.
+ *
+ * Returns null when there is nothing to narrow, else `sql(alias, next)` which
+ * renders the condition with its two parameters starting at `$next`.
+ */
+async function childScope(req) {
+    if (req.userRole !== 'parent') return null;
+    const wanted = String(req.query?.child || req.body?.child || '');
+    if (!wanted) return null;
+    const { childrenOf } = require('../services/parentChildren');
+    const kids = (await childrenOf(req.userId, req.schoolId, '_id')).map((k) => String(k._id));
+    if (kids.length < 2 || !kids.includes(wanted)) return null;
+
+    const R = NotificationReceipt.tableName;
+    return {
+        params: [wanted, kids],
+        sql: (alias, next) => `(EXISTS (SELECT 1 FROM "${R}" kc
+                                  WHERE kc.notification = ${alias}.notification AND kc.recipient = $${next}::uuid)
+             OR NOT EXISTS (SELECT 1 FROM "${R}" kc
+                             WHERE kc.notification = ${alias}.notification AND kc.recipient = ANY($${next + 1}::uuid[])))`,
+    };
+}
+
 exports.markAllRead = async (req, res) => {
     try {
-        await NotificationReceipt.updateMany({ recipient: req.userId, isRead: false }, { isRead: true, readAt: new Date() });
+        const scope = await childScope(req);
+        if (scope) {
+            const { query } = require('../db/pool');
+            await query(
+                `UPDATE "${NotificationReceipt.tableName}" r SET "isRead" = true, "readAt" = NOW()
+                  WHERE r.recipient = $1 AND NOT COALESCE(r."isRead", false) AND ${scope.sql('r', 2)}`,
+                [req.userId, ...scope.params],
+            );
+        } else {
+            await NotificationReceipt.updateMany({ recipient: req.userId, isRead: false }, { isRead: true, readAt: new Date() });
+        }
         _pushCount(req.userId);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -484,11 +528,15 @@ exports.deleteAll = async (req, res) => {
         const box = ['inbox', 'archived', 'all'].includes(req.body.box) ? req.body.box : 'inbox';
         const R   = NotificationReceipt.tableName;
 
-        const scope = box === 'inbox'    ? ' AND NOT COALESCE("isCleared", false)'
-                    : box === 'archived' ? ' AND COALESCE("isCleared", false)'
+        const scope = box === 'inbox'    ? ' AND NOT COALESCE(r."isCleared", false)'
+                    : box === 'archived' ? ' AND COALESCE(r."isCleared", false)'
                     : '';
+        // A parent looking at one child empties that child's view, not the
+        // other child's notifications they cannot see on screen.
+        const kid = await childScope(req);
         const { rowCount } = await query(
-            `DELETE FROM "${R}" WHERE recipient = $1${scope}`, [req.userId],
+            `DELETE FROM "${R}" r WHERE r.recipient = $1${scope}${kid ? ` AND ${kid.sql('r', 2)}` : ''}`,
+            [req.userId, ...(kid ? kid.params : [])],
         );
 
         _pushCount(req.userId);
@@ -658,6 +706,11 @@ exports.getAllNotifications = async (req, res) => {
         const where  = ['r.recipient = $1'];
         const add    = (sql, value) => { params.push(value); where.push(sql.replace('$?', `$${params.length}`)); };
 
+        // A parent's child switch: the child scope goes on the list AND on the
+        // tab badges — it is which mailbox is on screen, not a filter within it.
+        const kid = await childScope(req);
+        if (kid) { where.push(kid.sql('r', params.length + 1)); params.push(...kid.params); }
+
         if (box === 'inbox')    where.push('NOT COALESCE(r."isCleared", false)');
         if (box === 'archived') where.push('COALESCE(r."isCleared", false)');
 
@@ -679,7 +732,7 @@ exports.getAllNotifications = async (req, res) => {
         const whereSql = `WHERE ${where.join(' AND ')}`;
         const order    = (SORTS[req.query.sort] || SORTS.newest).replace('{{RANK}}', rankExpr);
 
-        const [rowsRes, countRes, boxRes] = await Promise.all([
+        const [rowsRes, countRes, boxRes, children] = await Promise.all([
             query(
                 `SELECT r._id, r."isRead", r."isCleared", r."readAt", r."createdAt",
                         n._id AS n_id, n.title, n.body, n."senderRole", n."createdAt" AS n_created,
@@ -704,9 +757,14 @@ exports.getAllNotifications = async (req, res) => {
                                            AND NOT COALESCE(r."isRead", false))::int AS unread,
                         COUNT(*) FILTER (WHERE COALESCE(r."isCleared", false))::int AS archived,
                         (SELECT COUNT(*)::int FROM "${N}" WHERE sender = $1) AS sent
-                   FROM "${R}" r WHERE r.recipient = $1`,
-                [req.userId],
+                   FROM "${R}" r WHERE r.recipient = $1${kid ? ` AND ${kid.sql('r', 2)}` : ''}`,
+                [req.userId, ...(kid ? kid.params : [])],
             ),
+            // Who the switch offers. Only a parent has one, and it travels with
+            // the list so the page needs no second request to draw it.
+            req.userRole === 'parent'
+                ? require('../services/parentChildren').childCards(req.userId, req.schoolId).catch(() => [])
+                : Promise.resolve(undefined),
         ]);
 
         const total = countRes.rows[0]?.n || 0;
@@ -741,6 +799,7 @@ exports.getAllNotifications = async (req, res) => {
             total, unread: boxes.unread, boxes,
             page, pages: Math.max(1, Math.ceil(total / limit)),
             modules: links.MODULE_OPTIONS,
+            ...(children ? { children, child: kid ? kid.params[0] : null } : {}),
         });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
@@ -783,10 +842,12 @@ exports.archiveRead = async (req, res) => {
     try {
         const { query } = require('../db/pool');
         const R = NotificationReceipt.tableName;
+        const kid = await childScope(req);
         const { rowCount } = await query(
-            `UPDATE "${R}" SET "isCleared" = true, "clearedAt" = NOW()
-              WHERE recipient = $1 AND COALESCE("isRead", false) AND NOT COALESCE("isCleared", false)`,
-            [req.userId],
+            `UPDATE "${R}" r SET "isCleared" = true, "clearedAt" = NOW()
+              WHERE r.recipient = $1 AND COALESCE(r."isRead", false) AND NOT COALESCE(r."isCleared", false)
+                ${kid ? `AND ${kid.sql('r', 2)}` : ''}`,
+            [req.userId, ...(kid ? kid.params : [])],
         );
         res.json({ success: true, archived: rowCount });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }

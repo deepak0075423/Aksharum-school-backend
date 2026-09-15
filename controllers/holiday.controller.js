@@ -585,26 +585,25 @@ exports.studentGetHolidays = getApplicableHolidays;
 exports.parentGetHolidays = async (req, res) => {
     try {
         const StudentProfile   = require('../models/StudentProfile');
-        const { childrenOf }   = require('../services/parentChildren');
+        const { childCards }   = require('../services/parentChildren');
 
         const filter = { school: req.schoolId };
         const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
         if (activeYear) filter.academicYear = { $in: [activeYear._id, null] };
 
-        // Names are read off User directly: populate on StudentProfile.user hands
-        // back the bare id in this ORM, so `profile.user.name` is quietly undefined.
-        const kidUsers = await childrenOf(req.userId, req.schoolId);
-        const profiles = kidUsers.length
-            ? await StudentProfile.find({ user: { $in: kidUsers.map((u) => u._id) }, school: req.schoolId })
+        // Name, class and section exactly as every parent page's child switch
+        // shows them; the class ids beside them decide which class days apply.
+        const cards = await childCards(req.userId, req.schoolId);
+        const profiles = cards.length
+            ? await StudentProfile.find({ user: { $in: cards.map((c) => c._id) }, school: req.schoolId })
                 .select('user currentSection currentClass').lean()
             : [];
         const profileOf = new Map(profiles.map((p) => [String(p.user), p]));
 
         const children = [];
-        for (const u of kidUsers) {
-            const id = String(u._id);
-            const { classIds, className } = await studentClasses(id, req.schoolId, profileOf.get(id));
-            children.push({ _id: id, name: u.name, className, classIds });
+        for (const c of cards) {
+            const { classIds } = await studentClasses(c._id, req.schoolId, profileOf.get(c._id));
+            children.push({ ...c, classIds });
         }
 
         const everyone = children.map((c) => c._id);
