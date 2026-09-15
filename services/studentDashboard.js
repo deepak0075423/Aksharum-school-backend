@@ -113,14 +113,24 @@ async function attendanceWeeks(sectionId, studentId, weeks = 8) {
     return buckets;
 }
 
-/** Published aptitude exams still ahead of this student's section. */
+/**
+ * Published aptitude exams still ahead of this student's section.
+ *
+ * An exam can reach several sections, and `section` holds only the first — so
+ * matching on it alone hid the exam from a child in any other of them. Exams
+ * whose window has already closed today are dropped: "upcoming" is the stage,
+ * not the calendar day.
+ */
 async function upcomingExams(schoolId, sectionId, limit = 3) {
     if (!sectionId) return [];
-    return AptitudeExam.find({
-        school: schoolId, section: sectionId,
+    const { reachesSection, examStage } = require('./aptitudeExam');
+    const rows = await AptitudeExam.find({
+        school: schoolId, ...reachesSection(sectionId),
         status: 'published', examDate: { $gte: new Date(Date.now() - 86400000) },
-    }).select('title examDate startTime duration').sort({ examDate: 1 }).limit(limit).lean()
+    }).select('title examDate startTime duration status').sort({ examDate: 1, startTime: 1 }).lean()
         .catch(() => []);
+    return rows.filter((e) => examStage(e) !== 'completed').slice(0, limit)
+        .map(({ status, ...e }) => e);
 }
 
 /**

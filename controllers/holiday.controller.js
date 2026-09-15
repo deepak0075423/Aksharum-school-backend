@@ -584,28 +584,16 @@ exports.studentGetHolidays = getApplicableHolidays;
  */
 exports.parentGetHolidays = async (req, res) => {
     try {
-        const ParentProfile  = require('../models/ParentProfile');
-        const StudentProfile = require('../models/StudentProfile');
-        const User           = require('../models/User');
+        const StudentProfile   = require('../models/StudentProfile');
+        const { childrenOf }   = require('../services/parentChildren');
 
         const filter = { school: req.schoolId };
         const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
         if (activeYear) filter.academicYear = { $in: [activeYear._id, null] };
 
-        const parent = await ParentProfile.findOne({ user: req.userId }).lean();
-        const listed = parent?.children?.length ? parent.children : (parent?.student ? [parent.student] : []);
-        const owned  = await StudentProfile.find({ parent: req.userId, school: req.schoolId })
-            .select('user').lean();
-        const kidIds = [...new Set([...listed, ...owned.map((p) => p.user)].filter(Boolean).map(String))];
-
-        // Read by hand rather than through populate: on this model it hands back
-        // the bare id, so `profile.user.name` is quietly undefined. Scoped to
-        // this school's students, so a stale id on the parent record cannot
-        // reach into another school.
-        const kidUsers = kidIds.length
-            ? await User.find({ _id: { $in: kidIds }, role: 'student', school: req.schoolId }).select('name').lean()
-            : [];
-        kidUsers.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+        // Names are read off User directly: populate on StudentProfile.user hands
+        // back the bare id in this ORM, so `profile.user.name` is quietly undefined.
+        const kidUsers = await childrenOf(req.userId, req.schoolId);
         const profiles = kidUsers.length
             ? await StudentProfile.find({ user: { $in: kidUsers.map((u) => u._id) }, school: req.schoolId })
                 .select('user currentSection currentClass').lean()

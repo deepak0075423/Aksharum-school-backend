@@ -342,9 +342,44 @@ exports.getInboxApi = async (req, res) => {
             .limit(+limit)
             .lean();
         const unread = await NotificationReceipt.countDocuments({ recipient: req.userId, isRead: false, isCleared: false });
-        res.json({ success: true, data: withLinks(receipts, req.userRole), unread });
+        const data = withLinks(receipts, req.userRole);
+        if (req.userRole === 'parent') await tagChildren(data, req);
+        res.json({ success: true, data, unread });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
+
+/**
+ * Which of a parent's children each notification is about.
+ *
+ * A message about one student — a library fine, an absence, a result — is
+ * sent to that student AND their parents, but the notification itself names no
+ * child. So a parent with two children saw one child's fine on the other's
+ * dashboard. The receipts already say who else got it: the children holding a
+ * receipt for the same notification are the ones it concerns.
+ *
+ * `forChildren: []` means none of them received it — a message to parents as
+ * such, or a school-wide notice — and belongs on every child's view. This
+ * reads the existing rows, so notifications sent before it are tagged too.
+ */
+async function tagChildren(rows, req) {
+    const { childrenOf } = require('../services/parentChildren');
+    const kids = (await childrenOf(req.userId, req.schoolId, '_id')).map((k) => String(k._id));
+    const notifIds = [...new Set(rows.map((r) => String(r.notification?._id || r.notification || '')).filter(Boolean))];
+
+    const held = kids.length && notifIds.length
+        ? await NotificationReceipt.find({ notification: { $in: notifIds }, recipient: { $in: kids } })
+            .select('notification recipient').lean()
+        : [];
+    const byNotif = new Map();
+    for (const h of held) {
+        const key = String(h.notification);
+        if (!byNotif.has(key)) byNotif.set(key, new Set());
+        byNotif.get(key).add(String(h.recipient));
+    }
+    for (const r of rows) {
+        r.forChildren = [...(byNotif.get(String(r.notification?._id || r.notification || '')) || [])];
+    }
+}
 
 exports.markAllRead = async (req, res) => {
     try {

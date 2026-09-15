@@ -31,6 +31,15 @@ exports.getDashboard = async (req, res) => {
         const userById    = new Map(users.map((u) => [String(u._id), u]));
         const profileByKid = new Map(profiles.map((p) => [String(p.user), p]));
 
+        // The nested populate above (section → class) hands back the bare class
+        // id in this ORM, so every child's class name came out blank and the
+        // hero read "D" rather than "Class 1 — D". Read the classes directly.
+        const Class = require('../models/Class');
+        const classIdOf = (p) => String(p.currentSection?.class?._id || p.currentSection?.class || p.currentClass || '');
+        const classRows = await Class.find({ _id: { $in: [...new Set(profiles.map(classIdOf).filter(Boolean))] } })
+            .select('className').lean();
+        const classNameById = new Map(classRows.map((c) => [String(c._id), c.className]));
+
         const sectionIds = profiles.map((p) => p.currentSection?._id).filter(Boolean);
         let recordsBySection = new Map();
         if (sectionIds.length) {
@@ -81,7 +90,7 @@ exports.getDashboard = async (req, res) => {
             children.push({
                 _id:        childId,
                 name:       user.name,
-                className:  sp?.currentSection?.class?.className || '',
+                className:  sp?.currentSection?.class?.className || (sp ? classNameById.get(classIdOf(sp)) : '') || '',
                 sectionName:sp?.currentSection?.sectionName || '',
                 rollNumber: sp?.rollNumber || '',
                 attendancePercentage: attendance,
