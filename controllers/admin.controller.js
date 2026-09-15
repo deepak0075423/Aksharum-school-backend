@@ -47,6 +47,7 @@ const { rollNumberTaken } = require('../utils/rollNumbers');
 const admissionNo = require('../utils/admissionNumber');
 const employeeIdUtil = require('../utils/employeeId');
 const { capacityErrorById } = require('../utils/sectionCapacity');
+const { identityClash, changed: idChanged } = require('../utils/identityNumbers');
 const { syncSectionsToSchoolSaturday } = require('../utils/timetableDays');
 const teacherDeps = require('../services/teacherDependencies');
 
@@ -182,6 +183,25 @@ const PARENT_FILE_MAP = {
     Photo:        'photoFile',
 };
 const PARENT_ROLES = ['father', 'mother', 'guardian'];
+
+/**
+ * The Aadhaar / PAN numbers a teacher write is setting (new, or different from
+ * what the record holds) — see utils/identityNumbers for the rule.
+ */
+function teacherIdEntries(b, current, userId) {
+    const owner = { kind: 'teacher', ref: userId ? String(userId) : null };
+    const out = [];
+    if (idChanged('aadhaar', b.aadhaarNumber, current?.aadhaarNumber)) out.push({ type: 'aadhaar', value: b.aadhaarNumber, label: 'Aadhaar number', owner });
+    if (idChanged('pan', b.panNumber, current?.panNumber))             out.push({ type: 'pan', value: b.panNumber, label: 'PAN number', owner });
+    return out;
+}
+
+/** The student's own Aadhaar, as an entry when it is being set. */
+function studentIdEntries(aadhaar, current, userId) {
+    return idChanged('aadhaar', aadhaar, current?.aadhaarNumber)
+        ? [{ type: 'aadhaar', value: aadhaar, label: "Student's Aadhaar number", owner: { kind: 'student', ref: userId ? String(userId) : null } }]
+        : [];
+}
 
 exports.STUDENT_DOC_FIELDS = [
     ...Object.keys(STUDENT_FILE_MAP),
@@ -340,7 +360,7 @@ function buildStudentProfile(profile = {}, uploads = {}) {
  *
  * @returns {Promise<{ parentId: String|null, error: String|null }>}
  */
-async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {}, existingBlocks = null }) {
+async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {}, existingBlocks = null, studentAadhaar = '' }) {
     if (!newParent) return { parentId: null, error: null };
 
     const str = (v) => String(v ?? '').trim();
@@ -419,6 +439,36 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
         return { parentId: null, error: `${holder.email} already belongs to a ${String(parentUser.role).replace('_', ' ')} account — use a different email for the parent` };
     if (parentUser && String(parentUser.school) !== String(schoolId))
         return { parentId: null, error: `${holder.email} is registered with another school` };
+
+    // Aadhaar / PAN: one record per number in the school. Checked before any
+    // account is created, against the profile this save is about to write (a
+    // sibling's parent account is the same record, not a clash with itself).
+    const target = parentUser ? await ParentProfile.findOne({ user: parentUser._id }).lean() : null;
+    const idEntries = [];
+    for (const key of PARENT_ROLES) {
+        const label = key[0].toUpperCase() + key.slice(1);
+        const owner = { kind: key, ref: target ? String(target._id) : null };
+        const blk = blocks[key];
+        if (idChanged('aadhaar', blk.aadhaarNumber, target?.[key]?.aadhaarNumber))
+            idEntries.push({ type: 'aadhaar', value: blk.aadhaarNumber, label: `${label}'s Aadhaar number`, owner });
+        if (idChanged('pan', blk.panNumber, target?.[key]?.panNumber))
+            idEntries.push({ type: 'pan', value: blk.panNumber, label: `${label}'s PAN number`, owner });
+    }
+    // Every number on this form is compared with every other — a parent block
+    // left unchanged still must not match the one being typed.
+    const peers = [
+        ...PARENT_ROLES.flatMap((key) => {
+            const label = key[0].toUpperCase() + key.slice(1);
+            return [
+                { type: 'aadhaar', value: blocks[key].aadhaarNumber, label: `${label}'s Aadhaar number` },
+                { type: 'pan',     value: blocks[key].panNumber,     label: `${label}'s PAN number` },
+            ];
+        }).filter((p) => !idEntries.some((e) => e.label === p.label)),
+        ...(studentAadhaar ? [{ type: 'aadhaar', value: studentAadhaar, label: "Student's Aadhaar number" }] : []),
+    ];
+    const idClash = await identityClash(schoolId, idEntries, { peers });
+    if (idClash) return { parentId: null, error: idClash };
+
     if (!parentUser) {
         const otp = generateOTP();
         parentUser = await createUserHelper(
@@ -792,11 +842,44 @@ const TAUGHT_SUBJECTS = `(
          WHERE sst."teacher" = u."_id" AND sub."school" = u."school"
     )`;
 
+/**
+ * Teaching or non-teaching — stated when the profile says so, derived otherwise.
+ *
+ * `TeacherProfile.staffType` is empty unless someone set it (the model is built
+ * that way so existing staff need no backfill), and the filter used to compare
+ * that column directly: with every profile empty, "Teaching" and "Non-teaching"
+ * both matched nobody. This is the Employee Directory's rule (staffTypeOf in
+ * employeeDirectory.controller), in SQL: a stated value wins; otherwise anyone
+ * with subjects on their profile, a section they lead or cover as vice class
+ * teacher, or a subject they teach on a section — in the active academic year —
+ * is teaching, and everyone else is not. Keep the two in step.
+ */
+const ACTIVE_YEAR_SECTION = `(
+        NOT EXISTS (SELECT 1 FROM ${qt(AcademicYear)} ay WHERE ay."school" = u."school" AND ay."status" = 'active')
+     OR s."academicYear" = (SELECT ay."_id" FROM ${qt(AcademicYear)} ay
+                             WHERE ay."school" = u."school" AND ay."status" = 'active' LIMIT 1)
+    )`;
+const STAFF_TYPE = `(CASE
+        WHEN tp."staffType" IN ('teaching', 'non_teaching') THEN tp."staffType"
+        WHEN jsonb_typeof(tp."subjects") = 'array' AND jsonb_array_length(tp."subjects") > 0 THEN 'teaching'
+        WHEN EXISTS (SELECT 1 FROM ${qt(ClassSection)} s
+                      WHERE s."school" = u."school"
+                        AND (s."classTeacher" = u."_id" OR s."substituteTeacher" = u."_id")
+                        AND ${ACTIVE_YEAR_SECTION})
+          OR EXISTS (SELECT 1 FROM ${qt(SectionSubjectTeacher)} sst
+                       JOIN ${qt(ClassSection)} s ON s."_id" = sst."section"
+                      WHERE sst."teacher" = u."_id" AND s."school" = u."school"
+                        AND ${ACTIVE_YEAR_SECTION})
+        THEN 'teaching'
+        ELSE 'non_teaching' END)`;
+
 const TEACHER_COLUMNS = `
         u."_id", u."name", u."email", u."phone", u."profileImage",
         u."isActive", u."createdAt",
         tp."employeeId", tp."designation", tp."department", tp."gender",
-        tp."staffType", tp."joiningDate", tp."qualification",
+        ${STAFF_TYPE} AS "staffType",
+        (CASE WHEN tp."staffType" IN ('teaching', 'non_teaching') THEN 'set' ELSE 'derived' END) AS "staffTypeSource",
+        tp."joiningDate", tp."qualification",
         COALESCE(tp."subjects", '[]'::jsonb) AS "profileSubjects",
         ${TAUGHT_SUBJECTS}                   AS "taughtSubjects",
         COALESCE(tp."classes",  '[]'::jsonb) AS "classes"`;
@@ -836,7 +919,7 @@ function teacherFilters(req) {
     if (designation) c.add(`tp."designation" = ?`, designation);
     if (department)  c.add(`tp."department" = ?`, department);
     if (gender)      c.add(`tp."gender" = ?`, gender);
-    if (staffType)   c.add(`tp."staffType" = ?`, staffType);
+    if (staffType)   c.add(`${STAFF_TYPE} = ?`, staffType);
     // Either source counts: `@>` on a jsonb array is "contains this element",
     // and the EXISTS covers a teacher assigned the subject on a section but
     // whose intake form never listed it.
@@ -1049,7 +1132,9 @@ exports.exportTeachers = async (req, res) => {
                       'Staff Type', 'Gender', 'Subjects', 'Classes', 'Joining Date', 'Status'],
             rows: rows.map(withSubjects).map((t) => [
                 t.employeeId || '', t.name, t.email, t.phone || '',
-                t.designation || '', t.department || '', t.staffType || '', t.gender || '',
+                t.designation || '', t.department || '',
+                t.staffType === 'non_teaching' ? 'Non-teaching' : t.staffType === 'teaching' ? 'Teaching' : '',
+                t.gender || '',
                 asList(t.subjects), asList(t.classes), sheetDate(t.joiningDate),
                 t.isActive === false ? 'Inactive' : 'Active',
             ]),
@@ -1148,6 +1233,10 @@ exports.updateStudentFull = async (req, res) => {
             // forces the admin to re-upload paperwork.
             || (sentProfile ? validateStudentDocs({ ...existing, ...sentFields }, uploads, existing) : null);
         if (profileErr) return res.status(400).json({ success: false, message: profileErr });
+        if (sentFields.aadhaarNumber !== undefined) {
+            const studentIdClash = await identityClash(req.schoolId, studentIdEntries(sentFields.aadhaarNumber, existing, req.params.id));
+            if (studentIdClash) return res.status(400).json({ success: false, message: studentIdClash });
+        }
         if (password) {
             if (password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
             userUpdate.password = await bcrypt.hash(password, 12);
@@ -1171,6 +1260,7 @@ exports.updateStudentFull = async (req, res) => {
                 : null;
             const { parentId: newId, error } = await resolveNewParent(newParent, {
                 schoolId: req.schoolId, schoolName, uploads, existingBlocks: existingParent,
+                studentAadhaar: sentFields.aadhaarNumber !== undefined ? sentFields.aadhaarNumber : existing?.aadhaarNumber,
             });
             if (error) return res.status(400).json({ success: false, message: error });
             if (newId) resolvedParentId = newId;
@@ -1599,6 +1689,9 @@ exports.createTeacher = async (req, res) => {
         const problem = validateTeacherIntake(b, files);
         if (problem) return res.status(400).json({ success: false, message: problem });
 
+        const idClash = await identityClash(req.schoolId, teacherIdEntries(b, null, null));
+        if (idClash) return res.status(400).json({ success: false, message: idClash });
+
         const exists = await User.findOne({ email: String(email).toLowerCase() });
         if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
 
@@ -1653,6 +1746,9 @@ exports.updateTeacherFull = async (req, res) => {
             { ...fileStubsFor(existing), ...files },
         );
         if (problem) return res.status(400).json({ success: false, message: problem });
+
+        const idClash = await identityClash(req.schoolId, teacherIdEntries(b, existing, user._id));
+        if (idClash) return res.status(400).json({ success: false, message: idClash });
 
         if (b.email && String(b.email).toLowerCase() !== String(user.email).toLowerCase()) {
             const taken = await User.findOne({ email: String(b.email).toLowerCase() }).lean();
@@ -1753,12 +1849,17 @@ exports.createStudent = async (req, res) => {
         const exists = await User.findOne({ email: email.toLowerCase() });
         if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
 
+        const studentIdClash = await identityClash(req.schoolId, studentIdEntries(profile.aadhaarNumber, null, null));
+        if (studentIdClash) return res.status(400).json({ success: false, message: studentIdClash });
+
         // Create (or link) the parent account before the student, so a bad
         // parent payload doesn't leave a student behind
         const schoolName = req.user?.school?.name || 'School';
         let resolvedParentId = parentId || null;
         if (!resolvedParentId) {
-            const { parentId: newId, error } = await resolveNewParent(newParent, { schoolId: req.schoolId, schoolName, uploads });
+            const { parentId: newId, error } = await resolveNewParent(newParent, {
+                schoolId: req.schoolId, schoolName, uploads, studentAadhaar: profile.aadhaarNumber,
+            });
             if (error) return res.status(400).json({ success: false, message: error });
             resolvedParentId = newId;
         }
@@ -2254,6 +2355,8 @@ exports.bulkTeachers = async (req, res) => {
                         continue;
                     }
                     const current = await TeacherProfile.findOne({ user: exists._id }).lean();
+                    const rowIdClash = await identityClash(req.schoolId, teacherIdEntries(b, current, exists._id));
+                    if (rowIdClash) { fail(rowIdClash); continue; }
                     // A typed employee ID may be a correction, but it must not
                     // collide with one another teacher already holds.
                     if (employeeId && employeeId !== (current?.employeeId || '')) {
@@ -2280,6 +2383,10 @@ exports.bulkTeachers = async (req, res) => {
                 // An employee ID is part of the employee record, so a bulk-created
                 // teacher gets one the same way the add-teacher form does —
                 // typed if supplied, otherwise generated from the school's format.
+                // Rows are saved one by one, so a number repeated further down
+                // the same sheet meets the row above it here.
+                const newIdClash = await identityClash(req.schoolId, teacherIdEntries(b, null, null));
+                if (newIdClash) { fail(newIdClash); continue; }
                 let resolvedId = employeeId;
                 if (resolvedId) {
                     const taken = await TeacherProfile.findOne({ school: req.schoolId, employeeId: resolvedId }).lean();
@@ -2544,11 +2651,16 @@ exports.bulkStudents = async (req, res) => {
                 // Same helper the wizard uses, so the guardian blocks, the login
                 // holder and the welcome email all behave identically. Documents
                 // already on the parent record survive a re-import.
+                const studentIdClash = await identityClash(req.schoolId,
+                    studentIdEntries(profile.aadhaarNumber, existingProfile, studentExists?._id));
+                if (studentIdClash) { fail(studentIdClash); continue; }
+
                 const existingParent = existingProfile?.parent
                     ? await ParentProfile.findOne({ user: existingProfile.parent }).lean()
                     : null;
                 const { parentId, error: parentErr } = await resolveNewParent(newParent, {
                     schoolId: req.schoolId, schoolName, uploads: {}, existingBlocks: existingParent,
+                    studentAadhaar: profile.aadhaarNumber || existingProfile?.aadhaarNumber || '',
                 });
                 if (parentErr) { fail(parentErr); continue; }
                 if (!parentId) { fail('Parent / guardian details are required'); continue; }

@@ -48,6 +48,14 @@ const SchoolSchema = new db.Schema({
         trim: true,
         default: '',
     },
+    // Which board, when `board` alone does not say: "State Board" is one of
+    // thirty-odd (Maharashtra, Kerala, …) and "Other" is not a board at all.
+    // Empty for every other choice.
+    boardName: {
+        type: String,
+        trim: true,
+        default: '',
+    },
     website: {
         type: String,
         default: '',

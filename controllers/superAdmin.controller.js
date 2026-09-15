@@ -105,6 +105,8 @@ exports.getSchool = async (req, res) => {
 };
 
 const SCHOOL_BOARDS = ['CBSE', 'ICSE', 'State Board', 'IB', 'Cambridge (IGCSE)', 'NIOS', 'Other'];
+// The two choices that do not name a board by themselves — the school has to.
+const NAMED_BOARDS = { 'State Board': 'State Board Name', 'Other': 'Board Name' };
 
 const _validateSchool = (body) => {
     const required = { name: 'School Name', code: 'School Code', board: 'School Board', email: 'Email', phone: 'Phone', address: 'Address', city: 'City', state: 'State', country: 'Country' };
@@ -112,6 +114,12 @@ const _validateSchool = (body) => {
         if (!body[field] || !String(body[field]).trim()) return `${label} is required`;
     }
     if (!SCHOOL_BOARDS.includes(body.board)) return 'School Board must be one of: ' + SCHOOL_BOARDS.join(', ');
+    if (NAMED_BOARDS[body.board]) {
+        const label = NAMED_BOARDS[body.board];
+        const name  = String(body.boardName ?? '').trim();
+        if (!name) return `${label} is required when the board is "${body.board}"`;
+        if (name.length < 2 || name.length > 100) return `${label} must be 2-100 characters`;
+    }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return 'Valid email is required';
     if (!/^\d{7,15}$/.test(body.phone.replace(/[\s\-+()]/g, ''))) return 'Valid phone number is required';
     if (body.website && !/^https?:\/\/.+\..+/.test(body.website)) return 'Website must be a valid URL starting with http:// or https://';
@@ -122,6 +130,9 @@ const _validateSchool = (body) => {
 
 const _buildSchoolData = (body, file) => {
     const data = { ...body };
+    // Kept only where it means something: switching a school from State Board to
+    // CBSE must not leave "Maharashtra State Board" behind on the record.
+    data.boardName = NAMED_BOARDS[data.board] ? String(data.boardName ?? '').trim() : '';
     // FormData always sends booleans as strings — coerce explicitly
     if (data.isActive !== undefined) data.isActive = data.isActive === 'true' || data.isActive === true;
     const removeLogo = data.removeLogo === 'true' || data.removeLogo === true;
