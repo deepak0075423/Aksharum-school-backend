@@ -11,6 +11,8 @@ const ttGenCtrl      = require('../../controllers/timetableGen.controller');
 const substituteCtrl = require('../../controllers/substitute.controller');
 const notifCtrl      = require('../../controllers/notification.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
+const aptAdmin       = require('../../controllers/aptitudeAdmin.controller');
+const aptAnalytics   = require('../../controllers/aptitudeAnalytics.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
 const compOffCtrl    = require('../../controllers/compOff.controller');
@@ -329,7 +331,33 @@ router.get('/notifications',        notifGuard, notifCtrl.getList);
 router.post('/notifications/send',  notifGuard, notifCtrl.send);
 
 // ── Aptitude Exams ────────────────────────────────────────────────────────────
-router.get('/exams', examGuard, examCtrl.getAdminExams);
+// The admin routes reach the teacher's question handlers for ANY exam in the
+// school; `examScope` lifts their created-by-me filter (see ownExam()).
+const schoolScope = (req, _res, next) => { req.examScope = 'school'; next(); };
+// Static paths first — Express would otherwise read "overview" as an :id.
+router.get   ('/exams',                        examGuard, aptAdmin.listExams);
+router.get   ('/exams/overview',               examGuard, aptAdmin.getOverview);
+router.get   ('/exams/insights',               examGuard, aptAdmin.getInsights);
+router.get   ('/exams/analytics',              examGuard, schoolScope, aptAnalytics.getOverview);
+router.get   ('/exams/meta',                   examGuard, aptAdmin.getMeta);
+router.get   ('/exams/questions/template',     examGuard, aptAdmin.getQuestionTemplate);
+router.post  ('/exams',                        examGuard, aptAdmin.createExam);
+router.get   ('/exams/:id',                    examGuard, aptAdmin.getExam);
+router.get   ('/exams/:id/report',             examGuard, schoolScope, aptAnalytics.getExamReport);
+router.put   ('/exams/:id',                    examGuard, aptAdmin.updateExam);
+router.delete('/exams/:id',                    examGuard, aptAdmin.deleteExam);
+router.post  ('/exams/:id/duplicate',          examGuard, aptAdmin.duplicateExam);
+router.post  ('/exams/:id/publish',            examGuard, schoolScope, examCtrl.publishExam);
+router.post  ('/exams/:id/unpublish',          examGuard, aptAdmin.unpublishExam);
+router.post  ('/exams/:id/cancel',             examGuard, aptAdmin.cancelExam);
+router.post  ('/exams/:id/results',            examGuard, aptAdmin.decideResults);
+router.get   ('/exams/:id/questions',          examGuard, schoolScope, examCtrl.getQuestions);
+router.post  ('/exams/:id/questions',          examGuard, schoolScope, examCtrl.addQuestion);
+router.post  ('/exams/:id/questions/import',   examGuard, schoolScope, uploadCsv.single('file'), aptAdmin.importQuestions);
+router.put   ('/exams/:id/questions/:qid',     examGuard, schoolScope, examCtrl.updateQuestion);
+router.delete('/exams/:id/questions/:qid',     examGuard, schoolScope, examCtrl.deleteQuestion);
+router.get   ('/exams/:id/submissions',        examGuard, schoolScope, examCtrl.getSubmissions);
+router.get   ('/exams/:id/analytics',          examGuard, schoolScope, examCtrl.getAnalytics);
 
 // ── Results / Formal Exams ────────────────────────────────────────────────────
 router.get('/results/exams',                          resultGuard, formalExamCtrl.adminGetExams);

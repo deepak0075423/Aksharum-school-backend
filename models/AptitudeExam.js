@@ -6,11 +6,22 @@ const AptitudeExamSchema = new db.Schema({
         ref: 'School',
         required: true,
     },
+    // The first section the exam reaches. Kept as a single required column
+    // because attempts, the teacher's approval screens and the mobile app all
+    // read it; `sections` below is the whole audience.
     section: {
         type: db.Types.UUID,
         ref: 'ClassSection',
         required: true,
     },
+    // Every section the exam reaches, `section` included. An admin can set one
+    // exam for Classes 9 – 10 at once; a teacher's exam holds one entry. Rows
+    // written before this column existed read null — see
+    // services/aptitudeExam.js `examSectionIds()`, which falls back to `section`.
+    sections: [{
+        type: db.Types.UUID,
+        ref: 'ClassSection',
+    }],
     academicYear: {
         type: db.Types.UUID,
         ref: 'AcademicYear',

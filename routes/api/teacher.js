@@ -8,6 +8,8 @@ const timetableCtrl  = require('../../controllers/timetable.controller');
 const substituteCtrl = require('../../controllers/substitute.controller');
 const notifCtrl      = require('../../controllers/notification.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
+const aptAdmin       = require('../../controllers/aptitudeAdmin.controller');
+const aptAnalytics   = require('../../controllers/aptitudeAnalytics.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
@@ -19,7 +21,7 @@ const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
-const { uploadExcel, uploadDocument, uploadLeaveDoc } = require('../../middleware/upload');
+const { uploadExcel, uploadDocument, uploadLeaveDoc, uploadCsv } = require('../../middleware/upload');
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('teacher')];
 const attendanceGuard  = [...guard, requireModule('attendance')];
@@ -82,7 +84,12 @@ router.post('/notifications/send',  notifGuard, notifCtrl.send);
 
 // ── Aptitude Exams ────────────────────────────────────────────────────────────
 router.get('/exams',                           examGuard, examCtrl.getTeacherExams);
+// Static paths before /exams/:id, or Express reads "board" as an id.
+router.get('/exams/board',                     examGuard, examCtrl.getTeacherBoard);
+router.get('/exams/analytics',                 examGuard, aptAnalytics.getOverview);
 router.get('/exams/meta',                      examGuard, examCtrl.getExamMeta);
+router.get('/exams/questions/template',        examGuard, aptAdmin.getQuestionTemplate);
+router.post('/exams/:id/questions/import',     examGuard, uploadCsv.single('file'), aptAdmin.importQuestions);
 router.post('/exams',                          examGuard, examCtrl.createExam);
 router.get('/exams/:id',                       examGuard, examCtrl.getExamDetail);
 router.put('/exams/:id',                       examGuard, examCtrl.updateExam);
@@ -95,6 +102,7 @@ router.delete('/exams/:id/questions/:qid',     examGuard, examCtrl.deleteQuestio
 router.get('/exams/:id/submissions',           examGuard, examCtrl.getSubmissions);
 router.get('/exams/:id/submissions/:studentId',examGuard, examCtrl.getStudentResponse);
 router.get('/exams/:id/analytics',             examGuard, examCtrl.getAnalytics);
+router.get('/exams/:id/report',                examGuard, aptAnalytics.getExamReport);
 router.get('/exams/:id/result-approval',            examGuard, examCtrl.getResultApproval);
 router.post('/exams/:id/subject-approve',           examGuard, examCtrl.subjectApproveResults);
 router.post('/exams/:id/result-approval',           examGuard, examCtrl.approveResults);
