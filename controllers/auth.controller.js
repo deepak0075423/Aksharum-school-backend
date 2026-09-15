@@ -67,24 +67,111 @@ exports.login = async (req, res) => {
         if (locked) {
             return res.status(403).json({ success: false, code: locked.code, message: locked.message });
         }
-        const token   = signToken(user);
-        const refresh = signRefresh(user._id);
-        res.json({
-            success: true,
-            token,
-            refreshToken: refresh,
-            user: {
-                id:           user._id,
-                name:         user.name,
-                email:        user.email,
-                role:         user.role,
-                isFirstLogin: user.isFirstLogin,
-                school:       user.school,
-                profileImage: user.profileImage,
-            },
-        });
+        sendSession(res, user);
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+/** The signed-in answer, identical whichever way the person proved who they are. */
+function sendSession(res, user) {
+    res.json({
+        success: true,
+        token:        signToken(user),
+        refreshToken: signRefresh(user._id),
+        user: {
+            id:           user._id,
+            name:         user.name,
+            email:        user.email,
+            role:         user.role,
+            isFirstLogin: user.isFirstLogin,
+            school:       user.school,
+            profileImage: user.profileImage,
+        },
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Sign in with Google
+//
+//  Google vouches for an email address; it never creates an account. The
+//  address has to belong to an account the school already made, and that
+//  account goes through exactly the checks a password sign-in does — disabled
+//  accounts and deactivated schools are refused the same way. A first-login
+//  account still has to set its password afterwards.
+//
+//  The browser's Google popup hands back a one-time authorization code; it is
+//  exchanged here, server to server, with the client secret. The ID token comes
+//  back from Google's token endpoint over TLS, which OpenID Connect accepts in
+//  place of a signature check — its claims are still checked: issued for this
+//  app, by Google, not expired, and for an email Google has verified.
+//
+//  Off until GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are both set; the page
+//  asks /google/config and shows no button while it is off.
+// ─────────────────────────────────────────────────────────────────────────────
+const googleConfigured = () => !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+
+exports.googleConfig = (req, res) => {
+    res.json({
+        success:  true,
+        enabled:  googleConfigured(),
+        clientId: googleConfigured() ? process.env.GOOGLE_CLIENT_ID : null,
+    });
+};
+
+const GOOGLE_ISSUERS = ['accounts.google.com', 'https://accounts.google.com'];
+
+function decodeJwtPayload(token) {
+    const part = String(token || '').split('.')[1];
+    if (!part) return null;
+    try { return JSON.parse(Buffer.from(part, 'base64url').toString('utf8')); } catch { return null; }
+}
+
+exports.googleLogin = async (req, res) => {
+    const refuse = (status, message) => res.status(status).json({ success: false, message });
+    try {
+        if (!googleConfigured()) return refuse(404, 'Google sign-in is not enabled');
+        // The popup flow's code must be redeemed by a script on our page, not by
+        // a form another site posted — Google's guidance for this flow.
+        if (req.get('X-Requested-With') !== 'XMLHttpRequest') return refuse(400, 'Invalid request');
+        const code = String(req.body?.code || '');
+        if (!code) return refuse(400, 'Google did not return a sign-in code');
+
+        const exchange = await fetch('https://oauth2.googleapis.com/token', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                code,
+                client_id:     process.env.GOOGLE_CLIENT_ID,
+                client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                redirect_uri:  'postmessage',
+                grant_type:    'authorization_code',
+            }),
+            signal: AbortSignal.timeout(10000),
+        });
+        const tokens = await exchange.json().catch(() => ({}));
+        if (!exchange.ok || !tokens.id_token) return refuse(401, 'Google sign-in could not be completed. Please try again.');
+
+        const claims = decodeJwtPayload(tokens.id_token);
+        const valid = claims
+            && GOOGLE_ISSUERS.includes(claims.iss)
+            && claims.aud === process.env.GOOGLE_CLIENT_ID
+            && Number(claims.exp) * 1000 > Date.now()
+            && (claims.email_verified === true || claims.email_verified === 'true')
+            && claims.email;
+        if (!valid) return refuse(401, 'Google could not confirm this email address');
+
+        const user = await User.findOne({ email: String(claims.email).toLowerCase() }).populate('school');
+        if (!user) {
+            return refuse(401, `No account uses ${claims.email}. Sign in with your email and password, or ask your school office to add this address.`);
+        }
+        if (!user.isActive) return refuse(403, 'Account disabled');
+        const locked = schoolLockout(user);
+        if (locked) return res.status(403).json({ success: false, code: locked.code, message: locked.message });
+
+        sendSession(res, user);
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Google sign-in failed. Please try again.' });
     }
 };
 

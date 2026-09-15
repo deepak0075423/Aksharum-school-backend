@@ -51,7 +51,9 @@ app.use(cors({
 
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  // X-Requested-With: sent by the Google sign-in call, which refuses a request
+  // without it (see auth.controller googleLogin) — cross-origin in production.
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
@@ -87,6 +89,9 @@ const authLimiter = rateLimit({
 for (const p of ['/api/auth/login', '/api/auth/forgot-password', '/api/auth/verify-otp', '/api/auth/new-password', '/api/auth/magic']) {
     app.use(p, authLimiter);
 }
+// Google sign-in: the POST only — app.use would also count /google/config, which
+// every visit to the login page reads.
+app.post('/api/auth/google', authLimiter);
 
 // ── Static Files (uploads) ────────────────────────────────────────────────────
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));

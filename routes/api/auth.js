@@ -5,6 +5,8 @@ const ctrl    = require('../../controllers/auth.controller');
 const { verifyToken } = require('../../middleware/auth');
 
 router.post('/login',            ctrl.login);
+router.get('/google/config',     ctrl.googleConfig);
+router.post('/google',           ctrl.googleLogin);
 router.post('/logout',           verifyToken, ctrl.logout);
 router.post('/forgot-password',  ctrl.forgotPassword);
 router.post('/verify-otp',       ctrl.verifyOtp);
