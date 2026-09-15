@@ -357,6 +357,7 @@ router.post  ('/exams/:id/questions/import',   examGuard, schoolScope, uploadCsv
 router.put   ('/exams/:id/questions/:qid',     examGuard, schoolScope, examCtrl.updateQuestion);
 router.delete('/exams/:id/questions/:qid',     examGuard, schoolScope, examCtrl.deleteQuestion);
 router.get   ('/exams/:id/submissions',        examGuard, schoolScope, examCtrl.getSubmissions);
+router.get   ('/exams/:id/submissions/:studentId', examGuard, schoolScope, examCtrl.getStudentResponse);
 router.get   ('/exams/:id/analytics',          examGuard, schoolScope, examCtrl.getAnalytics);
 
 // ── Results / Formal Exams ────────────────────────────────────────────────────

@@ -474,11 +474,43 @@ exports.adminGetAuditLog = async (req, res) => {
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
-// ── Read-only view for teacher / student / parent ─────────────────────────────
-// Filters by applicability so each role only sees relevant holidays.
+/**
+ * Every class one student belongs to, and the name to show for it.
+ *
+ * Three routes, and they are not always in step: the profile's
+ * `currentSection` pointer, the section's own `enrolledStudents` roster, and
+ * `currentClass` — admitted to a class but not placed in a section yet, which
+ * is still that class's holiday. Scoped to the school, so a stale roster row
+ * elsewhere cannot pull in another school's class.
+ */
+async function studentClasses(userId, schoolId, profile) {
+    const ClassSection = require('../models/ClassSection');
+
+    const orConds = [{ enrolledStudents: userId }];
+    if (profile?.currentSection) orConds.push({ _id: profile.currentSection });
+    const sections = await ClassSection.find({ school: schoolId, $or: orConds }, 'class sectionName').lean();
+
+    const classIds = new Set(sections.map((s) => s.class).filter(Boolean).map(String));
+    if (profile?.currentClass) classIds.add(String(profile.currentClass));
+
+    // The name follows the section the profile points at, not whichever row
+    // the roster query happened to return first.
+    const shown = sections.find((s) => String(s._id) === String(profile?.currentSection || ''))
+        || sections.find((s) => s.sectionName) || null;
+    const nameId = shown?.class || profile?.currentClass || null;
+    const named = nameId ? await Class.findOne({ _id: nameId, school: schoolId }).select('className').lean() : null;
+
+    return {
+        classIds: [...classIds],
+        className: [named?.className, shown?.sectionName].filter(Boolean).join(' '),
+    };
+}
+
+// ── Read-only view for teacher / student ──────────────────────────────────────
+// Filters by applicability so each role only sees relevant holidays. Parents
+// have their own handler below — their answer is per child.
 async function getApplicableHolidays(req, res) {
     try {
-        const ClassSection   = require('../models/ClassSection');
         const StudentProfile = require('../models/StudentProfile');
 
         const filter = { school: req.schoolId };
@@ -489,24 +521,12 @@ async function getApplicableHolidays(req, res) {
 
         const role = req.userRole;
 
-        // Collect ALL class IDs the student/parent is associated with.
-        // Uses both enrolledStudents (maintained by section assignment) and
-        // currentSection FK so we handle every possible data state.
         const userClassIds = new Set();
-
-        const collectClassIds = async (userId) => {
-            const profile = await StudentProfile.findOne({ user: userId }, 'currentSection').lean();
-            const orConds = [{ enrolledStudents: userId }];
-            if (profile?.currentSection) orConds.push({ _id: profile.currentSection });
-            const sects = await ClassSection.find({ $or: orConds }, 'class').lean();
-            sects.forEach(s => { if (s.class) userClassIds.add(s.class.toString()); });
-        };
-
         if (role === 'student') {
-            await collectClassIds(req.userId);
-        } else if (role === 'parent') {
-            const profile = await StudentProfile.findOne({ parent: req.userId }, 'user').lean();
-            if (profile?.user) await collectClassIds(profile.user);
+            const profile = await StudentProfile.findOne({ user: req.userId, school: req.schoolId })
+                .select('currentSection currentClass').lean();
+            (await studentClasses(req.userId, req.schoolId, profile)).classIds
+                .forEach((id) => userClassIds.add(id));
         }
         // Teachers never see class-specific holidays — those are student/parent only
 
@@ -555,10 +575,16 @@ exports.studentGetHolidays = getApplicableHolidays;
  * a school-wide day covers all of them, a class day only the children in that
  * class. The page can then show one child at a time, or all of them together
  * with each day labelled.
+ *
+ * The child list is read from BOTH links — the parent's own `children` array
+ * (which the dashboard and its child picker use) and each student profile's
+ * `parent` pointer. They drift; reading only the pointer meant a child the
+ * dashboard showed could be missing here, and a filter on `forChildren` then
+ * emptied that child's calendar.
  */
 exports.parentGetHolidays = async (req, res) => {
     try {
-        const ClassSection   = require('../models/ClassSection');
+        const ParentProfile  = require('../models/ParentProfile');
         const StudentProfile = require('../models/StudentProfile');
         const User           = require('../models/User');
 
@@ -566,37 +592,31 @@ exports.parentGetHolidays = async (req, res) => {
         const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
         if (activeYear) filter.academicYear = { $in: [activeYear._id, null] };
 
-        const profiles = await StudentProfile.find({ parent: req.userId, school: req.schoolId })
-            .select('user currentSection').lean();
+        const parent = await ParentProfile.findOne({ user: req.userId }).lean();
+        const listed = parent?.children?.length ? parent.children : (parent?.student ? [parent.student] : []);
+        const owned  = await StudentProfile.find({ parent: req.userId, school: req.schoolId })
+            .select('user').lean();
+        const kidIds = [...new Set([...listed, ...owned.map((p) => p.user)].filter(Boolean).map(String))];
 
         // Read by hand rather than through populate: on this model it hands back
-        // the bare id, so `profile.user.name` is quietly undefined — which is why
-        // the child list has to be looked up itself.
-        const kidIds = [...new Set(profiles.map((p) => p.user).filter(Boolean).map(String))];
+        // the bare id, so `profile.user.name` is quietly undefined. Scoped to
+        // this school's students, so a stale id on the parent record cannot
+        // reach into another school.
         const kidUsers = kidIds.length
-            ? await User.find({ _id: { $in: kidIds }, school: req.schoolId }).select('name').lean()
+            ? await User.find({ _id: { $in: kidIds }, role: 'student', school: req.schoolId }).select('name').lean()
             : [];
-        const nameOf = Object.fromEntries(kidUsers.map((u) => [String(u._id), u.name]));
+        kidUsers.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+        const profiles = kidUsers.length
+            ? await StudentProfile.find({ user: { $in: kidUsers.map((u) => u._id) }, school: req.schoolId })
+                .select('user currentSection currentClass').lean()
+            : [];
+        const profileOf = new Map(profiles.map((p) => [String(p.user), p]));
 
-        // A child belongs to a class by either route — the section's roster or
-        // the profile's own pointer — and the two are not always in step.
         const children = [];
-        for (const p of profiles) {
-            const id = p.user ? String(p.user) : '';
-            if (!id || !nameOf[id]) continue;
-            const orConds = [{ enrolledStudents: id }];
-            if (p.currentSection) orConds.push({ _id: p.currentSection });
-            const sections = await ClassSection.find({ $or: orConds }, 'class sectionName').lean();
-
-            const classIds = [...new Set(sections.map((s) => s.class).filter(Boolean).map(String))];
-            const named = await Class.findOne({ _id: { $in: classIds } }).select('className').lean();
-            const section = sections.find((s) => s.sectionName);
-            children.push({
-                _id: id,
-                name: nameOf[id],
-                className: [named?.className, section?.sectionName].filter(Boolean).join(' '),
-                classIds,
-            });
+        for (const u of kidUsers) {
+            const id = String(u._id);
+            const { classIds, className } = await studentClasses(id, req.schoolId, profileOf.get(id));
+            children.push({ _id: id, name: u.name, className, classIds });
         }
 
         const everyone = children.map((c) => c._id);

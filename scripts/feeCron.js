@@ -13,6 +13,7 @@
  */
 
 require('dotenv').config();
+require('../config/timezone');   // "past due" and "fined today" are school days, not UTC days
 const db = require('../db/orm');
 
 const School               = require('../models/School');

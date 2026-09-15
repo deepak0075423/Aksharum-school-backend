@@ -1,6 +1,7 @@
 'use strict';
 if (typeof globalThis.crypto === 'undefined') globalThis.crypto = require('crypto').webcrypto;
 require('dotenv').config();
+require('./config/timezone');   // before anything reads the clock — see the file
 const express  = require('express');
 const cors     = require('cors');
 const helmet   = require('helmet');

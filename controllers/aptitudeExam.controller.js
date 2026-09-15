@@ -692,9 +692,11 @@ exports.getAttemptExam = async (req, res) => {
         }).lean();
         if (!exam) return res.status(404).json({ success: false, message: 'Exam not found' });
 
-        const now       = new Date();
-        const examStart = new Date(`${exam.examDate.toISOString().slice(0,10)}T${exam.startTime}:00`);
-        const examEnd   = new Date(examStart.getTime() + exam.duration * 60 * 1000);
+        const now = new Date();
+        // The same window every list and stage reads. Building it by hand here
+        // skipped the zero-pad, so a "9:05" start made an Invalid Date — and
+        // both time checks below then passed at any hour.
+        const { start: examStart, end: examEnd } = examWindow(exam);
 
         let attempt = await ExamAttempt.findOne({ exam: exam._id, student: req.userId });
 
