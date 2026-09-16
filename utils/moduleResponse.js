@@ -14,13 +14,16 @@
 const School = require('../models/School');
 const designations = require('../services/designationService');
 const { MODULE_KEYS } = require('../config/modules');
+const { hasMySection } = require('../services/teacherOwnSections');
 
 async function buildModuleResponse(req) {
-    const [access, school] = await Promise.all([
+    const isTeacher = req.userRole === 'teacher';
+    const [access, school, mySection] = await Promise.all([
         designations.requestAccess(req),
         req.schoolId
             ? School.findById(req.schoolId).select('leaveSettings').lean()
             : Promise.resolve(null),
+        isTeacher ? hasMySection(req.schoolId, req.userId) : Promise.resolve(false),
     ]);
 
     const ls = school?.leaveSettings ?? {};
@@ -48,6 +51,11 @@ async function buildModuleResponse(req) {
         // just administrative access to their module.
         isLibrarian: moduleAdmin.library,
         isPrincipal: moduleAdmin.feedback,
+        // Not a module: whether this teacher is class teacher or vice class
+        // teacher of a section this year, which is what opens My Section. Sent
+        // here because every client already gates its menus on this payload.
+        // The page's endpoint enforces the same rule (services/teacherOwnSections).
+        hasMySection: mySection,
         saturdayConfig: {
             working: ls.saturdayWorking !== false,
             mode:    ls.saturdayMode    || 'all',

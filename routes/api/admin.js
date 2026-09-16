@@ -324,13 +324,10 @@ router.post('/attendance/mark-all', attendanceGuard, attendanceAdmin.markAll);
 router.get('/regularization-requests',         attendanceGuard, attendanceAdmin.requests);
 router.post('/regularization-requests/review', attendanceGuard, attendanceCtrl.adminReviewRegularization);
 
-// Admin self-attendance (same store as teacher self-attendance)
-router.get('/my-attendance',            attendanceGuard, attendanceCtrl.getTeacherSelfAttendance);
-router.get('/my-attendance/summary',    attendanceGuard, attendanceCtrl.getSelfAttendanceSummary);
-router.post('/my-attendance/clock-in',  attendanceGuard, attendanceCtrl.clockIn);
-router.post('/my-attendance/clock-out', attendanceGuard, attendanceCtrl.clockOut);
-router.get('/regularization',           attendanceGuard, attendanceCtrl.getRegularizationForm);
-router.post('/regularization',          attendanceGuard, attendanceCtrl.submitRegularization);
+// No self-attendance here. Clocking in and out, and asking for a missed punch
+// to be fixed, belong to the teacher role (routes/api/teacher.js): a person who
+// is both admin and teacher switches to their teacher post to do it. This
+// surface only corrects and reviews other people's attendance.
 router.post('/regularization/apply',    attendanceGuard, attendanceCtrl.adminRegularizeAttendance);
 router.get('/regularization/people',    attendanceGuard, attendanceCtrl.adminSearchPeople);
 router.get('/regularization/day',       attendanceGuard, attendanceAdmin.personDay);

@@ -1,10 +1,12 @@
 'use strict';
 const User           = require('../models/User');
 const TeacherProfile = require('../models/TeacherProfile');
+const { ownSections, primarySection } = require('../services/teacherOwnSections');
 
 exports.getDashboard = async (req, res) => {
     try {
         const ClassSection    = require('../models/ClassSection');
+        const Class           = require('../models/Class');
         const AttendanceCorrection = require('../models/AttendanceCorrection');
         const FormalExam      = require('../models/FormalExam');
         const Timetable       = require('../models/Timetable');
@@ -14,13 +16,17 @@ exports.getDashboard = async (req, res) => {
         const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
         const today = DAYS[new Date().getDay()];
 
-        const [profile, mySection] = await Promise.all([
+        // The section card links to My Section, so it follows the same rule the
+        // page does: class teacher or vice, this academic year. A subject-only
+        // teacher, or one whose class was last year's, gets no card.
+        const [profile, own] = await Promise.all([
             TeacherProfile.findOne({ user: req.userId }).lean(),
-            ClassSection.findOne({
-                school: req.schoolId,
-                $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
-            }).populate('class', 'className').lean(),
+            ownSections(req.schoolId, req.userId),
         ]);
+        const mySection = primarySection(own.sections, req.userId);
+        if (mySection?.class) {
+            mySection.class = await Class.findById(mySection.class).select('className').lean();
+        }
 
         const [pendingCorrections, pendingValidation, timetableIds, balances] = await Promise.all([
             mySection

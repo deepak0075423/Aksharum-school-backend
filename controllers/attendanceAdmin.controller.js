@@ -789,14 +789,20 @@ exports.reports = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
-/** Every active staff member's derived days over [from, until], summed. */
+/**
+ * Every active teacher's derived days over [from, until], summed.
+ *
+ * Teachers only: self attendance belongs to the teacher role, and a school_admin
+ * post never clocks in, so every working day of one would classify as absent. A
+ * person who is also a teacher is counted once, through their teacher post.
+ */
 async function staffReport(schoolId, from, until) {
     const { rows: staff } = await pool.query(
         `SELECT u."_id", u."name", u."role", u."profileImage" AS "photo",
                 tp."designation", tp."department", tp."employeeId"
            FROM ${T(User)} u
            LEFT JOIN ${T(TeacherProfile)} tp ON tp."user" = u."_id"
-          WHERE u."school" = $1 AND u."role" IN ('teacher', 'school_admin') AND u."isActive" IS NOT FALSE
+          WHERE u."school" = $1 AND u."role" = 'teacher' AND u."isActive" IS NOT FALSE
           ORDER BY u."name"`,
         [String(schoolId)],
     );
@@ -851,6 +857,8 @@ exports.requests = async (req, res) => {
         if (Object.keys(dateRange).length) filter.date = dateRange;
 
         // Resolved to ids first: focusPage() writes its own $or onto the filter.
+        // school_admin stays searchable: requests raised by admin posts before
+        // self attendance became teacher-only are still in the queue's history.
         const q = String(req.query.search || '').trim();
         if (q) {
             const like = `%${q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
@@ -940,7 +948,7 @@ exports.personDay = async (req, res) => {
         if (!userId || !day) return err(res, 'userId and date are required', 400);
 
         const person = await User.findOne({ _id: userId, school: req.schoolId }).select('_id name role email').lean();
-        if (!person || !['teacher', 'school_admin', 'student'].includes(person.role)) return err(res, 'Person not found', 404);
+        if (!person || !['teacher', 'student'].includes(person.role)) return err(res, 'Person not found', 404);
 
         if (person.role !== 'student') {
             const since = (await days.startDates(req.schoolId, [userId])).get(userId);

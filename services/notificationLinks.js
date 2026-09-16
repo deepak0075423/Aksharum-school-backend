@@ -63,7 +63,9 @@ const ROUTES = {
     // ── Attendance ───────────────────────────────────────────────────────────
     'attendance.mine': {
         teacher:      { web: '/teacher/attendance?tab=mine',          mobile: '/modules/teacher-attendance?tab=mine' },
-        school_admin: { web: '/admin/attendance?tab=my-attendance',   mobile: '/modules/admin/attendance?tab=mine' },
+        // An admin post has no attendance of its own any more; an answer to a
+        // request it raised before that lands on the request in the queue.
+        school_admin: { web: '/admin/attendance?tab=requests',        mobile: '/modules/admin/attendance?tab=requests' },
         student:      { web: '/student/attendance',                   mobile: '/modules/attendance' },
         parent:       { web: '/parent/child-attendance',              mobile: '/modules/attendance' },
     },

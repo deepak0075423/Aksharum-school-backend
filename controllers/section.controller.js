@@ -6,6 +6,7 @@ const ClassMonitor        = require('../models/ClassMonitor');
 const StudentProfile      = require('../models/StudentProfile');
 const { notify, withParents } = require('../services/notifyService');
 const { saveSectionMarks } = require('../services/attendanceMarks');
+const { ownSections, NOT_ASSIGNED } = require('../services/teacherOwnSections');
 const AttendanceRecord    = require('../models/AttendanceRecord');
 
 const ok  = (res, d, s=200) => res.status(s).json({ success: true, data: d });
@@ -23,6 +24,10 @@ const uniqFind = (Model, ids, select) => {
  * the section this teacher is class teacher of, the ones they cover as vice,
  * the sections they take a subject in, and their own section's monitors and
  * announcements.
+ *
+ * Only for a class teacher or vice class teacher this year: anyone else gets
+ * 403 MY_SECTION_NOT_ASSIGNED. Their subject classes are still listed here for
+ * those who do qualify.
  *
  * Classes repeat every academic year — this school has four rows called
  * "Class 1" — and only the ACTIVE year is this teacher's current work, so
@@ -44,30 +49,33 @@ exports.getMySection = async (req, res) => {
         const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 
         const me = String(req.userId);
-        const [own, links, activeYear] = await Promise.all([
-            ClassSection.find({
-                school: req.schoolId,
-                $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
-            }).lean(),
+        // This year only (see services/teacherOwnSections). Applied before
+        // anything is shaped, so the panels, the counts and the announcements
+        // all agree on the same set.
+        const [{ sections: mine, activeYear }, links] = await Promise.all([
+            ownSections(req.schoolId, req.userId),
             SectionSubjectTeacher.find({ teacher: req.userId }).lean(),
-            AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean(),
         ]);
+
+        // The page belongs to the class teacher and the vice class teacher. A
+        // teacher who only takes a subject somewhere is refused here as well as
+        // in the menu, so typing the URL gets nothing either.
+        if (!mine.length) {
+            return res.status(403).json({ success: false, ...NOT_ASSIGNED });
+        }
 
         // A subject link carries no school of its own, so the section it points
         // at is re-read school-scoped rather than trusted.
-        const ownIds  = new Set(own.map((s) => String(s._id)));
+        const ownIds  = new Set(mine.map((s) => String(s._id)));
         const linkIds = [...new Set(links.map((l) => String(l.section)).filter((id) => id && !ownIds.has(id)))];
         const extra   = linkIds.length
             ? await ClassSection.find({ _id: { $in: linkIds }, school: req.schoolId }).lean()
             : [];
 
-        // This year only. Applied here, before anything is shaped, so the
-        // panels, the counts and the announcements all agree on the same set.
         const thisYearOnly = (rows) => (activeYear
             ? rows.filter((s) => String(s.academicYear) === String(activeYear._id))
             : rows);
-        const mine = thisYearOnly(own);
-        const all  = [...mine, ...thisYearOnly(extra)];
+        const all = [...mine, ...thisYearOnly(extra)];
 
         const [classes, years, subjects] = await Promise.all([
             uniqFind(Class,        all.map((s) => s.class),        'className classNumber'),

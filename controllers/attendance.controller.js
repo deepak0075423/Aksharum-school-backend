@@ -89,7 +89,9 @@ exports.adminReviewRegularization = async (req, res) => {
         });
         if (!request) return err(res, 'Request not found or already reviewed', 404);
 
-        // Four-eyes rule: an admin's own request must be reviewed by another admin
+        // Four-eyes rule: nobody reviews their own request. Requests come from
+        // teacher posts only, so this is the teacher who holds admin on the
+        // attendance module and reached the queue through /admin.
         if (String(request.teacher) === String(req.userId))
             return err(res, 'You cannot review your own request — another admin must approve it', 403);
 
@@ -145,7 +147,7 @@ exports.adminReviewRegularization = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
-// Admin: directly regularise any staff member's attendance for a day (no request/approval)
+// Admin: directly regularise a teacher's attendance for a day (no request/approval)
 exports.adminRegularizeAttendance = async (req, res) => {
     try {
         const { teacherId, date, checkIn, checkOut, status, remarks } = req.body;
@@ -155,8 +157,11 @@ exports.adminRegularizeAttendance = async (req, res) => {
 
         const User = require('../models/User');
         const staff = await User.findOne({ _id: teacherId, school: req.schoolId }).select('_id role').lean();
-        if (!staff || !['teacher', 'school_admin'].includes(staff.role))
-            return err(res, 'Staff member not found', 404);
+        // Staff attendance is kept for teacher posts only — a school_admin post
+        // never clocks in, so a record written for one would be a lone day in
+        // an otherwise empty history.
+        if (!staff || staff.role !== 'teacher')
+            return err(res, 'Teacher not found', 404);
 
         const dateStr = new Date(date).toISOString().split('T')[0];
         if (dateStr > todayStr()) return err(res, 'Cannot regularise a future date', 400);
@@ -181,14 +186,14 @@ exports.adminRegularizeAttendance = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
-// Admin: search people (staff + students) to regularise, with clear role labels
+// Admin: search people (teachers + students) to regularise, with clear role labels
 exports.adminSearchPeople = async (req, res) => {
     try {
         const User = require('../models/User');
         const { search = '' } = req.query;
         const filter = {
             school: req.schoolId,
-            role: { $in: ['teacher', 'school_admin', 'student'] },
+            role: { $in: ['teacher', 'student'] },
         };
         if (search) filter.$or = [{ name: new RegExp(search, 'i') }, { email: new RegExp(search, 'i') }];
 
@@ -260,6 +265,23 @@ exports.adminRegularizeStudent = async (req, res) => {
 // Statuses are never hand-picked: clock-in → present, approved leave → leave /
 // half-day, holidays & non-working days are skipped, anything else in the past
 // counts as absent automatically.
+//
+// Self attendance belongs to the TEACHER role, decided by the post the session
+// is signed in as — not by the person. One email can hold a school_admin post
+// and a teacher post (separate User rows); only the teacher row clocks in, asks
+// for a regularization or has a history to show. The routes are teacher-only
+// already; this is the same rule held where the work is done, so mounting
+// these handlers anywhere else cannot quietly hand them to another role.
+const SELF_ATTENDANCE_ROLE = 'teacher';
+const refuseSelfAttendance = (req, res) => {
+    if (req.userRole === SELF_ATTENDANCE_ROLE) return false;
+    res.status(403).json({
+        success: false,
+        code: 'SELF_ATTENDANCE_TEACHER_ONLY',
+        message: 'Clock in, clock out and regularization requests are available from a teacher account only',
+    });
+    return true;
+};
 
 const hhmm = () => {
     const n = new Date();
@@ -283,7 +305,7 @@ const monthBounds = (month, year) => ({
 const isKey = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));
 
 // The day-by-day derivation lives in services/staffAttendanceDays.js, shared
-// with the admin calendar, its summary card and the staff report.
+// with the admin staff report and the Regularise panel.
 async function buildSelfAttendanceMonth(req, month, year) {
     const { from, to } = monthBounds(month, year);
     return staffDaysSvc.staffDays({ schoolId: req.schoolId, userId: req.userId, role: req.userRole }, from, to);
@@ -297,6 +319,7 @@ async function buildSelfAttendanceMonth(req, month, year) {
  */
 exports.getTeacherSelfAttendance = async (req, res) => {
     try {
+        if (refuseSelfAttendance(req, res)) return;
         const { from, to } = req.query;
         if (from || to) {
             if (!isKey(from) || !isKey(to) || from > to) return err(res, 'from and to must be YYYY-MM-DD, from ≤ to', 400);
@@ -314,55 +337,9 @@ exports.getTeacherSelfAttendance = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
-/**
- * GET my-attendance/summary?period=this-month|last-month|this-year
- *
- * The admin screen's summary ring: the counts behind one period and the same
- * counts for the period before it, so the page can say whether attendance is
- * up or down without a second request. "This month" and "this year" run to
- * today — days that have not happened yet are not days anyone missed.
- */
-exports.getSelfAttendanceSummary = async (req, res) => {
-    try {
-        const today = staffDaysSvc.localToday();
-        const [y, m] = today.split('-').map(Number);
-        const monthLabel = (mm, yy) => new Date(Date.UTC(yy, mm - 1, 1))
-            .toLocaleDateString('en-IN', { month: 'long', year: 'numeric', timeZone: 'UTC' });
-        const prevMonth = (mm, yy) => (mm === 1 ? [12, yy - 1] : [mm - 1, yy]);
-
-        const period = ['this-month', 'last-month', 'this-year'].includes(req.query.period)
-            ? req.query.period : 'this-month';
-
-        let cur, prev;
-        if (period === 'this-year') {
-            cur  = { from: `${y}-01-01`, to: today, label: String(y) };
-            prev = { from: `${y - 1}-01-01`, to: `${y - 1}-12-31`, label: String(y - 1) };
-        } else {
-            const [cm, cy] = period === 'last-month' ? prevMonth(m, y) : [m, y];
-            const [pm, py] = prevMonth(cm, cy);
-            const c = monthBounds(cm, cy);
-            cur  = { from: c.from, to: period === 'this-month' ? today : c.to, label: monthLabel(cm, cy) };
-            prev = { ...monthBounds(pm, py), label: monthLabel(pm, py) };
-        }
-
-        // One round of queries across both windows, then classify each.
-        const since  = (await staffDaysSvc.startDates(req.schoolId, [req.userId])).get(String(req.userId));
-        const who    = { userId: req.userId, role: req.userRole, since };
-        const inputs = await staffDaysSvc.loadInputs(req.schoolId, [req.userId], prev.from, cur.to);
-        const a = staffDaysSvc.classify(inputs, who, cur.from, cur.to);
-        const b = staffDaysSvc.classify(inputs, who, prev.from, prev.to);
-
-        ok(res, {
-            period,
-            since,
-            current:  { ...cur,  summary: a.summary, percentage: staffDaysSvc.percentOf(a.summary) },
-            previous: { ...prev, summary: b.summary, percentage: staffDaysSvc.percentOf(b.summary) },
-        });
-    } catch (e) { err(res, e); }
-};
-
 exports.clockIn = async (req, res) => {
     try {
+        if (refuseSelfAttendance(req, res)) return;
         const { start, end } = dayRange(todayStr());
 
         const LeaveApplication = require('../models/LeaveApplication');
@@ -392,6 +369,7 @@ exports.clockIn = async (req, res) => {
 
 exports.clockOut = async (req, res) => {
     try {
+        if (refuseSelfAttendance(req, res)) return;
         const { start, end } = dayRange(todayStr());
         const rec = await TeacherAttendance.findOne({
             teacher: req.userId, school: req.schoolId, date: { $gte: start, $lte: end },
@@ -410,6 +388,7 @@ exports.clockOut = async (req, res) => {
 
 exports.getRegularizationForm = async (req, res) => {
     try {
+        if (refuseSelfAttendance(req, res)) return;
         // Recent self-attendance for context + the teacher's pending requests
         const [recent, myRequests] = await Promise.all([
             TeacherAttendance.find({ teacher: req.userId }).sort({ date: -1 }).limit(30).lean(),
@@ -424,6 +403,7 @@ exports.getRegularizationForm = async (req, res) => {
 
 exports.submitRegularization = async (req, res) => {
     try {
+        if (refuseSelfAttendance(req, res)) return;
         const { date, checkIn, checkOut, reason } = req.body;
         if (!date || !reason) return err(res, 'date and reason are required', 400);
         if (!checkIn && !checkOut)
