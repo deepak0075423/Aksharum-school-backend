@@ -7,10 +7,16 @@ const UserSchema = new db.Schema({
         required: true,
         trim: true,
     },
+    // Deliberately NOT unique on its own — see services/accountIdentity.js. One
+    // address is one person, and a person can hold several posts: a teacher at
+    // two schools, a teacher who is also a parent, a parent with children at
+    // three schools. Each of those is a row here; what has to stay unique is the
+    // post, not the address (the compound index at the bottom of this file,
+    // which leads with `email` and so also serves the lookup that resolves an
+    // address to every post behind it).
     email: {
         type: String,
         required: true,
-        unique: true,
         lowercase: true,
         trim: true,
     },
@@ -71,6 +77,16 @@ const UserSchema = new db.Schema({
         type: Date,
         default: null,
     },
+    // Password reset: the token exchanged for the OTP above. Held on every row
+    // of the address, because a reset is a reset of the person's one password.
+    resetToken: {
+        type: String,
+        default: null,
+    },
+    resetTokenExpiry: {
+        type: Date,
+        default: null,
+    },
     // One-time magic login token
     loginToken: {
         type: String,
@@ -90,5 +106,11 @@ UserSchema.methods.comparePassword = async function (candidatePassword) {
 
 // Every admin list page (Students/Teachers/Admins) filters {school, role}
 UserSchema.index({ school: 1, role: 1 });
+
+// One post per person per school. The same address may appear again for another
+// role here (teacher + parent) or for the same role elsewhere (a teacher at two
+// schools), but never twice for the same role in the same school — that is what
+// stops two admins racing to add the same teacher from producing two accounts.
+UserSchema.index({ email: 1, school: 1, role: 1 }, { unique: true });
 
 module.exports = db.model('User', UserSchema);

@@ -86,7 +86,9 @@ const authLimiter = rateLimit({
     windowSec: Number(process.env.RL_AUTH_WINDOW) || 60,
     max:       Number(process.env.RL_AUTH_MAX)    || 60,
 });
-for (const p of ['/api/auth/login', '/api/auth/forgot-password', '/api/auth/verify-otp', '/api/auth/new-password', '/api/auth/magic']) {
+// /select belongs here too: it is unauthenticated (its ticket is the short-lived
+// selection token from /login), so it is guessable surface in the same way.
+for (const p of ['/api/auth/login', '/api/auth/forgot-password', '/api/auth/verify-otp', '/api/auth/new-password', '/api/auth/magic', '/api/auth/select']) {
     app.use(p, authLimiter);
 }
 // Google sign-in: the POST only — app.use would also count /google/config, which

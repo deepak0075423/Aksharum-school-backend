@@ -48,6 +48,14 @@ const verifyToken = async (req, res, next) => {
     }
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        // Not every token signed with this secret is a session. The sign-in
+        // chooser hands out a short-lived `purpose: 'select'` token that names
+        // the seats an address opened; it must not be usable as a session in its
+        // own right. Session tokens carry no purpose — including every token
+        // issued before the chooser existed.
+        if (decoded.purpose) {
+            return res.status(401).json({ success: false, message: 'Invalid token' });
+        }
         // Redis-cached first (bounded by a short TTL + explicit invalidation on
         // user mutations); fall back to the single-JOIN DB load and warm the cache.
         let user = await authCache.get(decoded.userId);

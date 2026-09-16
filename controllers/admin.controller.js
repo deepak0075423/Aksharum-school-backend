@@ -15,6 +15,9 @@ const School         = require('../models/School');
 const { GATEWAY_MODULES } = require('../services/paymentGateway');
 const ReceiptTemplate = require('../models/ReceiptTemplate');
 const { PRESETS, renderReceipt, defaultTemplate, sampleReceipt } = require('../services/receiptRenderer');
+// One address is one person, who may hold posts at several schools — see the
+// header of services/accountIdentity.js.
+const identity        = require('../services/accountIdentity');
 
 // The design fields a school may set; everything else on the row is bookkeeping.
 const TEMPLATE_FIELDS = [
@@ -36,7 +39,7 @@ exports._schoolForReceipt = schoolForReceipt;
 const Designation    = require('../models/Designation');
 const designationSvc = require('../services/designationService');
 const mailer         = require('../config/mailer');
-const { sendSchoolMail, emailHeaderHtml, getMailContext, invalidate: invalidateMailer } = require('../utils/schoolMailer');
+const { sendSchoolMail, emailHeaderHtml, getMailContext, sendSchoolAddedEmail, invalidate: invalidateMailer } = require('../utils/schoolMailer');
 const { notify } = require('../services/notifyService');
 const { setStudentSection } = require('../utils/sectionMembership');
 const { validate, isEmail, isPhone, isURL } = require('../utils/validators');
@@ -433,12 +436,16 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
         if (b.panNumber && !PAN_RE.test(b.panNumber)) return { parentId: null, error: `${label}'s PAN number looks invalid (e.g. ABCDE1234F)` };
     }
 
-    // Link to the existing account when that email is already registered
-    let parentUser = await User.findOne({ email: holder.email });
-    if (parentUser && parentUser.role !== 'parent')
-        return { parentId: null, error: `${holder.email} already belongs to a ${String(parentUser.role).replace('_', ' ')} account — use a different email for the parent` };
-    if (parentUser && String(parentUser.school) !== String(schoolId))
-        return { parentId: null, error: `${holder.email} is registered with another school` };
+    // Link to the sign-in that already owns this address.
+    //
+    // A parent with children at two schools is one person with one password and
+    // a parent record at each school — so an address registered elsewhere is
+    // joined, not refused. A teacher here who is also a parent here is the same
+    // person too. The one address that cannot become a parent is a student's;
+    // accountIdentity.linkTarget is where all of that is decided.
+    const link = await identity.linkTarget(holder.email, { schoolId, role: 'parent' });
+    if (link.mode === 'error') return { parentId: null, error: link.error || link.message };
+    let parentUser = link.mode === 'reuse' ? await User.findById(link.row._id) : null;
 
     // Aadhaar / PAN: one record per number in the school. Checked before any
     // account is created, against the profile this save is about to write (a
@@ -466,16 +473,20 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
         }).filter((p) => !idEntries.some((e) => e.label === p.label)),
         ...(studentAadhaar ? [{ type: 'aadhaar', value: studentAadhaar, label: "Student's Aadhaar number" }] : []),
     ];
-    const idClash = await identityClash(schoolId, idEntries, { peers });
+    const idClash = await identityClash(schoolId, idEntries, { peers, sameIdentity: holder.email });
     if (idClash) return { parentId: null, error: idClash };
 
     if (!parentUser) {
         const otp = generateOTP();
-        parentUser = await createUserHelper(
+        const created = await addMembership(
             { name: holder.name, email: holder.email, phone: holder.phone, password: otp },
             'parent', schoolId,
         );
-        sendWelcomeEmail(holder.email, holder.name, holder.email, otp, schoolName, schoolId);
+        parentUser = created.user;
+        // Already signing in elsewhere (another school, or as a teacher here):
+        // they keep their password and simply gain this school.
+        if (created.linked) sendSchoolAddedEmail(holder.email, holder.name, 'parent', schoolName, schoolId);
+        else                sendWelcomeEmail(holder.email, holder.name, holder.email, otp, schoolName, schoolId);
     }
 
     await ParentProfile.findOneAndUpdate(
@@ -1332,12 +1343,18 @@ exports.getUser = async (req, res) => {
 exports.updateUser = async (req, res) => {
     try {
         const { password, role, school, email, designation, ...allowed } = req.body;
-        if (password) {
-            if (password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
-            allowed.password = await bcrypt.hash(password, 12);
-        }
+        if (password && password.length < 6)
+            return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
         if (allowed.phone && !/^[+\d\s\-]{7,15}$/.test(allowed.phone))
             return res.status(400).json({ success: false, message: 'Invalid phone number' });
+        // Read before the write: the password is only this office's to set while
+        // the address signs in nowhere else.
+        const target = await User.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!target) return res.status(404).json({ success: false, message: 'User not found' });
+        if (password) {
+            const credGuard = await identity.guardAccountEdit(target, { password, schoolId: req.schoolId });
+            if (credGuard) return res.status(400).json({ success: false, message: credGuard });
+        }
         const user = await User.findOneAndUpdate(
             { _id: req.params.id, school: req.schoolId },
             allowed,
@@ -1345,6 +1362,11 @@ exports.updateUser = async (req, res) => {
         );
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         await authCache.invalidate(user._id);
+        // One person, one password — written across every post this address
+        // holds rather than onto this row alone.
+        if (password) {
+            await identity.setCredentials(user.email, { passwordHash: await bcrypt.hash(password, 12) });
+        }
         // designation lives on TeacherProfile — it decides which module
         // permissions this teacher inherits, so the cached resolution has to go.
         if (designation !== undefined && user.role === 'teacher') {
@@ -1421,6 +1443,18 @@ exports.toggleUser = async (req, res) => {
             report = await guardTeacherRemoval(req, res, { action: 'deactivated' });
             if (!report) return;
         }
+        // Switching a teacher or admin ON: they work at one school at a time, so
+        // a post still active at another school has to be let go there first.
+        // Never the other way round — this office does not get to switch off
+        // someone's access at a school it does not run.
+        if (!user.isActive) {
+            const blocked = await identity.staffActivationBlock({
+                email: user.email, role: user.role, schoolId: req.schoolId, userId: user._id, name: user.name,
+            });
+            if (blocked) {
+                return res.status(400).json({ success: false, code: 'ACTIVE_AT_ANOTHER_SCHOOL', message: blocked });
+            }
+        }
         user.isActive = !user.isActive;
         await user.save();
         await authCache.invalidate(user._id);
@@ -1429,10 +1463,29 @@ exports.toggleUser = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+/**
+ * Give someone a post at this school — creating their sign-in, or adding to the
+ * one they already have.
+ *
+ * An address that nobody uses becomes a new account with the one-time password
+ * the caller generated. An address that already signs in somewhere on the
+ * platform — a teacher at another school, a parent here whose child's teacher
+ * they now are — gets a second membership row that shares those credentials, so
+ * the person ends up with one password and a choice of schools rather than two
+ * accounts they have to keep straight. Their existing password is never touched,
+ * reset, or shown to the administrator doing the adding.
+ *
+ * Throws with `status` 400 and a message fit to show when the address cannot
+ * take the post (see accountIdentity.linkTarget); `linked` on the result tells
+ * the caller which of the two welcome emails to send — or, for `reused`, that
+ * the post already existed and nothing was created.
+ */
 const createUserHelper = async (body, role, school) => {
-    const hashed = await bcrypt.hash(body.password, 12);
-    return User.create({ ...body, email: body.email.toLowerCase(), role, school, password: hashed, isFirstLogin: true });
+    const { user } = await addMembership(body, role, school);
+    return user;
 };
+
+const addMembership = (body, role, school) => identity.createMembership(body, { role, school });
 
 // ── Teacher intake ────────────────────────────────────────────────────────────
 
@@ -1689,11 +1742,16 @@ exports.createTeacher = async (req, res) => {
         const problem = validateTeacherIntake(b, files);
         if (problem) return res.status(400).json({ success: false, message: problem });
 
-        const idClash = await identityClash(req.schoolId, teacherIdEntries(b, null, null));
+        const idClash = await identityClash(req.schoolId, teacherIdEntries(b, null, null), { sameIdentity: email });
         if (idClash) return res.status(400).json({ success: false, message: idClash });
 
-        const exists = await User.findOne({ email: String(email).toLowerCase() });
-        if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
+        // No global "email already registered" check any more: the same teacher
+        // may already work at another school, or be a parent here. What is
+        // refused is a second teaching post at THIS school — and addMembership
+        // below decides the rest.
+        if (await identity.existsAt(email, { schoolId: req.schoolId, role: 'teacher' })) {
+            return res.status(400).json({ success: false, message: 'This email is already a teacher at your school' });
+        }
 
         // Employee ID: use what was typed, else generate from the school's format
         const schoolDoc = await School.findById(req.schoolId).select('name code employeeIdFormat').lean();
@@ -1707,7 +1765,7 @@ exports.createTeacher = async (req, res) => {
         }
 
         const otp  = generateOTP();
-        const user = await createUserHelper({ name, email, phone, designation, password: otp }, 'teacher', req.schoolId);
+        const { user, linked, inactive, inactiveReason } = await addMembership({ name, email, phone, designation, password: otp }, 'teacher', req.schoolId);
         await withProfile(user, () => TeacherProfile.create({
             user: user._id,
             school: req.schoolId,
@@ -1716,8 +1774,16 @@ exports.createTeacher = async (req, res) => {
         }));
 
         const schoolName = req.user?.school?.name || 'School';
-        sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
-        jsonOk(res, { ...user.toObject?.() ?? user, employeeId }, 201);
+        // A person who already signs in keeps their password; sending them a
+        // one-time one would be a lie, and resetting theirs to it would lock
+        // them out of the school they already work at.
+        // No email for a post created inactive: there is nothing here they can
+        // sign in to yet, so the office is told instead (`notice`).
+        if (!inactive) {
+            if (linked) sendSchoolAddedEmail(email, name, 'teacher', schoolName, req.schoolId);
+            else        sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
+        }
+        jsonOk(res, { ...user.toObject?.() ?? user, employeeId, inactive, notice: inactiveReason }, 201);
     } catch (err) { jsonErr(res, err, 400); }
 };
 
@@ -1747,13 +1813,15 @@ exports.updateTeacherFull = async (req, res) => {
         );
         if (problem) return res.status(400).json({ success: false, message: problem });
 
-        const idClash = await identityClash(req.schoolId, teacherIdEntries(b, existing, user._id));
+        const idClash = await identityClash(req.schoolId, teacherIdEntries(b, existing, user._id), { sameIdentity: b.email || user.email });
         if (idClash) return res.status(400).json({ success: false, message: idClash });
 
-        if (b.email && String(b.email).toLowerCase() !== String(user.email).toLowerCase()) {
-            const taken = await User.findOne({ email: String(b.email).toLowerCase() }).lean();
-            if (taken) return res.status(400).json({ success: false, message: 'Email already registered' });
-        }
+        // The address and the password may be shared with a post at another
+        // school, which this office does not administer — see guardAccountEdit.
+        const credGuard = await identity.guardAccountEdit(user, {
+            email: b.email, password: b.password, schoolId: req.schoolId,
+        });
+        if (credGuard) return res.status(400).json({ success: false, message: credGuard });
 
         const typedId = String(b.employeeId ?? '').trim();
         if (typedId && typedId !== (existing?.employeeId || '')) {
@@ -1765,14 +1833,18 @@ exports.updateTeacherFull = async (req, res) => {
         if (b.name  !== undefined) userUpdate.name  = String(b.name).trim();
         if (b.phone !== undefined) userUpdate.phone = String(b.phone).trim();
         if (b.email !== undefined) userUpdate.email = String(b.email).toLowerCase().trim();
-        if (b.password) {
-            if (String(b.password).length < 6)
-                return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
-            userUpdate.password = await bcrypt.hash(b.password, 12);
-        }
+        if (b.password && String(b.password).length < 6)
+            return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
         if (Object.keys(userUpdate).length) {
             await User.findByIdAndUpdate(user._id, userUpdate);
             await authCache.invalidate(user._id);
+        }
+        // Written against the address so a person holding two posts here (a
+        // teacher who is also a parent) keeps one password, not two.
+        if (b.password) {
+            await identity.setCredentials(userUpdate.email || user.email, {
+                passwordHash: await bcrypt.hash(b.password, 12),
+            });
         }
 
         // A blank upload must not wipe the file already on record.
@@ -1846,8 +1918,14 @@ exports.createStudent = async (req, res) => {
             const full = await capacityErrorById(profile.currentSection);
             if (full) return res.status(400).json({ success: false, message: full });
         }
-        const exists = await User.findOne({ email: email.toLowerCase() });
-        if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
+        // A student's address is theirs alone. Schools often enter a parent's
+        // address on the admission form, and folding the child's account into
+        // the parent's sign-in would hand the child the parent's access — so a
+        // student is the one role that is never linked (accountIdentity.LINKABLE).
+        const studentLink = await identity.linkTarget(email, { schoolId: req.schoolId, role: 'student' });
+        if (studentLink.mode !== 'create') {
+            return res.status(400).json({ success: false, message: studentLink.message || 'Email already registered' });
+        }
 
         const studentIdClash = await identityClash(req.schoolId, studentIdEntries(profile.aadhaarNumber, null, null));
         if (studentIdClash) return res.status(400).json({ success: false, message: studentIdClash });
@@ -1904,14 +1982,21 @@ exports.createAdmin = async (req, res) => {
             phone: { label: 'Phone', type: 'phone' },
         });
         if (err) return res.status(400).json({ success: false, message: err });
-        const exists = await User.findOne({ email: req.body.email.toLowerCase() });
-        if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
+        // An administrator may also be a parent here, or run another school on
+        // the platform. Only a second administrator post at THIS school is a
+        // duplicate.
+        if (await identity.existsAt(req.body.email, { schoolId: req.schoolId, role: 'school_admin' })) {
+            return res.status(400).json({ success: false, message: 'This email is already an administrator at your school' });
+        }
 
         const otp = generateOTP();
-        const user = await createUserHelper({ ...req.body, password: otp }, 'school_admin', req.schoolId);
+        const { user, linked, inactive, inactiveReason } = await addMembership({ ...req.body, password: otp }, 'school_admin', req.schoolId);
         const schoolName = req.user?.school?.name || 'School';
-        sendWelcomeEmail(req.body.email, req.body.name, req.body.email, otp, schoolName, req.schoolId);
-        jsonOk(res, user, 201);
+        if (!inactive) {
+            if (linked) sendSchoolAddedEmail(req.body.email, req.body.name, 'school administrator', schoolName, req.schoolId);
+            else        sendWelcomeEmail(req.body.email, req.body.name, req.body.email, otp, schoolName, req.schoolId);
+        }
+        jsonOk(res, { ...(user.toObject?.() ?? user), inactive, notice: inactiveReason }, 201);
     } catch (err) { jsonErr(res, err, 400); }
 };
 
@@ -2346,16 +2431,17 @@ exports.bulkTeachers = async (req, res) => {
             pruneUnsuppliedTeacherFields(profileFields, b);
 
             try {
-                const exists = await User.findOne({ email }).lean();
+                // Only a teaching post AT THIS SCHOOL is the row's own record.
+                // The same address teaching elsewhere, or a parent here, is a
+                // different post belonging to the same person — it is joined
+                // below, not overwritten.
+                const exists = (await identity.membershipsByEmail(email))
+                    .find((r) => r.role === 'teacher' && String(r.school) === String(req.schoolId));
                 if (exists) {
                     // Re-uploading a sheet updates the existing teacher rather
-                    // than failing the row. Other roles are never overwritten.
-                    if (exists.role !== 'teacher' || String(exists.school) !== String(req.schoolId)) {
-                        fail(`Email "${email}" belongs to another account`);
-                        continue;
-                    }
+                    // than failing the row.
                     const current = await TeacherProfile.findOne({ user: exists._id }).lean();
-                    const rowIdClash = await identityClash(req.schoolId, teacherIdEntries(b, current, exists._id));
+                    const rowIdClash = await identityClash(req.schoolId, teacherIdEntries(b, current, exists._id), { sameIdentity: email });
                     if (rowIdClash) { fail(rowIdClash); continue; }
                     // A typed employee ID may be a correction, but it must not
                     // collide with one another teacher already holds.
@@ -2385,7 +2471,7 @@ exports.bulkTeachers = async (req, res) => {
                 // typed if supplied, otherwise generated from the school's format.
                 // Rows are saved one by one, so a number repeated further down
                 // the same sheet meets the row above it here.
-                const newIdClash = await identityClash(req.schoolId, teacherIdEntries(b, null, null));
+                const newIdClash = await identityClash(req.schoolId, teacherIdEntries(b, null, null), { sameIdentity: email });
                 if (newIdClash) { fail(newIdClash); continue; }
                 let resolvedId = employeeId;
                 if (resolvedId) {
@@ -2395,16 +2481,22 @@ exports.bulkTeachers = async (req, res) => {
                     resolvedId = await employeeIdUtil.nextEmployeeId(bulkSchoolDoc || { _id: req.schoolId });
                 }
                 const otp  = generateOTP();
-                const user = await createUserHelper(
+                const { user, linked, inactive, inactiveReason } = await addMembership(
                     { name, email, phone: b.phone, designation: b.designation, password: otp },
                     'teacher', req.schoolId,
                 );
                 await TeacherProfile.create({
                     user: user._id, school: req.schoolId, employeeId: resolvedId, ...profileFields,
                 });
-                sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
+                if (!inactive) {
+                    if (linked) sendSchoolAddedEmail(email, name, 'teacher', schoolName, req.schoolId);
+                    else        sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
+                }
                 created++;
-                push({ type: 'row_done', row: rowNum, name, success: true, action: 'created' });
+                push({
+                    type: 'row_done', row: rowNum, name, success: true, action: 'created',
+                    ...(inactive ? { note: inactiveReason } : {}),
+                });
             } catch (e) {
                 fail(e.code === 11000 ? 'Duplicate entry' : e.message);
             }
@@ -2612,10 +2704,15 @@ exports.bulkStudents = async (req, res) => {
             const sectionRoster = rosterBySection.get(secKey);
             const sectionSeats  = Number(section.maxStudents) || 0;
 
-            // A row whose email already exists updates that student instead of
-            // failing, so a corrected sheet can simply be re-uploaded.
-            const studentExists = await User.findOne({ email }).lean();
-            if (studentExists && (studentExists.role !== 'student' || String(studentExists.school) !== String(req.schoolId))) {
+            // A row whose email already names a student HERE updates that
+            // student instead of failing, so a corrected sheet can simply be
+            // re-uploaded. The same address held by anyone else — including the
+            // same person's parent or teaching account — is refused: a student
+            // never shares a sign-in (see accountIdentity.LINKABLE).
+            const addressRows = await identity.membershipsByEmail(email);
+            const studentExists = addressRows.find(
+                (r) => r.role === 'student' && String(r.school) === String(req.schoolId)) || null;
+            if (!studentExists && addressRows.length) {
                 fail(`Email "${email}" belongs to another account`);
                 continue;
             }
@@ -3076,12 +3173,43 @@ exports.downloadTeacherTemplate = async (req, res) => {
     } catch (err) { jsonErr(res, err); }
 };
 
+/**
+ * Does this address block the account the form is about to create?
+ *
+ * "Already registered somewhere" is no longer the question — a teacher may
+ * already teach at another school, and a parent may already have a child at one.
+ * What the form needs to know is whether THIS post can be added, so the answer
+ * is given for the role being created: `blocked` with the reason to show, or
+ * `linked` meaning it will join an existing sign-in rather than make a new one.
+ *
+ * `exists` is still returned for callers that only ask the old question.
+ */
 exports.checkEmail = async (req, res) => {
     try {
-        const { email } = req.query;
-        if (!email?.trim()) return res.json({ success: true, exists: false });
-        const exists = await User.exists({ email: email.toLowerCase().trim() });
-        res.json({ success: true, exists: !!exists });
+        const { email, role = 'teacher' } = req.query;
+        if (!email?.trim()) return res.json({ success: true, exists: false, blocked: false, linked: false, activeElsewhere: false });
+        const rows = await identity.membershipsByEmail(email);
+        const link = await identity.linkTarget(email, { schoolId: req.schoolId, role });
+        const blocked = link.mode === 'error' || link.mode === 'reuse';
+        // Only worth saying when the post can be added at all.
+        const activeElsewhere = !blocked && identity.isStaffRole(role)
+            && !!(await identity.activeStaffElsewhere(email, req.schoolId, { rows }));
+        res.json({
+            success: true,
+            exists:  rows.length > 0,
+            blocked,
+            linked:  link.mode === 'link',
+            activeElsewhere,
+            message: link.mode === 'error'
+                ? link.message
+                : link.mode === 'reuse'
+                    ? `This email is already a ${identity.ROLE_LABEL[role] || role} at your school`
+                    : activeElsewhere
+                        ? 'This person is currently active at another school. They will be added here as inactive, and can be activated once that school marks them inactive.'
+                        : link.mode === 'link'
+                            ? 'This person already signs in here — they will keep their existing password and gain this school.'
+                            : null,
+        });
     } catch (err) { jsonErr(res, err); }
 };
 

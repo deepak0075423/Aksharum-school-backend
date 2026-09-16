@@ -45,6 +45,7 @@ const ON_FILE = (() => {
         return `
         SELECT '${slot}' AS kind, pp."_id"::text AS ref, '${type}' AS type, ${clean} AS val,
                COALESCE(NULLIF(pp."${slot}"->>'name', ''), pu."name", '') AS who,
+               COALESCE(pu."email", '') AS "heldBy",
                (SELECT string_agg(cu."name", ', ' ORDER BY cu."name")
                   FROM jsonb_array_elements_text(
                            CASE WHEN jsonb_typeof(pp."children") = 'array' THEN pp."children" ELSE '[]'::jsonb END) AS c(id)
@@ -55,15 +56,16 @@ const ON_FILE = (() => {
     }));
     return [
         `SELECT 'teacher' AS kind, tp."user"::text AS ref, 'aadhaar' AS type,
-                regexp_replace(COALESCE(tp."aadhaarNumber", ''), '\\D', '', 'g') AS val, u."name" AS who, NULL AS "childNames"
+                regexp_replace(COALESCE(tp."aadhaarNumber", ''), '\\D', '', 'g') AS val, u."name" AS who,
+                COALESCE(u."email", '') AS "heldBy", NULL AS "childNames"
            FROM ${q(TeacherProfile)} tp JOIN ${q(User)} u ON u."_id" = tp."user"
           WHERE u."school" = $1`,
         `SELECT 'teacher', tp."user"::text, 'pan',
-                upper(regexp_replace(COALESCE(tp."panNumber", ''), '\\s', '', 'g')), u."name", NULL
+                upper(regexp_replace(COALESCE(tp."panNumber", ''), '\\s', '', 'g')), u."name", COALESCE(u."email", ''), NULL
            FROM ${q(TeacherProfile)} tp JOIN ${q(User)} u ON u."_id" = tp."user"
           WHERE u."school" = $1`,
         `SELECT 'student', sp."user"::text, 'aadhaar',
-                regexp_replace(COALESCE(sp."aadhaarNumber", ''), '\\D', '', 'g'), u."name", NULL
+                regexp_replace(COALESCE(sp."aadhaarNumber", ''), '\\D', '', 'g'), u."name", COALESCE(u."email", ''), NULL
            FROM ${q(StudentProfile)} sp JOIN ${q(User)} u ON u."_id" = sp."user"
           WHERE u."school" = $1`,
         ...parentRows,
@@ -90,7 +92,7 @@ function describe(row) {
  *                 Aadhaar while the parent blocks are being saved).
  * @returns {Promise<string|null>} the refusal message, or null
  */
-async function identityClash(schoolId, entries, { peers = [] } = {}) {
+async function identityClash(schoolId, entries, { peers = [], sameIdentity = '' } = {}) {
     const clean = entries
         .map((e) => ({ ...e, value: norm(e.type, e.value) }))
         .filter((e) => e.value);
@@ -119,9 +121,20 @@ async function identityClash(schoolId, entries, { peers = [] } = {}) {
             AND ((x.type = 'aadhaar' AND x.val = ANY($2::text[])) OR (x.type = 'pan' AND x.val = ANY($3::text[])))`,
         [String(schoolId), aadhaars, pans],
     );
+    // One person's own number, on their own other record, is not a repeat.
+    //
+    // A teacher who is also a parent at the same school holds two records here
+    // — a teaching post and a parent account — but one Aadhaar and one PAN. The
+    // rule is one number per PERSON per school, and the thing that says two
+    // records are one person is the address they sign in with (see
+    // services/accountIdentity.js). Without this, the second record could never
+    // be created: the school would be told the number belongs to someone else,
+    // and that someone else would be them.
+    const mine = String(sameIdentity || '').trim().toLowerCase();
     for (const e of clean) {
         const hit = rows.find((r) => r.type === e.type && r.val === e.value
-            && !replaced.has(`${r.kind}|${r.ref}|${r.type}`));
+            && !replaced.has(`${r.kind}|${r.ref}|${r.type}`)
+            && !(mine && String(r.heldBy || '').toLowerCase() === mine));
         if (hit) return `${e.label} (${lastFour(e.value)}) is already registered to ${describe(hit)} in this school`;
     }
     return null;

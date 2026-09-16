@@ -13,7 +13,10 @@ const ClassSection    = require('../models/ClassSection');
 const Class           = require('../models/Class');
 const AcademicYear    = require('../models/AcademicYear');
 const mailer  = require('../config/mailer');
-const { sendSchoolMail, emailHeaderHtml, getMailContext } = require('../utils/schoolMailer');
+const { sendSchoolMail, emailHeaderHtml, getMailContext, sendSchoolAddedEmail } = require('../utils/schoolMailer');
+// One address is one person, who may hold posts at several schools — see the
+// header of services/accountIdentity.js.
+const identity = require('../services/accountIdentity');
 const { validate, passwordError } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
@@ -328,19 +331,22 @@ exports.createUser = async (req, res) => {
         const school = (req.body.school && req.body.school !== '') ? req.body.school : null;
         if (role !== 'super_admin' && !school)
             return res.status(400).json({ success: false, message: 'School is required for this role' });
-        const exists = await User.findOne({ email: email.toLowerCase() });
-        if (exists) return res.status(400).json({ success: false, message: 'Email already registered' });
-        const otp    = generateOTP();
-        const user   = await User.create({
-            name,
-            email: email.toLowerCase(),
-            role,
-            password: await bcrypt.hash(otp, 12),
-            isFirstLogin: true,
-            school: (role !== 'super_admin') ? school : null,
-        });
-        sendWelcomeEmail(email, name, email, otp, undefined, school);
-        res.status(201).json({ success: true, data: user });
+        // An address is a person, who may already hold a post elsewhere on the
+        // platform — that is joined, not refused. Only the same post at the same
+        // school is a duplicate, and createMembership refuses what cannot link
+        // (a platform account, or anything involving a student).
+        const otp = generateOTP();
+        const { user, linked, reused, inactive, inactiveReason } = await identity.createMembership(
+            { name, email, password: otp },
+            { role, school: (role !== 'super_admin') ? school : null },
+        );
+        if (reused) return res.status(400).json({ success: false, message: 'Email already registered for this role at this school' });
+        // A staff post created inactive has nothing to sign in to yet.
+        if (!inactive) {
+            if (linked) sendSchoolAddedEmail(email, name, identity.ROLE_LABEL[role] || role, null, school);
+            else        sendWelcomeEmail(email, name, email, otp, undefined, school);
+        }
+        res.status(201).json({ success: true, data: user, inactive, notice: inactiveReason });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
@@ -359,11 +365,29 @@ exports.updateUser = async (req, res) => {
         if (password) {
             const pwErr = passwordError(password);
             if (pwErr) return res.status(400).json({ success: false, message: pwErr });
-            update.password = await bcrypt.hash(password, 12);
+        }
+        // Moving a live account into a staff role, or a staff account to another
+        // school, is the one edit here that could leave a person employed at two
+        // schools at once.
+        const before = await User.findById(req.params.id).select('email name isActive').lean();
+        if (!before) return res.status(404).json({ success: false, message: 'User not found' });
+        if (before.isActive) {
+            const blocked = await identity.staffActivationBlock(
+                { email: before.email, role, schoolId: update.school, userId: before._id, name: before.name },
+                { audience: 'platform' },
+            );
+            if (blocked) return res.status(400).json({ success: false, code: 'ACTIVE_AT_ANOTHER_SCHOOL', message: blocked });
         }
         const user = await User.findByIdAndUpdate(req.params.id, update, { new: true });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         await authCache.invalidate(user._id);
+        // One person, one password: written across every post this address holds
+        // so the two cannot drift apart. The platform operator is above every
+        // school, so unlike a school's own office it is not held back from
+        // setting the password of someone who also signs in elsewhere.
+        if (password) {
+            await identity.setCredentials(user.email, { passwordHash: await bcrypt.hash(password, 12) });
+        }
         res.json({ success: true, data: user });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
@@ -386,6 +410,16 @@ exports.toggleUserStatus = async (req, res) => {
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        // The platform admin is held to the same rule as a school's office: a
+        // teacher or admin is active at one school at a time. It is told WHICH
+        // school, so it can switch that post off itself if the school cannot.
+        if (!user.isActive) {
+            const blocked = await identity.staffActivationBlock(
+                { email: user.email, role: user.role, schoolId: user.school, userId: user._id, name: user.name },
+                { audience: 'platform' },
+            );
+            if (blocked) return res.status(400).json({ success: false, code: 'ACTIVE_AT_ANOTHER_SCHOOL', message: blocked });
+        }
         user.isActive = !user.isActive;
         await user.save();
         await authCache.invalidate(user._id);
@@ -426,25 +460,34 @@ const _bulkImport = async (req, res, role) => {
         const wb   = XLSX.read(req.file.buffer, { type: 'buffer' });
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
 
-        const created = []; const errors = [];
+        const created = []; const errors = []; const notices = [];
         for (const row of rows) {
             const name  = String(row.name  || row.Name  || '').trim();
             const email = String(row.email || row.Email || '').trim().toLowerCase();
             if (!name || !email) { errors.push({ email: email || '?', reason: 'name/email missing' }); continue; }
             try {
-                const exists = await User.findOne({ email }).lean();
-                if (exists) { errors.push({ email, reason: 'Email already registered' }); continue; }
-                const otp  = generateOTP();
-                const user = await User.create({ name, email, role, school: schoolId, password: await bcrypt.hash(otp, 12), isFirstLogin: true });
+                const otp = generateOTP();
+                const { user, linked, reused, inactive } = await identity.createMembership(
+                    { name, email, password: otp }, { role, school: schoolId },
+                );
+                if (reused) { errors.push({ email, reason: 'Already has this role at this school' }); continue; }
                 if (role === 'teacher') {
                     const designation = String(row.designation || row.Designation || '').trim();
                     await TeacherProfile.create({ user: user._id, school: schoolId, designation });
                 }
                 created.push(user._id);
-                sendWelcomeEmail(email, name, email, otp, undefined, schoolId);
+                if (inactive) {
+                    // Created, but switched off. Not an error — the row did import —
+                    // but not a plain success either, so it is reported on its own.
+                    notices.push({ email, reason: 'Added as inactive — currently active at another school' });
+                } else if (linked) {
+                    sendSchoolAddedEmail(email, name, identity.ROLE_LABEL[role] || role, null, schoolId);
+                } else {
+                    sendWelcomeEmail(email, name, email, otp, undefined, schoolId);
+                }
             } catch (e) { errors.push({ email, reason: e.code === 11000 ? 'Duplicate entry' : e.message }); }
         }
-        res.json({ success: true, created: created.length, errors });
+        res.json({ success: true, created: created.length, errors, notices });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -565,7 +608,9 @@ exports.bulkStudents = async (req, res) => {
                 continue;
             }
 
-            const studentExists = await User.findOne({ email }).lean();
+            // A student never shares a sign-in, so ANY existing use of the
+            // address refuses the row (accountIdentity.LINKABLE).
+            const studentExists = (await identity.membershipsByEmail(email)).length > 0;
             if (studentExists) {
                 const reason = `Email "${email}" already registered`;
                 errors.push({ row: rowNum, name, reason });
@@ -573,22 +618,27 @@ exports.bulkStudents = async (req, res) => {
                 continue;
             }
 
-            let parentUserId = null;
-            const existingParent = await User.findOne({ email: parentEmail }).lean();
-            if (existingParent) {
-                parentUserId = existingParent._id;
-                const pp = await ParentProfile.findOne({ user: existingParent._id }).lean();
-                if (!pp) await ParentProfile.create({ user: existingParent._id, school: schoolId });
-            } else {
-                const parentOtp = generateOTP();
-                const parentUser = await User.create({ name: parentName, email: parentEmail, phone: parentPhone, role: 'parent', school: schoolId, password: await bcrypt.hash(parentOtp, 12), isFirstLogin: true });
-                await ParentProfile.create({ user: parentUser._id, school: schoolId });
-                parentUserId = parentUser._id;
-                sendWelcomeEmail(parentEmail, parentName, parentEmail, parentOtp, schoolName, schoolId);
+            // The parent may already have a child at another school on the
+            // platform: that is the same person, so they gain a parent record
+            // here and keep the password they already use.
+            const parentOtp = generateOTP();
+            const { user: parentUser, linked: parentLinked, reused: parentReused } =
+                await identity.createMembership(
+                    { name: parentName, email: parentEmail, phone: parentPhone, password: parentOtp },
+                    { role: 'parent', school: schoolId },
+                );
+            const parentUserId = parentUser._id;
+            const pp = await ParentProfile.findOne({ user: parentUserId }).lean();
+            if (!pp) await ParentProfile.create({ user: parentUserId, school: schoolId });
+            if (!parentReused) {
+                if (parentLinked) sendSchoolAddedEmail(parentEmail, parentName, 'parent', schoolName, schoolId);
+                else              sendWelcomeEmail(parentEmail, parentName, parentEmail, parentOtp, schoolName, schoolId);
             }
 
             const otp = generateOTP();
-            const studentUser = await User.create({ name, email, phone, role: 'student', school: schoolId, password: await bcrypt.hash(otp, 12), isFirstLogin: true });
+            const { user: studentUser } = await identity.createMembership(
+                { name, email, phone, password: otp }, { role: 'student', school: schoolId },
+            );
             await StudentProfile.create({ user: studentUser._id, school: schoolId, admissionNumber: admNo, dob, gender, bloodGroup, category, address, currentSection: section._id, parent: parentUserId });
             // The section has to know too — a profile pointing at a class the
             // class does not list is a student every roster-based screen misses.

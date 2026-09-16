@@ -102,9 +102,52 @@ function emailHeaderHtml(school, subtitle = '') {
       </div>`;
 }
 
+/**
+ * The other welcome: this person already signs in here, and has just been given
+ * a post somewhere new — a second school, or a second role at this one.
+ *
+ * There are no credentials to send. They keep the password they already use, so
+ * "your account has been created, here is a one-time password" would be both
+ * wrong and alarming — and acting on it would lock them out of the school they
+ * already work at. What they need to know is that this school is now on their
+ * sign-in, and that they choose between schools after signing in.
+ *
+ * Shared by the school office and the platform's own user screens so the two
+ * cannot drift apart.
+ */
+function sendSchoolAddedEmail(to, name, roleLabel, schoolName, schoolId = null) {
+    const loginUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login`;
+    return getMailContext(schoolId).then(({ school }) => {
+        const where = schoolName || school?.name || 'a new school';
+        const html = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
+      ${emailHeaderHtml(school, `You've been added to ${where}`)}
+      <div style="background:#f9fafb;padding:28px 32px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none">
+        <p style="margin-top:0">Hi <strong>${name}</strong>,</p>
+        <p>You have been added to <strong>${where}</strong> as a ${roleLabel}.</p>
+        <p>Nothing changes about how you sign in — keep using <strong>${to}</strong> and your existing
+           password. After signing in you will be asked which school you want to open, and you can
+           switch between them at any time from your profile.</p>
+        <p style="margin:24px 0">
+          <a href="${loginUrl}" style="background:#4f46e5;color:#fff;padding:12px 22px;border-radius:6px;text-decoration:none;display:inline-block">Sign in</a>
+        </p>
+        <p style="color:#6b7280;font-size:.88rem;margin-bottom:0">
+          If you were not expecting this, please contact ${where}.
+        </p>
+      </div>
+    </div>`;
+        return sendSchoolMail(schoolId, {
+            to,
+            subject: `You've been added to ${where}`,
+            html,
+            fromName: where,
+        });
+    }).catch((err) => console.error(`[email] school-added notice failed for ${to}:`, err.message));
+}
+
 // Drop a school's cached transporter (call after SMTP settings change).
 function invalidate(schoolId) {
     if (schoolId) _cache.delete(schoolId.toString());
 }
 
-module.exports = { getMailContext, sendSchoolMail, schoolLogoUrl, emailHeaderHtml, invalidate };
+module.exports = { getMailContext, sendSchoolMail, schoolLogoUrl, emailHeaderHtml, sendSchoolAddedEmail, invalidate };
