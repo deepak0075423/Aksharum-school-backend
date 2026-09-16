@@ -6,6 +6,7 @@ const classCtrl     = require('../../controllers/class.controller');
 const subjectCtrl   = require('../../controllers/subject.controller');
 const reportCtrl    = require('../../controllers/report.controller');
 const attendanceCtrl = require('../../controllers/attendance.controller');
+const attendanceAdmin = require('../../controllers/attendanceAdmin.controller');
 const timetableCtrl  = require('../../controllers/timetable.controller');
 const ttGenCtrl      = require('../../controllers/timetableGen.controller');
 const substituteCtrl = require('../../controllers/substitute.controller');
@@ -313,17 +314,26 @@ router.delete('/timetable/versions/:id/entries/:entryId', timetableGuard, ttGenC
 router.get('/reports', guard, reportCtrl.getReports);
 
 // ── Attendance ───────────────────────────────────────────────────────────────
-router.get('/regularization-requests',         attendanceGuard, attendanceCtrl.getAdminRegularizationRequests);
+router.get('/attendance/overview',  attendanceGuard, attendanceAdmin.overview);
+router.get('/attendance/today',     attendanceGuard, attendanceAdmin.today);
+router.get('/attendance/activity',  attendanceGuard, attendanceAdmin.activity);
+router.get('/attendance/register',  attendanceGuard, attendanceAdmin.register);
+router.get('/attendance/reports',   attendanceGuard, attendanceAdmin.reports);
+router.post('/attendance/mark',     attendanceGuard, attendanceAdmin.mark);
+router.post('/attendance/mark-all', attendanceGuard, attendanceAdmin.markAll);
+router.get('/regularization-requests',         attendanceGuard, attendanceAdmin.requests);
 router.post('/regularization-requests/review', attendanceGuard, attendanceCtrl.adminReviewRegularization);
 
 // Admin self-attendance (same store as teacher self-attendance)
 router.get('/my-attendance',            attendanceGuard, attendanceCtrl.getTeacherSelfAttendance);
+router.get('/my-attendance/summary',    attendanceGuard, attendanceCtrl.getSelfAttendanceSummary);
 router.post('/my-attendance/clock-in',  attendanceGuard, attendanceCtrl.clockIn);
 router.post('/my-attendance/clock-out', attendanceGuard, attendanceCtrl.clockOut);
 router.get('/regularization',           attendanceGuard, attendanceCtrl.getRegularizationForm);
 router.post('/regularization',          attendanceGuard, attendanceCtrl.submitRegularization);
 router.post('/regularization/apply',    attendanceGuard, attendanceCtrl.adminRegularizeAttendance);
 router.get('/regularization/people',    attendanceGuard, attendanceCtrl.adminSearchPeople);
+router.get('/regularization/day',       attendanceGuard, attendanceAdmin.personDay);
 router.post('/regularization/student',  attendanceGuard, attendanceCtrl.adminRegularizeStudent);
 
 // ── Notifications ─────────────────────────────────────────────────────────────

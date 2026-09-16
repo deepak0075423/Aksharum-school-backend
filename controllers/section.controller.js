@@ -5,6 +5,7 @@ const ClassAnnouncement   = require('../models/ClassAnnouncement');
 const ClassMonitor        = require('../models/ClassMonitor');
 const StudentProfile      = require('../models/StudentProfile');
 const { notify, withParents } = require('../services/notifyService');
+const { saveSectionMarks } = require('../services/attendanceMarks');
 const AttendanceRecord    = require('../models/AttendanceRecord');
 
 const ok  = (res, d, s=200) => res.status(s).json({ success: true, data: d });
@@ -433,73 +434,20 @@ exports.markAttendance = async (req, res) => {
                 : 'No section assigned to you', 403);
         }
 
-        // Normalize to UTC midnight so the unique (section,date) index behaves
-        const attendanceDate = new Date(date + 'T00:00:00.000Z');
-        const session = await Attendance.findOneAndUpdate(
-            { section: mySection._id, date: attendanceDate },
-            { $setOnInsert: { section: mySection._id, date: attendanceDate, createdBy: req.userId } },
-            { upsert: true, new: true }
-        );
-
-        const saved = await Promise.all(records.map(r =>
-            AttendanceRecord.findOneAndUpdate(
-                { attendance: session._id, student: r.studentId },
-                { $set: { status: capStatus(r.status) } },
-                { upsert: true, new: true }
-            )
-        ));
-
-        // Notify parents by email + in-app (non-blocking)
-        setImmediate(async () => {
-            try {
-                const User = require('../models/User');
-                const School = require('../models/School');
-                const { sendAttendanceNotification } = require('../utils/sendEmail');
-                const school = await School.findById(req.schoolId).select('name').lean();
-                const dateLabel = new Date(date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-                // Batch-fetch every student profile + parent up front (one query
-                // per collection instead of two per student in the loop below).
-                const allProfiles = await StudentProfile.find({ user: { $in: records.map(x => x.studentId) } })
-                    .populate('user', 'name').lean();
-                const profileByStudent = new Map(allProfiles.map(p => [String(p.user?._id || p.user), p]));
-                const parentIds = [...new Set(allProfiles.map(p => p.parent).filter(Boolean).map(String))];
-                const parentUsers = parentIds.length
-                    ? await User.find({ _id: { $in: parentIds } }).select('name email').lean()
-                    : [];
-                const parentById = new Map(parentUsers.map(u => [String(u._id), u]));
-                for (const r of records) {
-                    const status = capStatus(r.status);
-                    const sp = profileByStudent.get(String(r.studentId));
-                    // In-app: tell absent/late students (and their parents) right away
-                    if (status !== 'Present') {
-                        const targets = [r.studentId];
-                        if (sp?.parent) targets.push(sp.parent);
-                        notify({
-                            school:     req.schoolId,
-                            sender:     req.userId,
-                            senderRole: req.userRole || 'teacher',
-                            title:      `Attendance: ${sp?.user?.name || 'Student'} marked ${status}`,
-                            body:       `${sp?.user?.name || 'The student'} was marked ${status.toLowerCase()} on ${dateLabel}.`,
-                            recipients: targets,
-                            // No id: the student's own calendar has no row keyed by a record
-                            link:       { type: 'attendance.student' },
-                        });
-                    }
-                    if (!sp?.parent) continue;
-                    const parentUser = parentById.get(String(sp.parent));
-                    if (!parentUser?.email) continue;
-                    await sendAttendanceNotification({
-                        to: parentUser.email,
-                        parentName: parentUser.name,
-                        studentName: sp.user?.name || '',
-                        date: new Date(date),
-                        status,
-                        schoolName: school?.name || '',
-                        schoolId: req.schoolId,
-                    });
-                }
-            } catch (e) { console.error('Attendance notification error:', e.message); }
+        // A register is one calendar day. The frontend sends 'YYYY-MM-DD'; the
+        // service stores it at UTC midnight so the unique (section,date) index
+        // behaves, and announces only the marks that changed.
+        const day = String(date).slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return err(res, 'date must be YYYY-MM-DD', 400);
+        const { records: saved } = await saveSectionMarks({
+            schoolId:  req.schoolId,
+            sectionId: mySection._id,
+            date:      day,
+            // Unknown statuses have always been recorded as absent here.
+            records:   records.map((r) => ({ studentId: r.studentId, status: capStatus(r.status) })),
+            actor:     { userId: req.userId, role: req.userRole || 'teacher' },
         });
+        saved.forEach((r) => { r.status = String(r.status || '').toLowerCase(); });
 
         ok(res, saved);
     } catch (e) { err(res, e); }

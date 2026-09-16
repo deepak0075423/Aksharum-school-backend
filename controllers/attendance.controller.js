@@ -76,29 +76,7 @@ async function studentMonthRecords(studentId, schoolId, month, year) {
 
 // ── Admin: teacher attendance regularization ─────────────────────────────────
 
-exports.getAdminRegularizationRequests = async (req, res) => {
-    try {
-        const { page=1, limit=20, status } = req.query;
-        const filter = { school: req.schoolId };
-        if (status) {
-            const capped = { pending: 'Pending', approved: 'Approved', rejected: 'Rejected' }[low(status)];
-            filter.status = capped || status;
-        }
-        const [requests, total] = await Promise.all([
-            TeacherAttendanceRegularization.find(filter)
-                .populate('teacher','name email')
-                .sort({ createdAt: -1 })
-                .skip((page-1)*+limit).limit(+limit)
-                .lean(),
-            TeacherAttendanceRegularization.countDocuments(filter),
-        ]);
-        res.json({
-            success: true,
-            data: requests.map(r => ({ ...r, status: low(r.status) })),
-            total,
-        });
-    } catch (e) { err(res, e); }
-};
+// The admin request queue lives in attendanceAdmin.controller.js (`requests`).
 
 exports.adminReviewRegularization = async (req, res) => {
     try {
@@ -267,7 +245,8 @@ exports.adminRegularizeStudent = async (req, res) => {
 
         const rec = await AttendanceRecord.findOneAndUpdate(
             { attendance: session._id, student: studentId },
-            { $set: { status: requested, remarks: `Regularized by admin. ${remarks || ''}`.trim() },
+            { $set: { status: requested, remarks: `Regularized by admin. ${remarks || ''}`.trim(),
+                      markedAt: new Date(), markedBy: req.userId },
               $setOnInsert: { attendance: session._id, student: studentId } },
             { upsert: true, new: true }
         );
@@ -294,131 +273,91 @@ const todayStr = () => {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-// Is this Saturday a working day under the school's leave settings?
-function saturdayWorking(day, ls = {}) {
-    if (ls.saturdayWorking === false) return false;
-    const ordinal = Math.ceil(day / 7); // 1st..5th Saturday of the month
-    if (ls.saturdayMode === '1_3_5') return [1, 3, 5].includes(ordinal);
-    if (ls.saturdayMode === '2_4')   return [2, 4].includes(ordinal);
-    return true; // 'all'
-}
+const staffDaysSvc = require('../services/staffAttendanceDays');
 
-// Find the approved leave covering a date, if any
-function leaveOn(dateUTC, leaves) {
-    return leaves.find(l => {
-        const from = new Date(new Date(l.fromDate).toISOString().split('T')[0] + 'T00:00:00.000Z');
-        const to   = new Date(new Date(l.toDate).toISOString().split('T')[0] + 'T23:59:59.999Z');
-        return dateUTC >= from && dateUTC <= to;
-    });
-}
+const pad2 = (n) => String(n).padStart(2, '0');
+const monthBounds = (month, year) => ({
+    from: `${year}-${pad2(month)}-01`,
+    to:   `${year}-${pad2(month)}-${pad2(new Date(Date.UTC(year, month, 0)).getUTCDate())}`,
+});
+const isKey = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));
 
+// The day-by-day derivation lives in services/staffAttendanceDays.js, shared
+// with the admin calendar, its summary card and the staff report.
 async function buildSelfAttendanceMonth(req, month, year) {
-    const School           = require('../models/School');
-    const LeaveApplication = require('../models/LeaveApplication');
-    const Holiday          = require('../models/Holiday');
-
-    const monthStart = new Date(Date.UTC(year, month - 1, 1));
-    const monthEnd   = new Date(Date.UTC(year, month, 0, 23, 59, 59));
-
-    const [records, leaves, holidays, school] = await Promise.all([
-        TeacherAttendance.find({ teacher: req.userId, date: { $gte: monthStart, $lte: monthEnd } }).lean(),
-        LeaveApplication.find({
-            teacher: req.userId, school: req.schoolId, status: 'approved',
-            fromDate: { $lte: monthEnd }, toDate: { $gte: monthStart },
-        }).populate('leaveType', 'name').lean().catch(() => []),
-        Holiday.find({
-            school: req.schoolId,
-            startDate: { $lte: monthEnd }, endDate: { $gte: monthStart },
-        }).lean().catch(() => []),
-        School.findById(req.schoolId).select('leaveSettings').lean(),
-    ]);
-
-    const ls    = school?.leaveSettings || {};
-    const dept  = req.userRole === 'teacher' ? 'teaching_staff' : 'admin_staff';
-    const staffHolidays = holidays.filter(h =>
-        !h.applicability || h.applicability.scope !== 'specific_departments' ||
-        (h.applicability.departments || []).includes(dept));
-
-    const recByDay = {};
-    records.forEach(r => { recByDay[new Date(r.date).getUTCDate()] = r; });
-
-    const now         = new Date();
-    const isCurrentMonth = now.getFullYear() === year && now.getMonth() === month - 1;
-    const lastDay     = new Date(Date.UTC(year, month, 0)).getUTCDate();
-    const todayDay    = isCurrentMonth ? now.getDate() : null;
-
-    const days    = [];
-    const summary = { present: 0, absent: 0, leave: 0, 'half-day': 0, holiday: 0 };
-
-    for (let d = 1; d <= lastDay; d++) {
-        const dateUTC = new Date(Date.UTC(year, month - 1, d));
-        const isPast  = isCurrentMonth ? d < todayDay : dateUTC < now;
-        const isToday = isCurrentMonth && d === todayDay;
-        const dow     = dateUTC.getUTCDay();
-
-        const holiday = staffHolidays.find(h => {
-            const from = new Date(new Date(h.startDate).toISOString().split('T')[0] + 'T00:00:00.000Z');
-            const to   = new Date(new Date(h.endDate).toISOString().split('T')[0] + 'T23:59:59.999Z');
-            return dateUTC >= from && dateUTC <= to;
-        });
-
-        let entry = { day: d, date: dateUTC, status: null };
-
-        if (dow === 0 || (dow === 6 && !saturdayWorking(d, ls))) {
-            entry.status = 'weekend';
-        } else if (holiday) {
-            entry.status = 'holiday';
-            entry.label  = holiday.name;
-            summary.holiday++;
-        } else {
-            const rec   = recByDay[d];
-            const leave = leaveOn(dateUTC, leaves);
-            // A clock-in, or an approved regularization (status Present), counts as present
-            if (rec?.checkIn || (rec && rec.status === 'Present')) {
-                entry.status   = 'present';
-                entry.checkIn  = rec.checkIn || '';
-                entry.checkOut = rec.checkOut || '';
-                summary.present++;
-            } else if (leave) {
-                entry.status = leave.leaveMode === 'half_day' ? 'half-day' : 'leave';
-                entry.label  = leave.leaveType?.name || 'Leave';
-                summary[entry.status]++;
-            } else if (isPast) {
-                entry.status = 'absent';   // auto-absent: past working day, never clocked in
-                summary.absent++;
-            } else if (isToday) {
-                entry.status = 'pending';  // today, not clocked in yet
-            }
-            // future working days stay null
-        }
-        days.push(entry);
-    }
-
-    // Today's clock state for the clock in/out buttons
-    let today = null;
-    if (isCurrentMonth) {
-        const rec   = recByDay[todayDay];
-        const leave = leaveOn(new Date(Date.UTC(year, month - 1, todayDay)), leaves);
-        today = {
-            clockedIn:  !!rec?.checkIn,
-            clockedOut: !!rec?.checkOut,
-            checkIn:    rec?.checkIn  || '',
-            checkOut:   rec?.checkOut || '',
-            onLeave:    !!leave,
-            leaveLabel: leave ? (leave.leaveType?.name || 'Leave') : '',
-        };
-    }
-
-    return { days, summary, today };
+    const { from, to } = monthBounds(month, year);
+    return staffDaysSvc.staffDays({ schoolId: req.schoolId, userId: req.userId, role: req.userRole }, from, to);
 }
 
+/**
+ * GET my-attendance — `?month=&year=` for one calendar month (the original
+ * contract every client uses), or `?from=YYYY-MM-DD&to=YYYY-MM-DD` for an
+ * arbitrary window such as a calendar grid that shows the tail of the previous
+ * month and the head of the next. Windows are capped at 62 days.
+ */
 exports.getTeacherSelfAttendance = async (req, res) => {
     try {
+        const { from, to } = req.query;
+        if (from || to) {
+            if (!isKey(from) || !isKey(to) || from > to) return err(res, 'from and to must be YYYY-MM-DD, from ≤ to', 400);
+            if (staffDaysSvc.addDays(from, 61) < to) return err(res, 'A window can span at most 62 days', 400);
+            const since = (await staffDaysSvc.startDates(req.schoolId, [req.userId])).get(String(req.userId));
+            const data = await staffDaysSvc.staffDays(
+                { schoolId: req.schoolId, userId: req.userId, role: req.userRole, since }, from, to);
+            return ok(res, data);
+        }
         const now   = new Date();
         const month = +req.query.month || now.getMonth() + 1;
         const year  = +req.query.year  || now.getFullYear();
         const data  = await buildSelfAttendanceMonth(req, month, year);
         ok(res, data);
+    } catch (e) { err(res, e); }
+};
+
+/**
+ * GET my-attendance/summary?period=this-month|last-month|this-year
+ *
+ * The admin screen's summary ring: the counts behind one period and the same
+ * counts for the period before it, so the page can say whether attendance is
+ * up or down without a second request. "This month" and "this year" run to
+ * today — days that have not happened yet are not days anyone missed.
+ */
+exports.getSelfAttendanceSummary = async (req, res) => {
+    try {
+        const today = staffDaysSvc.localToday();
+        const [y, m] = today.split('-').map(Number);
+        const monthLabel = (mm, yy) => new Date(Date.UTC(yy, mm - 1, 1))
+            .toLocaleDateString('en-IN', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+        const prevMonth = (mm, yy) => (mm === 1 ? [12, yy - 1] : [mm - 1, yy]);
+
+        const period = ['this-month', 'last-month', 'this-year'].includes(req.query.period)
+            ? req.query.period : 'this-month';
+
+        let cur, prev;
+        if (period === 'this-year') {
+            cur  = { from: `${y}-01-01`, to: today, label: String(y) };
+            prev = { from: `${y - 1}-01-01`, to: `${y - 1}-12-31`, label: String(y - 1) };
+        } else {
+            const [cm, cy] = period === 'last-month' ? prevMonth(m, y) : [m, y];
+            const [pm, py] = prevMonth(cm, cy);
+            const c = monthBounds(cm, cy);
+            cur  = { from: c.from, to: period === 'this-month' ? today : c.to, label: monthLabel(cm, cy) };
+            prev = { ...monthBounds(pm, py), label: monthLabel(pm, py) };
+        }
+
+        // One round of queries across both windows, then classify each.
+        const since  = (await staffDaysSvc.startDates(req.schoolId, [req.userId])).get(String(req.userId));
+        const who    = { userId: req.userId, role: req.userRole, since };
+        const inputs = await staffDaysSvc.loadInputs(req.schoolId, [req.userId], prev.from, cur.to);
+        const a = staffDaysSvc.classify(inputs, who, cur.from, cur.to);
+        const b = staffDaysSvc.classify(inputs, who, prev.from, prev.to);
+
+        ok(res, {
+            period,
+            since,
+            current:  { ...cur,  summary: a.summary, percentage: staffDaysSvc.percentOf(a.summary) },
+            previous: { ...prev, summary: b.summary, percentage: staffDaysSvc.percentOf(b.summary) },
+        });
     } catch (e) { err(res, e); }
 };
 
@@ -691,12 +630,12 @@ exports.reviewCorrection = async (req, res) => {
             const remarksText = `Corrected via student request. ${correction.teacherRemarks}`.trim();
             if (correction.attendanceRecord) {
                 await AttendanceRecord.findByIdAndUpdate(correction.attendanceRecord, {
-                    $set: { status: correction.requestedStatus, remarks: remarksText },
+                    $set: { status: correction.requestedStatus, remarks: remarksText, markedAt: new Date(), markedBy: req.userId },
                 });
             } else if (correction.attendance) {
                 await AttendanceRecord.findOneAndUpdate(
                     { attendance: correction.attendance, student: correction.student },
-                    { $set: { status: correction.requestedStatus, remarks: 'Added via correction request.' } },
+                    { $set: { status: correction.requestedStatus, remarks: 'Added via correction request.', markedAt: new Date(), markedBy: req.userId } },
                     { upsert: true }
                 );
             }

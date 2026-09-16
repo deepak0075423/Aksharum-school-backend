@@ -20,6 +20,19 @@ const AttendanceRecordSchema = new db.Schema({
         type: String,
         default: '',
     },
+    // When the CURRENT status was set, and by whom. They move only when the
+    // status changes (see services/attendanceMarks.js), so a register saved
+    // twice keeps the time each mark was really made. Rows written before these
+    // existed read null — callers fall back to the session's createdAt.
+    markedAt: {
+        type: Date,
+        default: null,
+    },
+    markedBy: {
+        type: db.Types.UUID,
+        ref: 'User',
+        default: null,
+    },
 });
 
 // One record per student per attendance session
