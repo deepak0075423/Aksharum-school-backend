@@ -30,6 +30,8 @@ router.get('/modules', guard, modulesHandler);
 
 // Attendance
 router.get('/child-attendance', attendanceGuard, attendanceCtrl.getParentChildAttendance);
+router.get('/child-attendance/overview', attendanceGuard, attendanceCtrl.getParentChildAttendanceOverview);
+router.get('/child-attendance/requests', attendanceGuard, attendanceCtrl.getParentChildCorrections);
 
 // Exams
 router.get('/exams', examGuard, examCtrl.getParentExamResults);

@@ -18,6 +18,7 @@ const AcademicYear          = require('../models/AcademicYear');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const Subject               = require('../models/Subject');
 const Attendance            = require('../models/Attendance');
+const sa                    = require('../services/studentAttendance');
 const AttendanceRecord      = require('../models/AttendanceRecord');
 const FormalResult          = require('../models/FormalResult');
 const ClassTest             = require('../models/ClassTest');
@@ -378,11 +379,12 @@ async function batchMetrics(studentIds, sectionIds, modules, schoolId, activeYea
                 student:    { $in: studentIds },
             }).select('student status').lean();
             const tally = {};
+            // Late as attended, a half day as half — services/studentAttendance.js
             records.forEach((r) => {
                 const k = String(r.student);
                 tally[k] = tally[k] || { total: 0, present: 0 };
                 tally[k].total += 1;
-                if (low(r.status) !== 'absent') tally[k].present += 1;
+                tally[k].present += sa.credit(r.status);
             });
             studentIds.forEach((id) => {
                 const t = tally[id];
@@ -696,38 +698,41 @@ async function generalBlock(ctx) {
 async function attendanceBlock(ctx) {
     const { user, profile } = ctx;
     const sectionId = sid(profile.currentSection);
-    if (!sectionId) return { tracked: false, total: 0, sessionsHeld: 0, present: 0, absent: 0, late: 0, percent: null, monthly: [], days: [], recent: [], rank: null, sectionSize: 0 };
+    if (!sectionId) return { tracked: false, total: 0, sessionsHeld: 0, present: 0, absent: 0, late: 0, halfDay: 0, percent: null, monthly: [], days: [], recent: [], rank: null, sectionSize: 0 };
 
     const sessions = await Attendance.find({ section: sectionId }).sort({ date: 1 }).lean();
     if (!sessions.length) {
-        return { tracked: false, total: 0, sessionsHeld: 0, present: 0, absent: 0, late: 0, percent: null, monthly: [], days: [], recent: [], rank: null, sectionSize: 0 };
+        return { tracked: false, total: 0, sessionsHeld: 0, present: 0, absent: 0, late: 0, halfDay: 0, percent: null, monthly: [], days: [], recent: [], rank: null, sectionSize: 0 };
     }
     const sessionIds = sessions.map((s) => s._id);
     const dateOf = Object.fromEntries(sessions.map((s) => [String(s._id), s.date]));
+    const subjectOf = Object.fromEntries(sessions.map((s) => [String(s._id), s.subject]));
 
     // Whole-section records power both the student's own numbers and their rank.
     const allRecords = await AttendanceRecord.find({ attendance: { $in: sessionIds } })
         .select('attendance student status remarks').lean();
 
     const mine = allRecords.filter((r) => String(r.student) === String(user._id));
-    const counts = { present: 0, absent: 0, late: 0 };
+    const counts = { present: 0, absent: 0, late: 0, halfDay: 0 };
+    const KEY = { present: 'present', absent: 'absent', late: 'late', 'half-day': 'halfDay' };
     const monthly = {};
     mine.forEach((r) => {
-        const st = low(r.status);
-        if (counts[st] !== undefined) counts[st] += 1;
+        const st = KEY[sa.lowStatus(r.status)];
+        if (st) counts[st] += 1;
         const k = monthKey(dateOf[String(r.attendance)]);
-        monthly[k] = monthly[k] || { month: k, present: 0, absent: 0, late: 0, total: 0 };
+        monthly[k] = monthly[k] || { month: k, present: 0, absent: 0, late: 0, halfDay: 0, total: 0, attended: 0 };
         monthly[k].total += 1;
-        if (monthly[k][st] !== undefined) monthly[k][st] += 1;
+        monthly[k].attended += sa.credit(r.status);
+        if (st) monthly[k][st] += 1;
     });
 
-    // Rank inside the section: present+late counted as attended, same as the %.
+    // Rank inside the section: Late as attended, a half day as half, same as the %.
     const tally = {};
     allRecords.forEach((r) => {
         const k = String(r.student);
         tally[k] = tally[k] || { total: 0, attended: 0 };
         tally[k].total += 1;
-        if (low(r.status) !== 'absent') tally[k].attended += 1;
+        tally[k].attended += sa.credit(r.status);
     });
     const ladder = Object.entries(tally)
         .map(([id, t]) => ({ id, percent: pct(t.attended, t.total) }))
@@ -736,9 +741,13 @@ async function attendanceBlock(ctx) {
 
     const total = mine.length;
     // Every marked day, not just the last twenty: a calendar has to colour the
-    // whole month it is showing, and the rows are already in memory here.
-    const days = mine
-        .map((r) => ({ date: dateOf[String(r.attendance)], status: low(r.status), remarks: r.remarks || '' }))
+    // whole month it is showing, and the rows are already in memory here. A day
+    // holding several subject registers is rolled up to one status.
+    const days = sa.rollupByDay(mine.map((r) => ({
+        date: dateOf[String(r.attendance)], status: r.status, remarks: r.remarks || '',
+        subject: subjectOf[String(r.attendance)] || null,
+    })))
+        .map((d) => ({ date: d.date, status: d.status, remarks: d.remarks }))
         .sort((a, b) => new Date(b.date) - new Date(a.date));
     const recent = days.slice(0, 20);
 
@@ -750,9 +759,10 @@ async function attendanceBlock(ctx) {
         present:     counts.present,
         absent:      counts.absent,
         late:        counts.late,
-        percent:     pct(counts.present + counts.late, total),
+        halfDay:     counts.halfDay,
+        percent:     pct(counts.present + counts.late + counts.halfDay * 0.5, total),
         monthly:     Object.values(monthly)
-            .map((m) => ({ ...m, percent: pct(m.present + m.late, m.total) }))
+            .map(({ attended, ...m }) => ({ ...m, percent: pct(attended, m.total) }))
             .sort((a, b) => a.month.localeCompare(b.month))
             .slice(-12),
         recent,

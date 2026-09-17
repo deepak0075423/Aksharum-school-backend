@@ -170,6 +170,14 @@ const SchoolSchema = new db.Schema({
         saturdayMode:     { type: String, enum: ['all', '1_3_5', '2_4'], default: 'all' },
         saturdayHalfDay:  { type: Boolean, default: false },
     },
+    // How student attendance is registered — see services/studentAttendance.js.
+    //   day      one register per section per day, taken by the class teacher
+    //            or vice class teacher
+    //   subject  one register per section per subject per day, taken by that
+    //            subject's teacher (or the class / vice class teacher)
+    attendanceSettings: {
+        registrationMode: { type: String, enum: ['day', 'subject'], default: 'day' },
+    },
     // Per-school SMTP — when enabled, all emails for this school are sent
     // through these credentials instead of the platform-wide transporter.
     smtp: {

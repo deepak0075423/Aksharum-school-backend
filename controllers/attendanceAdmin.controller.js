@@ -33,7 +33,12 @@ const TeacherProfile   = require('../models/TeacherProfile');
 const User             = require('../models/User');
 const { resolvePage }  = require('../utils/focusPage');
 const days             = require('../services/staffAttendanceDays');
-const { saveSectionMarks, capStatus } = require('../services/attendanceMarks');
+const { saveSectionMarks } = require('../services/attendanceMarks');
+const sa               = require('../services/studentAttendance');
+const { officeSectionSubjects } = require('../services/attendanceScope');
+const School           = require('../models/School');
+const Subject          = require('../models/Subject');
+const { capStatus, creditSql, rollupSql } = sa;
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true, data: d });
 const err = (res, e, s = 500) => res.status(s).json({ success: false, message: e.message || e });
@@ -154,30 +159,43 @@ function scopeCtes($, { schoolId, yearId, classId, sectionId }) {
 
 /**
  * Students in scope with their mark for one day. `status` narrows to
- * present | absent | late | unmarked; without `limit` every row comes back.
+ * present | absent | late | half-day | unmarked; without `limit` every row comes back.
+ *
+ * `register` picks which registers count: undefined → every register of the
+ * day, rolled up per student (a subject-wise school keeps several); '' → the
+ * day register only; a subject id → that subject's register.
  */
-async function studentDay({ schoolId, yearId, classId, sectionId, day, search, status, page = 1, limit = null }) {
+async function studentDay({ schoolId, yearId, classId, sectionId, day, search, status, page = 1, limit = null, register }) {
     const p = params();
     const ctes = scopeCtes(p.$, { schoolId, yearId, classId, sectionId });
     const from = p.$(keyDate(day));
     const to   = p.$(keyDate(addDays(day, 1)));
     const q = String(search || '').trim();
     const like = q ? p.$(`%${q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`) : null;
+    const registerKey = register === undefined ? '' : `AND COALESCE(a."subject"::text, '') = ${p.$(String(register || ''))}`;
 
     const base = `
     WITH ${ctes},
     day AS (
         SELECT u."_id", u."name", u."profileImage" AS "photo", sp."rollNumber",
                secs."className", secs."classNumber", secs."sectionName", roster."section",
-               r."status", COALESCE(r."markedAt", CASE WHEN r."_id" IS NOT NULL THEN a."createdAt" END) AS "markedAt",
-               mb."name" AS "markedBy", r."remarks"
+               d."status", d."markedAt", d."markedBy", d."remarks", d."registers"
           FROM roster
           JOIN ${T(User)} u ON u."_id" = roster."student"
           JOIN secs ON secs."_id" = roster."section"
           LEFT JOIN ${T(StudentProfile)} sp ON sp."user" = roster."student" AND sp."school" = $1
-          LEFT JOIN ${T(Attendance)} a ON a."section" = roster."section" AND a."date" >= ${from} AND a."date" < ${to}
-          LEFT JOIN ${T(AttendanceRecord)} r ON r."attendance" = a."_id" AND r."student" = roster."student"
-          LEFT JOIN ${T(User)} mb ON mb."_id" = COALESCE(r."markedBy", CASE WHEN r."_id" IS NOT NULL THEN a."createdBy" END)
+          LEFT JOIN LATERAL (
+              SELECT ${rollupSql('r."status"')} AS "status",
+                     max(COALESCE(r."markedAt", a."createdAt")) AS "markedAt",
+                     (array_agg(mb."name" ORDER BY COALESCE(r."markedAt", a."createdAt") DESC))[1] AS "markedBy",
+                     CASE WHEN count(r."_id") = 1 THEN max(r."remarks") ELSE '' END AS "remarks",
+                     count(r."_id")::int AS "registers"
+                FROM ${T(Attendance)} a
+                JOIN ${T(AttendanceRecord)} r ON r."attendance" = a."_id" AND r."student" = roster."student"
+                LEFT JOIN ${T(User)} mb ON mb."_id" = COALESCE(r."markedBy", a."createdBy")
+               WHERE a."section" = roster."section" AND a."date" >= ${from} AND a."date" < ${to}
+                 ${registerKey}
+          ) d ON true
          ${like ? `WHERE (u."name" ILIKE ${like} OR sp."rollNumber" ILIKE ${like})` : ''}
     )`;
 
@@ -185,6 +203,7 @@ async function studentDay({ schoolId, yearId, classId, sectionId, day, search, s
         present:  `"status" = 'Present'`,
         absent:   `"status" = 'Absent'`,
         late:     `"status" = 'Late'`,
+        'half-day': `"status" = 'Half-Day'`,
         unmarked: `"status" IS NULL`,
     };
     const where = STATUS_SQL[status] ? `WHERE ${STATUS_SQL[status]}` : '';
@@ -194,6 +213,7 @@ async function studentDay({ schoolId, yearId, classId, sectionId, day, search, s
                count(*) FILTER (WHERE "status" = 'Present')::int AS "present",
                count(*) FILTER (WHERE "status" = 'Absent')::int  AS "absent",
                count(*) FILTER (WHERE "status" = 'Late')::int    AS "late",
+               count(*) FILTER (WHERE "status" = 'Half-Day')::int AS "halfDay",
                count(*) FILTER (WHERE "status" IS NULL)::int     AS "unmarked"
           FROM day`;
 
@@ -218,7 +238,7 @@ async function studentDay({ schoolId, yearId, classId, sectionId, day, search, s
     return {
         counts:  counts.rows[0],
         matched: rows.rows[0]?.matched || 0,
-        rows:    rows.rows.map(({ matched, ...r }) => ({ ...r, status: low(r.status) })),
+        rows:    rows.rows.map(({ matched, ...r }) => ({ ...r, status: sa.lowStatus(r.status) })),
     };
 }
 
@@ -287,10 +307,10 @@ exports.overview = async (req, res) => {
         const marksSql = `WITH ${ctes}
             SELECT
               count(*) FILTER (WHERE a."date" >= ${cf} AND a."date" < ${ct})::int AS "curTotal",
-              count(*) FILTER (WHERE a."date" >= ${cf} AND a."date" < ${ct} AND r."status" IN ('Present','Late'))::int AS "curAttended",
+              COALESCE(sum(${creditSql('r."status"')}) FILTER (WHERE a."date" >= ${cf} AND a."date" < ${ct}), 0)::float AS "curAttended",
               count(DISTINCT r."student") FILTER (WHERE a."date" >= ${cf} AND a."date" < ${ct} AND r."status" = 'Absent')::int AS "curAbsentees",
               count(*) FILTER (WHERE a."date" >= ${pf} AND a."date" < ${pt})::int AS "prevTotal",
-              count(*) FILTER (WHERE a."date" >= ${pf} AND a."date" < ${pt} AND r."status" IN ('Present','Late'))::int AS "prevAttended",
+              COALESCE(sum(${creditSql('r."status"')}) FILTER (WHERE a."date" >= ${pf} AND a."date" < ${pt}), 0)::float AS "prevAttended",
               count(DISTINCT r."student") FILTER (WHERE a."date" >= ${pf} AND a."date" < ${pt} AND r."status" = 'Absent')::int AS "prevAbsentees"
               FROM ${T(AttendanceRecord)} r
               JOIN ${T(Attendance)} a ON a."_id" = r."attendance"
@@ -362,6 +382,7 @@ exports.today = async (req, res) => {
             }),
             classOptions(schoolId, year?._id),
         ]);
+        const mode = await sa.registrationMode(schoolId);
 
         res.json({
             success: true,
@@ -373,6 +394,7 @@ exports.today = async (req, res) => {
             classes,
             date:    day,
             year:    yearOut(year),
+            mode,
         });
     } catch (e) { err(res, e); }
 };
@@ -389,8 +411,20 @@ function markableDay(date) {
     return { day: date };
 }
 
+/**
+ * The subject a subject-wise register write names, checked to be this school's.
+ * A day-wise school writes the day register (null).
+ */
+async function registerSubject(req, subjectId) {
+    const mode = await sa.registrationMode(req.schoolId);
+    if (mode !== 'subject') return { subjectId: null };
+    if (!uuidOr(subjectId)) return { error: 'Attendance is taken subject-wise — choose the subject' };
+    const subject = await Subject.findOne({ _id: subjectId, school: req.schoolId }).select('_id').lean();
+    return subject ? { subjectId: String(subject._id) } : { error: 'Subject not found' };
+}
+
 /** Group resolved marks by section and write each register. */
-async function writeMarks(req, day, marks) {
+async function writeMarks(req, day, marks, subjectId = null) {
     const bySection = new Map();
     for (const mk of marks) {
         if (!bySection.has(mk.section)) bySection.set(mk.section, []);
@@ -399,7 +433,7 @@ async function writeMarks(req, day, marks) {
     let changed = 0, saved = 0;
     for (const [sectionId, records] of bySection) {
         const out = await saveSectionMarks({
-            schoolId: req.schoolId, sectionId, date: day, records,
+            schoolId: req.schoolId, sectionId, subjectId, date: day, records,
             actor: { userId: req.userId, role: req.userRole },
         });
         changed += out.changed.length;
@@ -415,6 +449,8 @@ exports.mark = async (req, res) => {
         const input = Array.isArray(req.body.records) ? req.body.records : [];
         if (!input.length) return err(res, 'records are required', 400);
         if (input.length > 5000) return err(res, 'Too many records in one request', 400);
+        const reg = await registerSubject(req, req.body.subject);
+        if (reg.error) return err(res, reg.error, 400);
 
         const studentIds = [...new Set(input.map((r) => uuidOr(r.studentId)).filter(Boolean))];
         const profiles = await StudentProfile.find({ user: { $in: studentIds }, school: req.schoolId })
@@ -444,13 +480,13 @@ exports.mark = async (req, res) => {
             const holds     = section && (
                 String(profile?.currentSection || '') === wanted
                 || (section.enrolledStudents || []).map(String).includes(studentId));
-            if (!status)  refused.push({ studentId: r.studentId, reason: 'status must be present, absent or late' });
+            if (!status)  refused.push({ studentId: r.studentId, reason: 'status must be present, absent, late or half-day' });
             else if (!profile || !holds) refused.push({ studentId: r.studentId, reason: 'Student is not in that section' });
             else marks.push({ studentId, section: wanted, status });
         }
         if (!marks.length) return err(res, refused[0]?.reason || 'Nothing to mark', 400);
 
-        const out = await writeMarks(req, day, marks);
+        const out = await writeMarks(req, day, marks, reg.subjectId);
         ok(res, { ...out, refused, date: day });
     } catch (e) { err(res, e); }
 };
@@ -465,7 +501,12 @@ exports.markAll = async (req, res) => {
         const { day, error } = markableDay(req.body.date);
         if (error) return err(res, error, 400);
         const status = capStatus(req.body.status);
-        if (!status) return err(res, 'status must be present, absent or late', 400);
+        if (!status) return err(res, 'status must be present, absent, late or half-day', 400);
+        // Subject-wise, "everyone unmarked" only means something for one subject
+        // register of one section.
+        const reg = await registerSubject(req, req.body.subject);
+        if (reg.error) return err(res, reg.error, 400);
+        if (reg.subjectId && !uuidOr(req.body.section)) return err(res, 'Choose a section and subject to mark', 400);
 
         const years = await schoolYears(req.schoolId);
         const year  = pickYear(years, { day });
@@ -475,10 +516,11 @@ exports.markAll = async (req, res) => {
             sectionId: uuidOr(req.body.section),
             search:    req.body.search,
             status:    'unmarked',
+            register:  reg.subjectId ? reg.subjectId : '',
         });
         if (!rows.length) return ok(res, { saved: 0, changed: 0, sections: 0, date: day });
 
-        const out = await writeMarks(req, day, rows.map((s) => ({ studentId: s._id, section: s.section, status })));
+        const out = await writeMarks(req, day, rows.map((s) => ({ studentId: s._id, section: s.section, status })), reg.subjectId);
         ok(res, { ...out, date: day });
     } catch (e) { err(res, e); }
 };
@@ -499,11 +541,22 @@ exports.register = async (req, res) => {
             .select('_id sectionName class academicYear classTeacher').lean();
         if (!section) return err(res, 'Section not found', 404);
 
+        // Subject-wise, the dialog edits one subject's register: the one asked
+        // for, else the first subject of the section.
+        const mode = await sa.registrationMode(req.schoolId);
+        const subjects = mode === 'subject' ? await officeSectionSubjects(req.schoolId, sectionId) : [];
+        const subject = mode === 'subject'
+            ? (subjects.find((x) => x._id === uuidOr(req.query.subject)) || subjects[0] || null)
+            : null;
+
         const [klass, teacher, session, result, holidays] = await Promise.all([
             Class.findById(section.class).select('className').lean(),
             section.classTeacher ? User.findById(section.classTeacher).select('name').lean() : null,
-            Attendance.findOne({ section: sectionId, date: { $gte: keyDate(day), $lt: keyDate(addDays(day, 1)) } }).lean(),
-            studentDay({ schoolId: req.schoolId, yearId: section.academicYear, sectionId, day }),
+            Attendance.findOne({
+                section: sectionId, date: { $gte: keyDate(day), $lt: keyDate(addDays(day, 1)) },
+                subject: subject ? subject._id : null,
+            }).lean(),
+            studentDay({ schoolId: req.schoolId, yearId: section.academicYear, sectionId, day, register: subject ? subject._id : '' }),
             Holiday.find({ school: req.schoolId, startDate: { $lte: new Date(`${day}T23:59:59.999Z`) }, endDate: { $gte: keyDate(day) } })
                 .select('name applicability').lean().catch(() => []),
         ]);
@@ -533,6 +586,7 @@ exports.register = async (req, res) => {
             counts:   result.counts,
             holiday,
             sunday:   keyDate(day).getUTCDay() === 0,
+            mode, subjects, subject,
         });
     } catch (e) { err(res, e); }
 };
@@ -570,14 +624,16 @@ exports.activity = async (req, res) => {
                      ORDER BY a."createdAt" DESC LIMIT $2
                  )
                  SELECT a."_id", a."section", a."date", a."createdAt" AS "at", cs."sectionName", c."className", u."name" AS "by",
+                        sj."subjectName",
                         count(r."_id")::int AS "count",
                         count(r."_id") FILTER (WHERE r."status" = 'Absent')::int AS "absent"
                    FROM recent a
                    JOIN ${T(ClassSection)} cs ON cs."_id" = a."section"
                    JOIN ${T(Class)} c ON c."_id" = cs."class"
                    LEFT JOIN ${T(User)} u ON u."_id" = a."createdBy"
+                   LEFT JOIN ${T(Subject)} sj ON sj."_id" = a."subject"
                    JOIN ${T(AttendanceRecord)} r ON r."attendance" = a."_id"
-                  GROUP BY a."_id", a."section", a."date", a."createdAt", cs."sectionName", c."className", u."name"`,
+                  GROUP BY a."_id", a."section", a."date", a."createdAt", cs."sectionName", c."className", u."name", sj."subjectName"`,
                 [school, limit * 2, since30],
             ),
             pool.query(
@@ -605,15 +661,22 @@ exports.activity = async (req, res) => {
                 [school, limit],
             ),
             pool.query(
-                `WITH recs AS (
+                `WITH marks AS (
                     SELECT r."student", r."status", a."date",
-                           COALESCE(r."markedAt", a."createdAt") AS "at", cs."sectionName", c."className",
-                           row_number() OVER (PARTITION BY r."student" ORDER BY a."date" DESC) AS "rn"
+                           COALESCE(r."markedAt", a."createdAt") AS "at", cs."sectionName", c."className"
                       FROM ${T(AttendanceRecord)} r
                       JOIN ${T(Attendance)} a ON a."_id" = r."attendance"
                       JOIN ${T(ClassSection)} cs ON cs."_id" = a."section"
                       JOIN ${T(Class)} c ON c."_id" = cs."class"
                      WHERE cs."school" = $1 AND a."date" >= $3
+                 ),
+                 -- One status per student per DAY: a subject-wise school keeps
+                 -- several registers a day, and a streak is about days.
+                 recs AS (
+                    SELECT "student", "date", ${rollupSql('"status"')} AS "status", max("at") AS "at",
+                           max("sectionName") AS "sectionName", max("className") AS "className",
+                           row_number() OVER (PARTITION BY "student" ORDER BY "date" DESC) AS "rn"
+                      FROM marks GROUP BY "student", "date"
                  ),
                  runs AS (
                     SELECT "student",
@@ -642,7 +705,8 @@ exports.activity = async (req, res) => {
         const items = [];
         for (const s of marked.rows) {
             items.push({ id: `m-${s._id}`, kind: 'marked', at: s.at, date: dateKey(s.date), section: s.section,
-                className: s.className, sectionName: s.sectionName, count: s.count, absent: s.absent, by: s.by });
+                className: s.className, sectionName: s.sectionName, subjectName: s.subjectName || '',
+                count: s.count, absent: s.absent, by: s.by });
         }
         for (const u of updated.rows) {
             items.push({ id: `u-${u.session}-${new Date(u.at).getTime()}`, kind: 'updated', at: u.at, date: dateKey(u.date), section: u.section,
@@ -708,7 +772,7 @@ exports.reports = async (req, res) => {
         const t = p.$(keyDate(addDays(until < from ? from : until, 1)));
         const withMarks = `WITH ${ctes},
             marks AS (
-                SELECT r."student", r."status", a."date", a."section"
+                SELECT r."student", r."status", a."date", a."section", a."subject"
                   FROM ${T(AttendanceRecord)} r
                   JOIN ${T(Attendance)} a ON a."_id" = r."attendance"
                   JOIN secs ON secs."_id" = a."section"
@@ -718,7 +782,8 @@ exports.reports = async (req, res) => {
             count(m."status")::int AS "total",
             count(m."status") FILTER (WHERE m."status" = 'Present')::int AS "present",
             count(m."status") FILTER (WHERE m."status" = 'Late')::int    AS "late",
-            count(m."status") FILTER (WHERE m."status" = 'Absent')::int  AS "absent"`;
+            count(m."status") FILTER (WHERE m."status" = 'Absent')::int  AS "absent",
+            count(m."status") FILTER (WHERE m."status" = 'Half-Day')::int AS "halfDay"`;
 
         const [trend, sections, students, totals] = await Promise.all([
             pool.query(`${withMarks}
@@ -742,12 +807,13 @@ exports.reports = async (req, res) => {
                  GROUP BY u."_id", u."name", u."profileImage", sp."rollNumber", s."className", s."sectionName"`, p.list),
             pool.query(`${withMarks}
                 SELECT ${tally}, count(DISTINCT m."date")::int AS "days",
-                       count(DISTINCT (m."section", m."date"))::int AS "registers",
+                       count(DISTINCT (m."section", m."date", m."subject"))::int AS "registers",
                        (SELECT count(*) FROM roster)::int AS "students"
                   FROM marks m`, p.list),
         ]);
 
-        const withPct = (row) => ({ ...row, percentage: pctOf(row.present + row.late, row.total) });
+        // Late counts as attended, a half day as half (services/studentAttendance.js).
+        const withPct = (row) => ({ ...row, percentage: pctOf(row.present + row.late + (row.halfDay || 0) * 0.5, row.total) });
 
         // Every bucket in the window, marked or not: an unmarked day is a gap in
         // the chart, never a bar at zero.
@@ -761,7 +827,7 @@ exports.reports = async (req, res) => {
         };
         for (let k = startOf(from), guard = 0; k <= to && guard < 400; guard++) {
             const hit = byKey.get(k);
-            series.push(hit ? { ...withPct(hit), key: k, marked: true } : { key: k, total: 0, present: 0, late: 0, absent: 0, percentage: null, marked: false });
+            series.push(hit ? { ...withPct(hit), key: k, marked: true } : { key: k, total: 0, present: 0, late: 0, absent: 0, halfDay: 0, percentage: null, marked: false });
             if (bucket === 'day') k = addDays(k, 1);
             else if (bucket === 'week') k = addDays(k, 7);
             else { const d = keyDate(k); d.setUTCMonth(d.getUTCMonth() + 1); k = dateKey(d); }
@@ -977,17 +1043,31 @@ exports.personDay = async (req, res) => {
             ? await ClassSection.findOne({ _id: profile.currentSection, school: req.schoolId }).select('_id sectionName class').lean()
             : null;
         const klass   = section ? await Class.findById(section.class).select('className').lean() : null;
-        const session = section
-            ? await Attendance.findOne({ section: section._id, date: { $gte: keyDate(day), $lt: keyDate(addDays(day, 1)) } }).lean()
-            : null;
-        const record  = session ? await AttendanceRecord.findOne({ attendance: session._id, student: userId }).lean() : null;
-        const [by, pending] = await Promise.all([
+        // Every register of the day: one in a day-wise school, one per subject
+        // in a subject-wise one. The day's status is their roll-up.
+        const mode     = await sa.registrationMode(req.schoolId);
+        const sessions = section
+            ? await Attendance.find({ section: section._id, date: { $gte: keyDate(day), $lt: keyDate(addDays(day, 1)) } }).lean()
+            : [];
+        const records  = sessions.length
+            ? await AttendanceRecord.find({ attendance: { $in: sessions.map((x) => x._id) }, student: userId }).lean()
+            : [];
+        const sessionOf = new Map(sessions.map((x) => [String(x._id), x]));
+        const latest = [...records].sort((a, b) =>
+            new Date(b.markedAt || sessionOf.get(String(b.attendance))?.createdAt || 0)
+            - new Date(a.markedAt || sessionOf.get(String(a.attendance))?.createdAt || 0))[0] || null;
+        const session = latest ? sessionOf.get(String(latest.attendance)) : sessions[0] || null;
+        const record  = latest;
+        const [by, pending, subjects] = await Promise.all([
             (record?.markedBy || (record && session?.createdBy))
                 ? User.findById(record.markedBy || session.createdBy).select('name').lean() : null,
             AttendanceCorrection.findOne({
                 student: userId, status: 'Pending', date: { $gte: keyDate(day), $lt: keyDate(addDays(day, 1)) },
             }).select('_id requestedStatus reason createdAt').lean(),
+            section && mode === 'subject' ? officeSectionSubjects(req.schoolId, section._id) : [],
         ]);
+        const nameOf = new Map(subjects.map((x) => [x._id, x.name]));
+        const recordOf = new Map(records.map((r) => [String(r.attendance), r]));
 
         ok(res, {
             kind: 'student', date: day,
@@ -996,12 +1076,69 @@ exports.personDay = async (req, res) => {
                 className: klass?.className || '', sectionName: section?.sectionName || '', rollNumber: profile?.rollNumber || '',
             },
             enrolled: !!section,
-            registerTaken: !!session,
-            status: low(record?.status),
-            remarks: record?.remarks || '',
+            registerTaken: sessions.length > 0,
+            mode,
+            subjects,
+            registers: sessions.map((x) => ({
+                subject: x.subject ? { _id: String(x.subject), name: nameOf.get(String(x.subject)) || 'Subject' } : null,
+                status: sa.lowStatus(recordOf.get(String(x._id))?.status),
+            })),
+            status: sa.lowStatus(sa.rollup(records.map((r) => r.status))),
+            remarks: records.length === 1 ? (record?.remarks || '') : '',
             markedAt: record ? (record.markedAt || session.createdAt) : null,
             markedBy: by?.name || '',
-            pendingRequest: pending ? { ...pending, requestedStatus: low(pending.requestedStatus) } : null,
+            pendingRequest: pending ? { ...pending, requestedStatus: sa.lowStatus(pending.requestedStatus) } : null,
         });
+    } catch (e) { err(res, e); }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GET /admin/attendance/settings      PUT /admin/attendance/settings { registrationMode }
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * How the school registers student attendance — by day or by subject — with
+ * what each kind of register already holds this academic year, so the office
+ * can see what a change affects before making it.
+ */
+exports.settings = async (req, res) => {
+    try {
+        const [school, year] = await Promise.all([
+            School.findById(req.schoolId).select('attendanceSettings leaveSettings').lean(),
+            AcademicYear.findOne({ school: req.schoolId, status: 'active' }).select('yearName startDate endDate').lean(),
+        ]);
+        const p = [String(req.schoolId)];
+        let window = '';
+        if (year) { p.push(year.startDate, new Date(`${dateKey(year.endDate)}T23:59:59.999Z`)); window = 'AND a."date" >= $2 AND a."date" <= $3'; }
+        const { rows: [counts] } = await pool.query(
+            `SELECT count(*) FILTER (WHERE a."subject" IS NULL)::int     AS "day",
+                    count(*) FILTER (WHERE a."subject" IS NOT NULL)::int AS "subject",
+                    max(a."date") FILTER (WHERE a."subject" IS NULL)     AS "lastDay",
+                    max(a."date") FILTER (WHERE a."subject" IS NOT NULL) AS "lastSubject"
+               FROM ${T(Attendance)} a
+               JOIN ${T(ClassSection)} cs ON cs."_id" = a."section"
+              WHERE cs."school" = $1 ${window}`, p);
+        ok(res, {
+            registrationMode: sa.modeOf(school),
+            year: year ? { yearName: year.yearName } : null,
+            registers: {
+                day: counts.day, subject: counts.subject,
+                lastDay: counts.lastDay ? dateKey(counts.lastDay) : null,
+                lastSubject: counts.lastSubject ? dateKey(counts.lastSubject) : null,
+            },
+            saturday: school?.leaveSettings || {},
+        });
+    } catch (e) { err(res, e); }
+};
+
+exports.saveSettings = async (req, res) => {
+    try {
+        const mode = String(req.body.registrationMode || '');
+        if (!sa.MODES.includes(mode)) return err(res, "registrationMode must be 'day' or 'subject'", 400);
+        // Only the school admin changes how the whole school registers: a
+        // teacher holding admin on the module runs attendance, not its policy.
+        if (req.userRole !== 'school_admin') return err(res, 'Only the school admin can change how attendance is registered', 403);
+        await School.findByIdAndUpdate(req.schoolId, { 'attendanceSettings.registrationMode': mode });
+        return exports.settings(req, res);
     } catch (e) { err(res, e); }
 };

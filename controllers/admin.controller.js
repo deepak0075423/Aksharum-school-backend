@@ -544,7 +544,8 @@ async function attendanceTrend(schoolId, days = 7) {
         `SELECT to_char(a."date" AT TIME ZONE 'UTC', 'YYYY-MM-DD')         AS "date",
                 count(*) FILTER (WHERE r."status" = 'Present')::int        AS "present",
                 count(*) FILTER (WHERE r."status" = 'Absent')::int         AS "absent",
-                count(*) FILTER (WHERE r."status" = 'Late')::int           AS "late"
+                count(*) FILTER (WHERE r."status" = 'Late')::int           AS "late",
+                count(*) FILTER (WHERE r."status" = 'Half-Day')::int       AS "halfDay"
            FROM ${qt(AttendanceRecord)} r
            JOIN ${qt(Attendance)}   a ON a."_id" = r."attendance"
            JOIN ${qt(ClassSection)} s ON s."_id" = a."section"
@@ -559,17 +560,18 @@ async function attendanceTrend(schoolId, days = 7) {
         const d = new Date(from);
         d.setUTCDate(from.getUTCDate() + i);
         const key = d.toISOString().slice(0, 10);
-        const hit = byDay.get(key) || { present: 0, absent: 0, late: 0 };
-        const total = hit.present + hit.absent + hit.late;
+        const hit = byDay.get(key) || { present: 0, absent: 0, late: 0, halfDay: 0 };
+        const total = hit.present + hit.absent + hit.late + hit.halfDay;
         out.push({
             date:       key,
             weekday:    d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }),
             present:    hit.present,
             absent:     hit.absent,
             late:       hit.late,
+            halfDay:    hit.halfDay,
             total,
-            // Late still counts as attended — the same rule the section reports use.
-            percentage: total ? Math.round(((hit.present + hit.late) / total) * 100) : 0,
+            // Late counts as attended, a half day as half — services/studentAttendance.js.
+            percentage: total ? Math.round(((hit.present + hit.late + hit.halfDay * 0.5) / total) * 100) : 0,
             marked:     total > 0,
         });
     }

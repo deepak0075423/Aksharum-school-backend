@@ -2,10 +2,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  Writing a section's register for a day.
 //
-//  Two callers take attendance: a class teacher for their own section, and the
+//  Two callers take attendance: a teacher for a register they hold, and the
 //  school office from the admin attendance screen, which can mark any section
 //  and — through "Mark all" — every unmarked student in the school at once.
 //  Both go through here so a register means the same thing whoever wrote it.
+//
+//  A register is one section on one day — and, when the school takes
+//  attendance subject-wise, one subject (services/studentAttendance.js).
 //
 //  Two things this does that the teacher path used to do differently:
 //
@@ -13,9 +16,9 @@
 //     upsert is a find followed by a save; for a whole school that was
 //     thousands of round trips inside one request.
 //
-//   • Only a mark that CHANGED is announced. Saving a register again — to fix
-//     one student — used to re-send the absence notice and the parent email for
-//     every student on it. `markedAt`/`markedBy` move only with the status, so
+//   • Only a mark that CHANGED is announced (services/attendanceNotices.js).
+//     Saving a register again — to fix one student — used to re-send the
+//     absence notice and the parent email for every student on it. `markedAt`/`markedBy` move only with the status, so
 //     they record when the current mark was actually made, which is what the
 //     admin table's "Marked at" column and the activity feed read.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,42 +26,50 @@ const crypto           = require('crypto');
 const pool             = require('../db/pool');
 const Attendance       = require('../models/Attendance');
 const AttendanceRecord = require('../models/AttendanceRecord');
-const StudentProfile   = require('../models/StudentProfile');
-const { notify }       = require('./notifyService');
+const { capStatus }    = require('./studentAttendance');
+const { marksChanged } = require('./attendanceNotices');
 
 const T_SESSION = `"${Attendance.tableName}"`;
 const T_RECORD  = `"${AttendanceRecord.tableName}"`;
 
-const STATUS = { present: 'Present', absent: 'Absent', late: 'Late' };
-/** 'present' → 'Present'; anything unknown → null. */
-const capStatus = (s) => STATUS[String(s || '').toLowerCase()] || null;
-
 /**
- * Upsert one section's marks for one date.
+ * Upsert one register's marks.
  *
  * @param {Object} o
  * @param {String} o.schoolId
  * @param {String} o.sectionId   already checked to belong to the school
+ * @param {String} [o.subjectId] the subject of a subject-wise register; null for a day register
  * @param {String} o.date        'YYYY-MM-DD' (the local calendar day)
- * @param {Array}  o.records     [{ studentId, status: 'Present'|'Absent'|'Late' }]
+ * @param {Array}  o.records     [{ studentId, status: 'Present'|'Absent'|'Late'|'Half-Day', remarks? }]
+ *                               `remarks` undefined leaves a saved remark alone.
  * @param {Object} o.actor       { userId, role, name }
+ * @param {String} [o.note]      why the marks changed (a correction's reason) — added to the notices
  * @returns {Promise<{ session, changed: Array<{student,status,was}>, records: Array }>}
  */
-async function saveSectionMarks({ schoolId, sectionId, date, records, actor }) {
+async function saveSectionMarks({ schoolId, sectionId, subjectId = null, date, records, actor, note = '' }) {
     const day = new Date(`${date}T00:00:00.000Z`);
 
-    // The session row: created once, first writer recorded as its author.
+    // The session row: created once, first writer recorded as its author. The
+    // conflict target is the expression index from db/migrate.js.
     const { rows: [session] } = await pool.query(
-        `INSERT INTO ${T_SESSION} ("_id", "section", "date", "createdBy", "createdAt")
-         VALUES ($1, $2, $3, $4, now())
-         ON CONFLICT ("section", "date") DO UPDATE SET "section" = EXCLUDED."section"
-         RETURNING "_id", "section", "date", "createdBy", "createdAt"`,
-        [crypto.randomUUID(), String(sectionId), day, String(actor.userId)],
+        `INSERT INTO ${T_SESSION} ("_id", "section", "date", "subject", "createdBy", "createdAt")
+         VALUES ($1, $2, $3, $4, $5, now())
+         ON CONFLICT ("section", "date", (COALESCE("subject"::text, ''))) DO UPDATE SET "section" = EXCLUDED."section"
+         RETURNING "_id", "section", "date", "subject", "createdBy", "createdAt"`,
+        [crypto.randomUUID(), String(sectionId), day, subjectId ? String(subjectId) : null, String(actor.userId)],
     );
 
     // Last write wins for a student listed twice in one request.
     const byStudent = new Map();
-    for (const r of records) if (r.studentId && r.status) byStudent.set(String(r.studentId), r.status);
+    const remarkOf  = new Map();
+    for (const r of records) {
+        const status = capStatus(r.status);
+        if (!r.studentId || !status) continue;
+        byStudent.set(String(r.studentId), status);
+        if (r.remarks !== undefined && r.remarks !== null) {
+            remarkOf.set(String(r.studentId), String(r.remarks).trim().slice(0, 300));
+        }
+    }
     const students = [...byStudent.keys()];
     if (!students.length) return { session, changed: [], records: [] };
 
@@ -92,69 +103,28 @@ async function saveSectionMarks({ schoolId, sectionId, date, records, actor }) {
         ],
     );
 
+    // A remark is not a mark: changing one moves neither markedAt nor anything
+    // anyone is told about.
+    if (remarkOf.size) {
+        const ids = [...remarkOf.keys()];
+        await pool.query(
+            `UPDATE ${T_RECORD} r SET "remarks" = i."remarks"
+               FROM unnest($2::uuid[], $3::text[]) AS i("student", "remarks")
+              WHERE r."attendance" = $1 AND r."student" = i."student"
+                AND r."remarks" IS DISTINCT FROM i."remarks"`,
+            [session._id, ids, ids.map((id) => remarkOf.get(id))],
+        );
+    }
+
     const { rows: saved } = await pool.query(
         `SELECT "_id", "attendance", "student", "status", "remarks", "markedAt", "markedBy"
            FROM ${T_RECORD} WHERE "attendance" = $1 AND "student" = ANY($2::uuid[])`,
         [session._id, students],
     );
 
-    if (changed.length) announce({ schoolId, date, changed, actor });
+    // Who is told what — marks, and the alerts they cross — is attendanceNotices.
+    if (changed.length) marksChanged({ schoolId, sectionId, subjectId: session.subject, date, changed, actor, note });
     return { session, changed, records: saved };
-}
-
-/**
- * Tell students and parents about marks that changed. Runs after the response;
- * a mail server that is down must not fail a register.
- */
-function announce({ schoolId, date, changed, actor }) {
-    setImmediate(async () => {
-        try {
-            const User   = require('../models/User');
-            const School = require('../models/School');
-            const { sendAttendanceNotification } = require('../utils/sendEmail');
-
-            const school    = await School.findById(schoolId).select('name').lean();
-            const dateLabel = new Date(`${date}T00:00:00.000Z`)
-                .toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
-
-            const profiles = await StudentProfile.find({ user: { $in: changed.map((c) => String(c.student)) } })
-                .populate('user', 'name').lean();
-            const profileOf = new Map(profiles.map((p) => [String(p.user?._id || p.user), p]));
-            const parentIds = [...new Set(profiles.map((p) => p.parent).filter(Boolean).map(String))];
-            const parents   = parentIds.length
-                ? await User.find({ _id: { $in: parentIds } }).select('name email').lean()
-                : [];
-            const parentOf  = new Map(parents.map((u) => [String(u._id), u]));
-
-            for (const c of changed) {
-                const sp   = profileOf.get(String(c.student));
-                const name = sp?.user?.name || 'Student';
-                if (c.status !== 'Present') {
-                    notify({
-                        school:     schoolId,
-                        sender:     actor.userId,
-                        senderRole: actor.role || 'teacher',
-                        title:      `Attendance: ${name} marked ${c.status}`,
-                        body:       `${name} was marked ${c.status.toLowerCase()} on ${dateLabel}.`,
-                        recipients: [String(c.student), ...(sp?.parent ? [String(sp.parent)] : [])],
-                        // No id: the student's own calendar has no row keyed by a record
-                        link:       { type: 'attendance.student' },
-                    });
-                }
-                const parent = sp?.parent && parentOf.get(String(sp.parent));
-                if (!parent?.email) continue;
-                await sendAttendanceNotification({
-                    to: parent.email,
-                    parentName: parent.name,
-                    studentName: sp.user?.name || '',
-                    date: new Date(`${date}T00:00:00.000Z`),
-                    status: c.status,
-                    schoolName: school?.name || '',
-                    schoolId,
-                });
-            }
-        } catch (e) { console.error('Attendance notification error:', e.message); }
-    });
 }
 
 module.exports = { saveSectionMarks, capStatus };

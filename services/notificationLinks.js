@@ -74,8 +74,23 @@ const ROUTES = {
         teacher:      { web: '/teacher/attendance?tab=mine',    mobile: '/modules/teacher-attendance?tab=mine' },
     },
     'attendance.corrections': {
-        teacher:      { web: '/teacher/attendance?tab=correct', mobile: '/modules/teacher-attendance?tab=corrections' },
+        teacher:      { web: '/teacher/attendance?tab=corrections', mobile: '/modules/teacher-attendance?tab=corrections' },
         school_admin: { web: '/admin/attendance?tab=requests',  mobile: '/modules/admin/attendance?tab=requests' },
+    },
+    // A student's own correction request — answered, or asked about.
+    'attendance.myCorrection': {
+        student:      { web: '/student/attendance?tab=requests', mobile: '/modules/attendance' },
+        parent:       { web: '/parent/child-attendance?tab=requests', mobile: '/modules/attendance' },
+    },
+    // An alert about a student — absent days in a row, attendance under the
+    // minimum. The teachers told are the class and vice class teacher; their
+    // ranking tab opens on the section (`params.section`) with the student
+    // flagged. Parents open on the child (`params.child`).
+    'attendance.alert': {
+        student:      { web: '/student/attendance',            mobile: '/modules/attendance' },
+        parent:       { web: '/parent/child-attendance',       mobile: '/modules/attendance' },
+        teacher:      { web: '/teacher/attendance?tab=ranking', mobile: '/modules/teacher-attendance?tab=ranking' },
+        school_admin: { web: '/admin/attendance?tab=reports',  mobile: '/modules/admin/attendance' },
     },
     'attendance.student': {
         student:      { web: '/student/attendance',      mobile: '/modules/attendance' },
@@ -465,7 +480,7 @@ const MODULE_LABELS = {
 // should still be visible after a filter down to "High".
 const HIGH_TYPES = [
     'leave.approvals', 'compoff.approvals',
-    'attendance.regularizations', 'attendance.corrections',
+    'attendance.regularizations', 'attendance.corrections', 'attendance.alert',
     'inventory.requests', 'transport.requests', 'video.approvals',
     'feedback.pending', 'feedback.form',
     'fees.mine', 'library.myfines', 'library.manage.fines', 'library.fines',

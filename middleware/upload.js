@@ -68,4 +68,7 @@ const uploadStudentDoc = multer({ storage: diskStorage('student-docs'), fileFilt
 // photos, incident/complaint attachments.
 const uploadHostelDoc = multer({ storage: diskStorage('hostel-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
-module.exports = { uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
+// Evidence for an attendance correction — a medical certificate, a note from home.
+const uploadAttendanceDoc = multer({ storage: diskStorage('attendance-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024, files: 3 } });
+
+module.exports = { uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

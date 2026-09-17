@@ -166,6 +166,10 @@ function classify(inputs, { userId, role, since = null }, from, to) {
                 entry.status   = 'present';
                 entry.checkIn  = rec.checkIn || '';
                 entry.checkOut = rec.checkOut || '';
+                // How the day came to be recorded: clocked by the teacher, or
+                // written by an approved or direct regularization.
+                entry.remarks  = rec.remarks || '';
+                entry.source   = /^Regulari[sz]ed/i.test(rec.remarks || '') ? 'regularized' : 'clock';
                 summary.present++;
             } else if (leave) {
                 entry.status = leave.leaveMode === 'half_day' ? 'half-day' : 'leave';
@@ -227,6 +231,6 @@ async function staffDays({ schoolId, userId, role, since = null }, from, to) {
 }
 
 module.exports = {
-    localToday, keyDate, dateKey, addDays,
+    localToday, keyDate, dateKey, addDays, saturdayWorking, covers,
     loadInputs, classify, staffDays, percentOf, startDates,
 };

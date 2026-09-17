@@ -70,4 +70,40 @@ async function childCards(parentUserId, schoolId) {
     });
 }
 
-module.exports = { childrenOf, childCards };
+/**
+ * The other direction: every active parent of these students, by both links —
+ * the student profile's `parent` pointer and any parent profile listing the
+ * student among its `children`. A notice about a child reaches every parent
+ * the school knows, not only the one the admission form happened to record.
+ *
+ * @returns {Promise<Map<studentId, string[]>>}
+ */
+async function parentsOf(studentIds, schoolId) {
+    const pool = require('../db/pool');
+    const ids = [...new Set((studentIds || []).map(String).filter(Boolean))];
+    const out = new Map(ids.map((id) => [id, []]));
+    if (!ids.length) return out;
+    const T = (M) => `"${M.tableName}"`;
+    const { rows } = await pool.query(
+        `WITH links AS (
+            SELECT sp."user"::text AS "student", sp."parent" AS "parent"
+              FROM ${T(StudentProfile)} sp
+             WHERE sp."user" = ANY($1::uuid[]) AND sp."parent" IS NOT NULL
+            UNION
+            SELECT e.id AS "student", pp."user" AS "parent"
+              FROM ${T(ParentProfile)} pp
+             CROSS JOIN LATERAL jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(pp."children") = 'array' THEN pp."children" ELSE '[]'::jsonb END) AS e(id)
+             WHERE e.id = ANY($2::text[])
+         )
+         SELECT DISTINCT l."student", u."_id"::text AS "parent"
+           FROM links l
+           JOIN ${T(User)} u ON u."_id" = l."parent"
+                AND u."role" = 'parent' AND u."school" = $3 AND u."isActive" IS NOT FALSE`,
+        [ids, ids, String(schoolId)],
+    );
+    for (const r of rows) out.get(r.student)?.push(r.parent);
+    return out;
+}
+
+module.exports = { childrenOf, childCards, parentsOf };

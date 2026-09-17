@@ -13,7 +13,8 @@ const AttendanceRecordSchema = new db.Schema({
     },
     status: {
         type: String,
-        enum: ['Present', 'Absent', 'Late'],
+        // Half-Day counts as half a day attended — services/studentAttendance.js
+        enum: ['Present', 'Absent', 'Late', 'Half-Day'],
         required: true,
     },
     remarks: {

@@ -21,17 +21,21 @@ const AttendanceRecord = require('../models/AttendanceRecord');
 const AptitudeExam     = require('../models/AptitudeExam');
 const FormalExam       = require('../models/FormalExam');
 const FormalResult     = require('../models/FormalResult');
+const sa               = require('./studentAttendance');
 
-/** Late still counts as attended — the same rule the section reports use. */
-const ATTENDED = ['Present', 'Late'];
-
+/**
+ * Late counts as attended and a half day as half — services/studentAttendance.
+ * `present` is full attendance (Present + Late); in a subject-wise school each
+ * subject register is one mark.
+ */
 const tally = (records) => {
-    const present = records.filter((r) => ATTENDED.includes(r.status)).length;
+    const t = sa.tally(records.map((r) => r.status));
     return {
-        total:      records.length,
-        present,
-        absent:     records.length - present,
-        percentage: records.length ? Math.round((present / records.length) * 100) : 0,
+        total:      t.total,
+        present:    t.present,
+        absent:     t.absent,
+        halfDay:    t.halfDay,
+        percentage: t.percentage ?? 0,
     };
 };
 

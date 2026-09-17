@@ -1,13 +1,10 @@
 'use strict';
 const ClassSection        = require('../models/ClassSection');
-const Attendance          = require('../models/Attendance');
 const ClassAnnouncement   = require('../models/ClassAnnouncement');
 const ClassMonitor        = require('../models/ClassMonitor');
 const StudentProfile      = require('../models/StudentProfile');
 const { notify, withParents } = require('../services/notifyService');
-const { saveSectionMarks } = require('../services/attendanceMarks');
 const { ownSections, NOT_ASSIGNED } = require('../services/teacherOwnSections');
-const AttendanceRecord    = require('../models/AttendanceRecord');
 
 const ok  = (res, d, s=200) => res.status(s).json({ success: true, data: d });
 const err = (res, e, s=500) => res.status(s).json({ success: false, message: e.message||e });
@@ -380,86 +377,9 @@ exports.removeMonitor = async (req, res) => {
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };
-// Attendance statuses are stored capitalized ('Present'|'Absent'|'Late') but the
-// frontend works in lowercase — normalize at this boundary in both directions.
-const CAP_STATUS = { present: 'Present', absent: 'Absent', late: 'Late' };
-const capStatus  = (s) => CAP_STATUS[String(s || '').toLowerCase()] || 'Absent';
-
-// Daily attendance belongs to the section, so only the two roles that own the
-// section can mark it. A subject teacher sees the class for one period and is
-// not who the day is recorded by.
-const MARKS_ATTENDANCE = ['classTeacher', 'vice'];
-
-exports.getAttendance = async (req, res) => {
-    try {
-        const { date } = req.query;
-        const rows      = await attachedSections(req);
-        const markable  = rows.filter((s) => MARKS_ATTENDANCE.includes(s.role));
-        const mySection = pickSection(rows, req.query.section, MARKS_ATTENDANCE);
-        // Every section this teacher may mark travels with the answer, so the
-        // page can offer the choice instead of silently marking the first one.
-        const sections  = await labelSections(req, markable);
-
-        // No section → no students. Guard against find({ currentSection: undefined })
-        // which would match all rows and leak the whole school.
-        if (!mySection) {
-            return ok(res, {
-                students: [], records: [], sections, section: null,
-                ...(req.query.section ? { refused: 'You do not take attendance for that section' } : {}),
-            });
-        }
-
-        const students = await StudentProfile.find({ currentSection: mySection._id })
-            .populate('user','name').lean();
-
-        let records = [];
-        if (date) {
-            const attendanceDate = new Date(date + 'T00:00:00.000Z');
-            const session = await Attendance.findOne({ section: mySection._id, date: attendanceDate }).lean();
-            if (session) {
-                const recs = await AttendanceRecord.find({ attendance: session._id }).lean();
-                records = recs.map(r => ({ ...r, status: String(r.status || '').toLowerCase() }));
-            }
-        }
-        ok(res, {
-            students, records, sections,
-            section: sections.find((x) => String(x._id) === String(mySection._id)) || null,
-        });
-    } catch (e) { err(res, e); }
-};
-
-exports.markAttendance = async (req, res) => {
-    try {
-        const { date, records } = req.body;
-        if (!date || !Array.isArray(records)) return err(res, 'date and records are required', 400);
-
-        const rows      = await attachedSections(req);
-        const wanted    = req.body.section || req.body.sectionId;
-        const mySection = pickSection(rows, wanted, MARKS_ATTENDANCE);
-        if (!mySection) {
-            return err(res, wanted
-                ? 'You do not take attendance for that section'
-                : 'No section assigned to you', 403);
-        }
-
-        // A register is one calendar day. The frontend sends 'YYYY-MM-DD'; the
-        // service stores it at UTC midnight so the unique (section,date) index
-        // behaves, and announces only the marks that changed.
-        const day = String(date).slice(0, 10);
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return err(res, 'date must be YYYY-MM-DD', 400);
-        const { records: saved } = await saveSectionMarks({
-            schoolId:  req.schoolId,
-            sectionId: mySection._id,
-            date:      day,
-            // Unknown statuses have always been recorded as absent here.
-            records:   records.map((r) => ({ studentId: r.studentId, status: capStatus(r.status) })),
-            actor:     { userId: req.userId, role: req.userRole || 'teacher' },
-        });
-        saved.forEach((r) => { r.status = String(r.status || '').toLowerCase(); });
-
-        ok(res, saved);
-    } catch (e) { err(res, e); }
-};
+// The register handlers (GET /teacher/attendance, POST /teacher/attendance/mark)
+// live in teacherAttendance.controller.js, where who may take which register —
+// day-wise or subject-wise — is decided by services/attendanceScope.js.
 
 // ── Teacher: all sections I'm attached to (class teacher / substitute / subject) ──
 exports.getMySections = async (req, res) => {

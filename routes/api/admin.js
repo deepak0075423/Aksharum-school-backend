@@ -321,6 +321,8 @@ router.get('/attendance/register',  attendanceGuard, attendanceAdmin.register);
 router.get('/attendance/reports',   attendanceGuard, attendanceAdmin.reports);
 router.post('/attendance/mark',     attendanceGuard, attendanceAdmin.mark);
 router.post('/attendance/mark-all', attendanceGuard, attendanceAdmin.markAll);
+router.get('/attendance/settings',  attendanceGuard, attendanceAdmin.settings);
+router.put('/attendance/settings',  attendanceGuard, attendanceAdmin.saveSettings);
 router.get('/regularization-requests',         attendanceGuard, attendanceAdmin.requests);
 router.post('/regularization-requests/review', attendanceGuard, attendanceCtrl.adminReviewRegularization);
 

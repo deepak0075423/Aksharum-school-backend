@@ -3,6 +3,7 @@ const express        = require('express');
 const router         = express.Router();
 const teacherCtrl    = require('../../controllers/teacher.controller');
 const sectionCtrl    = require('../../controllers/section.controller');
+const teacherAtt     = require('../../controllers/teacherAttendance.controller');
 const attendanceCtrl = require('../../controllers/attendance.controller');
 const timetableCtrl  = require('../../controllers/timetable.controller');
 const substituteCtrl = require('../../controllers/substitute.controller');
@@ -49,8 +50,14 @@ router.post('/monitors/assign',        guard, sectionCtrl.assignMonitor);
 router.delete('/monitors/:id',         guard, sectionCtrl.removeMonitor);
 
 // ── Student Attendance ────────────────────────────────────────────────────────
-router.get('/attendance',              attendanceGuard, sectionCtrl.getAttendance);
-router.post('/attendance/mark',        attendanceGuard, sectionCtrl.markAttendance);
+router.get('/attendance',              attendanceGuard, teacherAtt.register);
+router.post('/attendance/mark',        attendanceGuard, teacherAtt.mark);
+router.get('/attendance/calendar',     attendanceGuard, teacherAtt.calendar);
+router.get('/attendance/recent',       attendanceGuard, teacherAtt.recent);
+router.get('/attendance/ranking',      attendanceGuard, teacherAtt.ranking);
+router.get('/attendance/corrections',  attendanceGuard, teacherAtt.corrections);
+router.post('/attendance/corrections', attendanceGuard, teacherAtt.createCorrection);
+router.post('/attendance/corrections/:id/request-info', attendanceGuard, teacherAtt.requestInfo);
 
 // ── Teacher Self Attendance ───────────────────────────────────────────────────
 router.get('/my-attendance',           attendanceGuard, attendanceCtrl.getTeacherSelfAttendance);
@@ -67,8 +74,8 @@ router.get('/attendance-dashboard',    attendanceGuard, attendanceCtrl.getAttend
 router.get('/students/:studentId/attendance', attendanceGuard, attendanceCtrl.getStudentProfile);
 
 // ── Correction Requests ───────────────────────────────────────────────────────
-router.get('/correction-requests',     attendanceGuard, attendanceCtrl.getCorrectionRequests);
-router.post('/correction-requests/review', attendanceGuard, attendanceCtrl.reviewCorrection);
+router.get('/correction-requests',     attendanceGuard, teacherAtt.correctionsList);
+router.post('/correction-requests/review', attendanceGuard, teacherAtt.review);
 
 // ── Timetable ─────────────────────────────────────────────────────────────────
 router.get('/timetable',              timetableGuard, timetableCtrl.teacherViewTimetable);

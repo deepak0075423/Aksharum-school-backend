@@ -7,6 +7,9 @@ const AttendanceCorrection = require('../models/AttendanceCorrection');
 const StudentProfile   = require('../models/StudentProfile');
 const ClassSection     = require('../models/ClassSection');
 const { notify, schoolAdminIds } = require('../services/notifyService');
+const sa = require('../services/studentAttendance');
+const notices = require('../services/attendanceNotices');
+const { forStudent: studentCorrectionsOut } = require('../services/attendanceCorrections');
 
 const fmtDay = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 
@@ -16,7 +19,8 @@ const err = (res, e, s=500) => res.status(s).json({ success: false, message: e.m
 // Statuses are stored capitalized; the frontend uses lowercase — normalize here.
 const low = (s) => String(s || '').toLowerCase();
 const capReview  = (s) => (low(s) === 'approved' ? 'Approved' : low(s) === 'rejected' ? 'Rejected' : null);
-const capRecord  = (s) => ({ present: 'Present', absent: 'Absent', late: 'Late' }[low(s)] || null);
+// Student marks: Present | Absent | Late | Half-Day (services/studentAttendance.js)
+const capRecord  = (s) => sa.capStatus(s);
 const capTeacher = (s) => ({ present: 'Present', absent: 'Absent', 'half-day': 'Half-Day', leave: 'Leave' }[low(s)] || 'Present');
 
 const dayRange = (dateStr) => {
@@ -46,7 +50,9 @@ const teacherSection = (req) => ClassSection.findOne({
     $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
 }).lean();
 
-// Fetch a student's attendance records for a month via section sessions
+// A student's attendance for a month, one row per day. A day holding several
+// registers (a subject-wise school) is rolled up and carries the registers
+// behind it — services/studentAttendance.rollupByDay.
 async function studentMonthRecords(studentId, schoolId, month, year) {
     const profile = await StudentProfile.findOne({ user: studentId, school: schoolId }).lean();
     if (!profile?.currentSection) return [];
@@ -63,15 +69,23 @@ async function studentMonthRecords(studentId, schoolId, month, year) {
         student: studentId,
     }).lean();
     const byId = Object.fromEntries(records.map(r => [String(r.attendance), r]));
+    const subjectIds = [...new Set(sessions.map(s => s.subject).filter(Boolean).map(String))];
+    const names = subjectIds.length
+        ? new Map((await require('../models/Subject').find({ _id: { $in: subjectIds } }).select('subjectName').lean())
+            .map(x => [String(x._id), x.subjectName]))
+        : new Map();
 
-    return sessions
+    return sa.rollupByDay(sessions
         .filter(s => byId[String(s._id)])
         .map(s => ({
-            _id:     byId[String(s._id)]._id,
-            date:    s.date,
-            status:  low(byId[String(s._id)].status),
-            remarks: byId[String(s._id)].remarks || '',
-        }));
+            _id:         byId[String(s._id)]._id,
+            attendance:  s._id,
+            date:        s.date,
+            subject:     s.subject || null,
+            subjectName: s.subject ? names.get(String(s.subject)) : '',
+            status:      byId[String(s._id)].status,
+            remarks:     byId[String(s._id)].remarks || '',
+        })));
 }
 
 // ── Admin: teacher attendance regularization ─────────────────────────────────
@@ -224,14 +238,17 @@ exports.adminSearchPeople = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
-// Admin: directly set a student's attendance status for a given day (no request)
+// Admin: directly set a student's attendance status for a given day (no request).
+// In a subject-wise school the mark belongs to one subject's register: `subject`
+// names it. Without one, the day register is used — which is also where a
+// school that has always registered by day keeps its marks.
 exports.adminRegularizeStudent = async (req, res) => {
     try {
         const { studentId, date, status, remarks } = req.body;
         if (!studentId || !date || !status)
             return err(res, 'studentId, date and status are required', 400);
         const requested = capRecord(status);
-        if (!requested) return err(res, 'status must be present, absent or late', 400);
+        if (!requested) return err(res, 'status must be present, absent, late or half-day', 400);
 
         const dateStr = new Date(date).toISOString().split('T')[0];
         if (dateStr > todayStr()) return err(res, 'Cannot regularise a future date', 400);
@@ -240,14 +257,26 @@ exports.adminRegularizeStudent = async (req, res) => {
             .select('currentSection').lean();
         if (!profile?.currentSection) return err(res, 'Student is not enrolled in a section', 404);
 
+        const mode = await sa.registrationMode(req.schoolId);
+        let subjectId = null;
+        if (req.body.subject) {
+            const Subject = require('../models/Subject');
+            const subject = await Subject.findOne({ _id: req.body.subject, school: req.schoolId }).select('_id').lean();
+            if (!subject) return err(res, 'Subject not found', 404);
+            subjectId = subject._id;
+        } else if (mode === 'subject') {
+            return err(res, 'Attendance is taken subject-wise — choose the subject register to correct', 400);
+        }
+
         const { start, end } = dayRange(dateStr);
-        // Reuse the day's attendance session, or create one so the record has a parent
+        // Reuse the register, or create one so the record has a parent
         const session = await Attendance.findOneAndUpdate(
-            { section: profile.currentSection, date: { $gte: start, $lte: end } },
-            { $setOnInsert: { section: profile.currentSection, date: new Date(dateStr + 'T00:00:00.000Z'), createdBy: req.userId } },
+            { section: profile.currentSection, date: { $gte: start, $lte: end }, subject: subjectId },
+            { $setOnInsert: { section: profile.currentSection, date: new Date(dateStr + 'T00:00:00.000Z'), subject: subjectId, createdBy: req.userId } },
             { upsert: true, new: true }
         );
 
+        const prior = await AttendanceRecord.findOne({ attendance: session._id, student: studentId }).select('status').lean();
         const rec = await AttendanceRecord.findOneAndUpdate(
             { attendance: session._id, student: studentId },
             { $set: { status: requested, remarks: `Regularized by admin. ${remarks || ''}`.trim(),
@@ -255,7 +284,15 @@ exports.adminRegularizeStudent = async (req, res) => {
               $setOnInsert: { attendance: session._id, student: studentId } },
             { upsert: true, new: true }
         );
-        ok(res, { ...rec.toObject(), status: low(rec.status) });
+        if (prior?.status !== requested) {
+            notices.marksChanged({
+                schoolId: req.schoolId, sectionId: profile.currentSection, subjectId, date: dateStr,
+                changed: [{ student: studentId, status: requested, was: prior?.status || null }],
+                actor: { userId: req.userId, role: req.userRole },
+                note: `Corrected by the school office.${remarks ? ` ${String(remarks).trim()}` : ''}`,
+            });
+        }
+        ok(res, { ...rec.toObject(), status: sa.lowStatus(rec.status) });
     } catch (e) { err(res, e); }
 };
 
@@ -458,18 +495,15 @@ async function computeSectionRanking(sectionId, schoolId) {
 
     const sessions   = await Attendance.find(sessionFilter).select('_id').lean();
     const sessionIds = sessions.map(s => s._id);
-    const total      = sessionIds.length;
 
     const records = sessionIds.length
-        ? await AttendanceRecord.find({ attendance: { $in: sessionIds } }).lean()
+        ? await AttendanceRecord.find({ attendance: { $in: sessionIds } }).select('student status').lean()
         : [];
 
-    const byStudent = {};
-    for (const r of records) {
-        const k = String(r.student);
-        byStudent[k] = byStudent[k] || { present: 0 };
-        if (['Present', 'Late'].includes(r.status)) byStudent[k].present += 1;
-    }
+    // Each student over their own marks, Half-Day as half — the rule every
+    // attendance figure uses (services/studentAttendance.js).
+    const marksOf = {};
+    for (const r of records) (marksOf[String(r.student)] = marksOf[String(r.student)] || []).push(r.status);
 
     const ids = section.enrolledStudents || [];
     const [students, profiles] = await Promise.all([
@@ -479,11 +513,10 @@ async function computeSectionRanking(sectionId, schoolId) {
     const rollById = Object.fromEntries(profiles.map(p => [String(p.user), p.rollNumber]));
 
     const list = students.map(s => {
-        const st  = byStudent[String(s._id)] || { present: 0 };
-        const pct = total ? Math.round((st.present / total) * 100) : 0;
+        const t = sa.tally(marksOf[String(s._id)] || []);
         return {
             student: { _id: s._id, name: s.name, rollNumber: rollById[String(s._id)] || '' },
-            present: st.present, total, percentage: pct,
+            present: t.attended, total: t.total, halfDay: t.halfDay, percentage: t.percentage ?? 0,
         };
     });
 
@@ -535,21 +568,15 @@ exports.getAttendanceDashboard = async (req, res) => {
             ? await AttendanceRecord.find({ attendance: { $in: sessionIds } }).lean()
             : [];
 
-        const byStudent = {};
-        for (const r of records) {
-            const k = String(r.student);
-            byStudent[k] = byStudent[k] || { present: 0, absent: 0, late: 0 };
-            const s = low(r.status);
-            if (byStudent[k][s] !== undefined) byStudent[k][s] += 1;
-        }
+        const marksOf = {};
+        for (const r of records) (marksOf[String(r.student)] = marksOf[String(r.student)] || []).push(r.status);
 
         const data = students.map(sp => {
-            const stats = byStudent[String(sp.user?._id)] || { present: 0, absent: 0, late: 0 };
-            const total = stats.present + stats.absent + stats.late;
+            const t = sa.tally(marksOf[String(sp.user?._id)] || []);
             return {
                 student: { _id: sp.user?._id, name: sp.user?.name, rollNumber: sp.rollNumber },
-                ...stats, total,
-                percentage: total ? Math.round(((stats.present + stats.late) / total) * 100) : 0,
+                present: t.present - t.late, absent: t.absent, late: t.late, halfDay: t.halfDay,
+                total: t.total, percentage: t.percentage ?? 0,
             };
         });
         ok(res, { students: data, sessions: sessions.length });
@@ -566,71 +593,7 @@ exports.getStudentProfile = async (req, res) => {
 };
 
 // ── Teacher: student correction requests ──────────────────────────────────────
-
-exports.getCorrectionRequests = async (req, res) => {
-    try {
-        const mySection = await teacherSection(req);
-        if (!mySection) return ok(res, []);
-
-        const requests = await AttendanceCorrection.find({ section: mySection._id })
-            .populate('student', 'name email')
-            .sort({ createdAt: -1 })
-            .lean();
-        ok(res, requests.map(r => ({
-            ...r,
-            status:          low(r.status),
-            currentStatus:   low(r.currentStatus),
-            requestedStatus: low(r.requestedStatus),
-        })));
-    } catch (e) { err(res, e); }
-};
-
-exports.reviewCorrection = async (req, res) => {
-    try {
-        const { id, status, remarks } = req.body;
-        const newStatus = capReview(status);
-        if (!id || !newStatus) return err(res, 'id and status (approved/rejected) are required', 400);
-
-        const mySection = await teacherSection(req);
-        if (!mySection) return err(res, 'Not authorized', 403);
-
-        const correction = await AttendanceCorrection.findOne({
-            _id: id, section: mySection._id, status: 'Pending',
-        });
-        if (!correction) return err(res, 'Request not found or already reviewed', 404);
-
-        correction.status         = newStatus;
-        correction.reviewedBy     = req.userId;
-        correction.reviewedAt     = new Date();
-        correction.teacherRemarks = (remarks || '').trim();
-        await correction.save();
-
-        // Apply the approved status to the actual attendance record
-        if (newStatus === 'Approved') {
-            const remarksText = `Corrected via student request. ${correction.teacherRemarks}`.trim();
-            if (correction.attendanceRecord) {
-                await AttendanceRecord.findByIdAndUpdate(correction.attendanceRecord, {
-                    $set: { status: correction.requestedStatus, remarks: remarksText, markedAt: new Date(), markedBy: req.userId },
-                });
-            } else if (correction.attendance) {
-                await AttendanceRecord.findOneAndUpdate(
-                    { attendance: correction.attendance, student: correction.student },
-                    { $set: { status: correction.requestedStatus, remarks: 'Added via correction request.', markedAt: new Date(), markedBy: req.userId } },
-                    { upsert: true }
-                );
-            }
-        }
-        notify({
-            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-            title: newStatus === 'Approved' ? '✅ Attendance correction approved' : '❌ Attendance correction rejected',
-            body: `Your attendance correction request for ${fmtDay(correction.date)} was ${low(newStatus)}.${correction.teacherRemarks ? `\nRemarks: ${correction.teacherRemarks}` : ''}`,
-            recipients: [correction.student],
-            // No id: the student's attendance page lists days, not corrections
-            link: { type: 'attendance.student' },
-        });
-        ok(res, { ...correction.toObject(), status: low(correction.status) });
-    } catch (e) { err(res, e); }
-};
+// Listing, reviewing and asking about requests: teacherAttendance.controller.js.
 
 // ── Student: calendar & corrections ──────────────────────────────────────────
 
@@ -642,22 +605,70 @@ exports.getStudentAttendanceCalendar = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
+/** Files multer accepted for a correction, as they are stored on it. */
+const correctionFiles = (req) => (req.files || []).map(f => ({
+    name: f.originalname, url: `/uploads/attendance-docs/${f.filename}`,
+    size: f.size, type: f.mimetype, at: new Date().toISOString(), by: String(req.userId),
+}));
+
 exports.getStudentCorrectionForm = async (req, res) => {
     try {
         const requests = await AttendanceCorrection.find({ student: req.userId, school: req.schoolId })
-            .sort({ createdAt: -1 }).limit(20).lean();
-        ok(res, requests.map(r => ({ ...r, status: low(r.status) })));
+            .sort({ createdAt: -1 }).limit(30).lean();
+        ok(res, await studentCorrectionsOut(requests));
     } catch (e) { err(res, e); }
 };
 
+/**
+ * GET /student/attendance/day?date= — the registers of one day and this
+ * student's mark on each: what a correction can be asked about.
+ */
+exports.getStudentAttendanceDay = async (req, res) => {
+    try {
+        const dateStr = String(req.query.date || '').slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return err(res, 'date must be YYYY-MM-DD', 400);
+        const mode = await sa.registrationMode(req.schoolId);
+        const profile = await StudentProfile.findOne({ user: req.userId, school: req.schoolId }).lean();
+        if (!profile?.currentSection) return ok(res, { mode, date: dateStr, registers: [] });
+
+        const { start, end } = dayRange(dateStr);
+        const sessions = await Attendance.find({ section: profile.currentSection, date: { $gte: start, $lte: end } }).lean();
+        const [records, pending] = await Promise.all([
+            sessions.length ? AttendanceRecord.find({ attendance: { $in: sessions.map(s => s._id) }, student: req.userId }).lean() : [],
+            sessions.length ? AttendanceCorrection.find({ attendance: { $in: sessions.map(s => s._id) }, student: req.userId, status: 'Pending' }).select('attendance').lean() : [],
+        ]);
+        const recordOf = new Map(records.map(r => [String(r.attendance), r]));
+        const pendingOn = new Set(pending.map(p => String(p.attendance)));
+        const subjectIds = sessions.map(s => s.subject).filter(Boolean);
+        const names = subjectIds.length
+            ? new Map((await require('../models/Subject').find({ _id: { $in: subjectIds } }).select('subjectName').lean()).map(x => [String(x._id), x.subjectName]))
+            : new Map();
+        ok(res, {
+            mode, date: dateStr,
+            registers: sessions.map(s => ({
+                attendance: s._id,
+                subject: s.subject ? { _id: s.subject, name: names.get(String(s.subject)) || 'Subject' } : null,
+                status: sa.lowStatus(recordOf.get(String(s._id))?.status),
+                pending: pendingOn.has(String(s._id)),
+            })).sort((a, b) => String(a.subject?.name || '').localeCompare(String(b.subject?.name || ''))),
+        });
+    } catch (e) { err(res, e); }
+};
+
+/**
+ * POST /student/correction/submit  (multipart: date, attendance?, requestedStatus, reason, attachments[])
+ *
+ * `attendance` names the register when the day holds more than one (a
+ * subject-wise school); a day with a single register needs only the date.
+ */
 exports.submitStudentCorrection = async (req, res) => {
     try {
         const { date, requestedStatus, reason } = req.body;
-        if (!date || !requestedStatus || !reason)
+        if (!date || !requestedStatus || !String(reason || '').trim())
             return err(res, 'date, requestedStatus and reason are required', 400);
 
         const requested = capRecord(requestedStatus);
-        if (!requested) return err(res, 'requestedStatus must be present, absent or late', 400);
+        if (!requested) return err(res, 'requestedStatus must be present, absent, late or half-day', 400);
 
         // Students may only regularize within the last one month
         const dateStr = new Date(date).toISOString().split('T')[0];
@@ -670,19 +681,32 @@ exports.submitStudentCorrection = async (req, res) => {
         if (!profile?.currentSection) return err(res, 'You are not enrolled in a section', 400);
 
         const { start, end } = dayRange(dateStr);
-
-        const session = await Attendance.findOne({
+        const sessions = await Attendance.find({
             section: profile.currentSection, date: { $gte: start, $lte: end },
         }).lean();
-        if (!session) return err(res, 'No attendance was taken on that date', 400);
+        if (!sessions.length) return err(res, 'No attendance was taken on that date', 400);
+
+        let session;
+        if (req.body.attendance) {
+            session = sessions.find(s => String(s._id) === String(req.body.attendance));
+            if (!session) return err(res, 'That register is not one of yours for this date', 400);
+        } else if (sessions.length === 1) {
+            session = sessions[0];
+        } else {
+            return err(res, 'Attendance was taken for several subjects that day — choose which one to correct', 400);
+        }
 
         const existing = await AttendanceCorrection.findOne({
-            student: req.userId, date: { $gte: start, $lte: end }, status: 'Pending',
+            student: req.userId, attendance: session._id, status: 'Pending',
         }).lean();
-        if (existing) return err(res, 'A pending correction request already exists for this date', 400);
+        if (existing) return err(res, 'A pending correction request already exists for this register', 400);
 
         const record = await AttendanceRecord.findOne({ attendance: session._id, student: req.userId }).lean();
+        if (record?.status === requested) return err(res, `You are already marked ${requested}`, 400);
 
+        const files = correctionFiles(req);
+        const text = String(reason).trim().slice(0, 500);
+        const now = new Date();
         const corr = await AttendanceCorrection.create({
             student: req.userId,
             school:  req.schoolId,
@@ -690,39 +714,108 @@ exports.submitStudentCorrection = async (req, res) => {
             attendance:       session._id,
             attendanceRecord: record?._id || null,
             date:             session.date,
+            subject:          session.subject || null,
             currentStatus:    record?.status || 'Not Marked',
             requestedStatus:  requested,
-            reason: String(reason).trim(),
+            reason: text,
             status: 'Pending',
+            source: 'student',
+            attachments: files,
+            history: [{ event: 'submitted', at: now.toISOString(), by: String(req.userId), byName: req.user?.name || '', role: 'student', message: text, attachments: files.map(f => f.url) }],
+            updatedAt: now,
+            createdAt: now,
         });
-        // Tell the class teacher a correction is waiting
-        ClassSection.findById(session.section).select('classTeacher').lean().then(sec => {
-            if (!sec?.classTeacher) return;
-            notify({
-                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-                title: '📝 New attendance correction request',
-                body: `${req.user?.name || 'A student'} requested a correction for ${fmtDay(session.date)} (${record?.status || 'Not Marked'} → ${requested}).\nReason: ${String(reason).trim()}`,
-                recipients: [sec.classTeacher],
-                link: { type: 'attendance.corrections', entityId: corr._id },
-            });
-        }).catch(() => {});
-        ok(res, { ...corr.toObject(), status: low(corr.status) }, 201);
+
+        // The reviewing teachers, and the student's family, hear of it.
+        notices.correctionSubmitted({ req, correction: corr.toObject ? corr.toObject() : corr });
+        const [out] = await studentCorrectionsOut([corr.toObject ? corr.toObject() : corr]);
+        ok(res, out, 201);
+    } catch (e) { err(res, e); }
+};
+
+/**
+ * POST /student/correction/:id/reply  (multipart: message, attachments[])
+ * Answer a teacher who asked for more — the reply and any files join the trail.
+ */
+exports.replyStudentCorrection = async (req, res) => {
+    try {
+        const message = String(req.body.message || '').trim().slice(0, 500);
+        const files = correctionFiles(req);
+        if (!message && !files.length) return err(res, 'Write a reply or attach a file', 400);
+
+        const corr = await AttendanceCorrection.findOne({ _id: req.params.id, student: req.userId, school: req.schoolId });
+        if (!corr) return err(res, 'Request not found', 404);
+        if (corr.status !== 'Pending') return err(res, 'This request has already been reviewed', 409);
+
+        const now = new Date();
+        corr.attachments = [...(corr.attachments || []), ...files];
+        corr.history = [...(corr.history || []), {
+            event: 'replied', at: now.toISOString(), by: String(req.userId), byName: req.user?.name || '',
+            role: 'student', message, attachments: files.map(f => f.url),
+        }];
+        corr.updatedAt = now;
+        await corr.save();
+
+        notices.correctionReplied({ req, correction: corr.toObject(), message, fileCount: files.length });
+        const [out] = await studentCorrectionsOut([corr.toObject()]);
+        ok(res, out);
     } catch (e) { err(res, e); }
 };
 
 // ── Parent: child calendar ────────────────────────────────────────────────────
 
+/**
+ * The child a parent asks about (`?child=`, or the older `?childId=`), matched
+ * against the parent's own children by both links — never trusted. Without one,
+ * their first child. Returns { child, children }.
+ */
+async function parentChild(req) {
+    const { childCards } = require('../services/parentChildren');
+    const children = await childCards(req.userId, req.schoolId);
+    const wanted = String(req.query.child || req.query.childId || '');
+    const child = children.find((c) => c._id === wanted) || children[0] || null;
+    return { child, children };
+}
+
+/** GET /parent/child-attendance?child=&month=&year= — one month, one row per day (the mobile app). */
 exports.getParentChildAttendance = async (req, res) => {
     try {
-        const ParentProfile = require('../models/ParentProfile');
-        const parent  = await ParentProfile.findOne({ user: req.userId }).lean();
-        const childId = req.query.childId && (parent?.children || []).map(String).includes(String(req.query.childId))
-            ? req.query.childId
-            : (parent?.children?.[0] || parent?.student);
-        if (!childId) return ok(res, []);
-
+        const { child } = await parentChild(req);
+        if (!child) return ok(res, []);
         const { month, year } = req.query;
-        const records = await studentMonthRecords(childId, req.schoolId, +month || null, +year || null);
+        const records = await studentMonthRecords(child._id, req.schoolId, +month || null, +year || null);
         ok(res, records);
+    } catch (e) { err(res, e); }
+};
+
+/** GET /student/attendance/overview?month=YYYY-MM — services/studentAttendanceView.js */
+exports.getStudentAttendanceOverview = async (req, res) => {
+    try {
+        const { attendanceOverview } = require('../services/studentAttendanceView');
+        const data = await attendanceOverview({ schoolId: req.schoolId, studentId: req.userId, month: req.query.month });
+        if (!data) return err(res, 'Student not found', 404);
+        ok(res, data);
+    } catch (e) { err(res, e); }
+};
+
+/** GET /parent/child-attendance/overview?child=&month=YYYY-MM — the same view, for one of the parent's children. */
+exports.getParentChildAttendanceOverview = async (req, res) => {
+    try {
+        const { child, children } = await parentChild(req);
+        if (!child) return ok(res, { children: [], child: null });
+        const { attendanceOverview } = require('../services/studentAttendanceView');
+        const data = await attendanceOverview({ schoolId: req.schoolId, studentId: child._id, month: req.query.month });
+        ok(res, { ...data, children, child });
+    } catch (e) { err(res, e); }
+};
+
+/** GET /parent/child-attendance/requests?child= — the child's correction requests, to read. */
+exports.getParentChildCorrections = async (req, res) => {
+    try {
+        const { child } = await parentChild(req);
+        if (!child) return ok(res, []);
+        const rows = await AttendanceCorrection.find({ student: child._id, school: req.schoolId })
+            .sort({ createdAt: -1 }).limit(50).lean();
+        ok(res, await studentCorrectionsOut(rows));
     } catch (e) { err(res, e); }
 };

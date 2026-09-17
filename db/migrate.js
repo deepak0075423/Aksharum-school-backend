@@ -23,6 +23,20 @@ const STEPS = [
         name: 'users.email: drop platform-wide unique index',
         sql:  'DROP INDEX IF EXISTS "ux_users_email"',
     },
+    {
+        // Attendance registers were one per section per day. A school that takes
+        // attendance subject-wise keeps one per subject per day, so uniqueness
+        // moves to (section, date, subject) — with a day register's null subject
+        // folded to '' so two day registers still collide. Created before the
+        // old index is dropped: the old one already guarantees the new holds.
+        name: 'attendances: unique per section, date and subject',
+        sql:  `CREATE UNIQUE INDEX IF NOT EXISTS "ux_attendances_register"
+                 ON "attendances" ("section", "date", (COALESCE("subject"::text, '')))`,
+    },
+    {
+        name: 'attendances: drop the one-register-per-day unique index',
+        sql:  'DROP INDEX IF EXISTS "ux_attendances_6a938f2e"',
+    },
 ];
 
 async function runMigrations() {

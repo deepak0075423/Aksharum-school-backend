@@ -170,18 +170,22 @@ const sendOtpEmail = async ({ to, name, otp }) => {
 /* ─────────────────────────────────────────────
    ATTENDANCE NOTIFICATION — sent to parents
 ─────────────────────────────────────────────── */
-const sendAttendanceNotification = async ({ to, parentName, studentName, date, status, schoolName, schoolId = null }) => {
+const sendAttendanceNotification = async ({ to, parentName, studentName, date, status, subjectName = '', schoolName, schoolId = null }) => {
     const { school } = await getMailContext(schoolId).catch(() => ({ school: null }));
     const isPresent = status === 'Present';
     const isLate = status === 'Late';
-    const statusColor = isPresent ? '#10b981' : isLate ? '#f59e0b' : '#ef4444';
-    const statusBg = isPresent ? '#d1fae5' : isLate ? '#fef3c7' : '#fee2e2';
-    const statusIcon = isPresent ? '✅' : isLate ? '⏰' : '❌';
+    const isHalf = status === 'Half-Day';
+    const statusColor = isPresent ? '#10b981' : isLate ? '#f59e0b' : isHalf ? '#4f46e5' : '#ef4444';
+    const statusBg = isPresent ? '#d1fae5' : isLate ? '#fef3c7' : isHalf ? '#e0e7ff' : '#fee2e2';
+    const statusIcon = isPresent ? '✅' : isLate ? '⏰' : isHalf ? '🌗' : '❌';
+    const where = subjectName ? ` in <strong>${subjectName}</strong>` : '';
     const message = isPresent
-        ? `Your child is marked <strong>present</strong> today.`
+        ? `Your child is marked <strong>present</strong>${where} today.`
         : isLate
-        ? `Your child is marked as <strong>late</strong> today.`
-        : `Your child is marked <strong>absent</strong> today.`;
+        ? `Your child is marked as <strong>late</strong>${where} today.`
+        : isHalf
+        ? `Your child is marked <strong>half-day</strong>${where} today.`
+        : `Your child is marked <strong>absent</strong>${where} today.`;
 
     const formattedDate = new Date(date).toLocaleDateString('en-IN', {
         weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',

@@ -81,8 +81,8 @@ exports.getDashboard = async (req, res) => {
             let attendance = null;
             if (sp?.currentSection) {
                 const records = recordsBySection.get(`${String(sp.currentSection._id)}:${String(childId)}`) || [];
-                const present = records.filter((r) => ['Present', 'Late'].includes(r.status)).length;
-                attendance = records.length ? Math.round((present / records.length) * 100) : null;
+                // Half-Day as half: services/studentAttendance.js
+                attendance = require('../services/studentAttendance').tally(records.map((r) => r.status)).percentage;
             }
 
             const lastLedger = latestLedgerByKid.get(String(childId)) || null;

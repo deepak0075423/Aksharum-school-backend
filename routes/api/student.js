@@ -13,7 +13,17 @@ const classTestCtrl  = require('../../controllers/classTest.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
-const { uploadDocument } = require('../../middleware/upload');
+const { uploadDocument, uploadAttendanceDoc } = require('../../middleware/upload');
+
+// Up to three files on a correction request or reply. multer's own errors are
+// answers to the student ("too big"), not server faults.
+const correctionFiles = (req, res, next) => uploadAttendanceDoc.array('attachments', 3)(req, res, (e) => {
+    if (!e) return next();
+    const message = e.code === 'LIMIT_FILE_SIZE' ? 'Each file must be 5 MB or smaller'
+        : (e.code === 'LIMIT_FILE_COUNT' || e.code === 'LIMIT_UNEXPECTED_FILE') ? 'Attach at most 3 files'
+        : e.message;
+    res.status(400).json({ success: false, message });
+});
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('student')];
 const attendanceGuard  = [...guard, requireModule('attendance')];
@@ -36,8 +46,11 @@ router.get('/timetable/download', timetableGuard, timetableCtrl.studentDownloadT
 // Attendance
 router.get('/my-attendance',       attendanceGuard, attendanceCtrl.getStudentAttendanceCalendar);
 router.get('/attendance-ranking',  attendanceGuard, attendanceCtrl.getMyClassRanking);
+router.get('/attendance/day',      attendanceGuard, attendanceCtrl.getStudentAttendanceDay);
+router.get('/attendance/overview', attendanceGuard, attendanceCtrl.getStudentAttendanceOverview);
 router.get('/correction',          attendanceGuard, attendanceCtrl.getStudentCorrectionForm);
-router.post('/correction/submit',  attendanceGuard, attendanceCtrl.submitStudentCorrection);
+router.post('/correction/submit',  attendanceGuard, correctionFiles, attendanceCtrl.submitStudentCorrection);
+router.post('/correction/:id/reply', attendanceGuard, correctionFiles, attendanceCtrl.replyStudentCorrection);
 
 // Aptitude Exams
 router.get('/exams',                     examGuard, examCtrl.getStudentExams);
