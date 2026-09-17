@@ -79,8 +79,8 @@ const ROUTES = {
     },
     // A student's own correction request — answered, or asked about.
     'attendance.myCorrection': {
-        student:      { web: '/student/attendance?tab=requests', mobile: '/modules/attendance' },
-        parent:       { web: '/parent/child-attendance?tab=requests', mobile: '/modules/attendance' },
+        student:      { web: '/student/attendance?tab=requests', mobile: '/modules/attendance?tab=requests' },
+        parent:       { web: '/parent/child-attendance?tab=requests', mobile: '/modules/attendance?tab=requests' },
     },
     // An alert about a student — absent days in a row, attendance under the
     // minimum. The teachers told are the class and vice class teacher; their
