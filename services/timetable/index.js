@@ -8,6 +8,7 @@ const engine = require('./engine');
 const validator = require('./validator');
 const dataLoader = require('./dataLoader');
 const constraints = require('./constraints');
+const problems = require('./problems');
 
 module.exports = {
     ...types,
@@ -23,5 +24,7 @@ module.exports = {
     derivePeriods: dataLoader.derivePeriods,
     normalisePeriods: dataLoader.normalisePeriods,
     workingDaysFor: dataLoader.workingDaysFor,
+    explainConflicts: problems.explainConflicts,
+    REMEDIES: problems.REMEDIES,
     constraints,
 };

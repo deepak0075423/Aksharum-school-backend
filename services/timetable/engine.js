@@ -47,6 +47,11 @@ const {
 
 const sid = (v) => (v == null ? null : String(v._id ?? v));
 
+/** [{ dayOfWeek, periodNumber, label }] → Map(day#period → what is already there). */
+const busyMap = (rows) => new Map((rows || []).map((b) => [
+    slotKey(b.dayOfWeek, Number(b.periodNumber)), b.label || 'another class',
+]));
+
 /* ══════════════════════════════════════════════════════════════════════════
    1. COMPILE — turn the raw input into a solver context
    ══════════════════════════════════════════════════════════════════════════ */
@@ -112,12 +117,17 @@ function compile(input) {
     const roomsByType = new Map();
     for (const r of input.rooms || []) {
         const id = sid(r.id ?? r._id);
+        const busy = busyMap(r.busy);
         const room = {
             id,
             name: r.roomName || r.name || 'Room',
             type: r.roomType || 'Classroom',
             capacity: Number(r.capacity) || 0,
-            blocked: new Set((r.unavailable || []).map((u) => slotKey(u.dayOfWeek, Number(u.periodNumber)))),
+            blocked: new Set([
+                ...(r.unavailable || []).map((u) => slotKey(u.dayOfWeek, Number(u.periodNumber))),
+                ...busy.keys(),
+            ]),
+            busy,
             subjectIds: (r.subjects || r.subjectIds || []).length
                 ? new Set((r.subjects || r.subjectIds).map(sid))
                 : null,
@@ -136,10 +146,25 @@ function compile(input) {
     const teachers = new Map();
     for (const t of input.teachers || []) {
         const id = sid(t.id ?? t._id);
+        // Periods this teacher already teaches in a class this run does not
+        // cover. They are as closed as a declared unavailable slot, and they
+        // count towards the teacher's daily and weekly limits.
+        const busy = busyMap(t.busy);
+        const baseDay = new Map();
+        for (const key of busy.keys()) {
+            const day = key.split('#')[0];
+            baseDay.set(day, (baseDay.get(day) || 0) + 1);
+        }
         teachers.set(id, {
             id,
             name: t.name || 'Teacher',
-            blocked: new Set((t.unavailable || []).map((u) => slotKey(u.dayOfWeek, Number(u.periodNumber)))),
+            blocked: new Set([
+                ...(t.unavailable || []).map((u) => slotKey(u.dayOfWeek, Number(u.periodNumber))),
+                ...busy.keys(),
+            ]),
+            busy,
+            baseDay,
+            baseWeek: busy.size,
             maxPerDay: Number(t.maxPeriodsPerDay) || 0,
             maxPerWeek: Number(t.maxPeriodsPerWeek) || 0,
             hardDailyLimit: t.hardDailyLimit !== false,
@@ -191,7 +216,10 @@ function compile(input) {
         if (!section || weekly <= 0) continue;
 
         const subjectType = req.subjectType || 'Theory';
-        const size = Math.max(1, Math.min(Number(req.consecutivePeriods) || 1, 4));
+        // "Keep practicals back-to-back" switched off places lab subjects one
+        // period at a time, whatever their own rule asks for.
+        const blocksOff = options.keepPracticalsConsecutive === false && PRACTICAL_TYPES.has(subjectType);
+        const size = blocksOff ? 1 : Math.max(1, Math.min(Number(req.consecutivePeriods) || 1, 4));
         const teacherOptions = [sid(req.teacherId), ...(req.altTeacherIds || []).map(sid)]
             .filter((id, i, arr) => id && teachers.has(id) && arr.indexOf(id) === i);
 
@@ -319,6 +347,7 @@ function compile(input) {
                 subjectId: lead.subjectId,
                 description: `${lead.subjectName} is merged across ${members.map(label).join(' + ')} but no one teacher is assigned to it in all of them.`,
                 suggestion: 'Assign the same teacher to this subject in every merged section, or pick the teacher on the merge itself.',
+                meta: { sectionIds: members.map((m) => m.sectionId) },
             });
         }
 
@@ -333,6 +362,7 @@ function compile(input) {
                 subjectId: lead.subjectId,
                 description: `${lead.subjectName} is merged across ${members.map(label).join(' + ')} but they ask for different weekly counts (${members.map((m) => m.weeklyPeriods).join(', ')}). Scheduling ${weekly}.`,
                 suggestion: 'Give every merged section the same weekly period count for this subject.',
+                meta: { check: 'section_merge_weekly', counts: members.map((m) => m.weeklyPeriods), scheduled: weekly },
             });
         }
 
@@ -579,7 +609,7 @@ function preflight(ctx) {
                 sectionId,
                 description: `${section.label} needs ${demand} periods/week but only ${capacity} teaching slots exist.`,
                 suggestion: `Reduce weekly periods by ${demand - capacity}, or add periods / working days to this section.`,
-                meta: { demand, capacity },
+                meta: { check: 'section_week', demand, capacity },
             });
         }
     }
@@ -602,7 +632,11 @@ function preflight(ctx) {
                 teacherId: req.teacherOptions[0] || null,
                 description: `${req.subjectName} for ${section.label} requires ${req.weeklyPeriods} periods/week, but at most ${req.maxPerDay} per day across ${usableDays.length} working day(s) allows only ${ceiling}.`,
                 suggestion: `Raise "max per day" to ${Math.ceil(req.weeklyPeriods / Math.max(1, usableDays.length))}, add a working day, or lower the weekly requirement.`,
-                meta: { demand: req.weeklyPeriods, capacity: ceiling },
+                meta: {
+                    check: 'daily_ceiling', demand: req.weeklyPeriods, capacity: ceiling,
+                    maxPerDay: req.maxPerDay, days: usableDays.length,
+                    suggestedPerDay: Math.ceil(req.weeklyPeriods / Math.max(1, usableDays.length)),
+                },
             });
         }
     }
@@ -623,15 +657,26 @@ function preflight(ctx) {
                 if (!t.blocked.has(slotKey(day, p))) free++;
             }
         }
-        const cap = t.maxPerWeek > 0 ? Math.min(free, t.maxPerWeek) : free;
+        // Periods already taught in other classes use up the weekly limit too.
+        const limitLeft = t.maxPerWeek > 0 ? Math.max(0, t.maxPerWeek - (t.baseWeek || 0)) : Infinity;
+        const cap = Math.min(free, limitLeft);
         if (load > cap) {
+            const elsewhere = t.baseWeek || 0;
             conflicts.push({
                 type: CONFLICT_TYPES.WEEKLY_LIMIT_EXCEEDED,
                 severity: SEVERITY.ERROR,
                 teacherId: tid,
-                description: `${t.name} is required for ${load} periods/week but can only teach ${cap}.`,
+                description: `${t.name} is required for ${load} periods/week but can only teach ${cap}${elsewhere ? ` (already teaching ${elsewhere} in other classes)` : ''}.`,
                 suggestion: 'Add an alternate teacher for one of their subjects, widen their availability, or raise their weekly limit.',
-                meta: { load, capacity: cap },
+                meta: {
+                    check: 'teacher_load',
+                    load,
+                    capacity: cap,
+                    free,
+                    weeklyLimit: t.maxPerWeek || 0,
+                    elsewhere,
+                    limitedBy: limitLeft < free ? 'limit' : 'availability',
+                },
             });
         }
     }
@@ -666,7 +711,7 @@ function preflight(ctx) {
                 severity: SEVERITY.ERROR,
                 description: `${bucket.label || 'Special rooms'}: ${bucket.demand} practical periods required but only ${capacity} room-periods available.`,
                 suggestion: 'Add another room of this type or reduce the weekly practical periods.',
-                meta: { demand: bucket.demand, capacity },
+                meta: { check: 'room_supply', demand: bucket.demand, capacity, roomLabel: bucket.label || '' },
             });
         }
     }
@@ -700,7 +745,7 @@ function preflight(ctx) {
                 severity: SEVERITY.ERROR,
                 description: `This plan needs ${demand} teacher-periods a week but the staff can cover ${supply} — about ${shortBy} short.`,
                 suggestion: `Roughly ${Math.ceil(shortBy / Math.max(1, Math.round(supply / Math.max(1, ctx.teachers.size))))} more teacher(s) at current loads, or reduce weekly periods.`,
-                meta: { demand, supply, shortBy, teachers: ctx.teachers.size },
+                meta: { check: 'staff_supply', demand, supply, shortBy, teachers: ctx.teachers.size },
             });
         }
     }
@@ -855,6 +900,8 @@ function runSearch(ctx, seed, pinned) {
 
     // Pinned (manually edited / locked) entries are placed first and never moved.
     const pinnedIds = new Set();
+    // Pins that could not be honoured — reported, never silently lost.
+    const droppedPins = [];
     for (const pin of pinned || []) {
         // A cross-section merge is one block covering several sections, so a pin
         // naming ANY member has to find it — that is how generating 9-B alone
@@ -862,13 +909,22 @@ function runSearch(ctx, seed, pinned) {
         const block = ctx.blocks.find((b) => !pinnedIds.has(b.id)
             && (b.sectionIds || [b.sectionId]).includes(pin.sectionId)
             && b.subjectId === pin.subjectId && b.size === (pin.size || 1));
-        if (!block) continue;
+        if (!block) {
+            droppedPins.push({ ...pin, reason: 'That subject is no longer part of the weekly plan' });
+            continue;
+        }
         const section = ctx.sections.get(block.sectionId);
         const teaching = section?.teachingByDay.get(pin.dayOfWeek) || [];
         const startIdx = teaching.findIndex((s) => s.periodNumber === Number(pin.periodNumber));
-        if (startIdx < 0) continue;
+        if (startIdx < 0) {
+            droppedPins.push({ ...pin, reason: `${pin.dayOfWeek} P${pin.periodNumber} is no longer a teaching period` });
+            continue;
+        }
         const res = checkPlacement(ctx, state, block, pin.dayOfWeek, startIdx);
-        if (!res.ok) continue;
+        if (!res.ok) {
+            droppedPins.push({ ...pin, reason: res.reason || 'The slot is no longer free' });
+            continue;
+        }
         const placement = {
             day: pin.dayOfWeek, startIdx, periods: res.periods,
             teacherId: pin.teacherId || res.teacherId,
@@ -920,7 +976,7 @@ function runSearch(ctx, seed, pinned) {
     // search giving up early.
     const unplaced = ctx.blocks.filter((b) => !state.placements.has(b.id));
     for (const b of ctx.blocks) delete b.unplaced;
-    return { state, unplaced, pinnedIds };
+    return { state, unplaced, pinnedIds, droppedPins };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1058,7 +1114,9 @@ function generate(input, hooks = {}) {
         || ctx.days.indexOf(a.dayOfWeek) - ctx.days.indexOf(b.dayOfWeek)
         || a.periodNumber - b.periodNumber);
 
-    // Anything the search could not place is reported, never silently dropped.
+    // Anything the search could not place is reported, never silently dropped —
+    // together with WHY: every slot the block could have used is re-checked
+    // against the finished grid and the rejections are tallied.
     const shortfall = new Map();
     for (const block of best.unplaced) {
         const key = `${block.sectionId}#${block.subjectId}`;
@@ -1075,9 +1133,49 @@ function generate(input, hooks = {}) {
             teacherId: block.teacherOptions[0] || null,
             description: `${block.mergeLabel || block.subjectName} for ${section?.label || 'section'}: ${periods} period(s) of the weekly requirement could not be placed.`,
             suggestion: 'Free up teacher availability, add an alternate teacher, or lower the weekly period requirement.',
-            meta: { missingPeriods: periods },
+            meta: {
+                check: 'unplaced',
+                missingPeriods: periods,
+                subjectIds: [block.subjectId, ...(block.parallel || []).map((m) => m.subjectId)],
+                mergeLabel: block.mergeLabel || '',
+                sectionIds: block.sectionIds && block.sectionIds.length > 1 ? block.sectionIds : [],
+                ...diagnoseBlock(ctx, best.state, block),
+            },
         };
     });
+
+    // Hand edits and merged lessons pinned from an earlier run that no longer fit.
+    const pinConflicts = [];
+    const droppedManual = (best.droppedPins || []).filter((p) => p.source !== 'merge');
+    const droppedMerge = (best.droppedPins || []).filter((p) => p.source === 'merge');
+    if (droppedManual.length) {
+        pinConflicts.push({
+            type: CONFLICT_TYPES.OTHER,
+            severity: SEVERITY.INFO,
+            description: `${droppedManual.length} hand-made edit(s) from the previous version could not be kept.`,
+            suggestion: 'Check those periods in the grid and place them again by hand if they still matter.',
+            meta: {
+                check: 'dropped_pins',
+                pins: droppedManual.slice(0, 20).map((p) => ({
+                    sectionId: p.sectionId, subjectId: p.subjectId, dayOfWeek: p.dayOfWeek,
+                    periodNumber: Number(p.periodNumber), reason: p.reason,
+                })),
+            },
+        });
+    }
+    for (const p of droppedMerge) {
+        pinConflicts.push({
+            type: CONFLICT_TYPES.MERGE_GROUP_MISMATCH,
+            severity: SEVERITY.WARNING,
+            sectionId: p.sectionId,
+            subjectId: p.subjectId,
+            dayOfWeek: p.dayOfWeek,
+            periodNumber: Number(p.periodNumber),
+            description: `A combined lesson could not be lined up with the section it is shared with at ${p.dayOfWeek} P${p.periodNumber}: ${p.reason}.`,
+            suggestion: 'Generate the combined sections together, or check that the slot is free in this section.',
+            meta: { check: 'merge_pin', reason: p.reason },
+        });
+    }
 
     const stats = buildStats(ctx, best.state, assignments, startedAt, moves, score);
 
@@ -1086,10 +1184,55 @@ function generate(input, hooks = {}) {
     return {
         ctx,
         assignments,
-        conflicts: [...ctx.warnings, ...preflightConflicts, ...shortfallConflicts],
+        conflicts: [...ctx.warnings, ...preflightConflicts, ...shortfallConflicts, ...pinConflicts],
         stats,
         seed: best.seed,
         score,
+    };
+}
+
+/**
+ * Why could this block not be placed? Every start the block could ever use is
+ * checked against the finished grid and the first rule each one breaks is
+ * counted, so an admin reads "in 30 of 44 slots Class 8 A already has a lesson"
+ * instead of a bare shortfall.
+ */
+function diagnoseBlock(ctx, state, block) {
+    const section = ctx.sections.get(block.sectionId);
+    if (!section) return { slotsChecked: 0, reasons: [] };
+
+    // Starts the static domain threw away because no teacher for the subject is
+    // ever free there (declared unavailable, or teaching another class).
+    let possible = 0;
+    for (const day of section.days) {
+        const teaching = section.teachingByDay.get(day) || [];
+        for (let i = 0; i + block.size <= teaching.length; i++) {
+            let contiguous = true;
+            for (let k = 1; k < block.size; k++) {
+                if (teaching[i + k].adjacentToPrev === false) { contiguous = false; break; }
+            }
+            if (contiguous) possible++;
+        }
+    }
+
+    const tally = new Map();
+    const count = (code, reason, by = 1) => {
+        if (!tally.has(code)) tally.set(code, { code, count: 0, example: reason || '' });
+        tally.get(code).count += by;
+    };
+    const pruned = Math.max(0, possible - block.domain.length);
+    if (pruned) count('TEACHER_NOT_FREE', `No teacher for ${block.subjectName} is free at those times`, pruned);
+
+    for (const d of block.domain) {
+        const res = checkPlacement(ctx, state, block, d.day, d.startIdx);
+        if (res.ok) count('FREE', '');
+        else count(res.code || 'OTHER', res.reason);
+    }
+
+    return {
+        slotsChecked: possible,
+        size: block.size,
+        reasons: [...tally.values()].sort((a, b) => b.count - a.count),
     };
 }
 

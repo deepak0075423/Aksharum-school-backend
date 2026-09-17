@@ -286,6 +286,8 @@ router.delete('/timetable/merges/:id',  timetableGuard, ttGenCtrl.deleteMergeGro
 router.get('/timetable/availability',              timetableGuard, ttGenCtrl.listAvailability);
 router.put('/timetable/availability/:teacherId',   timetableGuard, ttGenCtrl.saveAvailability);
 
+// Dry run of the plan on screen: what would stop it, before anyone generates.
+router.post('/timetable/preflight',      timetableGuard, ttGenCtrl.preflight);
 router.post('/timetable/generate',       timetableGuard, ttGenCtrl.generate);
 router.get('/timetable/versions',        timetableGuard, ttGenCtrl.listVersions);
 router.get('/timetable/audit',           timetableGuard, ttGenCtrl.listAudit);

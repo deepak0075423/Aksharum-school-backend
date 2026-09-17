@@ -65,6 +65,13 @@ const TimetableVersionSchema = new db.Schema({
         ref: 'TimetableVersion',
         default: null,
     },
+    // An earlier attempt this run supersedes. It is soft-deleted once this run
+    // finishes, so retrying a conflicted draft does not leave a trail of them.
+    replaces: {
+        type: db.Types.UUID,
+        ref: 'TimetableVersion',
+        default: null,
+    },
     stats: {
         type: db.Types.JSON,
         default: {},

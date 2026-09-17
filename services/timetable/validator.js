@@ -114,6 +114,7 @@ function validate(ctx, entries) {
                 type: CONFLICT_TYPES.CLASS_CLASH, severity: SEVERITY.ERROR,
                 sectionId: e.sectionId, subjectId: e.subjectId, dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
                 description: `${label(e.sectionId)} has two subjects at ${e.dayOfWeek} P${e.periodNumber}.`,
+                meta: { withSubjectId: held.subjectId },
                 suggestion: 'Delete one of the two entries, or merge the two subjects if they are meant to run together.',
             });
         } else if (!held) {
@@ -134,6 +135,8 @@ function validate(ctx, entries) {
             const t = ctx.teachers.get(e.teacherId);
             const tKey = `${e.teacherId}#${slotKey(e.dayOfWeek, e.periodNumber)}`;
             const clash = teacherSlot.get(tKey);
+            // Already teaching a class outside this version (its published timetable).
+            const elsewhere = t?.busy?.get(slotKey(e.dayOfWeek, e.periodNumber));
             if (clash) {
                 push({
                     type: CONFLICT_TYPES.TEACHER_CLASH, severity: SEVERITY.ERROR,
@@ -141,12 +144,23 @@ function validate(ctx, entries) {
                     dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
                     description: `${t?.name || 'Teacher'} is booked for both ${label(clash.sectionId)} and ${label(e.sectionId)} at ${e.dayOfWeek} P${e.periodNumber}.`,
                     suggestion: 'Move one of the two periods or assign an alternate teacher.',
+                    meta: { withSectionId: clash.sectionId },
                 });
             } else {
                 teacherSlot.set(tKey, e);
             }
+            if (elsewhere) {
+                push({
+                    type: CONFLICT_TYPES.TEACHER_CLASH, severity: SEVERITY.ERROR,
+                    sectionId: e.sectionId, subjectId: e.subjectId, teacherId: e.teacherId,
+                    dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
+                    description: `${t.name} already teaches ${elsewhere} at ${e.dayOfWeek} P${e.periodNumber}.`,
+                    suggestion: 'Move this period, or give it to another teacher.',
+                    meta: { elsewhere },
+                });
+            }
             if (t) {
-                if (t.blocked.has(slotKey(e.dayOfWeek, e.periodNumber))) {
+                if (!elsewhere && t.blocked.has(slotKey(e.dayOfWeek, e.periodNumber))) {
                     push({
                         type: CONFLICT_TYPES.TEACHER_UNAVAILABLE, severity: SEVERITY.ERROR,
                         sectionId: e.sectionId, subjectId: e.subjectId, teacherId: e.teacherId,
@@ -174,6 +188,7 @@ function validate(ctx, entries) {
             const room = ctx.rooms.get(e.roomId);
             const rKey = `${e.roomId}#${slotKey(e.dayOfWeek, e.periodNumber)}`;
             const clash = roomSlot.get(rKey);
+            const usedElsewhere = room?.busy?.get(slotKey(e.dayOfWeek, e.periodNumber));
             if (clash) {
                 push({
                     type: CONFLICT_TYPES.ROOM_CLASH, severity: SEVERITY.ERROR,
@@ -181,12 +196,23 @@ function validate(ctx, entries) {
                     dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
                     description: `${room?.name || 'Room'} is double-booked by ${label(clash.sectionId)} and ${label(e.sectionId)} at ${e.dayOfWeek} P${e.periodNumber}.`,
                     suggestion: 'Assign a different room to one of the classes.',
+                    meta: { withSectionId: clash.sectionId },
                 });
             } else {
                 roomSlot.set(rKey, e);
             }
+            if (usedElsewhere) {
+                push({
+                    type: CONFLICT_TYPES.ROOM_CLASH, severity: SEVERITY.ERROR,
+                    sectionId: e.sectionId, subjectId: e.subjectId, roomId: e.roomId,
+                    dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
+                    description: `${room.name} is already used by ${usedElsewhere} at ${e.dayOfWeek} P${e.periodNumber}.`,
+                    suggestion: 'Pick another room for this period.',
+                    meta: { elsewhere: usedElsewhere },
+                });
+            }
             if (room) {
-                if (room.blocked.has(slotKey(e.dayOfWeek, e.periodNumber))) {
+                if (!usedElsewhere && room.blocked.has(slotKey(e.dayOfWeek, e.periodNumber))) {
                     push({
                         type: CONFLICT_TYPES.ROOM_UNAVAILABLE, severity: SEVERITY.ERROR,
                         sectionId: e.sectionId, roomId: e.roomId, dayOfWeek: e.dayOfWeek, periodNumber: e.periodNumber,
@@ -212,7 +238,7 @@ function validate(ctx, entries) {
                 sectionId: req.sectionId, subjectId: req.subjectId, teacherId: req.teacherOptions[0] || null,
                 description: `${req.subjectName} for ${label(req.sectionId)}: ${got} of ${req.weeklyPeriods} weekly periods scheduled.`,
                 suggestion: `Place ${req.weeklyPeriods - got} more period(s) or reduce the requirement.`,
-                meta: { scheduled: got, required: req.weeklyPeriods },
+                meta: { check: 'weekly_count', scheduled: got, required: req.weeklyPeriods, mergeLabel: req.mergeLabel || '' },
             });
         } else if (got > req.weeklyPeriods) {
             push({
@@ -220,7 +246,7 @@ function validate(ctx, entries) {
                 sectionId: req.sectionId, subjectId: req.subjectId,
                 description: `${req.subjectName} for ${label(req.sectionId)}: ${got} periods scheduled, ${req.weeklyPeriods} required.`,
                 suggestion: 'Remove the extra period(s) or raise the weekly requirement.',
-                meta: { scheduled: got, required: req.weeklyPeriods },
+                meta: { check: 'weekly_count', scheduled: got, required: req.weeklyPeriods },
             });
         }
 
@@ -234,14 +260,18 @@ function validate(ctx, entries) {
                     sectionId: req.sectionId, subjectId: req.subjectId, dayOfWeek: day,
                     description: `${req.subjectName} runs ${n} times on ${day} for ${label(req.sectionId)} (max ${req.maxPerDay}).`,
                     suggestion: 'Move the extra period to another day.',
+                    meta: { count: n, limit: req.maxPerDay },
                 });
             }
         }
 
-        // HARD #12: consecutive-period requirement actually honoured.
+        // HARD #12: consecutive-period requirement actually honoured. A weekly
+        // count that does not divide by the block size (3 periods, 2 in a row)
+        // leaves one shorter run by design — that one is not a problem.
         if (req.consecutivePeriods > 1) {
+            const section = ctx.sections.get(req.sectionId);
+            const broken = [];
             for (const day of ctx.days) {
-                const section = ctx.sections.get(req.sectionId);
                 const teaching = section?.teachingByDay.get(day) || [];
                 let run = 0;
                 const runs = [];
@@ -251,23 +281,33 @@ function validate(ctx, entries) {
                     else { if (run) runs.push(run); run = 0; }
                 }
                 if (run) runs.push(run);
-                const broken = runs.filter((r) => r % req.consecutivePeriods !== 0 && r < req.consecutivePeriods);
-                if (broken.length) {
-                    push({
-                        type: CONFLICT_TYPES.CONSECUTIVE_PERIOD_ERROR, severity: SEVERITY.WARNING,
-                        sectionId: req.sectionId, subjectId: req.subjectId, dayOfWeek: day,
-                        description: `${req.subjectName} needs ${req.consecutivePeriods} consecutive periods but sits alone on ${day} for ${label(req.sectionId)}.`,
-                        suggestion: 'Move it next to its paired period or regenerate.',
-                    });
+                for (const r of runs) {
+                    if (r % req.consecutivePeriods !== 0 && r < req.consecutivePeriods) broken.push({ day, length: r });
                 }
+            }
+            const remainder = req.weeklyPeriods % req.consecutivePeriods;
+            if (remainder) {
+                const expected = broken.findIndex((b) => b.length === remainder);
+                if (expected >= 0) broken.splice(expected, 1);
+            }
+            for (const day of [...new Set(broken.map((b) => b.day))]) {
+                push({
+                    type: CONFLICT_TYPES.CONSECUTIVE_PERIOD_ERROR, severity: SEVERITY.WARNING,
+                    sectionId: req.sectionId, subjectId: req.subjectId, dayOfWeek: day,
+                    description: `${req.subjectName} needs ${req.consecutivePeriods} consecutive periods but sits alone on ${day} for ${label(req.sectionId)}.`,
+                    suggestion: 'Move it next to its paired period or regenerate.',
+                    meta: { size: req.consecutivePeriods },
+                });
             }
         }
     }
 
     // HARD #10: teacher workload ceilings.
-    for (const [key, count] of teacherDay) {
+    // Periods the teacher already teaches outside this version count too.
+    for (const [key, own] of teacherDay) {
         const [teacherId, day] = key.split('#');
         const t = ctx.teachers.get(teacherId);
+        const count = own + (t?.baseDay?.get(day) || 0);
         if (!t || !t.maxPerDay || count <= t.maxPerDay) continue;
         push({
             type: CONFLICT_TYPES.DAILY_LIMIT_EXCEEDED,
@@ -275,16 +315,19 @@ function validate(ctx, entries) {
             teacherId, dayOfWeek: day,
             description: `${t.name} has ${count} periods on ${day} (limit ${t.maxPerDay}).`,
             suggestion: 'Move a period to another day or raise the teacher\'s daily limit.',
+            meta: { count, limit: t.maxPerDay, elsewhere: t.baseDay?.get(day) || 0 },
         });
     }
-    for (const [teacherId, count] of teacherWeek) {
+    for (const [teacherId, own] of teacherWeek) {
         const t = ctx.teachers.get(teacherId);
+        const count = own + (t?.baseWeek || 0);
         if (!t || !t.maxPerWeek || count <= t.maxPerWeek) continue;
         push({
             type: CONFLICT_TYPES.WEEKLY_LIMIT_EXCEEDED, severity: SEVERITY.ERROR,
             teacherId,
             description: `${t.name} has ${count} periods this week (limit ${t.maxPerWeek}).`,
             suggestion: 'Reassign some periods to another teacher.',
+            meta: { check: 'teacher_week', count, limit: t.maxPerWeek, elsewhere: t.baseWeek || 0 },
         });
     }
 
@@ -310,11 +353,19 @@ function validate(ctx, entries) {
  * @returns {{ok:boolean, conflicts:Array, blocking:Array}}
  */
 function validateMove(ctx, entries, move) {
-    const moved = entries.map((e) => (
-        String(e._id ?? e.id) === String(move.entryId)
-            ? { ...e, dayOfWeek: move.dayOfWeek, periodNumber: Number(move.periodNumber), room: move.roomId ?? e.room, teacher: move.teacherId ?? e.teacher }
-            : e
-    ));
+    // `move.swap` ({ entryId, dayOfWeek, periodNumber }) moves the period that
+    // already holds the target slot into the one being vacated — a drop onto a
+    // filled slot is a swap, checked as one change.
+    const moved = entries.map((e) => {
+        const id = String(e._id ?? e.id);
+        if (id === String(move.entryId)) {
+            return { ...e, dayOfWeek: move.dayOfWeek, periodNumber: Number(move.periodNumber), room: move.roomId ?? e.room, teacher: move.teacherId ?? e.teacher };
+        }
+        if (move.swap && id === String(move.swap.entryId)) {
+            return { ...e, dayOfWeek: move.swap.dayOfWeek, periodNumber: Number(move.swap.periodNumber) };
+        }
+        return e;
+    });
     const before = validate(ctx, entries);
     const after = validate(ctx, moved);
 

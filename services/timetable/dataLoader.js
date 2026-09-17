@@ -21,6 +21,7 @@ const TeacherAvailability   = require('../../models/TeacherAvailability');
 const SubjectRequirement    = require('../../models/SubjectRequirement');
 const TimetableMergeGroup   = require('../../models/TimetableMergeGroup');
 const TimetableConfig       = require('../../models/TimetableConfig');
+const TimetableEntry        = require('../../models/TimetableEntry');
 
 const { DAYS, PRACTICAL_TYPES, periodTypeOf } = require('./types');
 
@@ -115,9 +116,76 @@ async function resolveScope(schoolId, academicYearId, scopeType, { sectionIds = 
    ══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * Every period a teacher or room is already committed to in the PUBLISHED
+ * timetable of a section outside `scopeIds`.
+ *
+ * The solver only sees its own sections, so generating Class 8 and then Class 9
+ * as separate runs used to put a shared teacher in two rooms at once — caught,
+ * if at all, as a "clashes with other sections" warning at publish. Feeding the
+ * other classes' committed periods in as busy slots makes the solver avoid them
+ * in the first place.
+ *
+ * A combined lesson a section in scope shares with one outside it is the same
+ * lesson, not a clash, and is skipped (it is pinned separately).
+ */
+async function loadBusyElsewhere({ schoolId, academicYearId, scopeIds, mergeFor }) {
+    const scope = new Set(scopeIds);
+    const timetables = await Timetable.find({ academicYear: academicYearId }).select('_id section').lean();
+    const outside = timetables.filter((t) => !scope.has(sid(t.section)));
+    if (!outside.length) return { teachers: new Map(), rooms: new Map() };
+
+    // Only sections that are still running this year — a deleted or inactive
+    // section's leftover timetable must not block anyone.
+    const sections = await ClassSection.find({
+        _id: { $in: uniq(outside.map((t) => sid(t.section))) },
+        school: schoolId, academicYear: academicYearId, status: 'active',
+    }).select('_id sectionName class').lean();
+    if (!sections.length) return { teachers: new Map(), rooms: new Map() };
+    const classes = await Class.find({ _id: { $in: uniq(sections.map((x) => sid(x.class))) } }).select('className').lean();
+    const className = new Map(classes.map((c) => [sid(c._id), c.className]));
+    const labelOf = new Map(sections.map((x) => [sid(x._id), `${className.get(sid(x.class)) || ''} ${x.sectionName || ''}`.trim()]));
+
+    const sectionOfTimetable = new Map(outside
+        .filter((t) => labelOf.has(sid(t.section)))
+        .map((t) => [sid(t._id), sid(t.section)]));
+    if (!sectionOfTimetable.size) return { teachers: new Map(), rooms: new Map() };
+
+    const entries = await TimetableEntry.find({ timetable: { $in: [...sectionOfTimetable.keys()] } })
+        .select('timetable dayOfWeek periodNumber subject teacher room additionalSubjects mergedSections').lean();
+
+    const teachers = new Map();   // teacherId -> [{ dayOfWeek, periodNumber, label }]
+    const rooms = new Map();
+    const add = (map, id, row) => {
+        if (!id) return;
+        if (!map.has(id)) map.set(id, []);
+        map.get(id).push(row);
+    };
+    for (const e of entries) {
+        const sectionId = sectionOfTimetable.get(sid(e.timetable));
+        if (!sectionId) continue;
+        const sharedWithScope = (e.mergedSections || []).map(sid).some((x) => scope.has(x))
+            || (mergeFor(sectionId, sid(e.subject))?.members || []).some((x) => scope.has(x));
+        if (sharedWithScope) continue;
+
+        const row = { dayOfWeek: e.dayOfWeek, periodNumber: Number(e.periodNumber), label: labelOf.get(sectionId) };
+        add(teachers, sid(e.teacher), row);
+        add(rooms, sid(e.room), row);
+        for (const m of e.additionalSubjects || []) {
+            add(teachers, sid(m.teacher ?? m.teacherId), row);
+            add(rooms, sid(m.room ?? m.roomId), row);
+        }
+    }
+    return { teachers, rooms };
+}
+
+/**
+ * @param {object}  args
+ * @param {Map}     [args.requirementOverride]  sectionId -> SubjectRequirement-shaped
+ *   rows used INSTEAD of the stored ones. The Generate screen's dry run checks an
+ *   unsaved plan this way, through exactly the path a real run takes.
  * @returns engine input + the lookup maps the controller needs for labelling.
  */
-async function loadGenerationInput({ schoolId, academicYearId, sectionIds, options = {} }) {
+async function loadGenerationInput({ schoolId, academicYearId, sectionIds, options = {}, requirementOverride = null }) {
     const ids = uniq(sectionIds.map(sid));
     if (!ids.length) throw new Error('No sections in scope');
 
@@ -151,11 +219,12 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
     const mergeFor = (sectionId, subjectId) => mergeBySectionSubject.get(`${sectionId}#${subjectId}`) || null;
 
     const classIds = uniq(sections.map((s) => sid(s.class)));
-    const [classes, timetables, sst, classSubjects] = await Promise.all([
+    const [classes, timetables, sst, classSubjects, busyElsewhere] = await Promise.all([
         Class.find({ _id: { $in: classIds } }).select('className classNumber').lean(),
         Timetable.find({ section: { $in: ids }, academicYear: academicYearId }).lean(),
         SectionSubjectTeacher.find({ section: { $in: ids } }).lean(),
         ClassSubject.find({ class: { $in: classIds } }).lean(),
+        loadBusyElsewhere({ schoolId, academicYearId, scopeIds: ids, mergeFor }),
     ]);
 
     // Teachers referenced anywhere, plus every active teacher (alternates).
@@ -226,9 +295,22 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
     const reqBySection = new Map();
     for (const r of requirements) {
         const key = sid(r.section);
+        if (requirementOverride?.has(key)) continue;
         if (!reqBySection.has(key)) reqBySection.set(key, []);
         reqBySection.get(key).push(r);
     }
+    for (const [key, rows] of requirementOverride || []) reqBySection.set(String(key), rows);
+
+    // What each section actually teaches today — the same two sources the
+    // Generate screen lists. A saved requirement for a subject that has since
+    // been deleted, or taken off the section, is invisible on that screen and
+    // cannot be edited there, so it must not reach the solver either: it used
+    // to fill the week with periods for a subject nobody could see.
+    const taughtIn = (section) => new Set([
+        ...sst.filter((x) => sid(x.section) === section.id).map((x) => sid(x.subject)),
+        ...classSubjects.filter((x) => sid(x.class) === section.classId).map((x) => sid(x.subject)),
+    ]);
+    const ignoredRequirements = [];
 
     /**
      * Merge fields for one requirement. A pinned teacher or room on the group
@@ -248,7 +330,12 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
     const engineRequirements = [];
     const derivedFor = [];
     for (const section of engineSections) {
-        const rows = reqBySection.get(section.id) || [];
+        const taught = taughtIn(section);
+        const rows = (reqBySection.get(section.id) || []).filter((r) => {
+            const keep = subjectById.has(sid(r.subject)) && taught.has(sid(r.subject));
+            if (!keep) ignoredRequirements.push({ sectionId: section.id, subjectId: sid(r.subject) });
+            return keep;
+        });
         if (rows.length) {
             for (const r of rows) {
                 const subject = subjectById.get(sid(r.subject));
@@ -333,6 +420,7 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
             id: sid(t._id),
             name: t.name || 'Teacher',
             unavailable: a?.unavailable || [],
+            busy: busyElsewhere.teachers.get(sid(t._id)) || [],
             maxPeriodsPerDay: a?.maxPeriodsPerDay ?? defaults.maxTeacherPeriodsPerDay ?? 0,
             maxPeriodsPerWeek: a?.maxPeriodsPerWeek ?? defaults.maxTeacherPeriodsPerWeek ?? 0,
             hardDailyLimit: a?.hardDailyLimit ?? defaults.hardTeacherDailyLimit ?? true,
@@ -348,7 +436,7 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
             sections: engineSections,
             requirements: engineRequirements,
             teachers: engineTeachers,
-            rooms: rooms.map((r) => ({ ...r, id: sid(r._id) })),
+            rooms: rooms.map((r) => ({ ...r, id: sid(r._id), busy: busyElsewhere.rooms.get(sid(r._id)) || [] })),
             options,
             weights: config?.softWeights,
             solver: config?.solver,
@@ -364,6 +452,7 @@ async function loadGenerationInput({ schoolId, academicYearId, sectionIds, optio
             teacherById: new Map(teacherDocs.map((t) => [sid(t._id), t])),
             roomById: new Map(rooms.map((r) => [sid(r._id), r])),
             derivedRequirementSections: derivedFor,
+            ignoredRequirements,
         },
     };
 }

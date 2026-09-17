@@ -121,11 +121,14 @@ function resolveRoom(ctx, state, sectionId, demand, day, periods, ignoreBlockId 
         return holder === undefined || holder === ignoreBlockId;
     });
     const notBlocked = (room) => periods.every((p) => !room.blocked.has(slotKey(day, p)));
+    const bookedElsewhere = (room) => room.busy && periods.map((p) => room.busy.get(slotKey(day, p))).find(Boolean);
 
     // 1. Admin pinned one specific room — it is that room or nothing.
     if (demand.pinnedRoomId) {
         const room = ctx.rooms.get(demand.pinnedRoomId);
         if (!room) return { ok: false, code: CONFLICT_TYPES.PRACTICAL_ROOM_MISSING, reason: 'Pinned room no longer exists' };
+        const other = bookedElsewhere(room);
+        if (other) return { ok: false, code: CONFLICT_TYPES.ROOM_CLASH, reason: `${room.name} is already used by ${other} at this time` };
         if (!notBlocked(room)) return { ok: false, code: CONFLICT_TYPES.ROOM_UNAVAILABLE, reason: `${room.name} is unavailable at this time` };
         if (!free(room.id))    return { ok: false, code: CONFLICT_TYPES.ROOM_CLASH, reason: `${room.name} is already booked at this time` };
         // Seat counts are not a constraint: a room is judged on its type and on
@@ -203,6 +206,14 @@ function resolveTeacher(ctx, state, demand, day, periods, size, ignore = null, t
             code = CONFLICT_TYPES.SUBJECT_TEACHER_MISMATCH;
             continue;
         }
+        // HARD #2 (outside this run): already teaching a class this run does not
+        // cover. Checked before availability so the reason names the class.
+        const elsewhere = t.busy && periods.map((p) => t.busy.get(slotKey(day, p))).find(Boolean);
+        if (elsewhere) {
+            reason = `${t.name} already teaches ${elsewhere} at ${day} P${periods[0]}`;
+            code = CONFLICT_TYPES.TEACHER_CLASH;
+            continue;
+        }
         // HARD #4: declared unavailable.
         if (periods.some((p) => t.blocked.has(slotKey(day, p)))) {
             reason = `${t.name} is unavailable on ${day}`;
@@ -222,14 +233,15 @@ function resolveTeacher(ctx, state, demand, day, periods, size, ignore = null, t
         }
         // HARD #10: daily / weekly workload ceilings.
         const self = selfLoad(state, ignore, teacherId, day);
+        // Periods taught in classes outside this run count towards both limits.
         if (t.hardDailyLimit && t.maxPerDay > 0 &&
-            (state.teacherDay.get(`${teacherId}#${day}`) || 0) - self.day + size > t.maxPerDay) {
+            (state.teacherDay.get(`${teacherId}#${day}`) || 0) + (t.baseDay?.get(day) || 0) - self.day + size > t.maxPerDay) {
             reason = `${t.name} is at their ${t.maxPerDay}-period daily limit on ${day}`;
             code = CONFLICT_TYPES.DAILY_LIMIT_EXCEEDED;
             continue;
         }
         if (t.maxPerWeek > 0 &&
-            (state.teacherWeek.get(teacherId) || 0) - self.week + size > t.maxPerWeek) {
+            (state.teacherWeek.get(teacherId) || 0) + (t.baseWeek || 0) - self.week + size > t.maxPerWeek) {
             reason = `${t.name} is at their ${t.maxPerWeek}-period weekly limit`;
             code = CONFLICT_TYPES.WEEKLY_LIMIT_EXCEEDED;
             continue;

@@ -22,7 +22,7 @@ const TimetableConflictSchema = new db.Schema({
             'SUBJECT_TEACHER_MISMATCH', 'PRACTICAL_ROOM_MISSING',
             'DAILY_LIMIT_EXCEEDED', 'WEEKLY_LIMIT_EXCEEDED',
             'CONSECUTIVE_PERIOD_ERROR', 'NON_TEACHING_SLOT',
-            'NO_TEACHER_ASSIGNED', 'OTHER',
+            'NO_TEACHER_ASSIGNED', 'MERGE_GROUP_MISMATCH', 'TEACHER_NOT_QUALIFIED', 'OTHER',
         ],
         required: true,
     },

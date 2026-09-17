@@ -227,6 +227,40 @@ async function publishVersion({ version, entries, userId, structureBySection }) 
     }
 }
 
+/**
+ * Swap two periods of one section inside a version, atomically.
+ *
+ * (version, section, day, period) is unique, so the two rows cannot trade
+ * places one UPDATE at a time without passing through a collision: the target
+ * is parked on an impossible period first, all on one connection in one
+ * transaction.
+ */
+async function swapVersionEntries(entry, target, changes = {}) {
+    const client = await pool.getPool().connect();
+    const q = (sql, params) => client.query(sql, params);
+    try {
+        await q('BEGIN');
+        await q(`UPDATE ${VE} SET "periodNumber" = -1 WHERE "_id" = $1::uuid`, [String(target._id)]);
+        await q(
+            `UPDATE ${VE} SET "dayOfWeek" = $2, "periodNumber" = $3, "teacher" = $4::uuid, "room" = $5::uuid,
+                    "isManual" = true, "updatedAt" = now() WHERE "_id" = $1::uuid`,
+            [String(entry._id), target.dayOfWeek, Number(target.periodNumber),
+                sid(changes.teacher !== undefined ? changes.teacher : entry.teacher),
+                sid(changes.room !== undefined ? changes.room : entry.room)],
+        );
+        await q(
+            `UPDATE ${VE} SET "dayOfWeek" = $2, "periodNumber" = $3, "isManual" = true, "updatedAt" = now() WHERE "_id" = $1::uuid`,
+            [String(target._id), entry.dayOfWeek, Number(entry.periodNumber)],
+        );
+        await q('COMMIT');
+    } catch (e) {
+        try { await q('ROLLBACK'); } catch { /* connection already broken */ }
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
 /** Copy every entry of one version into another (duplicate / restore). */
 async function copyEntries(fromVersionId, toVersionId, schoolId) {
     const rows = await TimetableVersionEntry.find({ version: fromVersionId }).lean();
@@ -258,5 +292,5 @@ async function writeProgress(versionId, progress, extra = {}) {
 
 module.exports = {
     replaceVersionEntries, replaceConflicts, publishVersion,
-    copyEntries, nextVersionNumber, writeProgress, chunkedInsert,
+    swapVersionEntries, copyEntries, nextVersionNumber, writeProgress, chunkedInsert,
 };

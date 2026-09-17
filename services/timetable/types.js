@@ -30,6 +30,8 @@ const CONFLICT_TYPES = {
     NON_TEACHING_SLOT:        'NON_TEACHING_SLOT',
     NO_TEACHER_ASSIGNED:      'NO_TEACHER_ASSIGNED',
     MERGE_GROUP_MISMATCH:     'MERGE_GROUP_MISMATCH',
+    // A subject merged across sections has no one teacher assigned in all of them.
+    TEACHER_NOT_QUALIFIED:    'TEACHER_NOT_QUALIFIED',
     OTHER:                    'OTHER',
 };
 
