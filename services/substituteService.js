@@ -34,6 +34,8 @@ const TeacherAvailability = require('../models/TeacherAvailability');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const SubstituteAssignment  = require('../models/SubstituteAssignment');
 const SubstituteSettings    = require('../models/SubstituteSettings');
+const LeaveType             = require('../models/LeaveType');
+const TeacherProfile        = require('../models/TeacherProfile');
 const { notify }            = require('./notifyService');
 const { schoolModuleFlags } = require('../config/modules');
 const {
@@ -105,11 +107,14 @@ async function saveSettings(schoolId, patch, userId) {
         'autoAssign', 'useAttendance', 'useLeave', 'skipPeriodsAlreadyStarted',
         'respectAvailabilityBlocks', 'respectDailyPeriodCap', 'requireSubjectMatch',
         'notifySubstitute', 'notifyOriginalTeacher', 'notifyOnChange', 'emailSubstitute',
+        'useUnapprovedLeave', 'useOnDuty', 'allowCrossDepartment', 'excludeTeachersOnLeave',
+        'includeSubsInWorkload', 'showInTeacherTimetable', 'allowExport',
     ];
     const NUMBERS = [
         'maxSubstitutionsPerDay',
         'weightSubsToday', 'weightSubsWeek', 'weightSubsMonth', 'weightNormalToday',
         'bonusSubjectMatch', 'bonusSameSection',
+        'historyYears',
     ];
     const $set = { updatedBy: userId || null };
     for (const k of BOOLEANS) {
@@ -119,6 +124,15 @@ async function saveSettings(schoolId, patch, userId) {
         if (patch[k] === undefined) continue;
         const n = Number(patch[k]);
         $set[k] = Number.isFinite(n) ? Math.max(0, n) : 0;
+    }
+    if (patch.halfDayAbsentAfter !== undefined) {
+        $set.halfDayAbsentAfter = toMinutes(patch.halfDayAbsentAfter) == null
+            ? '12:00'
+            : String(patch.halfDayAbsentAfter).trim();
+    }
+    if (patch.historyYears !== undefined) {
+        const n = Number(patch.historyYears);
+        $set.historyYears = Number.isFinite(n) ? Math.min(10, Math.max(1, Math.round(n))) : 1;
     }
     if (patch.unmarkedAbsentAfter !== undefined) {
         // Reject anything that isn't a clock time rather than storing a value
@@ -182,6 +196,12 @@ async function buildContext(schoolId, dateLike) {
         availabilityByTeacher: new Map(),
         subjectsByTeacher:     new Map(),
         sectionsByTeacher:     new Map(),
+        departmentByTeacher:   new Map(),
+        // Everyone recorded away today for any reason. Distinct from the
+        // detected-absence map: that one is per requirement and a half-day
+        // teacher is in it for one half only, while this answers the flatter
+        // "should this person be offered a class at all today".
+        onLeaveToday:          new Set(),
         ready: false,
     };
 
@@ -189,6 +209,29 @@ async function buildContext(schoolId, dateLike) {
         .select('name email').lean();
     ctx.teachers = teachers;
     for (const t of teachers) ctx.teacherById.set(sid(t._id), t);
+
+    const [profiles, awayLeave, awayMarked] = await Promise.all([
+        TeacherProfile.find({ teacher: { $in: teachers.map((t) => t._id) } })
+            .select('teacher department designation').lean(),
+        flags.leave
+            ? LeaveApplication.find({
+                school: schoolId, status: 'approved',
+                fromDate: { $lte: date }, toDate: { $gte: date },
+            }).select('teacher').lean()
+            : [],
+        flags.attendance
+            ? TeacherAttendance.find({ school: schoolId, date })
+                .select('teacher status').lean()
+            : [],
+    ]);
+    for (const pr of profiles) {
+        ctx.departmentByTeacher.set(sid(pr.teacher), pr.department || '');
+        ctx.designationByTeacher = ctx.designationByTeacher || new Map();
+        ctx.designationByTeacher.set(sid(pr.teacher), pr.designation || '');
+    }
+    ctx.designationByTeacher = ctx.designationByTeacher || new Map();
+    for (const a of awayLeave) ctx.onLeaveToday.add(sid(a.teacher));
+    for (const r of awayMarked) if (r.status !== 'Present') ctx.onLeaveToday.add(sid(r.teacher));
 
     // No active year means no published timetable to substitute against.
     if (!year) return ctx;
@@ -347,26 +390,41 @@ async function detectAbsences(ctx) {
     const useLeave      = ctx.settings.useLeave && ctx.flags.leave;
 
     if (useLeave) {
+        // A pending application is not yet an absence — covering it would commit
+        // the school to a leave nobody has granted — so it is opt-in.
+        const statuses = ctx.settings.useUnapprovedLeave ? ['approved', 'pending'] : ['approved'];
         const apps = await LeaveApplication.find({
             school:   ctx.schoolId,
-            status:   'approved',
+            status:   { $in: statuses },
             fromDate: { $lte: ctx.date },
             toDate:   { $gte: ctx.date },
-        }).select('teacher leaveMode halfDaySession _id').lean();
+        }).select('teacher leaveType leaveMode halfDaySession status _id').lean();
+
+        // On duty is an absence from the classroom, not from work, and a school
+        // that handles those itself can switch them off. There is no on-duty
+        // status on the model — it is a leave TYPE, so the codes are read.
+        const onDuty = ctx.settings.useOnDuty ? null : await onDutyTypeIds(ctx);
+
         for (const a of apps) {
+            if (onDuty && a.leaveType && onDuty.has(sid(a.leaveType))) continue;
             const half = a.leaveMode === 'half_day';
             // Which half matters: cover for a morning absence is a different set
             // of periods from an afternoon one. Before the session was recorded
             // this could only be flagged for review.
             const session = half ? (a.halfDaySession === 'second' ? 'second' : 'first') : null;
+            const pending = a.status === 'pending';
             out.set(sid(a.teacher), {
                 reason: 'leave',
                 sourceRef: a._id,
-                needsReview: half,
+                // A pending application always wants a human look before anyone
+                // is committed to covering it.
+                needsReview: half || pending,
                 halfDaySession: session,
-                label: half
-                    ? `Approved leave (${session === 'second' ? 'second' : 'first'} half)`
-                    : 'Approved leave',
+                label: pending
+                    ? 'Leave applied for (not approved)'
+                    : half
+                        ? `Approved leave (${session === 'second' ? 'second' : 'first'} half)`
+                        : 'Approved leave',
             });
         }
     }
@@ -383,6 +441,11 @@ async function detectAbsences(ctx) {
                 reason:      r.status === 'Leave' ? 'leave' : 'absent',
                 sourceRef:   r._id,
                 needsReview: r.status === 'Half-Day',
+                // The register records "half day" without saying which half, so
+                // the school's own boundary decides: periods from that time on
+                // are the half being missed. Still flagged for review — this is
+                // an inference, not a record.
+                halfDaySession: r.status === 'Half-Day' ? 'second' : null,
                 label:       r.status === 'Half-Day' ? 'Half day'
                            : r.status === 'Leave'    ? 'On leave (attendance)'
                            : 'Marked absent',
@@ -412,6 +475,49 @@ async function detectAbsences(ctx) {
         if (!ctx.teacherById.has(tid)) out.delete(tid);
     }
     return out;
+}
+
+/**
+ * Leave types the school uses for official duty. There is no on-duty flag on
+ * LeaveType, so the codes and names are read — every school that has such a
+ * type calls it some spelling of "on duty" or "official". A school whose type
+ * is named something else simply keeps covering those periods, which is the
+ * behaviour it had before the switch existed.
+ */
+const ON_DUTY_RE = /^(od|on[\s_-]?duty|official|duty)$/i;
+const _onDutyCache = new Map();
+async function onDutyTypeIds(ctx) {
+    const key = sid(ctx.schoolId);
+    if (_onDutyCache.has(key)) return _onDutyCache.get(key);
+    const types = await LeaveType.find({ school: ctx.schoolId }).select('name code').lean();
+    const ids = new Set(types
+        .filter((t) => ON_DUTY_RE.test(String(t.code || '').trim())
+            || /on[\s_-]?duty|official\s*(work|duty)/i.test(String(t.name || '')))
+        .map((t) => sid(t._id)));
+    _onDutyCache.set(key, ids);
+    return ids;
+}
+
+/**
+ * Is this period inside the half of the day the teacher actually missed?
+ * `boundary` is the school's own morning/afternoon line in minutes. A period
+ * with no recorded start time cannot be placed, so it is kept — better a row
+ * the admin cancels than a period nobody was told about.
+ */
+function inAbsentHalf(period, session, boundary) {
+    const start = toMinutes(period.startTime);
+    if (start == null || boundary == null) return true;
+    return session === 'second' ? start >= boundary : start < boundary;
+}
+
+/** Same department, for the school that keeps cover inside a department. */
+function sameDepartment(ctx, aId, bId) {
+    const a = (ctx.departmentByTeacher.get(sid(aId)) || '').trim().toLowerCase();
+    const b = (ctx.departmentByTeacher.get(sid(bId)) || '').trim().toLowerCase();
+    // An unrecorded department cannot exclude anyone — a school that has not
+    // filled its directory in would otherwise find every period uncoverable.
+    if (!a || !b) return true;
+    return a === b;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -451,10 +557,16 @@ async function ensureRequirements(ctx, absences) {
     const keyOf = (entryId, teacherId) => `${sid(entryId)}|${sid(teacherId)}`;
     const haveKeys = new Set(existing.map((r) => keyOf(r.timetableEntry, r.originalTeacher)));
 
+    const boundary = toMinutes(ctx.settings.halfDayAbsentAfter) ?? toMinutes('12:00');
+
     let created = 0;
     for (const [teacherId, info] of absences) {
         for (const p of periodsOf(ctx, teacherId)) {
             if (!p.section) continue;
+            // A half-day absence misses half a day. Raising a requirement for
+            // every period of it hands the admin six rows to cancel by hand and
+            // buries the two that actually need cover.
+            if (info.halfDaySession && !inAbsentHalf(p, info.halfDaySession, boundary)) continue;
             if (haveKeys.has(keyOf(p.timetableEntry, teacherId))) continue;
             try {
                 await SubstituteAssignment.create({
@@ -646,6 +758,10 @@ function candidatesFor(ctx, requirement, { absences, workloads, busySlots, extra
         if (busySlots.has(`${tid}|${period}`)) continue;         // already covering this slot
         if (extraBusy && extraBusy.has(`${tid}|${period}`)) continue;
         if (isBlockedByAvailability(ctx, tid, period)) continue; // blocked slot
+        // Away today for a reason the board did not raise a requirement for —
+        // a half-day teacher is in `absences` only for the half they missed.
+        if (ctx.settings.excludeTeachersOnLeave && ctx.onLeaveToday.has(tid)) continue;
+        if (!ctx.settings.allowCrossDepartment && !sameDepartment(ctx, originalId, tid)) continue;
 
         const work = workloads.get(tid) || {
             normalToday: 0, normalWeek: 0, normalMonth: 0, subsToday: 0, subsWeek: 0, subsMonth: 0,
@@ -994,6 +1110,38 @@ function decorate(ctx, row) {
 }
 
 /**
+ * The shape of the school day — every period and every break, in order, with
+ * its clock times. The board is a school-wide day view, so where sections run
+ * different grids the fullest one is used: a break the whole school takes still
+ * belongs in the middle of the day, and a row missing from the longest grid
+ * would leave a hole nothing explains.
+ */
+function periodGrid(ctx) {
+    let best = [];
+    for (const tt of ctx.timetableById.values()) {
+        const rows = (tt.periodsStructure || []).filter((p) => p && (p.startTime || p.periodNumber));
+        if (rows.length > best.length) best = rows;
+    }
+    return best
+        .map((p) => {
+            const isBreak = !!p.isRecess || (p.periodType && p.periodType !== 'Teaching');
+            return {
+                periodNumber: isBreak ? 0 : Number(p.periodNumber) || 0,
+                startTime: p.startTime || '',
+                endTime: p.endTime || '',
+                isBreak,
+                label: isBreak ? (p.recessName || p.label || p.periodType || 'Break') : '',
+            };
+        })
+        .sort((a, b) => {
+            const at = toMinutes(a.startTime);
+            const bt = toMinutes(b.startTime);
+            if (at != null && bt != null && at !== bt) return at - bt;
+            return (a.periodNumber || 99) - (b.periodNumber || 99);
+        });
+}
+
+/**
  * Everything the admin board renders for one day: who is away, every affected
  * period grouped under them, and the coverage state of each.
  */
@@ -1016,6 +1164,10 @@ async function getBoard(schoolId, dateLike) {
         },
         absentTeachers: [],
         assignments: [],
+        periods: ctx.ready ? periodGrid(ctx) : [],
+        // The classes the day actually touches, so the board's filters offer
+        // what is on screen rather than every section in the school.
+        classes: [],
         summary: { total: 0, assigned: 0, uncovered: 0, needsReview: 0, cancelled: 0 },
     };
     if (!ctx.ready || !working) return base;
@@ -1060,6 +1212,15 @@ async function getBoard(schoolId, dateLike) {
     base.absentTeachers = [...byTeacher.values()]
         .sort((a, b) => String(a.teacher.name).localeCompare(String(b.teacher.name)));
     base.assignments = decorated;
+    const seenClass = new Map();
+    for (const row of decorated) {
+        const cls = row.section.className || 'Class';
+        if (!seenClass.has(cls)) seenClass.set(cls, new Set());
+        if (row.section.sectionName) seenClass.get(cls).add(row.section.sectionName);
+    }
+    base.classes = [...seenClass.entries()]
+        .map(([className, sections]) => ({ className, sections: [...sections].sort() }))
+        .sort((a, b) => String(a.className).localeCompare(String(b.className), undefined, { numeric: true }));
     base.summary = {
         total:       decorated.filter((r) => r.status !== 'cancelled').length,
         assigned:    decorated.filter((r) => r.status === 'assigned').length,
@@ -1076,6 +1237,8 @@ module.exports = {
     weekRange, monthRange, workingDaysIn, isoOf, sid, toMinutes,
     // settings
     getSettings, saveSettings,
+    // helpers the controllers reuse
+    onDutyTypeIds, inAbsentHalf, sameDepartment, periodTimes, slotsOf, periodGrid,
     // detection & requirements
     detectAbsences, ensureRequirements,
     // candidates & workload

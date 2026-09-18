@@ -252,6 +252,12 @@ router.get('/substitutions/history',            timetableGuard, substituteCtrl.g
 router.get('/substitutions/teacher-periods',    timetableGuard, substituteCtrl.getTeacherPeriods);
 router.get('/substitutions/schedulable-teachers', timetableGuard, substituteCtrl.getSchedulableTeachers);
 router.post('/substitutions/manual',            timetableGuard, substituteCtrl.createManual);
+// Literal paths before '/:id' — an id route would otherwise swallow 'recent'.
+router.get('/substitutions/recent',             timetableGuard, substituteCtrl.getRecent);
+router.get('/substitutions/workload-report',    timetableGuard, substituteCtrl.getWorkloadReport);
+router.get('/substitutions/slot',               timetableGuard, substituteCtrl.getSlot);
+router.post('/substitutions/slot',              timetableGuard, substituteCtrl.assignSlot);
+router.post('/substitutions/bulk',              timetableGuard, substituteCtrl.bulkAssign);
 router.get('/substitutions/:id/candidates',     timetableGuard, substituteCtrl.getCandidates);
 router.post('/substitutions/:id/assign',        timetableGuard, substituteCtrl.assign);
 router.put('/substitutions/:id/remarks',        timetableGuard, substituteCtrl.updateRemarks);
@@ -266,9 +272,13 @@ router.get('/timetable/config',          timetableGuard, ttGenCtrl.getConfig);
 router.put('/timetable/config',          timetableGuard, ttGenCtrl.saveConfig);
 
 router.get('/timetable/rooms',           timetableGuard, ttGenCtrl.listRooms);
+// The Rooms screen's own read: the rooms plus the tiles and filters around them.
+router.get('/timetable/rooms/overview',  timetableGuard, ttGenCtrl.roomsOverview);
+router.post('/timetable/rooms/import',   timetableGuard, ttGenCtrl.importRooms);
 router.post('/timetable/rooms',          timetableGuard, ttGenCtrl.createRoom);
 router.put('/timetable/rooms/:id',       timetableGuard, ttGenCtrl.updateRoom);
 router.delete('/timetable/rooms/:id',    timetableGuard, ttGenCtrl.deleteRoom);
+router.get('/timetable/rooms/:id/schedule', timetableGuard, ttGenCtrl.roomSchedule);
 
 // Start next year from last year's plan (dry-run unless apply:true)
 router.post('/timetable/carry-forward', timetableGuard, ttGenCtrl.carryForward);
@@ -276,6 +286,11 @@ router.post('/timetable/carry-forward', timetableGuard, ttGenCtrl.carryForward);
 // Reports over the PUBLISHED week
 router.get('/timetable/reports/teacher-workload', timetableGuard, ttGenCtrl.teacherWorkload);
 router.get('/timetable/reports/room-utilisation', timetableGuard, ttGenCtrl.roomUtilisation);
+router.get('/timetable/reports/overview',            timetableGuard, ttGenCtrl.reportOverview);
+router.get('/timetable/reports/subject-distribution', timetableGuard, ttGenCtrl.subjectDistribution);
+router.get('/timetable/reports/free-periods',        timetableGuard, ttGenCtrl.freePeriodsReport);
+router.get('/timetable/reports/conflicts',           timetableGuard, ttGenCtrl.conflictReport);
+router.get('/timetable/reports/year-comparison',     timetableGuard, ttGenCtrl.yearComparison);
 
 // Merge groups — sections taught a subject together (one teacher, one room)
 router.get('/timetable/merges',         timetableGuard, ttGenCtrl.listMergeGroups);
@@ -284,6 +299,9 @@ router.put('/timetable/merges/:id',     timetableGuard, ttGenCtrl.saveMergeGroup
 router.delete('/timetable/merges/:id',  timetableGuard, ttGenCtrl.deleteMergeGroup);
 
 router.get('/timetable/availability',              timetableGuard, ttGenCtrl.listAvailability);
+// Literal segments first — '/:teacherId' would otherwise claim them.
+router.get('/timetable/availability/overview',     timetableGuard, ttGenCtrl.availabilityOverview);
+router.post('/timetable/availability/import',      timetableGuard, ttGenCtrl.importAvailabilityFromLeave);
 router.put('/timetable/availability/:teacherId',   timetableGuard, ttGenCtrl.saveAvailability);
 
 // Dry run of the plan on screen: what would stop it, before anyone generates.

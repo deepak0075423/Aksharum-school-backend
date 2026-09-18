@@ -42,6 +42,26 @@ const SubstituteSettingsSchema = new db.Schema({
         type: Boolean,
         default: true,
     },
+    // Where the morning ends, for an absence recorded as "half day" without
+    // saying which half. Periods starting at or after this clock time are the
+    // ones treated as the absent half. 'HH:mm', school local time.
+    halfDayAbsentAfter: {
+        type: String,
+        default: '12:00',
+    },
+    // Leave applications that are not approved yet. Off by default: a pending
+    // application is not yet an absence, and covering it commits the school to
+    // a leave nobody has granted.
+    useUnapprovedLeave: {
+        type: Boolean,
+        default: false,
+    },
+    // On duty / official work — the teacher is at the school's request but not
+    // in the classroom, so the period still needs covering.
+    useOnDuty: {
+        type: Boolean,
+        default: true,
+    },
 
     // ── Eligibility ─────────────────────────────────────────────────────────
     // Honour TeacherAvailability.unavailable — the same blocked slots the
@@ -69,6 +89,21 @@ const SubstituteSettingsSchema = new db.Schema({
     requireSubjectMatch: {
         type: Boolean,
         default: false,
+    },
+    // Offer teachers from outside the absent teacher's department. On by
+    // default: most schools would rather a covered period than a departmental
+    // match, and the ranking already prefers someone who teaches the subject.
+    allowCrossDepartment: {
+        type: Boolean,
+        default: true,
+    },
+    // Never offer a teacher who is themselves away that day. Candidates who are
+    // absent are already filtered out; this also drops anyone with an approved
+    // leave covering the date whose absence the school does not detect from
+    // attendance.
+    excludeTeachersOnLeave: {
+        type: Boolean,
+        default: true,
     },
 
     // ── Fairness ranking ────────────────────────────────────────────────────
@@ -101,6 +136,33 @@ const SubstituteSettingsSchema = new db.Schema({
     emailSubstitute: {
         type: Boolean,
         default: false,
+    },
+
+    // ── Reports & records ───────────────────────────────────────────────────
+    // How far back the history and recent-activity lists reach, in academic
+    // years. Older rows are never deleted here — they simply stop being read,
+    // so a school that shortens this can lengthen it again and get them back.
+    historyYears: {
+        type: Number,
+        default: 1,
+        min: 1,
+        max: 10,
+    },
+    // Count substituted periods towards a teacher's load in the workload
+    // reports. Off = the reports show the timetable only.
+    includeSubsInWorkload: {
+        type: Boolean,
+        default: true,
+    },
+    // Show the cover on the substitute's own timetable screen.
+    showInTeacherTimetable: {
+        type: Boolean,
+        default: true,
+    },
+    // Offer the CSV/Excel export of the day board and the reports.
+    allowExport: {
+        type: Boolean,
+        default: true,
     },
 
     updatedBy: {

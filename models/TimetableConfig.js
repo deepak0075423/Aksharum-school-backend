@@ -65,6 +65,28 @@ const TimetableConfigSchema = new db.Schema({
         maxRestarts:    { type: Number, default: 3 },
         optimiseRounds: { type: Number, default: 2000 },
     },
+    // Named sets of generator preferences an admin can reload next term —
+    // [{ name, savedAt, options, softWeights, solver }]. Stored as JSON rather
+    // than a table of its own: they are read and written whole, never queried.
+    ruleTemplates: {
+        type: [db.Types.JSON],
+        default: [],
+    },
+    // Morning assembly gets its own row in the grid rather than eating period 1.
+    includeAssembly: {
+        type: Boolean,
+        default: false,
+    },
+    // Break times are laid out by the auto-calculator instead of by hand.
+    autoBreaks: {
+        type: Boolean,
+        default: true,
+    },
+    lunchAfterPeriod: { type: Number, default: 4 },
+    lunchMinutes:     { type: Number, default: 30 },
+    dayStartsAt:      { type: String, default: '08:00' },
+    dayEndsAt:        { type: String, default: '14:00' },
+
     updatedBy: {
         type: db.Types.UUID,
         ref: 'User',

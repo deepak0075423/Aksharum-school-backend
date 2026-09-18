@@ -14,6 +14,12 @@
 const SubstituteAssignment = require('../models/SubstituteAssignment');
 const TimetableEntry       = require('../models/TimetableEntry');
 const User                 = require('../models/User');
+const ClassSection         = require('../models/ClassSection');
+const Class                = require('../models/Class');
+const Subject              = require('../models/Subject');
+const TeacherProfile       = require('../models/TeacherProfile');
+const TimetableConfig      = require('../models/TimetableConfig');
+const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const sub                  = require('../services/substituteService');
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true, data: d });
@@ -413,6 +419,453 @@ exports.getHistory = async (req, res) => {
         ok(res, { date: sub.isoOf(ctx.date), rows: rows.map((r) => sub.decorate(ctx, r)) });
     } catch (e) { err(res, e); }
 };
+
+/* ══════════════════════════════════════════════════════════════════════════
+   ADMIN — recent activity, one slot, and the workload roll-up
+══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The last N substitutions across days, newest first.
+ *
+ * Deliberately NOT decorated through a day context: that loads a whole day's
+ * timetable, and a list spanning three weeks would load twenty of them. The
+ * names are resolved in four flat lookups instead.
+ */
+exports.getRecent = async (req, res) => {
+    try {
+        const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 10));
+        const settings = await sub.getSettings(req.schoolId);
+
+        const filter = { school: req.schoolId };
+        if (req.query.via) filter.assignedVia = String(req.query.via);
+        if (req.query.status) filter.status = String(req.query.status);
+        else filter.status = { $in: ['uncovered', 'assigned'] };
+        if (req.query.reason) filter.reason = String(req.query.reason);
+
+        // The retention setting bounds how far back the list reaches. Rows are
+        // never deleted for it, so lengthening it brings them back.
+        const floor = new Date();
+        floor.setUTCFullYear(floor.getUTCFullYear() - Math.max(1, Number(settings.historyYears) || 1));
+        filter.date = { $gte: floor };
+
+        const rows = await SubstituteAssignment.find(filter)
+            .sort({ date: -1, periodNumber: 1 })
+            .limit(limit)
+            .lean();
+
+        ok(res, { rows: await hydrate(req.schoolId, rows) });
+    } catch (e) { err(res, e); }
+};
+
+/**
+ * Resolve section / subject / teacher names for rows that may span many days.
+ * One query per table, whatever the number of rows.
+ */
+async function hydrate(schoolId, rows) {
+    if (!rows.length) return [];
+    const ids = (key) => [...new Set(rows.map((r) => sub.sid(r[key])).filter(Boolean))];
+    const [sections, subjects, users] = await Promise.all([
+        ClassSection.find({ _id: { $in: ids('section') } }).select('sectionName class').lean(),
+        Subject.find({ _id: { $in: ids('subject') } }).select('subjectName').lean(),
+        User.find({ _id: { $in: [...ids('originalTeacher'), ...ids('substituteTeacher'), ...ids('assignedBy')] } })
+            .select('name').lean(),
+    ]);
+    const classes = await Class.find({ _id: { $in: [...new Set(sections.map((x) => sub.sid(x.class)))] } })
+        .select('className').lean();
+    const className = new Map(classes.map((c) => [sub.sid(c._id), c.className]));
+    const sectionById = new Map(sections.map((x) => [sub.sid(x._id), x]));
+    const subjectById = new Map(subjects.map((x) => [sub.sid(x._id), x.subjectName]));
+    const userById = new Map(users.map((x) => [sub.sid(x._id), x.name]));
+    const nameOf = (id) => (id ? userById.get(sub.sid(id)) || '' : '');
+
+    return rows.map((r) => {
+        const sec = sectionById.get(sub.sid(r.section));
+        const cls = sec ? className.get(sub.sid(sec.class)) || '' : '';
+        return {
+            _id: r._id,
+            date: sub.isoOf(r.date),
+            dayOfWeek: r.dayOfWeek,
+            periodNumber: r.periodNumber,
+            startTime: r.startTime || '',
+            endTime: r.endTime || '',
+            status: r.status,
+            reason: r.reason,
+            assignedVia: r.assignedVia,
+            needsReview: !!r.needsReview,
+            remarks: r.remarks || '',
+            section: {
+                _id: r.section,
+                className: cls,
+                sectionName: sec ? sec.sectionName : '',
+                label: cls ? `${cls} - ${sec.sectionName}` : (sec ? sec.sectionName : ''),
+            },
+            subject: { _id: r.subject, name: subjectById.get(sub.sid(r.subject)) || '' },
+            originalTeacher: { _id: r.originalTeacher, name: nameOf(r.originalTeacher) },
+            substituteTeacher: r.substituteTeacher
+                ? { _id: r.substituteTeacher, name: nameOf(r.substituteTeacher) } : null,
+            assignedBy: r.assignedBy ? { _id: r.assignedBy, name: nameOf(r.assignedBy) } : null,
+            assignedAt: r.assignedAt || null,
+        };
+    });
+}
+
+/**
+ * One slot of the published week: what is taught there, by whom, whether they
+ * are recorded away, and who could cover it.
+ *
+ * The manual-assignment screen asks this BEFORE any substitution row exists —
+ * an admin picks a class, a section and a period, and wants to see the teacher
+ * and the free staff before committing to anything. /:id/candidates cannot
+ * answer that, because it needs a row to rank against.
+ */
+exports.getSlot = async (req, res) => {
+    try {
+        const { sectionId, periodNumber } = req.query;
+        if (!sectionId || !periodNumber) return err(res, 'Section and period are required', 400);
+
+        const ctx = await sub.buildContext(req.schoolId, parseDate(req.query.date));
+        if (!ctx.ready) return err(res, 'No published timetable for the active academic year', 400);
+
+        const period = Number(periodNumber);
+        const slots = (ctx.slotsByDayPeriod.get(`${ctx.dayOfWeek}|${period}`) || [])
+            .filter((slot) => {
+                const tt = ctx.timetableById.get(sub.sid(slot.entry.timetable));
+                return tt && sub.sid(tt.section) === String(sectionId);
+            });
+
+        const times = slots.length
+            ? sub.periodTimes(ctx, slots[0].entry.timetable, period)
+            : { startTime: '', endTime: '' };
+
+        const [absences, busySlots] = await Promise.all([
+            sub.detectAbsences(ctx),
+            sub.busySubstituteSlots(ctx),
+        ]);
+        const workloads = await sub.computeWorkloads(ctx, ctx.teachers.map((t) => t._id));
+
+        // Every teacher who is due in this room at this period: the main subject
+        // plus any additional subject sharing the slot.
+        const teaching = slots.map((slot) => {
+            const away = absences.get(sub.sid(slot.teacher));
+            return {
+                teacher: { _id: slot.teacher, name: sub.teacherName(ctx, slot.teacher) },
+                subject: { _id: slot.subject, name: sub.subjectName(ctx, slot.subject) },
+                timetableEntry: slot.entry._id,
+                isPrimary: slot.isPrimary,
+                absence: away ? { reason: away.reason, label: away.label, needsReview: !!away.needsReview } : null,
+            };
+        });
+
+        const existing = await SubstituteAssignment.find({
+            school: req.schoolId, date: ctx.date, section: sectionId,
+            periodNumber: period, status: { $in: ['uncovered', 'assigned'] },
+        }).lean();
+
+        // Rank against the first teaching slot — the candidate list is the same
+        // for every teacher in the period, bar the subject-match bonus.
+        const requirement = {
+            periodNumber: period,
+            section: sectionId,
+            subject: slots[0] ? slots[0].subject : null,
+            originalTeacher: slots[0] ? slots[0].teacher : null,
+        };
+        const candidates = slots.length
+            ? sub.candidatesFor(ctx, requirement, { absences, workloads, busySlots })
+            : [];
+
+        // Everyone NOT free, and why — the availability panel lists both.
+        const freeIds = new Set(candidates.map((c) => sub.sid(c.teacher._id)));
+        const unavailable = ctx.teachers
+            .filter((t) => !freeIds.has(sub.sid(t._id)))
+            .map((t) => {
+                const tid = sub.sid(t._id);
+                const away = absences.get(tid);
+                const busy = (ctx.slotsByDayPeriod.get(`${ctx.dayOfWeek}|${period}`) || [])
+                    .some((x) => x.teacher === tid);
+                return {
+                    teacher: { _id: t._id, name: t.name },
+                    reason: away ? (away.label || 'Away') : busy ? 'Teaching this period' : 'Not available',
+                    subjects: [...(ctx.subjectsByTeacher.get(tid) || [])]
+                        .map((id) => sub.subjectName(ctx, id)).filter(Boolean),
+                };
+            });
+
+        ok(res, {
+            date: sub.isoOf(ctx.date),
+            dayOfWeek: ctx.dayOfWeek,
+            periodNumber: period,
+            ...times,
+            teaching,
+            existing: existing.map((r) => sub.decorate(ctx, r)),
+            candidates: candidates.map((c) => ({
+                ...c,
+                subjects: [...(ctx.subjectsByTeacher.get(sub.sid(c.teacher._id)) || [])]
+                    .map((id) => sub.subjectName(ctx, id)).filter(Boolean),
+            })),
+            unavailable,
+        });
+    } catch (e) { err(res, e); }
+};
+
+/**
+ * Cover a period that has no substitution row yet, in one call: open it, then
+ * assign. The manual screen is one form with one button, and making the client
+ * chain create → assign leaves a half-made row behind whenever the second call
+ * fails.
+ *
+ * Addressed by class period rather than by timetable entry, because that is
+ * what the admin picked on screen; the entry is looked up here.
+ */
+exports.assignSlot = async (req, res) => {
+    try {
+        const { sectionId, periodNumber, substituteTeacherId } = req.body || {};
+        if (!sectionId || !periodNumber) return err(res, 'Section and period are required', 400);
+        if (!substituteTeacherId) return err(res, 'Choose a substitute teacher', 400);
+
+        const ctx = await sub.buildContext(req.schoolId, parseDate(req.body.date));
+        if (!ctx.ready) return err(res, 'No published timetable for the active academic year', 400);
+
+        const period = Number(periodNumber);
+        const slots = (ctx.slotsByDayPeriod.get(`${ctx.dayOfWeek}|${period}`) || [])
+            .filter((slot) => {
+                const tt = ctx.timetableById.get(sub.sid(slot.entry.timetable));
+                return tt && sub.sid(tt.section) === String(sectionId);
+            });
+        if (!slots.length) return err(res, 'Nothing is timetabled for that class at that period', 400);
+
+        const wanted = req.body.originalTeacherId
+            ? slots.find((x) => x.teacher === sub.sid(req.body.originalTeacherId))
+            : slots[0];
+        if (!wanted) return err(res, 'That teacher does not take this period', 400);
+        if (sub.sid(substituteTeacherId) === wanted.teacher) {
+            return err(res, 'A teacher cannot substitute for themselves', 400);
+        }
+
+        const tt = ctx.timetableById.get(sub.sid(wanted.entry.timetable));
+        let row = await SubstituteAssignment.findOne({
+            school: req.schoolId, date: ctx.date,
+            timetableEntry: wanted.entry._id, originalTeacher: wanted.teacher,
+            status: { $in: sub.LIVE },
+        }).lean();
+
+        if (!row) {
+            const times = sub.periodTimes(ctx, wanted.entry.timetable, period);
+            const created = await SubstituteAssignment.create({
+                school:          req.schoolId,
+                academicYear:    ctx.year._id,
+                date:            ctx.date,
+                dayOfWeek:       ctx.dayOfWeek,
+                timetableEntry:  wanted.entry._id,
+                section:         tt.section,
+                subject:         wanted.subject || null,
+                periodNumber:    period,
+                startTime:       times.startTime,
+                endTime:         times.endTime,
+                originalTeacher: wanted.teacher,
+                // What the admin says is wrong today. 'manual' is the honest
+                // default: this screen covers periods with no recorded absence.
+                reason:          ['absent', 'leave', 'manual'].includes(req.body.reason)
+                    ? req.body.reason : 'manual',
+                status:          'uncovered',
+                assignedVia:     'none',
+            });
+            row = created.toObject ? created.toObject() : created;
+        }
+
+        // The same override rule the per-row assign uses: a clash is refused
+        // with its reason, never accepted quietly.
+        if (req.body.force !== true) {
+            const [absences, busySlots] = await Promise.all([
+                sub.detectAbsences(ctx),
+                sub.busySubstituteSlots(ctx),
+            ]);
+            const workloads = await sub.computeWorkloads(ctx, [substituteTeacherId]);
+            const eligible = sub.candidatesFor(ctx, row, { absences, workloads, busySlots })
+                .some((c) => sub.sid(c.teacher._id) === sub.sid(substituteTeacherId));
+            if (!eligible) {
+                return err(res, `${sub.teacherName(ctx, substituteTeacherId) || 'That teacher'} `
+                    + 'is not available for this period. Re-send with force to assign anyway.', 409);
+            }
+        }
+
+        const saved = await sub.assignSubstitute(ctx, row, {
+            substituteTeacherId,
+            remarks: req.body.remarks || '',
+            actor: req.userId,
+            actorName: req.user && req.user.name,
+            via: 'manual',
+        });
+        ok(res, sub.decorate(ctx, saved), 201);
+    } catch (e) { err(res, e, e.status || 500); }
+};
+
+/** Assign several open periods in one action — one board, one decision. */
+exports.bulkAssign = async (req, res) => {
+    try {
+        const items = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+        if (!items.length) return err(res, 'Nothing to assign', 400);
+        if (items.length > 50) return err(res, 'Assign at most 50 periods at a time', 400);
+
+        const date = parseDate(req.body.date);
+        const ctx = await sub.buildContext(req.schoolId, date);
+
+        const done = [];
+        const failed = [];
+        for (const item of items) {
+            try {
+                const row = await loadRow(item.id, req.schoolId);
+                if (!row) throw new Error('Substitution not found');
+                const saved = await sub.assignSubstitute(ctx, row, {
+                    substituteTeacherId: item.substituteTeacherId,
+                    remarks: item.remarks || req.body.remarks || '',
+                    actor: req.userId,
+                    actorName: req.user && req.user.name,
+                    via: 'manual',
+                });
+                done.push(sub.decorate(ctx, saved));
+            } catch (e) {
+                failed.push({ id: item.id, message: e.message || 'Could not assign' });
+            }
+        }
+        ok(res, { assigned: done.length, failed, rows: done });
+    } catch (e) { err(res, e); }
+};
+
+/**
+ * The workload screen: every teacher's timetabled load beside the cover they
+ * have taken on, and which side of the school's own thresholds that puts them.
+ *
+ * The bands are derived from the configured weekly ceiling rather than being
+ * hard-coded, so the labels a school reads ("> 34 periods") are its own numbers.
+ */
+exports.getWorkloadReport = async (req, res) => {
+    try {
+        const ctx = await sub.buildContext(req.schoolId, parseDate(req.query.date));
+        const settings = ctx.settings;
+
+        const from = req.query.from ? parseDate(req.query.from) : monthStart(ctx.date);
+        const to   = req.query.to ? parseDate(req.query.to) : ctx.date;
+
+        const [profiles, sst, subjects, sections, config] = await Promise.all([
+            TeacherProfile.find({ teacher: { $in: ctx.teachers.map((t) => t._id) } })
+                .select('teacher designation department').lean(),
+            SectionSubjectTeacher.find().select('section subject teacher').lean(),
+            Subject.find({ school: req.schoolId }).select('subjectName').lean(),
+            ClassSection.find({ school: req.schoolId, ...(ctx.year ? { academicYear: ctx.year._id } : {}) })
+                .populate('class', 'className').lean(),
+            ctx.year
+                ? TimetableConfig.findOne({ school: req.schoolId, academicYear: ctx.year._id }).lean()
+                : null,
+        ]);
+
+        const profileOf = new Map(profiles.map((p) => [sub.sid(p.teacher), p]));
+        const subjectName = new Map(subjects.map((x) => [sub.sid(x._id), x.subjectName]));
+        const sectionById = new Map(sections.map((x) => [sub.sid(x._id), x]));
+
+        // Weekly timetabled load: every slot the teacher holds, across the week.
+        const weekly = new Map();
+        const sectionsOf = new Map();
+        for (const slot of ctx.slots) {
+            const tid = slot.teacher;
+            weekly.set(tid, (weekly.get(tid) || 0) + 1);
+            const tt = ctx.timetableById.get(sub.sid(slot.entry.timetable));
+            if (tt) {
+                if (!sectionsOf.has(tid)) sectionsOf.set(tid, new Set());
+                sectionsOf.get(tid).add(sub.sid(tt.section));
+            }
+        }
+
+        const covers = await SubstituteAssignment.find({
+            school: req.schoolId, status: 'assigned',
+            date: { $gte: from, $lte: to },
+        }).select('substituteTeacher').lean();
+        const subsBy = new Map();
+        for (const c of covers) {
+            const tid = sub.sid(c.substituteTeacher);
+            if (tid) subsBy.set(tid, (subsBy.get(tid) || 0) + 1);
+        }
+
+        const target = Number(config && config.defaults && config.defaults.maxTeacherPeriodsPerWeek) || 30;
+        const overAt  = target;
+        const underAt = Math.max(1, Math.round(target * 0.4));
+
+        const teacherSubjects = new Map();
+        for (const row of sst) {
+            const tid = sub.sid(row.teacher);
+            if (!sectionById.has(sub.sid(row.section))) continue;
+            if (!teacherSubjects.has(tid)) teacherSubjects.set(tid, new Map());
+            const name = subjectName.get(sub.sid(row.subject));
+            if (name) teacherSubjects.get(tid).set(sub.sid(row.subject), name);
+        }
+
+        // Filters name a class, a section or a subject; a teacher qualifies by
+        // actually teaching there in the published week.
+        const wantClass   = (req.query.className || '').trim();
+        const wantSection = (req.query.sectionName || '').trim();
+        const wantSubject = (req.query.subjectId || '').trim();
+        const wantTeacher = (req.query.teacherId || '').trim();
+        const wantStatus  = (req.query.status || '').trim();
+
+        const rows = ctx.teachers.map((t) => {
+            const tid = sub.sid(t._id);
+            const profile = profileOf.get(tid);
+            const assigned = weekly.get(tid) || 0;
+            const substitutions = subsBy.get(tid) || 0;
+            const total = settings.includeSubsInWorkload ? assigned + substitutions : assigned;
+            const status = total > overAt ? 'overloaded' : total < underAt ? 'underloaded' : 'balanced';
+            const mine = [...(sectionsOf.get(tid) || [])].map((id) => sectionById.get(id)).filter(Boolean);
+            return {
+                teacher: { _id: t._id, name: t.name },
+                designation: (profile && profile.designation) || 'Teacher',
+                department: (profile && profile.department) || '',
+                subjects: [...(teacherSubjects.get(tid) || new Map()).entries()]
+                    .map(([_id, name]) => ({ _id, name })),
+                assignedPeriods: assigned,
+                substitutionPeriods: substitutions,
+                totalLoad: total,
+                loadPct: target > 0 ? Math.round((total / target) * 100) : 0,
+                status,
+                classes: [...new Set(mine.map((x) => (x.class && x.class.className) || ''))].filter(Boolean),
+                sectionNames: [...new Set(mine.map((x) => x.sectionName))].filter(Boolean),
+            };
+        }).filter((r) => {
+            if (wantTeacher && sub.sid(r.teacher._id) !== wantTeacher) return false;
+            if (wantClass && !r.classes.includes(wantClass)) return false;
+            if (wantSection && !r.sectionNames.includes(wantSection)) return false;
+            if (wantSubject && !r.subjects.some((x) => String(x._id) === wantSubject)) return false;
+            if (wantStatus && r.status !== wantStatus) return false;
+            return true;
+        }).sort((a, b) => b.totalLoad - a.totalLoad
+            || String(a.teacher.name).localeCompare(String(b.teacher.name)));
+
+        const all = rows;
+        ok(res, {
+            from: sub.isoOf(from),
+            to: sub.isoOf(to),
+            thresholds: { target, overAt, underAt },
+            includeSubsInWorkload: !!settings.includeSubsInWorkload,
+            summary: {
+                totalTeachers: all.length,
+                averagePerWeek: all.length
+                    ? Math.round((all.reduce((n, r) => n + r.totalLoad, 0) / all.length) * 10) / 10
+                    : 0,
+                overloaded: all.filter((r) => r.status === 'overloaded').length,
+                balanced: all.filter((r) => r.status === 'balanced').length,
+                underloaded: all.filter((r) => r.status === 'underloaded').length,
+            },
+            top: all.slice(0, 5).map((r) => ({ name: r.teacher.name, periods: r.totalLoad })),
+            teachers: all,
+        });
+    } catch (e) { err(res, e); }
+};
+
+/** First of the month a date falls in, at UTC midnight like every stored day. */
+function monthStart(d) {
+    const x = new Date(d);
+    x.setUTCDate(1);
+    x.setUTCHours(0, 0, 0, 0);
+    return x;
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
    ADMIN — settings

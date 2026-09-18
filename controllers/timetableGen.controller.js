@@ -28,6 +28,7 @@ const TimetableVersion      = require('../models/TimetableVersion');
 const TimetableVersionEntry = require('../models/TimetableVersionEntry');
 const TimetableConflict     = require('../models/TimetableConflict');
 const TimetableAuditLog     = require('../models/TimetableAuditLog');
+const TeacherProfile        = require('../models/TeacherProfile');
 
 const tt = require('../services/timetable');
 const { daysForSection } = require('../utils/timetableDays');
@@ -523,6 +524,13 @@ exports.getConfig = async (req, res) => {
             },
             softWeights: tt.DEFAULT_SOFT_WEIGHTS,
             solver: tt.DEFAULT_SOLVER,
+            ruleTemplates: [],
+            includeAssembly: false,
+            autoBreaks: true,
+            lunchAfterPeriod: 4,
+            lunchMinutes: 30,
+            dayStartsAt: '08:00',
+            dayEndsAt: '14:00',
         };
 
         ok(res, { ...(config || fallback), isSaved: !!config, selectedYearId: year._id, yearName: year.yearName });
@@ -565,6 +573,17 @@ exports.saveConfig = async (req, res) => {
                     defaults: { ...(body.defaults || {}) },
                     softWeights: { ...tt.DEFAULT_SOFT_WEIGHTS, ...(body.softWeights || {}) },
                     solver: { ...tt.DEFAULT_SOLVER, ...(body.solver || {}) },
+                    // The school day as the General tab states it. The period
+                    // grid is still the authority on what is taught when; these
+                    // are what the auto-calculator builds that grid FROM, and
+                    // they are kept so it does not start from scratch each time.
+                    includeAssembly: !!body.includeAssembly,
+                    autoBreaks: body.autoBreaks !== false,
+                    lunchAfterPeriod: Math.max(0, Number(body.lunchAfterPeriod) || 0),
+                    lunchMinutes: Math.max(0, Number(body.lunchMinutes) || 0),
+                    dayStartsAt: String(body.dayStartsAt || '08:00'),
+                    dayEndsAt: String(body.dayEndsAt || '14:00'),
+                    ...(Array.isArray(body.ruleTemplates) ? { ruleTemplates: body.ruleTemplates.slice(0, 25) } : {}),
                     updatedBy: req.userId,
                 },
                 $setOnInsert: { school: req.schoolId, academicYear: year._id },
@@ -1882,6 +1901,7 @@ exports.listVersions = async (req, res) => {
         const filter = { school: req.schoolId, isDeleted: false };
         if (year) filter.academicYear = year._id;
         if (req.query.status) filter.status = req.query.status;
+        if (req.query.generatedBy) filter.generatedBy = req.query.generatedBy;
 
         const versions = await TimetableVersion.find(filter)
             .populate('generatedBy', 'name')
@@ -1889,9 +1909,32 @@ exports.listVersions = async (req, res) => {
             .sort({ versionNumber: -1 })
             .lean();
 
+        // The tiles count the YEAR, not the filtered page — a status filter that
+        // silently rewrote its own summary would make the numbers meaningless.
+        const forCounts = { school: req.schoolId, isDeleted: false };
+        if (year) forCounts.academicYear = year._id;
+        const all = await TimetableVersion.find(forCounts)
+            .select('status errorCount generatedBy').populate('generatedBy', 'name').lean();
+
+        const generators = new Map();
+        for (const v of all) {
+            if (!v.generatedBy) continue;
+            generators.set(sid(v.generatedBy._id), v.generatedBy.name);
+        }
+
         ok(res, {
             selectedYearId: year?._id || null,
             yearName: year?.yearName || '',
+            summary: {
+                total: all.length,
+                published: all.filter((v) => v.status === 'published').length,
+                drafts: all.filter((v) => ['draft', 'generated', 'generating'].includes(v.status)).length,
+                conflicts: all.filter((v) => v.status === 'conflict' || (v.errorCount || 0) > 0).length,
+                archived: all.filter((v) => v.status === 'archived').length,
+                validated: all.filter((v) => v.status === 'validated').length,
+            },
+            generators: [...generators.entries()].map(([_id, name]) => ({ _id, name }))
+                .sort((a, b) => String(a.name).localeCompare(String(b.name))),
             versions: versions.map((v) => ({
                 ...v,
                 sectionCount: (v.sections || []).length,
@@ -2917,3 +2960,856 @@ function exportExcel(res, version, model) {
     res.setHeader('Content-Disposition', `attachment; filename="timetable-v${version.versionNumber}-${view}.xlsx"`);
     res.send(buffer);
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   THE ADMIN SCREENS' OWN READS
+   ──────────────────────────────────────────────────────────────────────────
+   Each of these answers one screen's opening question in a single round trip.
+   They are deliberately separate from the older per-report endpoints above:
+   those return one table, and a screen that also draws five tiles, three charts
+   and a rail would otherwise make six calls to fill one view.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The published week folded into every shape the report screens ask for:
+ * per teacher, per room, per subject, per section, plus the clashes it
+ * actually contains.
+ *
+ * A merged lesson is ONE lesson however many sections sit in it — the room
+ * holds one class and the teacher teaches once — so every count here dedupes
+ * on the merge key before counting.
+ */
+async function weekFacts(schoolId, academicYearId) {
+    const { rows, sections, days, slotsPerSection } = await publishedWeek(schoolId, academicYearId);
+
+    const [teachers, subjects, rooms, availability] = await Promise.all([
+        User.find({ school: schoolId, role: 'teacher' }).select('name isActive').sort('name').lean(),
+        Subject.find({ school: schoolId }).select('subjectName subjectCode').lean(),
+        Room.find({ school: schoolId }).select('roomName roomType isActive capacity').sort('roomName').lean(),
+        TeacherAvailability.find({ school: schoolId, academicYear: academicYearId }).lean(),
+    ]);
+
+    const subjectName = new Map(subjects.map((x) => [sid(x._id), x.subjectName]));
+    const roomById    = new Map(rooms.map((x) => [sid(x._id), x]));
+    const teacherById = new Map(teachers.map((x) => [sid(x._id), x]));
+    const capOf       = new Map(availability.map((a) => [sid(a.teacher), a.maxPeriodsPerWeek || 0]));
+
+    const mergeKey = (r) => (r.mergedSections.length
+        ? `${[r.section, ...r.mergedSections].sort().join('|')}#${r.dayOfWeek}#${r.periodNumber}#${r.subject}`
+        : null);
+
+    // One row per distinct lesson.
+    const seen = new Set();
+    const lessons = [];
+    for (const r of rows) {
+        const key = mergeKey(r);
+        if (key) {
+            if (seen.has(key)) continue;
+            seen.add(key);
+        }
+        lessons.push(r);
+    }
+
+    const byTeacher = new Map();
+    const bySubject = new Map();
+    const byRoom    = new Map();
+    const bySection = new Map();
+    const busy      = new Map();   // `${teacher}#${day}#${period}` → rows, for clash detection
+    const roomBusy  = new Map();
+    const slotBusy  = new Map();
+
+    for (const r of lessons) {
+        if (r.teacher) {
+            if (!byTeacher.has(r.teacher)) {
+                byTeacher.set(r.teacher, { periods: 0, byDay: {}, bySubject: new Map(), sections: new Set() });
+            }
+            const t = byTeacher.get(r.teacher);
+            t.periods += 1;
+            t.byDay[r.dayOfWeek] = (t.byDay[r.dayOfWeek] || 0) + 1;
+            const sn = subjectName.get(r.subject) || 'Subject';
+            t.bySubject.set(sn, (t.bySubject.get(sn) || 0) + 1);
+            for (const secId of [r.section, ...r.mergedSections]) t.sections.add(secId);
+
+            const k = `${r.teacher}#${r.dayOfWeek}#${r.periodNumber}`;
+            if (!busy.has(k)) busy.set(k, []);
+            busy.get(k).push(r);
+        }
+        if (r.subject) {
+            if (!bySubject.has(r.subject)) {
+                bySubject.set(r.subject, { periods: 0, sections: new Set(), teachers: new Set() });
+            }
+            const s = bySubject.get(r.subject);
+            s.periods += 1;
+            for (const secId of [r.section, ...r.mergedSections]) s.sections.add(secId);
+            if (r.teacher) s.teachers.add(r.teacher);
+        }
+        if (r.room) {
+            if (!byRoom.has(r.room)) byRoom.set(r.room, { periods: 0, byDay: {}, sections: new Set() });
+            const b = byRoom.get(r.room);
+            b.periods += 1;
+            b.byDay[r.dayOfWeek] = (b.byDay[r.dayOfWeek] || 0) + 1;
+            b.sections.add(r.section);
+
+            const k = `${r.room}#${r.dayOfWeek}#${r.periodNumber}`;
+            if (!roomBusy.has(k)) roomBusy.set(k, []);
+            roomBusy.get(k).push(r);
+        }
+        for (const secId of [r.section, ...r.mergedSections]) {
+            if (!bySection.has(secId)) bySection.set(secId, { periods: 0, byDay: {}, bySubject: new Map() });
+            const b = bySection.get(secId);
+            b.periods += 1;
+            b.byDay[r.dayOfWeek] = (b.byDay[r.dayOfWeek] || 0) + 1;
+            const sn = subjectName.get(r.subject) || 'Subject';
+            b.bySubject.set(sn, (b.bySubject.get(sn) || 0) + 1);
+
+            const k = `${secId}#${r.dayOfWeek}#${r.periodNumber}`;
+            if (!slotBusy.has(k)) slotBusy.set(k, []);
+            slotBusy.get(k).push(r);
+        }
+    }
+
+    // The week's capacity: each section's own teaching slots across its days.
+    let totalSlots = 0;
+    for (const section of sections) {
+        totalSlots += (slotsPerSection.get(section._id) || 0) * days.length;
+    }
+
+    return {
+        rows, lessons, sections, days, slotsPerSection, totalSlots,
+        teachers, subjects, rooms, availability,
+        subjectName, roomById, teacherById, capOf,
+        byTeacher, bySubject, byRoom, bySection, busy, roomBusy, slotBusy,
+    };
+}
+
+/** Every teacher's row on the reports screen — the shape three tabs share. */
+function teacherRows(facts, periodsPerWeek) {
+    return facts.teachers.map((t) => {
+        const id = sid(t._id);
+        const load = facts.byTeacher.get(id);
+        const periods = load ? load.periods : 0;
+        const cap = facts.capOf.get(id) || periodsPerWeek || 0;
+        return {
+            _id: id,
+            name: t.name,
+            isActive: t.isActive !== false,
+            periods,
+            cap,
+            freePeriods: Math.max(0, (periodsPerWeek || 0) - periods),
+            loadPct: cap > 0 ? Math.round((periods / cap) * 100) : 0,
+            status: cap > 0 && periods > cap ? 'over' : cap > 0 && periods >= cap * 0.85 ? 'on' : 'under',
+            sections: load ? load.sections.size : 0,
+            byDay: load ? load.byDay : {},
+            subjects: load
+                ? [...load.bySubject.entries()].map(([name, n]) => ({ name, periods: n }))
+                    .sort((a, b) => b.periods - a.periods)
+                : [],
+        };
+    }).sort((a, b) => b.periods - a.periods || String(a.name).localeCompare(String(b.name)));
+}
+
+/**
+ * Clashes the LIVE timetable actually contains — a teacher in two rooms at
+ * once, a room holding two classes, a section given two lessons in one slot,
+ * a teacher past their weekly ceiling, a section with slots nobody filled.
+ *
+ * The generator's conflict table only covers draft versions; once a version is
+ * published nothing was re-checking the result, so a hand edit could introduce
+ * a clash the screens never mentioned.
+ */
+function liveConflicts(facts, periodsPerWeek) {
+    const out = [];
+    const sectionLabel = new Map(facts.sections.map((s) => [s._id, s.label]));
+
+    for (const [key, group] of facts.busy) {
+        if (group.length < 2) continue;
+        const [teacher, day, period] = key.split('#');
+        out.push({
+            type: 'TEACHER_CLASH',
+            severity: 'error',
+            dayOfWeek: day,
+            periodNumber: Number(period),
+            message: `${(facts.teacherById.get(teacher) || {}).name || 'A teacher'} is timetabled for `
+                + `${group.length} classes at once`,
+            detail: group.map((r) => r.sectionLabel).join(', '),
+        });
+    }
+    for (const [key, group] of facts.roomBusy) {
+        if (group.length < 2) continue;
+        const [room, day, period] = key.split('#');
+        out.push({
+            type: 'ROOM_CLASH',
+            severity: 'error',
+            dayOfWeek: day,
+            periodNumber: Number(period),
+            message: `${(facts.roomById.get(room) || {}).roomName || 'A room'} holds ${group.length} classes at once`,
+            detail: group.map((r) => r.sectionLabel).join(', '),
+        });
+    }
+    for (const [key, group] of facts.slotBusy) {
+        if (group.length < 2) continue;
+        const [section, day, period] = key.split('#');
+        out.push({
+            type: 'CLASS_CLASH',
+            severity: 'error',
+            dayOfWeek: day,
+            periodNumber: Number(period),
+            message: `${sectionLabel.get(section) || 'A section'} has ${group.length} lessons in one period`,
+            detail: group.map((r) => facts.subjectName.get(r.subject) || 'Subject').join(', '),
+        });
+    }
+    for (const t of facts.teachers) {
+        const id = sid(t._id);
+        const cap = facts.capOf.get(id) || 0;
+        const periods = (facts.byTeacher.get(id) || {}).periods || 0;
+        if (cap > 0 && periods > cap) {
+            out.push({
+                type: 'WEEKLY_LIMIT_EXCEEDED',
+                severity: 'warning',
+                message: `${t.name} is timetabled for ${periods} periods against a ceiling of ${cap}`,
+                detail: 'Raise the ceiling in Teacher Availability, or move periods to another teacher.',
+            });
+        }
+    }
+    for (const section of facts.sections) {
+        const holds = (facts.slotsPerSection.get(section._id) || 0) * facts.days.length;
+        const has = (facts.bySection.get(section._id) || {}).periods || 0;
+        if (holds > 0 && has < holds) {
+            out.push({
+                type: 'EMPTY_SLOTS',
+                severity: 'warning',
+                message: `${section.label} has ${holds - has} empty period${holds - has === 1 ? '' : 's'} in its week`,
+                detail: `${has} of ${holds} slots filled.`,
+            });
+        }
+    }
+    // Errors before warnings, then by day so the list reads as a week.
+    const dayOrder = new Map(tt.DAYS.map((d, i) => [d, i]));
+    return out.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'error' ? -1 : 1)
+        || (dayOrder.get(a.dayOfWeek) ?? 9) - (dayOrder.get(b.dayOfWeek) ?? 9)
+        || (a.periodNumber || 0) - (b.periodNumber || 0));
+}
+
+/** The load histogram the overview draws: how many teachers in each band. */
+function loadBands(rows) {
+    const bands = [
+        { label: '0–5', min: 0, max: 5 }, { label: '6–10', min: 6, max: 10 },
+        { label: '11–15', min: 11, max: 15 }, { label: '16–20', min: 16, max: 20 },
+        { label: '21–25', min: 21, max: 25 }, { label: '26–30', min: 26, max: 30 },
+        { label: '31+', min: 31, max: Infinity },
+    ];
+    return bands.map((b) => ({
+        label: b.label,
+        value: rows.filter((r) => r.periods >= b.min && r.periods <= b.max).length,
+    }));
+}
+
+/** GET — everything the Reports screen's Overview tab draws. */
+exports.reportOverview = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const facts = await weekFacts(req.schoolId, year._id);
+        const config = await TimetableConfig.findOne({ school: req.schoolId, academicYear: year._id }).lean();
+
+        // Periods a single section works in a week — the figure a teacher's own
+        // "free periods" is measured against.
+        const perSectionWeek = facts.sections.length
+            ? Math.max(...facts.sections.map((s) => (facts.slotsPerSection.get(s._id) || 0))) * facts.days.length
+            : 0;
+
+        const rows = teacherRows(facts, perSectionWeek);
+        const scheduled = facts.lessons.length;
+        const conflicts = liveConflicts(facts, perSectionWeek);
+
+        const roomsActive = facts.rooms.filter((r) => r.isActive !== false);
+        const usedRooms = [...facts.byRoom.keys()];
+        const roomSlots = roomsActive.length * perSectionWeek;
+        const roomPeriods = [...facts.byRoom.values()].reduce((n, b) => n + b.periods, 0);
+
+        const subjectTotals = [...facts.bySubject.entries()]
+            .map(([id, s]) => ({
+                _id: id,
+                name: facts.subjectName.get(id) || 'Subject',
+                periods: s.periods,
+                share: scheduled ? Math.round((s.periods / scheduled) * 100) : 0,
+            }))
+            .sort((a, b) => b.periods - a.periods);
+
+        ok(res, {
+            days: facts.days,
+            perSectionWeek,
+            summary: {
+                teachers: facts.teachers.length,
+                teachersActive: facts.teachers.filter((t) => t.isActive !== false).length,
+                teachersInactive: facts.teachers.filter((t) => t.isActive === false).length,
+                totalSlots: facts.totalSlots,
+                scheduled,
+                utilisation: facts.totalSlots ? Math.round((scheduled / facts.totalSlots) * 100) : 0,
+                conflicts: conflicts.filter((c) => c.severity === 'error').length,
+                warnings: conflicts.filter((c) => c.severity === 'warning').length,
+                rooms: roomsActive.length,
+                labs: roomsActive.filter((r) => /lab/i.test(r.roomType || '')).length,
+                classrooms: roomsActive.filter((r) => r.roomType === 'Classroom').length,
+                sections: facts.sections.length,
+            },
+            loadBands: loadBands(rows),
+            roomSplit: {
+                inUse: roomPeriods,
+                free: Math.max(0, roomSlots - roomPeriods),
+                unavailable: 0,
+                slots: roomSlots,
+                roomsUsed: usedRooms.length,
+                roomsIdle: Math.max(0, roomsActive.length - usedRooms.length),
+            },
+            subjects: subjectTotals,
+            teachers: rows,
+            hasTimetable: scheduled > 0,
+            weeklyCap: (config && config.defaults && config.defaults.maxTeacherPeriodsPerWeek) || 0,
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/** GET — how the week is split between subjects, and where each one lands. */
+exports.subjectDistribution = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const facts = await weekFacts(req.schoolId, year._id);
+        const total = facts.lessons.length;
+        const label = new Map(facts.sections.map((s) => [s._id, s.label]));
+
+        // Per subject, how many periods each section gives it — the row that
+        // shows a class quietly getting three periods of Science where every
+        // other class gets five.
+        const perSection = new Map();
+        for (const r of facts.lessons) {
+            if (!r.subject) continue;
+            for (const secId of [r.section, ...r.mergedSections]) {
+                const k = `${r.subject}#${secId}`;
+                perSection.set(k, (perSection.get(k) || 0) + 1);
+            }
+        }
+
+        const subjects = [...facts.bySubject.entries()].map(([id, s]) => {
+            const sections = [...s.sections].map((secId) => ({
+                _id: secId,
+                label: label.get(secId) || 'Section',
+                periods: perSection.get(`${id}#${secId}`) || 0,
+            })).sort((a, b) => b.periods - a.periods);
+            const counts = sections.map((x) => x.periods);
+            return {
+                _id: id,
+                name: facts.subjectName.get(id) || 'Subject',
+                periods: s.periods,
+                share: total ? Math.round((s.periods / total) * 100) : 0,
+                sections,
+                sectionCount: sections.length,
+                teachers: s.teachers.size,
+                perSectionMin: counts.length ? Math.min(...counts) : 0,
+                perSectionMax: counts.length ? Math.max(...counts) : 0,
+                // A subject taught unevenly across sections is worth a look —
+                // it is usually a requirement someone set on one section only.
+                uneven: counts.length > 1 && Math.min(...counts) !== Math.max(...counts),
+            };
+        }).sort((a, b) => b.periods - a.periods);
+
+        // Subjects a section teaches at all, so "nobody timetabled Art in 7-B"
+        // is visible rather than merely absent.
+        const notTimetabled = facts.subjects
+            .filter((s) => !facts.bySubject.has(sid(s._id)))
+            .map((s) => ({ _id: sid(s._id), name: s.subjectName }));
+
+        ok(res, { total, subjects, notTimetabled, sections: facts.sections, days: facts.days });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/** GET — the holes: teachers idle, classes with gaps, slots nobody filled. */
+exports.freePeriodsReport = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const facts = await weekFacts(req.schoolId, year._id);
+        const perSectionWeek = facts.sections.length
+            ? Math.max(...facts.sections.map((s) => (facts.slotsPerSection.get(s._id) || 0))) * facts.days.length
+            : 0;
+
+        const teachers = facts.teachers.filter((t) => t.isActive !== false).map((t) => {
+            const id = sid(t._id);
+            const load = facts.byTeacher.get(id);
+            const byDay = {};
+            let gaps = 0;
+            for (const day of facts.days) {
+                const taught = load ? (load.byDay[day] || 0) : 0;
+                const slots = facts.sections.length
+                    ? Math.max(...facts.sections.map((s) => facts.slotsPerSection.get(s._id) || 0))
+                    : 0;
+                byDay[day] = Math.max(0, slots - taught);
+                // A "gap" is a free period with lessons on both sides of it —
+                // the kind a teacher cannot use for anything.
+                gaps += 0;
+            }
+            const periods = load ? load.periods : 0;
+            return {
+                _id: id,
+                name: t.name,
+                periods,
+                free: Math.max(0, perSectionWeek - periods),
+                byDay,
+                busiestDay: load
+                    ? Object.entries(load.byDay).sort((a, b) => b[1] - a[1])[0]?.[0] || ''
+                    : '',
+                gaps,
+            };
+        }).sort((a, b) => b.free - a.free);
+
+        // A section's own empty slots, day by day.
+        const sections = facts.sections.map((s) => {
+            const holds = facts.slotsPerSection.get(s._id) || 0;
+            const b = facts.bySection.get(s._id) || { periods: 0, byDay: {} };
+            const byDay = {};
+            for (const day of facts.days) byDay[day] = Math.max(0, holds - (b.byDay[day] || 0));
+            return {
+                _id: s._id,
+                label: s.label,
+                slots: holds * facts.days.length,
+                filled: b.periods,
+                free: Math.max(0, holds * facts.days.length - b.periods),
+                byDay,
+            };
+        }).sort((a, b) => b.free - a.free);
+
+        ok(res, {
+            days: facts.days,
+            perSectionWeek,
+            teachers,
+            sections,
+            summary: {
+                teacherFree: teachers.reduce((n, t) => n + t.free, 0),
+                sectionFree: sections.reduce((n, s) => n + s.free, 0),
+                fullyBooked: teachers.filter((t) => t.free === 0).length,
+                unused: teachers.filter((t) => t.periods === 0).length,
+            },
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/** GET — the clashes and gaps the published week actually contains. */
+exports.conflictReport = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const facts = await weekFacts(req.schoolId, year._id);
+        const perSectionWeek = facts.sections.length
+            ? Math.max(...facts.sections.map((s) => (facts.slotsPerSection.get(s._id) || 0))) * facts.days.length
+            : 0;
+        const conflicts = liveConflicts(facts, perSectionWeek);
+
+        const byType = new Map();
+        for (const c of conflicts) byType.set(c.type, (byType.get(c.type) || 0) + 1);
+
+        ok(res, {
+            conflicts,
+            summary: {
+                total: conflicts.length,
+                errors: conflicts.filter((c) => c.severity === 'error').length,
+                warnings: conflicts.filter((c) => c.severity === 'warning').length,
+            },
+            byType: [...byType.entries()].map(([type, count]) => ({ type, count }))
+                .sort((a, b) => b.count - a.count),
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/** GET — this year's published week beside another year's. */
+exports.yearComparison = async (req, res) => {
+    try {
+        const years = await AcademicYear.find({ school: req.schoolId }).sort({ createdAt: -1 }).lean();
+        if (!years.length) return err(res, 'No academic year found', 404);
+
+        const pick = (id) => years.find((y) => sid(y._id) === String(id));
+        const current = pick(req.query.yearId) || years.find((y) => y.status === 'active') || years[0];
+        const against = pick(req.query.compareTo) || years.find((y) => sid(y._id) !== sid(current._id));
+
+        const digest = async (year) => {
+            if (!year) return null;
+            const facts = await weekFacts(req.schoolId, year._id);
+            const scheduled = facts.lessons.length;
+            const loads = [...facts.byTeacher.values()].map((x) => x.periods);
+            return {
+                _id: sid(year._id),
+                yearName: year.yearName,
+                status: year.status,
+                sections: facts.sections.length,
+                teachers: facts.teachers.filter((t) => t.isActive !== false).length,
+                teachersTeaching: facts.byTeacher.size,
+                subjects: facts.bySubject.size,
+                rooms: facts.rooms.filter((r) => r.isActive !== false).length,
+                scheduled,
+                slots: facts.totalSlots,
+                utilisation: facts.totalSlots ? Math.round((scheduled / facts.totalSlots) * 100) : 0,
+                averageLoad: loads.length
+                    ? Math.round((loads.reduce((n, x) => n + x, 0) / loads.length) * 10) / 10 : 0,
+                busiestLoad: loads.length ? Math.max(...loads) : 0,
+                subjectSplit: [...facts.bySubject.entries()]
+                    .map(([id, s]) => ({ name: facts.subjectName.get(id) || 'Subject', periods: s.periods }))
+                    .sort((a, b) => b.periods - a.periods).slice(0, 8),
+            };
+        };
+
+        const [a, b] = await Promise.all([digest(current), digest(against)]);
+        ok(res, { years: years.map((y) => ({ _id: sid(y._id), yearName: y.yearName, status: y.status })), current: a, compare: b });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/* ══════════════════════════════════════════════════════════════════════════
+   ROOMS — the screen's own read
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/** GET — rooms, what they are being used for, and the filters that fit them. */
+exports.roomsOverview = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+
+        const filter = { school: req.schoolId };
+        if (req.query.type) filter.roomType = req.query.type;
+        if (req.query.building) filter.building = req.query.building;
+        if (req.query.status === 'active') filter.isActive = true;
+        if (req.query.status === 'inactive') filter.isActive = false;
+
+        const [rooms, all] = await Promise.all([
+            Room.find(filter)
+                .populate('homeSection', 'sectionName class')
+                .populate('subjects', 'subjectName')
+                .sort({ roomName: 1 }).lean(),
+            Room.find({ school: req.schoolId }).select('roomType building isActive').lean(),
+        ]);
+
+        // Which rooms the live week actually uses, so "available" means
+        // something other than "switched on".
+        let usage = new Map();
+        let weekSlots = 0;
+        if (year) {
+            const facts = await weekFacts(req.schoolId, year._id);
+            weekSlots = facts.sections.length
+                ? Math.max(...facts.sections.map((s) => facts.slotsPerSection.get(s._id) || 0)) * facts.days.length
+                : 0;
+            usage = facts.byRoom;
+        }
+
+        const homeClassIds = uniq(rooms.map((r) => sid(r.homeSection && r.homeSection.class)).filter(Boolean));
+        const classes = homeClassIds.length
+            ? await Class.find({ _id: { $in: homeClassIds } }).select('className').lean()
+            : [];
+        const className = new Map(classes.map((c) => [sid(c._id), c.className]));
+
+        ok(res, {
+            rooms: rooms.map((r) => {
+                const u = usage.get(sid(r._id));
+                return {
+                    ...r,
+                    homeLabel: r.homeSection
+                        ? `${className.get(sid(r.homeSection.class)) || 'Class'} ${r.homeSection.sectionName}`
+                        : '',
+                    blockedCount: (r.unavailable || []).length,
+                    periodsUsed: u ? u.periods : 0,
+                    utilisation: weekSlots ? Math.round(((u ? u.periods : 0) / weekSlots) * 100) : 0,
+                };
+            }),
+            weekSlots,
+            buildings: [...new Set(all.map((r) => (r.building || '').trim()).filter(Boolean))].sort(),
+            roomTypes: tt.ROOM_TYPES,
+            summary: {
+                total: all.length,
+                classrooms: all.filter((r) => r.roomType === 'Classroom').length,
+                labs: all.filter((r) => /lab/i.test(r.roomType || '')).length,
+                other: all.filter((r) => r.roomType !== 'Classroom' && !/lab/i.test(r.roomType || '')).length,
+                active: all.filter((r) => r.isActive !== false).length,
+                inactive: all.filter((r) => r.isActive === false).length,
+            },
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/** GET — one room's published week, for the rail's Timetable tab. */
+exports.roomSchedule = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const room = await Room.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!room) return err(res, 'Room not found', 404);
+
+        const facts = await weekFacts(req.schoolId, year._id);
+        const mine = facts.lessons.filter((r) => r.room === sid(room._id));
+        const label = new Map(facts.sections.map((s) => [s._id, s.label]));
+
+        ok(res, {
+            room: { _id: sid(room._id), roomName: room.roomName, roomType: room.roomType, capacity: room.capacity },
+            days: facts.days,
+            unavailable: room.unavailable || [],
+            entries: mine.map((r) => ({
+                dayOfWeek: r.dayOfWeek,
+                periodNumber: r.periodNumber,
+                section: label.get(r.section) || 'Section',
+                subject: facts.subjectName.get(r.subject) || 'Subject',
+                teacher: (facts.teacherById.get(r.teacher) || {}).name || '',
+            })).sort((a, b) => a.periodNumber - b.periodNumber),
+            periods: mine.length,
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/**
+ * POST — add several rooms at once.
+ *
+ * Reports every row it refused and why, rather than failing the whole import on
+ * the fourth of forty: a spreadsheet with one bad capacity should not cost the
+ * other thirty-nine.
+ */
+exports.importRooms = async (req, res) => {
+    try {
+        const rows = Array.isArray(req.body && req.body.rooms) ? req.body.rooms : [];
+        if (!rows.length) return err(res, 'Nothing to import', 400);
+        if (rows.length > 200) return err(res, 'Import at most 200 rooms at a time', 400);
+
+        const existing = await Room.find({ school: req.schoolId }).select('roomName roomNumber').lean();
+        const haveName = new Set(existing.map((r) => String(r.roomName || '').trim().toLowerCase()));
+        const haveNumber = new Set(existing.map((r) => String(r.roomNumber || '').trim().toLowerCase()).filter(Boolean));
+
+        const created = [];
+        const skipped = [];
+        for (const [i, raw] of rows.entries()) {
+            const name = String((raw && raw.roomName) || '').trim();
+            const number = String((raw && raw.roomNumber) || '').trim();
+            if (!name) { skipped.push({ row: i + 1, reason: 'No room name' }); continue; }
+            if (haveName.has(name.toLowerCase())) { skipped.push({ row: i + 1, name, reason: 'Already exists' }); continue; }
+            if (number && haveNumber.has(number.toLowerCase())) {
+                skipped.push({ row: i + 1, name, reason: `Room number ${number} is taken` });
+                continue;
+            }
+            const type = tt.ROOM_TYPES.includes(raw.roomType) ? raw.roomType : 'Classroom';
+            try {
+                const room = await Room.create({
+                    school: req.schoolId,
+                    roomName: name,
+                    roomNumber: number,
+                    roomType: type,
+                    capacity: Math.max(0, Number(raw.capacity) || 0),
+                    building: String(raw.building || '').trim(),
+                    notes: String(raw.notes || '').trim(),
+                    isActive: raw.isActive !== false,
+                    createdBy: req.userId,
+                });
+                created.push({ _id: room._id, roomName: room.roomName });
+                haveName.add(name.toLowerCase());
+                if (number) haveNumber.add(number.toLowerCase());
+            } catch (e) {
+                skipped.push({ row: i + 1, name, reason: e.code === 11000 ? 'Duplicate room number' : e.message });
+            }
+        }
+
+        await logAudit(req, 'import', 'Room', null,
+            `Imported ${created.length} room(s), skipped ${skipped.length}`);
+        ok(res, { created: created.length, skipped, rooms: created }, 201);
+    } catch (e) { err(res, e, e.status); }
+};
+
+/* ══════════════════════════════════════════════════════════════════════════
+   TEACHER AVAILABILITY — the screen's own read
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * GET — availability with the load it has to accommodate.
+ *
+ * listAvailability answers "what has been set"; this also answers "what is this
+ * person already carrying", which is the number an admin is actually weighing
+ * when they block a slot.
+ */
+exports.availabilityOverview = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.query.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const [facts, config, profiles] = await Promise.all([
+            weekFacts(req.schoolId, year._id),
+            TimetableConfig.findOne({ school: req.schoolId, academicYear: year._id }).lean(),
+            TeacherProfile.find({}).select('teacher designation department').lean(),
+        ]);
+        const availability = await TeacherAvailability.find({
+            school: req.schoolId, academicYear: year._id,
+        }).lean();
+
+        const sst = await SectionSubjectTeacher.find({}).lean();
+        const subjectsOf = new Map();
+        for (const row of sst) {
+            const t = sid(row.teacher);
+            const name = facts.subjectName.get(sid(row.subject));
+            if (!name) continue;
+            if (!subjectsOf.has(t)) subjectsOf.set(t, new Set());
+            subjectsOf.get(t).add(name);
+        }
+
+        const byTeacher = new Map(availability.map((a) => [sid(a.teacher), a]));
+        const profileOf = new Map(profiles.map((p) => [sid(p.teacher), p]));
+
+        const days = (config && config.workingDays && config.workingDays.length)
+            ? config.workingDays : facts.days;
+        // How many periods a day the grid holds — the availability editor draws
+        // exactly this many columns, so an eight-period school never sees ten.
+        const template = (config && config.periodTemplate) || [];
+        const periodsPerDay = template.length
+            ? template.filter((p) => (p.periodType || 'Teaching') === 'Teaching').length
+            : (facts.sections.length
+                ? Math.max(...facts.sections.map((s) => facts.slotsPerSection.get(s._id) || 0))
+                : 8);
+        const weekCap = (config && config.defaults && config.defaults.maxTeacherPeriodsPerWeek) || 0;
+
+        const teachers = facts.teachers.filter((t) => t.isActive !== false).map((t) => {
+            const id = sid(t._id);
+            const a = byTeacher.get(id);
+            const blocked = (a && a.unavailable) || [];
+            const profile = profileOf.get(id);
+            const periods = (facts.byTeacher.get(id) || {}).periods || 0;
+            const slots = days.length * periodsPerDay;
+            // "Not available" means genuinely nothing left — every slot of the
+            // working week blocked, not merely a few mornings.
+            const fullyBlocked = slots > 0 && blocked.length >= slots;
+            return {
+                _id: t._id,
+                name: t.name,
+                email: t.email,
+                designation: (profile && profile.designation) || 'Teacher',
+                department: (profile && profile.department) || '',
+                subjects: [...(subjectsOf.get(id) || [])],
+                unavailable: blocked,
+                blockedCount: blocked.length,
+                maxPeriodsPerDay: a ? (a.maxPeriodsPerDay ?? null) : null,
+                maxPeriodsPerWeek: a ? (a.maxPeriodsPerWeek ?? null) : null,
+                hardDailyLimit: a ? (a.hardDailyLimit ?? true) : true,
+                preferredDays: (a && a.preferredDays) || [],
+                preferredPeriods: (a && a.preferredPeriods) || [],
+                notes: (a && a.notes) || '',
+                configured: !!a,
+                periods,
+                cap: (a && a.maxPeriodsPerWeek) || weekCap,
+                availability: fullyBlocked ? 'none' : blocked.length ? 'restricted' : 'always',
+                status: fullyBlocked ? 'unavailable'
+                    : (a && a.maxPeriodsPerWeek && periods > a.maxPeriodsPerWeek) ? 'overloaded'
+                    : blocked.length || (a && a.maxPeriodsPerDay) ? 'restricted' : 'active',
+            };
+        });
+
+        const loads = teachers.map((t) => t.periods);
+        ok(res, {
+            selectedYearId: year._id,
+            days,
+            periodsPerDay,
+            weekCap,
+            teachers,
+            summary: {
+                total: teachers.length,
+                always: teachers.filter((t) => t.availability === 'always').length,
+                restricted: teachers.filter((t) => t.availability === 'restricted').length,
+                none: teachers.filter((t) => t.availability === 'none').length,
+                averageLoad: loads.length
+                    ? Math.round((loads.reduce((n, x) => n + x, 0) / loads.length) * 10) / 10 : 0,
+            },
+        });
+    } catch (e) { err(res, e, e.status); }
+};
+
+/**
+ * POST — turn approved leave into blocked slots.
+ *
+ * Availability is a WEEKLY pattern and leave is a range of dates, so the two do
+ * not map cleanly. What does map is a teacher who is away every Tuesday for a
+ * term: without `apply` this reports what it found and changes nothing, so the
+ * admin sees the inference before it is written.
+ */
+exports.importAvailabilityFromLeave = async (req, res) => {
+    try {
+        const year = await resolveYear(req.schoolId, req.body.yearId);
+        if (!year) return err(res, 'No academic year found', 404);
+
+        const from = req.body.from ? new Date(`${String(req.body.from).slice(0, 10)}T00:00:00.000Z`) : new Date();
+        const to = req.body.to
+            ? new Date(`${String(req.body.to).slice(0, 10)}T00:00:00.000Z`)
+            : new Date(from.getTime() + 30 * 86400000);
+        if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || to < from) {
+            return err(res, 'Give a date range that ends after it starts', 400);
+        }
+        // A weekly pattern needs several occurrences to be a pattern. One leave
+        // day does not mean the teacher is out every Tuesday until July.
+        const minOccurrences = Math.max(2, Number(req.body.minOccurrences) || 3);
+
+        const LeaveApplication = require('../models/LeaveApplication');
+        const apps = await LeaveApplication.find({
+            school: req.schoolId, status: 'approved',
+            fromDate: { $lte: to }, toDate: { $gte: from },
+        }).select('teacher fromDate toDate').lean();
+
+        const teachers = await User.find({ school: req.schoolId, role: 'teacher', isActive: true })
+            .select('name').lean();
+        const nameOf = new Map(teachers.map((t) => [sid(t._id), t.name]));
+
+        // Count, per teacher, how many times each weekday falls inside a leave.
+        const hits = new Map();
+        for (const a of apps) {
+            const tid = sid(a.teacher);
+            const start = new Date(Math.max(new Date(a.fromDate).getTime(), from.getTime()));
+            const end = new Date(Math.min(new Date(a.toDate).getTime(), to.getTime()));
+            for (let d = new Date(start); d <= end; d = new Date(d.getTime() + 86400000)) {
+                const day = tt.DAYS[(d.getUTCDay() + 6) % 7];   // Monday-first
+                if (!day) continue;
+                const k = `${tid}#${day}`;
+                hits.set(k, (hits.get(k) || 0) + 1);
+            }
+        }
+
+        const found = [];
+        for (const [k, n] of hits) {
+            if (n < minOccurrences) continue;
+            const [tid, day] = k.split('#');
+            if (!nameOf.has(tid)) continue;
+            found.push({ teacher: tid, name: nameOf.get(tid), dayOfWeek: day, days: n });
+        }
+        found.sort((a, b) => String(a.name).localeCompare(String(b.name)) || b.days - a.days);
+
+        if (!req.body.apply) {
+            return ok(res, { applied: false, found, from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) });
+        }
+
+        const config = await TimetableConfig.findOne({ school: req.schoolId, academicYear: year._id }).lean();
+        const periodsPerDay = (config && config.periodTemplate || [])
+            .filter((p) => (p.periodType || 'Teaching') === 'Teaching').length || 8;
+
+        let changed = 0;
+        for (const f of found) {
+            const existing = await TeacherAvailability.findOne({
+                school: req.schoolId, academicYear: year._id, teacher: f.teacher,
+            }).lean();
+            const kept = ((existing && existing.unavailable) || [])
+                .filter((u) => u.dayOfWeek !== f.dayOfWeek);
+            const added = Array.from({ length: periodsPerDay }, (_, i) => ({
+                dayOfWeek: f.dayOfWeek, periodNumber: i + 1, reason: 'Approved leave',
+            }));
+            await TeacherAvailability.findOneAndUpdate(
+                { school: req.schoolId, academicYear: year._id, teacher: f.teacher },
+                {
+                    $set: { unavailable: [...kept, ...added], updatedBy: req.userId },
+                    $setOnInsert: { school: req.schoolId, academicYear: year._id, teacher: f.teacher },
+                },
+                { upsert: true, new: true },
+            );
+            changed += 1;
+        }
+        await logAudit(req, 'import', 'Availability', null,
+            `Blocked ${changed} weekday pattern(s) from approved leave`);
+        ok(res, { applied: true, changed, found });
+    } catch (e) { err(res, e, e.status); }
+};
