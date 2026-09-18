@@ -10,6 +10,7 @@ const docCtrl        = require('../../controllers/document.controller');
 const docViewer      = require('../../controllers/documentViewer.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const feedbackParent = require('../../controllers/feedbackParent.controller');
+const timetableCtrl  = require('../../controllers/timetable.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
@@ -21,9 +22,16 @@ const resultGuard      = [...guard, requireModule('result')];
 const docGuard         = [...guard, requireModule('document')];
 const holidayGuard     = [...guard, requireModule('holiday')];
 const feedbackGuard    = [...guard, requireModule('feedback')];
+const timetableGuard   = [...guard, requireModule('timetable')];
 
 router.get('/dashboard',   guard, parentCtrl.getDashboard);
 router.get('/child-class', guard, parentCtrl.getChildClass);
+
+// ── Timetable ─────────────────────────────────────────────────────────────────
+// Per child: ?child=<studentUserId>. Behind the same module flag as every other
+// timetable screen.
+router.get('/timetable',          timetableGuard, timetableCtrl.parentViewTimetable);
+router.get('/timetable/download', timetableGuard, timetableCtrl.parentDownloadTimetable);
 
 // Enabled modules for this school
 router.get('/modules', guard, modulesHandler);

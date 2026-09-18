@@ -2,6 +2,7 @@
 const Timetable            = require('../models/Timetable');
 const TimetableEntry       = require('../models/TimetableEntry');
 const ClassSection         = require('../models/ClassSection');
+const Class                = require('../models/Class');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const School               = require('../models/School');
 // One resolver for "does this section teach on Saturday" — utils/timetableDays.js
@@ -553,9 +554,75 @@ exports.teacherViewTimetable = async (req, res) => {
             selectedYearId: selectedYear?._id || null,
             years:          allYears,
             allTeachers,
+            // Cover this week, both directions: periods this teacher is taking
+            // for somebody else, and their own periods somebody else is taking.
+            // Only for the teacher's OWN week — looking up a colleague's
+            // timetable is a planning view, not a duty roster.
+            ...(String(teacher._id) === String(req.userId)
+                ? await teacherCoverWeek(req.schoolId, teacher._id, req.query.week)
+                : { coverDuties: [], handedOver: [], week: null }),
         });
     } catch (e) { err(res, e); }
 };
+
+/**
+ * One teacher's substitution week, in both directions.
+ *
+ * Gated on the school's `showInTeacherTimetable` switch like every other cover
+ * overlay — a school that keeps covers off the timetable gets empty lists here
+ * rather than a screen that contradicts its own settings.
+ */
+async function teacherCoverWeek(schoolId, teacherId, weekOf) {
+    const SubstituteAssignment = require('../models/SubstituteAssignment');
+    const SubstituteSettings   = require('../models/SubstituteSettings');
+    const { from, to } = weekBounds(weekOf);
+    const week = { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) };
+
+    const settings = await SubstituteSettings.findOne({ school: schoolId }).lean();
+    if (settings && settings.showInTeacherTimetable === false) {
+        return { coverDuties: [], handedOver: [], week };
+    }
+
+    const rows = await SubstituteAssignment.find({
+        school: schoolId,
+        status: { $in: ['uncovered', 'assigned'] },
+        date: { $gte: from, $lte: to },
+        $or: [{ substituteTeacher: teacherId }, { originalTeacher: teacherId }],
+    }).populate('subject', 'subjectName')
+        .populate('substituteTeacher', 'name').populate('originalTeacher', 'name')
+        .populate('section', 'sectionName class').lean();
+
+    const classIds = [...new Set(rows.map((r) => r.section && r.section.class).filter(Boolean).map(String))];
+    const classes = classIds.length
+        ? await Class.find({ _id: { $in: classIds } }).select('className').lean() : [];
+    const className = new Map(classes.map((c) => [String(c._id), c.className]));
+
+    const shape = (r) => ({
+        _id: r._id,
+        date: new Date(r.date).toISOString().slice(0, 10),
+        dayOfWeek: r.dayOfWeek,
+        periodNumber: r.periodNumber,
+        startTime: r.startTime || '',
+        endTime: r.endTime || '',
+        subject: r.subject?.subjectName || '',
+        sectionLabel: r.section
+            ? `${className.get(String(r.section.class)) || 'Class'} – ${r.section.sectionName}`
+            : '',
+        originalTeacher: r.originalTeacher?.name || '',
+        substituteTeacher: r.substituteTeacher?.name || '',
+        status: r.status,
+        remarks: r.remarks || '',
+    });
+
+    const mine = (id) => String(id && id._id ? id._id : id) === String(teacherId);
+    return {
+        coverDuties: rows.filter((r) => mine(r.substituteTeacher)).map(shape)
+            .sort((a, b) => a.date.localeCompare(b.date) || a.periodNumber - b.periodNumber),
+        handedOver: rows.filter((r) => mine(r.originalTeacher)).map(shape)
+            .sort((a, b) => a.date.localeCompare(b.date) || a.periodNumber - b.periodNumber),
+        week,
+    };
+}
 
 exports.teacherDownloadTimetable = async (req, res) => {
     try {
@@ -815,6 +882,14 @@ exports.studentViewTimetable = async (req, res) => {
         const school = await School.findById(req.schoolId).select('leaveSettings').lean();
         const days   = daysForSection(effectiveSection, school);
 
+        // Who is actually taking each period this week. A grid that still shows
+        // the regular teacher on a day they are away is wrong in the one way a
+        // student would notice.
+        const { from, to } = weekBounds(req.query.week);
+        const covers = effectiveSection
+            ? await coversForSections(req.schoolId, [effectiveSection._id], { from, to })
+            : [];
+
         ok(res, {
             timetable: tt,
             section: {
@@ -825,6 +900,8 @@ exports.studentViewTimetable = async (req, res) => {
             entries,
             days,
             activeYear,
+            covers,
+            week: { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
         });
     } catch (e) { err(res, e); }
 };
@@ -882,3 +959,182 @@ exports.studentDownloadTimetable = async (req, res) => {
         res.status(500).send('Failed to generate timetable PDF.');
     }
 };
+
+/* ══════════════════════════════════════════════════════════════════════════
+   PARENT — a child's week
+   ──────────────────────────────────────────────────────────────────────────
+   Per CHILD, never "the first one". A parent with two children at the school
+   has two different timetables, and a screen that silently answers for one of
+   them is worse than no screen: it is confidently wrong on alternate days.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/** The section a student sits in, plus the timetable that section actually runs. */
+async function sectionWeekFor(studentUserId, schoolId) {
+    const StudentProfile = require('../models/StudentProfile');
+    const AcademicYear   = require('../models/AcademicYear');
+
+    const profile = await StudentProfile.findOne({ user: studentUserId, school: schoolId }).lean();
+    const sectionId = profile?.currentSection || profile?.section;
+    if (!sectionId) return { section: null, timetable: null, entries: [], activeYear: null };
+
+    const [section, activeYear] = await Promise.all([
+        ClassSection.findById(sectionId).populate('class').lean(),
+        AcademicYear.findOne({ school: schoolId, status: 'active' }).lean(),
+    ]);
+
+    let tt = null;
+    let effective = section;
+    if (activeYear) {
+        tt = await Timetable.findOne({ section: sectionId, academicYear: activeYear._id }).lean();
+        // The student's profile can still point at last year's section row. Match
+        // the same class + section name inside the active year rather than
+        // reporting "no timetable" at the start of every session.
+        if (!tt && section?.class) {
+            const candidates = await ClassSection.find({
+                school: schoolId, sectionName: section.sectionName, academicYear: activeYear._id,
+            }).populate('class').lean();
+            const match = candidates.find((s) => s.class?.className === section.class?.className);
+            if (match) {
+                tt = await Timetable.findOne({ section: match._id, academicYear: activeYear._id }).lean();
+                effective = match;
+            }
+        }
+    }
+
+    const entries = tt
+        ? await TimetableEntry.find({ timetable: tt._id })
+            .populate('subject', 'subjectName').populate('teacher', 'name')
+            .populate('additionalSubjects.subject', 'subjectName')
+            .populate('additionalSubjects.teacher', 'name')
+            .populate('mergedSections', 'sectionName')
+            .lean()
+        : [];
+
+    return { section: effective, timetable: tt, entries, activeYear };
+}
+
+/**
+ * Covers affecting a set of sections over a date range, as the viewer's grid
+ * wants them: keyed by day and period.
+ *
+ * Gated on the school's own `showInTeacherTimetable` switch, so a school that
+ * would rather keep covers off the timetable gets a plain week everywhere.
+ */
+async function coversForSections(schoolId, sectionIds, { from, to }) {
+    if (!sectionIds.length) return [];
+    const SubstituteAssignment = require('../models/SubstituteAssignment');
+    const SubstituteSettings   = require('../models/SubstituteSettings');
+
+    const settings = await SubstituteSettings.findOne({ school: schoolId }).lean();
+    if (settings && settings.showInTeacherTimetable === false) return [];
+
+    const rows = await SubstituteAssignment.find({
+        school: schoolId,
+        section: { $in: sectionIds },
+        status: { $in: ['uncovered', 'assigned'] },
+        date: { $gte: from, $lte: to },
+    }).populate('substituteTeacher', 'name').populate('originalTeacher', 'name')
+        .populate('subject', 'subjectName').lean();
+
+    return rows.map((r) => ({
+        _id: r._id,
+        date: new Date(r.date).toISOString().slice(0, 10),
+        dayOfWeek: r.dayOfWeek,
+        periodNumber: r.periodNumber,
+        section: String(r.section),
+        subject: r.subject?.subjectName || '',
+        originalTeacher: r.originalTeacher?.name || '',
+        substituteTeacher: r.substituteTeacher?.name || '',
+        status: r.status,
+        reason: r.reason,
+    }));
+}
+
+/** Monday..Sunday of the week a date falls in, at UTC midnight. */
+function weekBounds(dateLike) {
+    const d = new Date(dateLike || Date.now());
+    d.setUTCHours(0, 0, 0, 0);
+    const from = new Date(d);
+    from.setUTCDate(from.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+    const to = new Date(from);
+    to.setUTCDate(to.getUTCDate() + 6);
+    return { from, to };
+}
+
+exports.parentViewTimetable = async (req, res) => {
+    try {
+        const { childCards } = require('../services/parentChildren');
+        const children = await childCards(req.userId, req.schoolId);
+        if (!children.length) {
+            return ok(res, { children: [], child: null, section: null, timetable: null, entries: [], days: [] });
+        }
+
+        // An unknown or missing ?child= falls back to the first child rather
+        // than erroring — but the payload always names which child it answered
+        // for, so the screen can never show one child's week under another's name.
+        const wanted = String(req.query.child || '');
+        const child = children.find((c) => c._id === wanted) || children[0];
+
+        const { section, timetable, entries, activeYear } =
+            await sectionWeekFor(child._id, req.schoolId);
+
+        const school = await School.findById(req.schoolId).select('name leaveSettings').lean();
+        const days   = daysForSection(section, school);
+        const { from, to } = weekBounds(req.query.week);
+        const covers = section
+            ? await coversForSections(req.schoolId, [section._id], { from, to })
+            : [];
+
+        ok(res, {
+            children,
+            child,
+            section: section ? {
+                _id: section._id,
+                sectionName: section.sectionName,
+                className: section.class?.className || '',
+            } : null,
+            timetable,
+            entries,
+            days,
+            activeYear,
+            covers,
+            week: { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
+        });
+    } catch (e) { err(res, e); }
+};
+
+exports.parentDownloadTimetable = async (req, res) => {
+    try {
+        const { childCards } = require('../services/parentChildren');
+        const children = await childCards(req.userId, req.schoolId);
+        if (!children.length) return res.status(404).send('No child is linked to this account.');
+
+        const wanted = String(req.query.child || '');
+        const child = children.find((c) => c._id === wanted) || children[0];
+
+        const { section, timetable, entries, activeYear } =
+            await sectionWeekFor(child._id, req.schoolId);
+        if (!timetable) return res.status(404).send(`No timetable is set up for ${child.name}'s class yet.`);
+
+        const school = await School.findById(req.schoolId).lean();
+        const days   = daysForSection(section, school);
+        const { generateTimetablePDF } = require('../utils/timetablePdf');
+
+        generateTimetablePDF(res, [{
+            className:   section?.class?.className || 'Class',
+            sectionName: section?.sectionName || '',
+            yearName:    activeYear?.yearName || '',
+            timetable,
+            entries,
+            days,
+        }], school, `${String(child.name).replace(/\s+/g, '-').toLowerCase()}-timetable.pdf`);
+    } catch (e) {
+        console.error(e);
+        res.status(500).send('Failed to generate the timetable PDF.');
+    }
+};
+
+/** Shared by the student and teacher views so all three read one implementation. */
+exports._sectionWeekFor = sectionWeekFor;
+exports._coversForSections = coversForSections;
+exports._weekBounds = weekBounds;
