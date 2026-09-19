@@ -78,4 +78,37 @@ router.post('/user-seen', requireInternalSecret, async (req, res) => {
     }
 });
 
+// ── Chat commands from the gateway ───────────────────────────────────────────
+// A browser sends over its socket and waits for an ack; the gateway turns that
+// into one of these calls and hands the answer straight back. Commands travel
+// over HTTP (a reply per request, load-balanced across workers); fan-out to the
+// room still travels over Redis (chat.deliver), published by the writer.
+//
+// The user id comes from a socket the gateway has already verified. Role,
+// school and every access gate are re-resolved here from the database, exactly
+// as a REST call would be (chatMessageService.actorForUser).
+const chatWriter = require('../../services/chatMessageService');
+
+const chatCommand = (run) => async (req, res) => {
+    try {
+        const actor = await chatWriter.actorForUser(req.body?.userId);
+        const data = await run(actor, req.body || {});
+        res.json({ ok: true, data });
+    } catch (err) {
+        if (err instanceof chatWriter.ChatError) {
+            return res.status(err.status).json({ ok: false, status: err.status, message: err.message, code: err.code });
+        }
+        console.error('[internal/chat]', err);
+        res.status(500).json({ ok: false, status: 500, message: 'Could not complete that — try again' });
+    }
+};
+
+router.post('/chat/send', requireInternalSecret, chatCommand(async (actor, b) => {
+    const { message, duplicate } = await chatWriter.send(actor, b.chatId, b);
+    return { message, duplicate };
+}));
+
+router.post('/chat/read', requireInternalSecret, chatCommand((actor, b) =>
+    chatWriter.markRead(actor, b.chatId, b.messageId || null)));
+
 module.exports = router;

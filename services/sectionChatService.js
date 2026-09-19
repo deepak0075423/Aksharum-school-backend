@@ -1,97 +1,46 @@
 'use strict';
 /**
- * Section teacher group chat
- * ──────────────────────────
- * Every section gets one group chat holding exactly its teaching staff:
- *   • the class teacher            (group admin)
- *   • the vice class teacher       (ClassSection.substituteTeacher)
- *   • every subject teacher of that section (SectionSubjectTeacher)
+ * Section group chats — maintenance only.
+ * ──────────────────────────────────────
+ * This used to CREATE a "Class 1 – A Teachers" group the moment a teacher was
+ * attached to a section. Class groups are now made by hand — by the class
+ * teacher, the vice class teacher, or a subject teacher for their subject (see
+ * services/classGroupService). What is left here is keeping the groups those
+ * teachers made in step when a section's line-up changes: it never creates one.
  *
- * syncSectionChatGroup() is idempotent: it creates the group the first time a
- * teacher is attached to the section, then keeps the roster in step whenever
- * teachers are assigned or removed. School admins are not members — they can
- * already observe any chat in their school (chat.controller adminObserver).
+ * The callers (class.controller / subject.controller on teacher assignment)
+ * keep calling syncSectionChatGroup(); the name stayed so they did not have to
+ * learn a new one.
+ *
+ * Old automatic staff groups (kind '' with a classSection) are left alone —
+ * scripts/removeAutoSectionGroups.js removes the empty ones.
  */
-const Chat                  = require('../models/Chat');
-const ChatMember            = require('../models/ChatMember');
-const ClassSection          = require('../models/ClassSection');
-const Class                 = require('../models/Class');
-const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
-const broker                = require('./chatBrokerService');
+const classGroups = require('./classGroupService');
 
-/** Members the group should have, class teacher first. */
-async function resolveTeachers(section) {
-    const subjectLinks = await SectionSubjectTeacher.find({ section: section._id }, 'teacher').lean();
-    const ids = [
-        section.classTeacher,
-        section.substituteTeacher,
-        ...subjectLinks.map(l => l.teacher),
-    ].filter(Boolean).map(String);
-    return [...new Set(ids)];
+/** Reconcile the section's teacher-made class and subject groups. */
+async function syncSectionChatGroup(sectionId, schoolId) {
+    return classGroups.reconcileSection(sectionId, schoolId);
 }
 
-async function groupName(section) {
-    const cls = await Class.findById(section.class, 'className').lean();
-    return `${cls?.className || 'Class'} – ${section.sectionName} Teachers`;
+/** The class and subject groups teachers have made for a section, for its admin page. */
+async function sectionGroups(sectionId, schoolId) {
+    const pool = require('../db/pool');
+    const { rows } = await pool.query(
+        `SELECT c."_id", c."name", c."kind", c."isReadOnly", c."createdAt", c."lastActivity",
+                sub."subjectName", cu."name" AS "createdByName",
+                (SELECT count(*)::int FROM "chatmembers" x JOIN "users" u ON u."_id" = x."user"
+                  WHERE x."chat" = c."_id" AND x."isActive" = true AND u."role" = 'student') AS "students",
+                (SELECT count(*)::int FROM "chatmembers" x JOIN "users" u ON u."_id" = x."user"
+                  WHERE x."chat" = c."_id" AND x."isActive" = true AND u."role" <> 'student') AS "teachers",
+                (SELECT count(*)::int FROM "messages" m WHERE m."chat" = c."_id") AS "messages"
+           FROM "chats" c
+           LEFT JOIN "subjects" sub ON sub."_id" = c."subject"
+           LEFT JOIN "users" cu ON cu."_id" = c."createdBy"
+          WHERE c."school" = $1::uuid AND c."classSection" = $2::uuid AND c."kind" IN ('class', 'subject')
+          ORDER BY (c."kind" = 'class') DESC, sub."subjectName"`,
+        [String(schoolId), String(sectionId)],
+    );
+    return rows.map((r) => ({ ...r, _id: String(r._id) }));
 }
 
-/**
- * Create or update the section's teacher group.
- * @returns {Promise<Object|null>} the chat document, or null when the section
- *          has no teachers yet (nothing to create).
- */
-async function syncSectionChatGroup(sectionId, schoolId, actingUserId = null) {
-    const section = await ClassSection.findOne({ _id: sectionId, school: schoolId }).lean();
-    if (!section) return null;
-
-    const teacherIds = await resolveTeachers(section);
-    let chat = await Chat.findOne({ school: schoolId, classSection: section._id, type: 'group' }).lean();
-
-    if (!chat) {
-        if (!teacherIds.length) return null;           // nothing to chat about yet
-        const created = await Chat.create({
-            school:       schoolId,
-            type:         'group',
-            name:         await groupName(section),
-            description:  'Class teacher, vice class teacher and subject teachers of this section.',
-            createdBy:    actingUserId || section.classTeacher || teacherIds[0],
-            classSection: section._id,
-            lastActivity: new Date(),
-        });
-        chat = created.toObject ? created.toObject() : created;
-    } else {
-        const name = await groupName(section);
-        if (name !== chat.name) {
-            await Chat.findByIdAndUpdate(chat._id, { name });
-            chat.name = name;
-        }
-    }
-
-    const existing = await ChatMember.find({ chat: chat._id }).lean();
-    const byUser   = new Map(existing.map(m => [String(m.user), m]));
-    const wanted   = new Set(teacherIds);
-
-    // Add / reactivate
-    for (const uid of teacherIds) {
-        const role = String(uid) === String(section.classTeacher) ? 'admin' : 'member';
-        const row  = byUser.get(uid);
-        if (!row) {
-            await ChatMember.create({ chat: chat._id, user: uid, school: schoolId, role });
-            await broker.publishMembership('join', uid, chat._id).catch(() => {});
-        } else if (!row.isActive || row.role !== role) {
-            await ChatMember.findByIdAndUpdate(row._id, { isActive: true, role });
-            if (!row.isActive) await broker.publishMembership('join', uid, chat._id).catch(() => {});
-        }
-    }
-
-    // Drop teachers who left the section (soft-delete keeps their history)
-    for (const row of existing) {
-        if (wanted.has(String(row.user)) || !row.isActive) continue;
-        await ChatMember.findByIdAndUpdate(row._id, { isActive: false });
-        await broker.publishMembership('leave', row.user, chat._id).catch(() => {});
-    }
-
-    return { ...chat, memberCount: teacherIds.length };
-}
-
-module.exports = { syncSectionChatGroup };
+module.exports = { syncSectionChatGroup, sectionGroups };

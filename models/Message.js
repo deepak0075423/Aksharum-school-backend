@@ -37,6 +37,7 @@ const MessageSchema = new db.Schema(
             type: String,
             default: '',
             maxlength: 4000,
+            trgm: true,     // message search is an ILIKE substring match
         },
         type: {
             type: String,
@@ -93,6 +94,13 @@ const MessageSchema = new db.Schema(
             type:    Boolean,
             default: false,
         },
+        // Client-generated id for one send attempt. A socket send that times out
+        // is retried over REST with the same id, and the unique index below turns
+        // the retry into a read of the first write instead of a second message.
+        clientId: {
+            type:    String,
+            default: null,
+        },
         reactions: {
             type: [{
                 emoji:    { type: String, required: true },
@@ -108,8 +116,11 @@ const MessageSchema = new db.Schema(
 
 // Primary access pattern: paginated history per chat
 MessageSchema.index({ chat: 1, createdAt: -1 });
-// Full-text search
-MessageSchema.index({ content: 'text' });
+// Idempotent sends: one message per (sender, clientId)
+MessageSchema.index({ sender: 1, clientId: 1 }, {
+    unique: true,
+    partialFilterExpression: { clientId: { $exists: true } },
+});
 // Sender-based queries (e.g. "delete all messages from user X")
 MessageSchema.index({ sender: 1, chat: 1 });
 

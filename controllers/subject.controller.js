@@ -451,8 +451,8 @@ exports.assignSubjectTeacher = async (req, res) => {
         // The class teaches this subject — record that too, or the parent portal
         // and the year import never learn about it. See ensureClassSubject.
         await ensureClassSubject(req.params.sectionId, req.body.subject);
-        // Subject teachers belong to the section's teacher group chat
-        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
+        // Keep teacher-made class/subject groups of the section in step
+        syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
         ok(res, sst, 201);
     } catch (e) { err(res, e, 400); }
 };
@@ -517,9 +517,9 @@ exports.assignSubjectToSections = async (req, res) => {
             await SectionSubjectTeacher.create({ section: sid, subject, teacher });
             await ensureClassSubject(sid, subject);
         }
-        // Subject teachers belong to each section's teacher group chat.
+        // Keep teacher-made class/subject groups of each section in step.
         for (const sid of toCreate) {
-            syncSectionChatGroup(sid, req.schoolId, req.userId).catch(() => {});
+            syncSectionChatGroup(sid, req.schoolId).catch(() => {});
         }
 
         ok(res, { ...payload, preview: false, created: toCreate.length }, 201);
@@ -569,7 +569,7 @@ exports.removeSectionSubject = async (req, res) => {
     try {
         await SectionSubjectTeacher.deleteMany({ section: req.params.sectionId, subject: req.params.subjectId });
         const pruned = await pruneClassSubject(req.params.sectionId, req.params.subjectId);
-        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
+        syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
         res.json({ success: true, ...pruned });
     } catch (e) { err(res, e); }
 };
@@ -583,7 +583,7 @@ exports.removeSectionSubjectTeacher = async (req, res) => {
         // Was that the last teacher this subject had anywhere in the class? Then
         // the class no longer teaches it either.
         const pruned = await pruneClassSubject(req.params.sectionId, req.params.subjectId);
-        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
+        syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
         res.json({ success: true, ...pruned });
     } catch (e) { err(res, e); }
 };

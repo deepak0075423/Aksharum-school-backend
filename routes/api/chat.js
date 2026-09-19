@@ -17,8 +17,11 @@ const guard = [verifyToken, requirePasswordReset, requireModule('chat')];
 
 // ── Chat list & messages ──────────────────────────────────────────────────────
 router.get('/chats',                  guard, ctrl.getChats);
+router.get('/chats/:chatId',          guard, ctrl.getChat);
+router.get('/chats/:chatId/profile',  guard, ctrl.getChatProfile);
 router.get('/chats/:chatId/messages', guard, ctrl.getMessages);
 router.post('/chats/:chatId/messages',guard, ctrl.sendMessage);
+router.post('/chats/:chatId/read',    guard, ctrl.markRead);
 router.get('/chats/:chatId/members',  guard, ctrl.getChatMembers);
 
 // ── Contacts / search / unread ────────────────────────────────────────────────
@@ -36,12 +39,21 @@ router.patch('/messages/:msgId',        guard, ctrl.editMessage);
 router.delete('/messages/:msgId',       guard, ctrl.deleteMessage);
 router.post('/messages/:msgId/react',   guard, ctrl.toggleReaction);
 
+// ── Class & subject groups (made by their teachers) ──────────────────────────
+router.get('/class-groups/options', guard, ctrl.getClassGroupOptions);
+router.get('/class-groups/roster',  guard, ctrl.getClassGroupRoster);
+router.post('/class-groups',        guard, ctrl.createClassGroup);
+
 // ── Group management ──────────────────────────────────────────────────────────
+router.post('/group/:chatId/sync',      guard, ctrl.syncGroup);
+router.get('/group/:chatId/candidates', guard, ctrl.getGroupCandidates);
 router.patch('/group/:chatId/settings',          guard, ctrl.updateGroupSettings);
 router.post('/group/:chatId/member',             guard, ctrl.addMember);
 router.delete('/group/:chatId/member/:memberId', guard, ctrl.removeMember);
 
 // ── Admin oversight ───────────────────────────────────────────────────────────
+router.get('/admin/people',         guard, ctrl.getAdminPeople);
+router.get('/admin/people/:userId', guard, ctrl.getAdminPersonChats);
 router.get('/admin/school-users', guard, ctrl.getSchoolUsers);
 router.get('/admin/user-chats',   guard, ctrl.getAdminUserChats);
 

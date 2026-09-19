@@ -39,6 +39,24 @@ async function loadAuthUser(userId) {
     return user;
 }
 
+/**
+ * The signed-in user a token names, with its school joined — Redis-cached
+ * first (bounded by a short TTL + explicit invalidation on user mutations),
+ * falling back to the single-JOIN DB load and warming the cache.
+ *
+ * Exported for the WebSocket gateway's internal routes, which receive a user
+ * id from an already-verified socket and must see the same user a REST call
+ * would (active flag, school, first-login state).
+ */
+async function loadSessionUser(userId) {
+    let user = await authCache.get(userId);
+    if (!user) {
+        user = await loadAuthUser(userId);
+        if (user) await authCache.set(userId, user);
+    }
+    return user;
+}
+
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.startsWith('Bearer ') && authHeader.slice(7);
@@ -58,11 +76,7 @@ const verifyToken = async (req, res, next) => {
         }
         // Redis-cached first (bounded by a short TTL + explicit invalidation on
         // user mutations); fall back to the single-JOIN DB load and warm the cache.
-        let user = await authCache.get(decoded.userId);
-        if (!user) {
-            user = await loadAuthUser(decoded.userId);
-            if (user) await authCache.set(decoded.userId, user);
-        }
+        const user = await loadSessionUser(decoded.userId);
         if (!user || !user.isActive) {
             return res.status(401).json({ success: false, message: 'User not found or inactive' });
         }
@@ -109,4 +123,4 @@ const requirePasswordReset = (req, res, next) => {
     next();
 };
 
-module.exports = { verifyToken, requireRole, requirePasswordReset };
+module.exports = { verifyToken, requireRole, requirePasswordReset, loadSessionUser };

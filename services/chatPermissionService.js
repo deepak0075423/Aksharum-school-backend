@@ -10,15 +10,20 @@
  *   ClassSection.substituteTeacher  → vice-class-teacher user FK
  *   SectionSubjectTeacher.teacher   → subject teacher user FK per section
  *   StudentProfile.currentSection   → section FK
- *   ParentProfile.children          → [student user FKs]
+ *   ParentProfile.children / StudentProfile.parent → parent ↔ child (both read)
  */
 
 const User                 = require('../models/User');
 const StudentProfile       = require('../models/StudentProfile');
 const TeacherProfile       = require('../models/TeacherProfile');
-const ParentProfile        = require('../models/ParentProfile');
 const ClassSection         = require('../models/ClassSection');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
+// A parent's children have two links that drift (ParentProfile.children and
+// StudentProfile.parent); every rule below reads both through these.
+const { childrenOf, parentsOf } = require('./parentChildren');
+
+const childIds = async (parentId, schoolId) =>
+    (await childrenOf(parentId, schoolId)).map((k) => k._id);
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -92,12 +97,11 @@ async function _teacherCanMessage(teacherId, receiverId, receiverRole, schoolId)
     }
 
     if (receiverRole === 'parent') {
-        const pp = await ParentProfile.findOne({ user: receiverId, school: schoolId })
-            .select('children').lean();
-        if (!pp || !pp.children.length) {
+        const children = await childIds(receiverId, schoolId);
+        if (!children.length) {
             return { allowed: false, reason: 'Parent has no linked students' };
         }
-        for (const childId of pp.children) {
+        for (const childId of children) {
             const r = await _teacherStudentAllowed(teacherId, childId, schoolId);
             if (r.allowed) return { allowed: true };
         }
@@ -166,13 +170,12 @@ async function _parentCanMessage(parentId, receiverId, receiverRole, schoolId) {
         return { allowed: false, reason: "Parents can only message their children's teachers or admin" };
     }
 
-    const pp = await ParentProfile.findOne({ user: parentId, school: schoolId })
-        .select('children').lean();
-    if (!pp || !pp.children.length) {
+    const children = await childIds(parentId, schoolId);
+    if (!children.length) {
         return { allowed: false, reason: 'No children linked to your account' };
     }
 
-    for (const childId of pp.children) {
+    for (const childId of children) {
         const r = await _teacherStudentAllowed(receiverId, childId, schoolId);
         if (r.allowed) return { allowed: true };
     }
@@ -197,37 +200,41 @@ async function _teacherContacts(teacherId, schoolId) {
         .select('name role email profileImage').lean();
     admins.forEach(a => contacts.set(String(a._id), a));
 
-    // Sections this teacher owns (classTeacher / substituteTeacher)
-    const ownedSections = await ClassSection.find({
-        school: schoolId,
-        $or: [{ classTeacher: teacherId }, { substituteTeacher: teacherId }],
-    }).select('enrolledStudents').lean();
+    // Sections this teacher owns (class / vice class teacher) or teaches a
+    // subject in. Students are then found by their own currentSection — the
+    // pointer _teacherStudentAllowed reads — not the section's roster, which
+    // drifts from it and listed students the send would then refuse.
+    const [ownedSections, sstRows] = await Promise.all([
+        ClassSection.find({
+            school: schoolId,
+            $or: [{ classTeacher: teacherId }, { substituteTeacher: teacherId }],
+        }).select('_id').lean(),
+        SectionSubjectTeacher.find({ teacher: teacherId }).select('section').lean(),
+    ]);
+    const sectionIds = [...new Set([
+        ...ownedSections.map((s) => String(s._id)),
+        ...sstRows.map((r) => String(r.section)),
+    ])];
 
-    // Sections this teacher teaches as subject teacher
-    const sstRows = await SectionSubjectTeacher.find({ teacher: teacherId })
-        .populate({ path: 'section', select: 'enrolledStudents school', match: { school: schoolId } })
-        .lean();
+    if (sectionIds.length) {
+        const profiles = await StudentProfile.find({
+            school: schoolId, currentSection: { $in: sectionIds },
+        }).select('user').lean();
+        const studentIds = [...new Set(profiles.map((p) => String(p.user)))];
 
-    const studentIds = new Set();
-    ownedSections.forEach(s => s.enrolledStudents.forEach(id => studentIds.add(String(id))));
-    sstRows.forEach(r => {
-        if (r.section) r.section.enrolledStudents.forEach(id => studentIds.add(String(id)));
-    });
-
-    if (studentIds.size) {
-        const students = await User.find({ _id: { $in: [...studentIds] }, isActive: true })
-            .select('name role email profileImage').lean();
-        students.forEach(s => contacts.set(String(s._id), s));
-
-        // Parents of those students
-        const sps = await StudentProfile.find({
-            user: { $in: [...studentIds] }, school: schoolId,
-        }).select('parent').lean();
-        const parentIds = sps.filter(sp => sp.parent).map(sp => sp.parent);
-        if (parentIds.length) {
-            const parents = await User.find({ _id: { $in: parentIds }, isActive: true })
+        if (studentIds.length) {
+            const students = await User.find({ _id: { $in: studentIds }, school: schoolId, isActive: true })
                 .select('name role email profileImage').lean();
-            parents.forEach(p => contacts.set(String(p._id), p));
+            students.forEach(s => contacts.set(String(s._id), s));
+
+            // Parents of those students, through both parent links
+            const byStudent = await parentsOf(studentIds, schoolId);
+            const parentIds = [...new Set([...byStudent.values()].flat())];
+            if (parentIds.length) {
+                const parents = await User.find({ _id: { $in: parentIds }, isActive: true })
+                    .select('name role email profileImage').lean();
+                parents.forEach(p => contacts.set(String(p._id), p));
+            }
         }
     }
 
@@ -264,12 +271,11 @@ async function _studentContacts(studentId, schoolId) {
 }
 
 async function _parentContacts(parentId, schoolId) {
-    const pp = await ParentProfile.findOne({ user: parentId, school: schoolId })
-        .select('children').lean();
-    if (!pp || !pp.children.length) return [];
+    const children = await childIds(parentId, schoolId);
+    if (!children.length) return [];
 
     // One batched round trip per collection instead of up to 3 per child.
-    const profiles = await StudentProfile.find({ user: { $in: pp.children }, school: schoolId })
+    const profiles = await StudentProfile.find({ user: { $in: children }, school: schoolId })
         .select('currentSection').lean();
     const sectionIds = profiles.map((sp) => sp.currentSection).filter(Boolean);
 

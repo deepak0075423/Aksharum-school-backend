@@ -4,11 +4,9 @@ const Class          = require('../models/Class');
 const ClassSection   = require('../models/ClassSection');
 const StudentProfile = require('../models/StudentProfile');
 const User           = require('../models/User');
-const Chat           = require('../models/Chat');
-const ChatMember     = require('../models/ChatMember');
 const { isDate }     = require('../utils/validators');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
-const { syncSectionChatGroup } = require('../services/sectionChatService');
+const { syncSectionChatGroup, sectionGroups } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
 const { capacityError, seatsFor, seatsOf } = require('../utils/sectionCapacity');
 const { setStudentSection, syncCounts }   = require('../utils/sectionMembership');
@@ -1578,23 +1576,23 @@ exports.getSectionTeacherOptions = async (req, res) => {
     } catch (e) { err(res, e); }
 };
 
-// Section teacher group chat — class teacher + vice class teacher + subject teachers
+// A section's class and subject group chats. Teachers create them by hand from
+// Chat (class teacher / vice class teacher → class group, subject teacher →
+// subject group); this page shows what exists and can bring their members back
+// in step with the section. It never creates one.
 exports.getSectionChatGroup = async (req, res) => {
     try {
-        const chat = await Chat.findOne({
-            school: req.schoolId, classSection: req.params.sectionId, type: 'group',
-        }).lean();
-        if (!chat) return ok(res, null);
-        const members = await ChatMember.find({ chat: chat._id, isActive: true })
-            .populate('user', 'name email').lean();
-        ok(res, { ...chat, members: members.map(m => ({ ...m.user, memberRole: m.role })) });
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).select('_id').lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+        ok(res, { groups: await sectionGroups(req.params.sectionId, req.schoolId) });
     } catch (e) { err(res, e); }
 };
 exports.syncSectionChatGroup = async (req, res) => {
     try {
-        const chat = await syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId);
-        if (!chat) return err(res, { message: 'Assign a class teacher, vice class teacher or subject teacher first — a group needs at least one member.' }, 400);
-        ok(res, chat, 201);
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).select('_id').lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+        const result = await syncSectionChatGroup(req.params.sectionId, req.schoolId);
+        ok(res, { ...result, groups: await sectionGroups(req.params.sectionId, req.schoolId) });
     } catch (e) { err(res, e); }
 };
 
@@ -1990,8 +1988,9 @@ exports.updateSectionTeacher = async (req, res) => {
             .populate('classTeacher',     'name email phone')
             .populate('substituteTeacher','name email phone');
 
-        // Keep the section's teacher group chat in step with the new line-up
-        syncSectionChatGroup(req.params.sectionId, req.schoolId, req.userId).catch(() => {});
+        // Keep the class/subject groups teachers made for this section in step
+        // with the new line-up (never creates one)
+        syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
 
         ok(res, section);
     } catch (e) { err(res, e); }

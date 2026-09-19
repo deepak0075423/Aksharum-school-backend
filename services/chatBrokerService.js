@@ -23,11 +23,6 @@
 
 const { pubClient, subClient } = require('../config/redis');
 
-const Chat           = require('../models/Chat');
-const ChatMember     = require('../models/ChatMember');
-const Message        = require('../models/Message');
-const MessageReceipt = require('../models/MessageReceipt');
-
 // Redis channel names — shared constants used by both this service and the gateway
 const CH = {
     SEND:   'chat.send',
@@ -69,139 +64,40 @@ function init() {
     });
 }
 
-// ─── Inbound handlers ─────────────────────────────────────────────────────────
+// ─── Inbound handlers (legacy) ────────────────────────────────────────────────
+// The gateway now sends commands to /internal/chat/* over HTTP so it can ack the
+// browser. These channels stay subscribed for a gateway that has not been
+// redeployed yet; both paths run the same writer, so they cannot drift again.
+// Required lazily — the writer publishes through this module.
+const writer = () => require('./chatMessageService');
 
-async function _onSend(payload) {
-    const { chatId, senderId, senderRole, schoolId, content, type = 'text',
-            replyTo, attachments = [], tempId } = payload;
-
-    // 1. Verify membership
-    const member = await ChatMember.findOne({
-        chat: chatId, user: senderId, school: schoolId, isActive: true,
-    }).lean();
-    if (!member) return _errorToUser(senderId, 'Not a member of this chat');
-
-    // 2. Load chat for read-only gate
-    const chat = await Chat.findOne({ _id: chatId, school: schoolId }).lean();
-    if (!chat) return _errorToUser(senderId, 'Chat not found');
-
-    if (chat.isReadOnly && !['school_admin', 'super_admin', 'teacher'].includes(senderRole)) {
-        return _errorToUser(senderId, 'This is a read-only channel');
+async function _asActor(userId, run) {
+    const svc = writer();
+    try {
+        const actor = await svc.actorForUser(userId);
+        await run(svc, actor);
+    } catch (err) {
+        if (err instanceof svc.ChatError) return _errorToUser(userId, err.message);
+        throw err;
     }
-
-    // 3. Persist message
-    const msg = await Message.create({
-        chat:       chatId,
-        school:     schoolId,
-        sender:     senderId,
-        senderRole,
-        content:    (content || '').trim(),
-        type,
-        attachments,
-        replyTo:    replyTo || null,
-    });
-
-    await Chat.findByIdAndUpdate(chatId, {
-        lastMessage:  msg._id,
-        lastActivity: new Date(),
-    });
-
-    // 4. Populate for delivery
-    const populated = await Message.findById(msg._id)
-        .populate('sender', 'name role profileImage')
-        .populate({
-            path:    'replyTo',
-            select:  'content isDeleted',
-            populate: { path: 'sender', select: 'name' },
-        })
-        .lean();
-
-    // 5. Deliver to everyone in the room
-    await _toRoom(chatId, 'chat:message', { ...populated, tempId });
-
-    // 6. Write delivery receipts (background — do not block delivery)
-    _writeReceipts(msg._id, chatId, senderId, schoolId).catch(() => {});
 }
 
-async function _onRead(payload) {
-    const { chatId, userId, messageId } = payload;
-
-    await ChatMember.findOneAndUpdate(
-        { chat: chatId, user: userId },
-        { lastReadMessage: messageId || null, lastReadAt: new Date() }
-    );
-
-    await MessageReceipt.updateMany(
-        { chat: chatId, user: userId, readAt: null },
-        { readAt: new Date() }
-    );
-
-    // Notify room so senders see double-tick
-    await _toRoom(chatId, 'chat:message_read', {
-        chatId, userId, messageId: messageId || null, readAt: new Date(),
-    });
+async function _onSend(p) {
+    await _asActor(p.senderId, (svc, actor) => svc.send(actor, p.chatId, {
+        content: p.content, type: p.type, replyTo: p.replyTo, attachments: p.attachments, clientId: p.tempId,
+    }));
 }
 
-async function _onEdit(payload) {
-    const { messageId, senderId, content } = payload;
-    if (!content) return;
-
-    const msg = await Message.findOne({
-        _id: messageId, sender: senderId, isDeleted: false,
-    }).lean();
-    if (!msg) return _errorToUser(senderId, 'Message not found or not authorised');
-
-    if (Date.now() - new Date(msg.createdAt).getTime() > 86_400_000) {
-        return _errorToUser(senderId, 'Cannot edit messages older than 24 hours');
-    }
-
-    await Message.findByIdAndUpdate(messageId, {
-        content:  content.trim(),
-        isEdited: true,
-        editedAt: new Date(),
-    });
-
-    await _toRoom(String(msg.chat), 'chat:message_edited', {
-        messageId,
-        chatId:   String(msg.chat),
-        content:  content.trim(),
-        editedAt: new Date(),
-    });
+async function _onRead(p) {
+    await _asActor(p.userId, (svc, actor) => svc.markRead(actor, p.chatId, p.messageId || null));
 }
 
-async function _onDelete(payload) {
-    const { messageId, senderId, senderRole } = payload;
-
-    const msg = await Message.findOne({ _id: messageId, isDeleted: false }).lean();
-    if (!msg) return;
-
-    const isOwner = String(msg.sender) === String(senderId);
-    const isAdmin = ['school_admin', 'super_admin'].includes(senderRole);
-    if (!isOwner && !isAdmin) return _errorToUser(senderId, 'Not authorised to delete');
-
-    await Message.findByIdAndUpdate(messageId, {
-        isDeleted: true, deletedAt: new Date(), deletedBy: senderId,
-    });
-
-    await _toRoom(String(msg.chat), 'chat:message_deleted', {
-        messageId, chatId: String(msg.chat),
-    });
+async function _onEdit(p) {
+    await _asActor(p.senderId, (svc, actor) => svc.edit(actor, p.messageId, p.content));
 }
 
-// ─── Background helpers ───────────────────────────────────────────────────────
-
-async function _writeReceipts(messageId, chatId, senderUserId, schoolId) {
-    const members = await ChatMember.find({
-        chat: chatId, user: { $ne: senderUserId }, isActive: true,
-    }).select('user').lean();
-    if (!members.length) return;
-    await MessageReceipt.insertMany(
-        members.map(m => ({
-            message: messageId, chat: chatId, user: m.user,
-            school:  schoolId, deliveredAt: new Date(),
-        })),
-        { ordered: false }
-    );
+async function _onDelete(p) {
+    await _asActor(p.senderId, (svc, actor) => svc.remove(actor, p.messageId));
 }
 
 // ─── Publish helpers (used by this service AND by HTTP controllers) ────────────
@@ -226,7 +122,9 @@ async function publishToRoom(chatId, event, data) {
  * Used to deliver errors and targeted notifications.
  */
 async function publishToUser(userId, event, data) {
-    return _publish(CH.DELIVER, { target: 'user', targetId: String(userId), event, data });
+    // The gateway joins each socket to `user:<id>` — the bare id is no room at
+    // all, which is why chat:error never reached anybody before.
+    return _publish(CH.DELIVER, { target: 'user', targetId: `user:${userId}`, event, data });
 }
 
 /**

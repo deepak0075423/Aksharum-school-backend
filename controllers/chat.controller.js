@@ -1,648 +1,485 @@
 'use strict';
-const Chat            = require('../models/Chat');
-const ChatMember      = require('../models/ChatMember');
-const Message         = require('../models/Message');
-const MessageReceipt  = require('../models/MessageReceipt');
-const User            = require('../models/User');
-const perm            = require('../services/chatPermissionService');
-const broker          = require('../services/chatBrokerService');
+/**
+ * Chat HTTP endpoints.
+ *
+ * Thin by design: reads go through services/chatReadModel (raw SQL), every
+ * message write through services/chatMessageService (the same writer the
+ * WebSocket gateway reaches via /internal/chat/*), and every "may A talk to B"
+ * question through services/chatPermissionService.
+ *
+ * Response shapes are the ones the web page and the Expo app already read;
+ * new fields are only ever added.
+ */
+const Chat       = require('../models/Chat');
+const ChatMember = require('../models/ChatMember');
+const User       = require('../models/User');
+const pool       = require('../db/pool');
+const perm       = require('../services/chatPermissionService');
+const broker     = require('../services/chatBrokerService');
+const readModel  = require('../services/chatReadModel');
+const writer     = require('../services/chatMessageService');
+const classGroups = require('../services/classGroupService');
+
+const { ChatError, actorFromRequest } = writer;
+
+const isSchoolAdmin = (req) => req.userRole === 'school_admin';
+
+function fail(res, err, fallback, tag) {
+    if (err instanceof ChatError) {
+        return res.status(err.status).json({ success: false, message: err.message, ...(err.code && { code: err.code }) });
+    }
+    console.error(`[chatCtrl] ${tag}:`, err);
+    return res.status(500).json({ success: false, message: fallback });
+}
+
+/**
+ * The caller's membership, or — for a school admin — read-only access to any
+ * conversation in their own school. Anything else is a 403/404.
+ */
+async function accessTo(req, chatId) {
+    const member = await ChatMember.findOne({ chat: chatId, user: req.userId, school: req.schoolId, isActive: true }).lean();
+    if (member) return { member, observer: false };
+    if (!isSchoolAdmin(req)) throw new ChatError(403, 'You are not a member of this conversation');
+    const chat = await Chat.findOne({ _id: chatId, school: req.schoolId }).select('_id').lean();
+    if (!chat) throw new ChatError(404, 'Conversation not found');
+    return { member: null, observer: true };
+}
+
+const joinRoom = (userIds, chatId) =>
+    Promise.all(userIds.map((uid) => broker.publishMembership('join', uid, chatId).catch(() => {})));
 
 // ─── Chat list ────────────────────────────────────────────────────────────────
 
 /** GET /api/chat/chats */
 exports.getChats = async (req, res) => {
     try {
-        const memberships = await ChatMember.find({
-            user: req.userId, school: req.schoolId, isActive: true,
-        })
-        .populate({
-            path: 'chat',
-            populate: {
-                path: 'lastMessage',
-                select: 'content type sender isDeleted createdAt',
-                populate: { path: 'sender', select: 'name' },
-            },
-        })
-        .lean();
-
-        const results = await Promise.all(
-            memberships
-                .filter(m => m.chat && m.chat._id)
-                .map(m => _enrichChat(m, req.userId, req.schoolId))
-        );
-
-        results.sort((a, b) => new Date(b.lastActivity || 0) - new Date(a.lastActivity || 0));
-
-        res.json({ success: true, data: results });
-    } catch (err) {
-        console.error('[chatCtrl] getChats:', err);
-        res.status(500).json({ success: false, message: 'Failed to load chats' });
-    }
+        // A student is in every class/subject group of their section — joined
+        // here, as they open chat, rather than by hooking every place a student
+        // can change section.
+        if (req.userRole === 'student') {
+            await classGroups.joinMyClassGroups(req.userId, req.schoolId).catch((e) => console.error('[chatCtrl] joinMyClassGroups:', e.message));
+        }
+        const data = await readModel.listChats(req.userId, req.schoolId, { isAdmin: isSchoolAdmin(req) });
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to load chats', 'getChats'); }
 };
 
-async function _enrichChat(membership, userId, schoolId) {
-    const chat = membership.chat;
-    let displayName   = chat.name;
-    let displayAvatar = chat.avatar;
-    let otherUser     = null;
-    let otherReadAt   = null;   // recipient's last-read time — drives read ticks
+/** GET /api/chat/chats/:chatId — one list row, for a conversation the page has not seen yet */
+exports.getChat = async (req, res) => {
+    try {
+        const data = await readModel.chatSummary(req.userId, req.schoolId, req.params.chatId, { isAdmin: isSchoolAdmin(req) });
+        if (!data) return res.status(404).json({ success: false, message: 'Conversation not found' });
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to load chat', 'getChat'); }
+};
 
-    if (chat.type === 'direct') {
-        const other = await ChatMember.findOne({
-            chat: chat._id, user: { $ne: userId }, isActive: true,
-        }).populate('user', 'name role profileImage lastSeenAt').lean();
-        if (other && other.user) {
-            otherUser     = other.user;
-            displayName   = other.user.name;
-            displayAvatar = other.user.profileImage || '';
-            otherReadAt   = other.lastReadAt || null;
-        }
-    }
+/** GET /api/chat/chats/:chatId/profile — thread header + info panel */
+exports.getChatProfile = async (req, res) => {
+    try {
+        await accessTo(req, req.params.chatId);
+        const chat = await Chat.findOne({ _id: req.params.chatId, school: req.schoolId }).lean();
+        if (!chat) return res.status(404).json({ success: false, message: 'Conversation not found' });
+        if (classGroups.isClassGroup(chat)) await classGroups.reconcileSoon(chat).catch((e) => console.error('[chatCtrl] reconcile:', e.message));
 
-    const unreadCount = await Message.countDocuments({
-        chat:      chat._id,
-        sender:    { $ne: userId },
-        isDeleted: false,
-        createdAt: { $gt: membership.lastReadAt || new Date(0) },
-    });
-
-    return {
-        ...chat,
-        displayName,
-        displayAvatar,
-        otherUser,
-        otherReadAt,
-        unreadCount,
-        isMuted:    membership.isMuted,
-        isArchived: membership.isArchived,
-        memberRole: membership.role,
-        lastReadAt: membership.lastReadAt,
-    };
-}
+        const data = await readModel.chatProfile(req.params.chatId, req.schoolId, req.userId);
+        if (!data) return res.status(404).json({ success: false, message: 'Conversation not found' });
+        if (classGroups.isClassGroup(chat)) data.manage = await classGroups.manageInfo(chat, req.userId, data.members || []);
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to load details', 'getChatProfile'); }
+};
 
 // ─── Messages ─────────────────────────────────────────────────────────────────
 
-/** GET /api/chat/chats/:chatId/messages?before=<iso>&limit=40 */
+/** GET /api/chat/chats/:chatId/messages?before=<iso>|after=<iso>&limit=40 */
 exports.getMessages = async (req, res) => {
     try {
-        const { chatId }             = req.params;
-        const { before, limit = 40 } = req.query;
+        const { chatId } = req.params;
+        const { before, after, limit } = req.query;
+        const { member, observer } = await accessTo(req, chatId);
 
-        const member        = await ChatMember.findOne({ chat: chatId, user: req.userId, isActive: true }).lean();
-        const adminObserver = !member && req.userRole === 'school_admin';
-
-        if (!member && !adminObserver) {
-            return res.status(403).json({ success: false, message: 'Not a member' });
-        }
-        if (adminObserver) {
-            const chat = await Chat.findOne({ _id: chatId, school: req.schoolId }).lean();
-            if (!chat) return res.status(404).json({ success: false, message: 'Chat not found' });
-        }
-
-        const filter = { chat: chatId, school: req.schoolId };
-        if (before) filter.createdAt = { $lt: new Date(before) };
-
-        const lim  = Math.min(parseInt(limit) || 40, 100);
-        const msgs = await Message.find(filter)
-            .populate('sender', 'name role profileImage')
-            .populate({
-                path: 'replyTo',
-                select: 'content isDeleted type',
-                populate: { path: 'sender', select: 'name' },
-            })
-            .sort({ createdAt: -1 })
-            .limit(lim)
-            .lean();
-
-        // Skip read-tracking for admin observers (they are not members)
-        if (!adminObserver) _markRead(chatId, req.userId, msgs).catch(() => {});
-
-        // Only school admins see deleted content + full edit history.
-        const isAdmin = req.userRole === 'school_admin';
-        const shaped = msgs.map(m => {
-            if (isAdmin) return m;
-            const { editHistory, ...rest } = m;
-            if (rest.isDeleted) { rest.content = ''; rest.attachments = []; }
-            return rest;
+        const { messages, hasMore } = await readModel.messagesPage(chatId, req.schoolId, {
+            before, after, limit, isAdmin: isSchoolAdmin(req),
         });
 
-        res.json({
-            success: true,
-            data:    shaped.reverse(),
-            hasMore: msgs.length >= lim,
-        });
-    } catch (err) {
-        console.error('[chatCtrl] getMessages:', err);
-        res.status(500).json({ success: false, message: 'Failed to load messages' });
-    }
+        // Opening a conversation is reading it. Scrolling back (before=) reads
+        // nothing new, a reconnect catch-up (after=) may be for a conversation
+        // that is not on screen, and observers are not members.
+        if (member && !before && !after && messages.length) {
+            writer.markRead(actorFromRequest(req), chatId).catch(() => {});
+        }
+
+        res.json({ success: true, data: messages, hasMore, observer });
+    } catch (err) { fail(res, err, 'Failed to load messages', 'getMessages'); }
 };
 
-async function _markRead(chatId, userId, msgs) {
-    if (!msgs.length) return;
-    const latest = msgs[0]; // sorted desc, so first = newest
-    await ChatMember.findOneAndUpdate(
-        { chat: chatId, user: userId },
-        { lastReadMessage: latest._id, lastReadAt: new Date() }
-    );
-    await MessageReceipt.updateMany(
-        { chat: chatId, user: userId, readAt: null },
-        { readAt: new Date() }
-    );
-    // Notify room so senders see read ticks
-    broker.publishToRoom(chatId, 'chat:message_read', {
-        chatId, userId: String(userId), messageId: latest._id, readAt: new Date(),
-    }).catch(() => {});
-}
-
-/**
- * POST /api/chat/chats/:chatId/messages  body: { content, type, replyTo, attachments, tempId }
- * REST send path — persists the message and broadcasts it to the room via the
- * broker so gateway-connected members receive it in real time.
- */
+/** POST /api/chat/chats/:chatId/messages  { content, type, replyTo, attachments, clientId|tempId, isForwarded } */
 exports.sendMessage = async (req, res) => {
     try {
-        const { chatId } = req.params;
-        const { content, type = 'text', replyTo, attachments = [], tempId, isForwarded = false } = req.body;
-
-        const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
-        if (!content?.trim() && !hasAttachments) {
-            return res.status(400).json({ success: false, message: 'Content is required' });
-        }
-
-        const member = await ChatMember.findOne({ chat: chatId, user: req.userId, isActive: true }).lean();
-        if (!member) return res.status(403).json({ success: false, message: 'Not a member of this chat' });
-
-        const chat = await Chat.findOne({ _id: chatId, school: req.schoolId }).lean();
-        if (!chat) return res.status(404).json({ success: false, message: 'Chat not found' });
-
-        if (chat.isReadOnly && !['school_admin', 'super_admin', 'teacher'].includes(req.userRole)) {
-            return res.status(403).json({ success: false, message: 'This is a read-only channel' });
-        }
-
-        const message = await Message.create({
-            chat:        chatId,
-            school:      req.schoolId,
-            sender:      req.userId,
-            senderRole:  req.userRole,
-            content:     (content || '').trim(),
-            type,
-            attachments: hasAttachments ? attachments : [],
-            replyTo:     isForwarded ? null : (replyTo || null),
-            isForwarded: !!isForwarded,
-        });
-
-        await Chat.updateOne({ _id: chatId }, { lastMessage: message._id, lastActivity: new Date() });
-        await ChatMember.updateOne(
-            { chat: chatId, user: req.userId },
-            { lastReadAt: new Date(), lastReadMessage: message._id }
-        );
-
-        const populated = await Message.findById(message._id)
-            .populate('sender', 'name role profileImage')
-            .populate({
-                path: 'replyTo',
-                select: 'content isDeleted type',
-                populate: { path: 'sender', select: 'name' },
-            })
-            .lean();
-
-        // Real-time broadcast + delivery receipts (non-blocking)
-        broker.publishToRoom(chatId, 'chat:message', { ...populated, tempId: tempId || null }).catch(() => {});
-        _writeReceipts(message._id, chatId, req.userId, req.schoolId).catch(() => {});
-
-        res.status(201).json({ success: true, data: populated });
-    } catch (err) {
-        console.error('[chatCtrl] sendMessage:', err);
-        res.status(500).json({ success: false, message: 'Failed to send message' });
-    }
+        const { message, duplicate } = await writer.send(actorFromRequest(req), req.params.chatId, req.body || {});
+        res.status(duplicate ? 200 : 201).json({ success: true, data: message });
+    } catch (err) { fail(res, err, 'Failed to send message', 'sendMessage'); }
 };
 
-async function _writeReceipts(messageId, chatId, senderUserId, schoolId) {
-    const members = await ChatMember.find({
-        chat: chatId, user: { $ne: senderUserId }, isActive: true,
-    }).select('user').lean();
-    if (!members.length) return;
-    await MessageReceipt.insertMany(
-        members.map(m => ({
-            message: messageId, chat: chatId, user: m.user,
-            school:  schoolId, deliveredAt: new Date(),
-        })),
-        { ordered: false }
-    );
-}
-
-// ─── Create direct chat ───────────────────────────────────────────────────────
-
-/** POST /api/chat/direct  body: { targetUserId } */
-exports.createDirectChat = async (req, res) => {
+/** POST /api/chat/chats/:chatId/read  { messageId? } */
+exports.markRead = async (req, res) => {
     try {
-        const targetUserId = req.body.targetUserId || req.body.receiverId;
-
-        if (!targetUserId) return res.status(400).json({ success: false, message: 'targetUserId required' });
-        if (String(targetUserId) === String(req.userId)) {
-            return res.status(400).json({ success: false, message: 'Cannot chat with yourself' });
-        }
-
-        const receiver = await User.findOne({ _id: targetUserId, school: req.schoolId }).select('role').lean();
-        if (!receiver) return res.status(404).json({ success: false, message: 'User not found' });
-
-        const check = await perm.canMessage(req.userId, req.userRole, targetUserId, receiver.role, req.schoolId);
-        if (!check.allowed) return res.status(403).json({ success: false, message: check.reason });
-
-        // Find existing direct chat between these two users
-        const myMemberships = await ChatMember.find({ user: req.userId, school: req.schoolId, isActive: true })
-            .select('chat').lean();
-        const myChatIds = myMemberships.map(m => m.chat);
-
-        const existing = await ChatMember.findOne({
-            chat:     { $in: myChatIds },
-            user:     targetUserId,
-            isActive: true,
-        })
-        .populate({ path: 'chat', match: { type: 'direct', school: req.schoolId } })
-        .lean();
-
-        if (existing && existing.chat) {
-            return res.json({ success: true, data: existing.chat });
-        }
-
-        const chat = await Chat.create({
-            school: req.schoolId, type: 'direct', createdBy: req.userId, lastActivity: new Date(),
-        });
-        await ChatMember.insertMany([
-            { chat: chat._id, user: req.userId,   school: req.schoolId, role: 'admin' },
-            { chat: chat._id, user: targetUserId, school: req.schoolId, role: 'member' },
-        ]);
-
-        await broker.publishMembership('join', req.userId, chat._id);
-        await broker.publishMembership('join', targetUserId, chat._id);
-
-        res.status(201).json({ success: true, data: chat.toObject() });
-    } catch (err) {
-        console.error('[chatCtrl] createDirectChat:', err);
-        res.status(500).json({ success: false, message: 'Failed to create chat' });
-    }
+        const data = await writer.markRead(actorFromRequest(req), req.params.chatId, req.body?.messageId || null);
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to mark read', 'markRead'); }
 };
 
-// ─── Create group ─────────────────────────────────────────────────────────────
-
-/** POST /api/chat/group  body: { name, description, memberIds[], isReadOnly, type } */
-exports.createGroup = async (req, res) => {
-    try {
-        const { name, description = '', isReadOnly = false } = req.body;
-        let   { memberIds, type = 'group' }                  = req.body;
-
-        if (!perm.canCreateGroup(req.userRole)) {
-            return res.status(403).json({ success: false, message: 'You cannot create groups' });
-        }
-        if (!name || !name.trim()) {
-            return res.status(400).json({ success: false, message: 'Group name is required' });
-        }
-
-        if (typeof memberIds === 'string') {
-            try { memberIds = JSON.parse(memberIds); } catch { memberIds = []; }
-        }
-        memberIds = (Array.isArray(memberIds) ? memberIds : [])
-            .map(String)
-            .filter(id => id !== String(req.userId));
-
-        // Validate every proposed member
-        for (const memberId of memberIds) {
-            const rx = await User.findOne({ _id: memberId, school: req.schoolId }).select('name role').lean();
-            if (!rx) continue;
-            const c = await perm.canMessage(req.userId, req.userRole, memberId, rx.role, req.schoolId);
-            if (!c.allowed) {
-                return res.status(403).json({
-                    success: false,
-                    message: `Cannot add ${rx.name}: ${c.reason}`,
-                });
-            }
-        }
-
-        const chatType = type === 'broadcast' ? 'broadcast' : 'group';
-        const chat = await Chat.create({
-            school:      req.schoolId,
-            type:        chatType,
-            name:        name.trim(),
-            description,
-            createdBy:   req.userId,
-            isReadOnly:  isReadOnly === true || isReadOnly === 'true',
-            lastActivity: new Date(),
-        });
-
-        const allMembers = [String(req.userId), ...memberIds];
-        await ChatMember.insertMany(
-            allMembers.map(mid => ({
-                chat:   chat._id,
-                user:   mid,
-                school: req.schoolId,
-                role:   mid === String(req.userId) ? 'admin' : 'member',
-            }))
-        );
-
-        for (const mid of allMembers) await broker.publishMembership('join', mid, chat._id);
-        await broker.publishToRoom(chat._id, 'chat:group_created', {
-            chatId: chat._id, name: chat.name, type: chat.type,
-        });
-
-        res.status(201).json({ success: true, data: chat.toObject() });
-    } catch (err) {
-        console.error('[chatCtrl] createGroup:', err);
-        res.status(500).json({ success: false, message: 'Failed to create group' });
-    }
-};
-
-// ─── Contacts ─────────────────────────────────────────────────────────────────
-
-/** GET /api/chat/contacts?q=<search> */
-exports.getContacts = async (req, res) => {
-    try {
-        const { q } = req.query;
-        let contacts = await perm.getAllowedContacts(req.userId, req.userRole, req.schoolId);
-        if (q) {
-            const s = q.toLowerCase();
-            contacts = contacts.filter(
-                c => c.name.toLowerCase().includes(s) || c.role.toLowerCase().includes(s)
-            );
-        }
-        res.json({ success: true, data: contacts });
-    } catch (err) {
-        console.error('[chatCtrl] getContacts:', err);
-        res.status(500).json({ success: false, message: 'Failed to load contacts' });
-    }
-};
-
-// ─── Message search ───────────────────────────────────────────────────────────
-
-/** GET /api/chat/search?q=<text>&chatId=<optional> */
-exports.searchMessages = async (req, res) => {
-    try {
-        const { q, chatId } = req.query;
-
-        if (!q || q.trim().length < 2) return res.json({ success: true, data: [] });
-
-        const memberships = await ChatMember.find({ user: req.userId, school: req.schoolId, isActive: true })
-            .select('chat').lean();
-        const chatIds = memberships.map(m => m.chat);
-
-        const filter = {
-            school:    req.schoolId,
-            chat:      chatId ? chatId : { $in: chatIds },
-            isDeleted: false,
-            $text:     { $search: q.trim() },
-        };
-
-        const msgs = await Message.find(filter, { score: { $meta: 'textScore' } })
-            .populate('sender', 'name role profileImage')
-            .populate('chat', 'name type')
-            .sort({ score: { $meta: 'textScore' } })
-            .limit(30)
-            .lean();
-
-        res.json({ success: true, data: msgs });
-    } catch (err) {
-        console.error('[chatCtrl] searchMessages:', err);
-        res.status(500).json({ success: false, message: 'Search failed' });
-    }
-};
-
-// ─── Edit / Delete messages ───────────────────────────────────────────────────
-
-/** PATCH /api/chat/messages/:msgId  body: { content } */
+/** PATCH /api/chat/messages/:msgId  { content } */
 exports.editMessage = async (req, res) => {
     try {
-        const { msgId }   = req.params;
-        const { content } = req.body;
-
-        if (!content || !content.trim()) {
-            return res.status(400).json({ success: false, message: 'Content required' });
-        }
-
-        const msg = await Message.findOne({ _id: msgId, sender: req.userId, isDeleted: false }).lean();
-        if (!msg) return res.status(403).json({ success: false, message: 'Not authorised' });
-
-        if (Date.now() - new Date(msg.createdAt).getTime() > 86_400_000) {
-            return res.status(400).json({ success: false, message: 'Cannot edit messages older than 24 hours' });
-        }
-
-        const now = new Date();
-        await Message.findByIdAndUpdate(msgId, {
-            content: content.trim(), isEdited: true, editedAt: now,
-            // Keep the version we're replacing for the admin audit trail
-            $push: { editHistory: { content: msg.content, editedAt: now } },
-        });
-
-        await broker.publishToRoom(msg.chat, 'chat:message_edited', {
-            messageId: msgId, chatId: String(msg.chat),
-            content: content.trim(), editedAt: now,
-            // Prev content only reaches admin clients (they already hold it) —
-            // non-admin clients ignore it. Kept out of persisted socket payload.
-            previousContent: msg.content,
-        });
-        res.json({ success: true });
-    } catch (err) {
-        console.error('[chatCtrl] editMessage:', err);
-        res.status(500).json({ success: false, message: 'Failed to edit' });
-    }
+        const data = await writer.edit(actorFromRequest(req), req.params.msgId, req.body?.content);
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to edit', 'editMessage'); }
 };
 
 /** DELETE /api/chat/messages/:msgId */
 exports.deleteMessage = async (req, res) => {
     try {
-        const { msgId } = req.params;
-
-        const msg = await Message.findOne({ _id: msgId, isDeleted: false }).lean();
-        if (!msg) return res.status(404).json({ success: false, message: 'Message not found' });
-
-        const isOwner = String(msg.sender) === String(req.userId);
-        const isAdmin = ['school_admin', 'super_admin'].includes(req.userRole);
-        if (!isOwner && !isAdmin) {
-            return res.status(403).json({ success: false, message: 'Not authorised' });
-        }
-
-        await Message.findByIdAndUpdate(msgId, {
-            isDeleted: true, deletedAt: new Date(), deletedBy: req.userId,
-        });
-
-        await broker.publishToRoom(msg.chat, 'chat:message_deleted', {
-            messageId: msgId, chatId: String(msg.chat),
-        });
+        await writer.remove(actorFromRequest(req), req.params.msgId);
         res.json({ success: true });
-    } catch (err) {
-        console.error('[chatCtrl] deleteMessage:', err);
-        res.status(500).json({ success: false, message: 'Failed to delete' });
-    }
+    } catch (err) { fail(res, err, 'Failed to delete', 'deleteMessage'); }
 };
 
 /** POST /api/chat/messages/:msgId/react  { emoji } */
 exports.toggleReaction = async (req, res) => {
     try {
-        const { msgId } = req.params;
-        const { emoji } = req.body;
-        const userName  = req.user?.name || '';
+        const data = await writer.react(actorFromRequest(req), req.params.msgId, req.body?.emoji);
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to react', 'toggleReaction'); }
+};
 
-        if (!emoji) return res.status(400).json({ success: false, message: 'emoji required' });
+// ─── Members ──────────────────────────────────────────────────────────────────
 
-        const msg = await Message.findOne({ _id: msgId, isDeleted: false }).lean();
-        if (!msg) return res.status(404).json({ success: false, message: 'Message not found' });
+/** GET /api/chat/chats/:chatId/members */
+exports.getChatMembers = async (req, res) => {
+    try {
+        await accessTo(req, req.params.chatId);
+        const members = await ChatMember.find({ chat: req.params.chatId, isActive: true })
+            .populate('user', 'name role profileImage email')
+            .lean();
+        res.json({ success: true, data: members });
+    } catch (err) { fail(res, err, 'Failed to load members', 'getChatMembers'); }
+};
 
-        const existing = (msg.reactions || []).find(r => String(r.user) === String(req.userId));
-        let update;
-        if (existing && existing.emoji === emoji) {
-            update = { $pull: { reactions: { user: req.userId } } };
-        } else if (existing) {
-            await Message.findByIdAndUpdate(msgId, { $pull: { reactions: { user: req.userId } } });
-            update = { $push: { reactions: { emoji, user: req.userId, userName } } };
+// ─── Contacts ─────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/chat/contacts?q=&role=&limit=
+ *
+ * Everyone the caller may start a conversation with, each with a short line
+ * (subjects, class, whose parent). A school admin may reach the whole school,
+ * so that one list is searched and cut in SQL; without `limit` it stays whole,
+ * which is what the Expo app's client-side filter expects.
+ */
+exports.getContacts = async (req, res) => {
+    try {
+        const q     = String(req.query.q || '').trim();
+        const role  = ['teacher', 'student', 'parent', 'school_admin'].includes(req.query.role) ? req.query.role : null;
+        const limit = req.query.limit ? Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 500) : null;
+
+        let contacts;
+        if (isSchoolAdmin(req)) {
+            const params = [String(req.schoolId), String(req.userId), q ? `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null, role];
+            const { rows } = await pool.query(
+                `SELECT "_id", "name", "role", "email", "profileImage" FROM "users"
+                  WHERE "school" = $1::uuid AND "_id" <> $2::uuid AND "isActive" = true
+                    AND "role" IN ('teacher', 'student', 'parent', 'school_admin')
+                    AND ($3::text IS NULL OR "name" ILIKE $3 OR "email" ILIKE $3)
+                    AND ($4::text IS NULL OR "role" = $4::text)
+                  ORDER BY "name"
+                  ${limit ? `LIMIT ${limit}` : ''}`,
+                params,
+            );
+            contacts = rows.map((r) => ({ ...r, _id: String(r._id) }));
         } else {
-            update = { $push: { reactions: { emoji, user: req.userId, userName } } };
+            contacts = await perm.getAllowedContacts(req.userId, req.userRole, req.schoolId);
+            if (q) {
+                const s = q.toLowerCase();
+                contacts = contacts.filter((c) => (c.name || '').toLowerCase().includes(s) || (c.role || '').toLowerCase().includes(s));
+            }
+            if (role) contacts = contacts.filter((c) => c.role === role);
+            contacts.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+            if (limit) contacts = contacts.slice(0, limit);
         }
 
-        const updated = await Message.findByIdAndUpdate(msgId, update, { new: true }).lean();
+        const lines = await readModel.contactLines(contacts.map((c) => c._id), req.schoolId);
+        res.json({ success: true, data: contacts.map((c) => ({ ...c, _id: String(c._id), line: lines.get(String(c._id)) || '' })) });
+    } catch (err) { fail(res, err, 'Failed to load contacts', 'getContacts'); }
+};
 
-        await broker.publishToRoom(msg.chat, 'chat:reaction', {
-            messageId: msgId, chatId: String(msg.chat), reactions: updated.reactions,
-        });
+// ─── Search / unread / heartbeat ──────────────────────────────────────────────
 
-        res.json({ success: true, data: updated.reactions });
-    } catch (err) {
-        console.error('[chatCtrl] toggleReaction:', err);
-        res.status(500).json({ success: false, message: 'Failed' });
+/** GET /api/chat/search?q=<text>&chatId=<optional> */
+exports.searchMessages = async (req, res) => {
+    try {
+        const q = String(req.query.q || '').trim();
+        if (q.length < 2) return res.json({ success: true, data: [] });
+        const data = await readModel.searchMessages(req.userId, req.schoolId, q, { chatId: req.query.chatId || null });
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Search failed', 'searchMessages'); }
+};
+
+/** GET /api/chat/unread-count */
+exports.getUnreadCount = async (req, res) => {
+    try {
+        res.json({ success: true, data: { count: await readModel.unreadTotal(req.userId, req.schoolId) } });
+    } catch {
+        res.json({ success: true, data: { count: 0 } });
     }
+};
+
+/** POST /api/chat/heartbeat — refresh my presence, return total unread count */
+exports.heartbeat = async (req, res) => {
+    try {
+        await User.updateOne({ _id: req.userId }, { lastSeenAt: new Date() });
+        res.json({ success: true, data: { unread: await readModel.unreadTotal(req.userId, req.schoolId) } });
+    } catch {
+        res.json({ success: true, data: { unread: 0 } });
+    }
+};
+
+// ─── Create chats ─────────────────────────────────────────────────────────────
+
+/** POST /api/chat/direct  { targetUserId } — opens the existing conversation when there is one */
+exports.createDirectChat = async (req, res) => {
+    try {
+        const targetUserId = req.body.targetUserId || req.body.receiverId;
+        if (!targetUserId) return res.status(400).json({ success: false, message: 'targetUserId required' });
+        if (String(targetUserId) === String(req.userId)) {
+            return res.status(400).json({ success: false, message: 'Cannot chat with yourself' });
+        }
+
+        const receiver = await User.findOne({ _id: targetUserId, school: req.schoolId, isActive: true }).select('role').lean();
+        if (!receiver) return res.status(404).json({ success: false, message: 'User not found' });
+
+        const check = await perm.canMessage(req.userId, req.userRole, targetUserId, receiver.role, req.schoolId);
+        if (!check.allowed) return res.status(403).json({ success: false, message: check.reason });
+
+        const { rows } = await pool.query(
+            `SELECT c."_id" FROM "chats" c
+               JOIN "chatmembers" a ON a."chat" = c."_id" AND a."user" = $1::uuid
+               JOIN "chatmembers" b ON b."chat" = c."_id" AND b."user" = $2::uuid
+              WHERE c."school" = $3::uuid AND c."type" = 'direct'
+              ORDER BY c."lastActivity" DESC NULLS LAST LIMIT 1`,
+            [String(req.userId), String(targetUserId), String(req.schoolId)],
+        );
+
+        let chatId = rows[0]?._id;
+        let created = false;
+        if (chatId) {
+            // A direct conversation is never really left — bring either side back.
+            await ChatMember.updateMany({ chat: chatId, user: { $in: [req.userId, targetUserId] } }, { isActive: true });
+        } else {
+            const chat = await Chat.create({ school: req.schoolId, type: 'direct', createdBy: req.userId, lastActivity: new Date() });
+            chatId = chat._id;
+            created = true;
+            await ChatMember.insertMany([
+                { chat: chatId, user: req.userId,   school: req.schoolId, role: 'admin' },
+                { chat: chatId, user: targetUserId, school: req.schoolId, role: 'member' },
+            ]);
+        }
+        await joinRoom([req.userId, targetUserId], chatId);
+
+        const data = await readModel.chatSummary(req.userId, req.schoolId, chatId, { isAdmin: isSchoolAdmin(req) });
+        res.status(created ? 201 : 200).json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to create chat', 'createDirectChat'); }
+};
+
+function parseIds(v) {
+    let ids = v;
+    if (typeof ids === 'string') { try { ids = JSON.parse(ids); } catch { ids = [ids]; } }
+    return [...new Set((Array.isArray(ids) ? ids : []).map(String).filter(Boolean))];
+}
+
+/** Every proposed member must be someone the caller may message. */
+async function vetMembers(req, ids) {
+    if (!ids.length) return [];
+    const users = await User.find({ _id: { $in: ids }, school: req.schoolId, isActive: true }).select('name role').lean();
+    for (const u of users) {
+        const c = await perm.canMessage(req.userId, req.userRole, u._id, u.role, req.schoolId);
+        if (!c.allowed) throw new ChatError(403, `Cannot add ${u.name}: ${c.reason}`);
+    }
+    return users.map((u) => String(u._id));
+}
+
+/**
+ * A teacher's own groups are staff groups. Students (and their parents) are
+ * reached through a class group or a subject group, whose membership follows
+ * the school's records — otherwise a subject teacher could build a class group
+ * with any teacher they liked in it, which is exactly what those rules forbid.
+ */
+async function staffOnly(req, ids) {
+    if (!ids.length) return;
+    const users = await User.find({ _id: { $in: ids }, school: req.schoolId }).select('name role').lean();
+    const outsider = users.find((u) => !['teacher', 'school_admin'].includes(u.role));
+    if (outsider) {
+        throw new ChatError(403, `${outsider.name} can’t be added here — students join through a class group or a subject group`);
+    }
+}
+
+/** POST /api/chat/group  { name, description, memberIds[], isReadOnly, type } */
+exports.createGroup = async (req, res) => {
+    try {
+        const { description = '', isReadOnly = false, type = 'group' } = req.body;
+        const name = String(req.body.name || '').trim();
+
+        if (!perm.canCreateGroup(req.userRole)) throw new ChatError(403, 'You cannot create groups');
+        if (!name) throw new ChatError(400, 'Group name is required');
+        if (name.length > 80) throw new ChatError(400, 'Group names are limited to 80 characters');
+
+        const wanted = parseIds(req.body.memberIds).filter((id) => id !== String(req.userId));
+        if (req.userRole === 'teacher') await staffOnly(req, wanted);
+        const memberIds = await vetMembers(req, wanted);
+        if (!memberIds.length) throw new ChatError(400, 'Add at least one member');
+
+        const chat = await Chat.create({
+            school:       req.schoolId,
+            type:         type === 'broadcast' ? 'broadcast' : 'group',
+            name,
+            description:  String(description || '').trim().slice(0, 300),
+            createdBy:    req.userId,
+            isReadOnly:   isReadOnly === true || isReadOnly === 'true' || type === 'broadcast',
+            lastActivity: new Date(),
+        });
+        const everyone = [String(req.userId), ...memberIds];
+        await ChatMember.insertMany(everyone.map((uid) => ({
+            chat: chat._id, user: uid, school: req.schoolId, role: uid === String(req.userId) ? 'admin' : 'member',
+        })));
+
+        await joinRoom(everyone, chat._id);
+        broker.publishToRoom(chat._id, 'chat:group_created', { chatId: String(chat._id), name: chat.name, type: chat.type }).catch(() => {});
+
+        const data = await readModel.chatSummary(req.userId, req.schoolId, chat._id, { isAdmin: isSchoolAdmin(req) });
+        res.status(201).json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to create group', 'createGroup'); }
 };
 
 // ─── Group management ─────────────────────────────────────────────────────────
 
-/** PATCH /api/chat/group/:chatId/settings  body: { name, description, isReadOnly } */
+async function requireGroupAdmin(req, chatId) {
+    const [me, chat] = await Promise.all([
+        ChatMember.findOne({ chat: chatId, user: req.userId, school: req.schoolId, role: 'admin', isActive: true }).lean(),
+        Chat.findOne({ _id: chatId, school: req.schoolId }).lean(),
+    ]);
+    if (!chat) throw new ChatError(404, 'Conversation not found');
+    if (chat.type === 'direct') throw new ChatError(400, 'This is not a group');
+    if (!me) throw new ChatError(403, 'Only group admins can do that');
+    return chat;
+}
+
+/** PATCH /api/chat/group/:chatId/settings  { name, description, isReadOnly } */
 exports.updateGroupSettings = async (req, res) => {
     try {
-        const { chatId }                        = req.params;
+        const { chatId } = req.params;
+        await requireGroupAdmin(req, chatId);
         const { name, description, isReadOnly } = req.body;
 
-        const adminCheck = await ChatMember.findOne({
-            chat: chatId, user: req.userId, role: 'admin', isActive: true,
-        }).lean();
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, message: 'Only group admins can update settings' });
-        }
-
         const update = {};
-        if (name !== undefined)        update.name        = name.trim();
-        if (description !== undefined) update.description = description;
-        if (isReadOnly !== undefined)  update.isReadOnly  = isReadOnly === true || isReadOnly === 'true';
+        if (name !== undefined) {
+            const n = String(name).trim();
+            if (!n) throw new ChatError(400, 'Group name is required');
+            update.name = n.slice(0, 80);
+        }
+        if (description !== undefined) update.description = String(description || '').trim().slice(0, 300);
+        if (isReadOnly !== undefined)  update.isReadOnly = isReadOnly === true || isReadOnly === 'true';
 
         await Chat.findByIdAndUpdate(chatId, update);
-
-        await broker.publishToRoom(chatId, 'chat:group_updated', { chatId, ...update });
-
-        res.json({ success: true });
-    } catch (err) {
-        console.error('[chatCtrl] updateGroupSettings:', err);
-        res.status(500).json({ success: false, message: 'Failed to update group' });
-    }
+        broker.publishToRoom(chatId, 'chat:group_updated', { chatId: String(chatId), ...update }).catch(() => {});
+        res.json({ success: true, data: update });
+    } catch (err) { fail(res, err, 'Failed to update group', 'updateGroupSettings'); }
 };
 
-/** POST /api/chat/group/:chatId/member  body: { memberId } */
+/** POST /api/chat/group/:chatId/member  { memberId } | { memberIds: [] } */
 exports.addMember = async (req, res) => {
     try {
-        const { chatId }   = req.params;
-        const { memberId } = req.body;
+        const { chatId } = req.params;
+        const chat = await requireGroupAdmin(req, chatId);
+        const wanted = parseIds(req.body.memberIds || req.body.memberId);
+        if (!wanted.length) throw new ChatError(400, 'memberId required');
+        if (classGroups.isClassGroup(chat)) await classGroups.assertCanAdd(chat, wanted);
+        else if (req.userRole === 'teacher') await staffOnly(req, wanted);
 
-        if (!memberId) return res.status(400).json({ success: false, message: 'memberId required' });
+        const existing = await ChatMember.find({ chat: chatId, user: { $in: wanted } }).lean();
+        const byUser = new Map(existing.map((m) => [String(m.user), m]));
+        const fresh = wanted.filter((id) => !byUser.get(id)?.isActive);
+        if (!fresh.length) throw new ChatError(400, wanted.length === 1 ? 'Already a member' : 'Everyone picked is already a member');
 
-        const adminCheck = await ChatMember.findOne({
-            chat: chatId, user: req.userId, role: 'admin', isActive: true,
-        }).lean();
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, message: 'Only group admins can add members' });
+        // Class/subject groups were vetted against the section's records above.
+        const allowed = classGroups.isClassGroup(chat) ? fresh : await vetMembers(req, fresh);
+        for (const uid of allowed) {
+            const row = byUser.get(uid);
+            if (row) await ChatMember.findByIdAndUpdate(row._id, { isActive: true, role: 'member', joinedAt: new Date() });
+            else await ChatMember.create({ chat: chatId, user: uid, school: req.schoolId, role: 'member' });
         }
-
-        const existing = await ChatMember.findOne({ chat: chatId, user: memberId }).lean();
-        if (existing) {
-            if (existing.isActive) {
-                return res.status(400).json({ success: false, message: 'User is already a member' });
-            }
-            await ChatMember.findByIdAndUpdate(existing._id, { isActive: true });
-        } else {
-            const rx = await User.findOne({ _id: memberId, school: req.schoolId }).select('role').lean();
-            if (!rx) return res.status(404).json({ success: false, message: 'User not found' });
-            const c = await perm.canMessage(req.userId, req.userRole, memberId, rx.role, req.schoolId);
-            if (!c.allowed) return res.status(403).json({ success: false, message: c.reason });
-            await ChatMember.create({ chat: chatId, user: memberId, school: req.schoolId, role: 'member' });
+        await joinRoom(allowed, chatId);
+        for (const uid of allowed) {
+            broker.publishToRoom(chatId, 'chat:member_added', { chatId: String(chatId), userId: uid }).catch(() => {});
         }
-
-        await broker.publishMembership('join', memberId, chatId);
-        await broker.publishToRoom(chatId, 'chat:member_added', { chatId, userId: memberId });
-
-        res.json({ success: true });
-    } catch (err) {
-        console.error('[chatCtrl] addMember:', err);
-        res.status(500).json({ success: false, message: 'Failed to add member' });
-    }
+        res.json({ success: true, data: { added: allowed.length } });
+    } catch (err) { fail(res, err, 'Failed to add member', 'addMember'); }
 };
 
-/** DELETE /api/chat/group/:chatId/member/:memberId */
+/** DELETE /api/chat/group/:chatId/member/:memberId — an admin removing someone, or anyone leaving */
 exports.removeMember = async (req, res) => {
     try {
         const { chatId, memberId } = req.params;
+        const leaving = String(memberId) === String(req.userId);
+        if (!leaving) await requireGroupAdmin(req, chatId);
 
-        if (String(memberId) !== String(req.userId)) {
-            const check = await ChatMember.findOne({
-                chat: chatId, user: req.userId, role: 'admin', isActive: true,
-            }).lean();
-            if (!check) return res.status(403).json({ success: false, message: 'Only admins can remove members' });
+        const row = await ChatMember.findOne({ chat: chatId, user: memberId, school: req.schoolId, isActive: true }).lean();
+        if (!row) throw new ChatError(404, 'Not a member');
+        const chat = await Chat.findOne({ _id: chatId, school: req.schoolId }).lean();
+        if (classGroups.isClassGroup(chat)) await classGroups.assertCanRemove(chat, memberId, { leaving });
+        await ChatMember.findByIdAndUpdate(row._id, { isActive: false });
+
+        // The last admin walking out would leave a group nobody can manage —
+        // hand it to whoever has been in it longest.
+        if (row.role === 'admin') {
+            const admins = await ChatMember.countDocuments({ chat: chatId, isActive: true, role: 'admin' });
+            if (!admins) {
+                const heir = await ChatMember.findOne({ chat: chatId, isActive: true }).sort({ joinedAt: 1 }).lean();
+                if (heir) await ChatMember.findByIdAndUpdate(heir._id, { role: 'admin' });
+            }
         }
 
-        await ChatMember.findOneAndUpdate({ chat: chatId, user: memberId }, { isActive: false });
-
-        await broker.publishMembership('leave', memberId, chatId);
-        await broker.publishToRoom(chatId, 'chat:member_removed', { chatId, userId: memberId });
-
+        broker.publishToRoom(chatId, 'chat:member_removed', { chatId: String(chatId), userId: String(memberId) }).catch(() => {});
+        broker.publishMembership('leave', memberId, chatId).catch(() => {});
         res.json({ success: true });
-    } catch (err) {
-        console.error('[chatCtrl] removeMember:', err);
-        res.status(500).json({ success: false, message: 'Failed to remove member' });
-    }
+    } catch (err) { fail(res, err, 'Failed to remove member', 'removeMember'); }
 };
 
-// ─── Mute / Archive ───────────────────────────────────────────────────────────
+// ─── Mute / archive ───────────────────────────────────────────────────────────
 
-/** POST /api/chat/:chatId/mute  body: { muteUntil? } */
+/** POST /api/chat/:chatId/mute  { muteUntil? } */
 exports.toggleMute = async (req, res) => {
     try {
-        const { chatId }    = req.params;
-        const { muteUntil } = req.body || {};
-
-        const member = await ChatMember.findOne({ chat: chatId, user: req.userId }).lean();
-        if (!member) return res.status(403).json({ success: false, message: 'Not a member' });
-
+        const { chatId } = req.params;
+        const member = await ChatMember.findOne({ chat: chatId, user: req.userId, school: req.schoolId, isActive: true }).lean();
+        if (!member) throw new ChatError(403, 'Not a member');
+        const muteUntil = req.body?.muteUntil ? new Date(req.body.muteUntil) : null;
         const update = member.isMuted
             ? { isMuted: false, muteUntil: null }
-            : { isMuted: true,  muteUntil: muteUntil ? new Date(muteUntil) : null };
-
-        await ChatMember.findOneAndUpdate({ chat: chatId, user: req.userId }, update);
-        res.json({ success: true, data: { isMuted: !member.isMuted } });
-    } catch (err) {
-        console.error('[chatCtrl] toggleMute:', err);
-        res.status(500).json({ success: false, message: 'Failed to toggle mute' });
-    }
+            : { isMuted: true, muteUntil: muteUntil && !Number.isNaN(muteUntil.getTime()) ? muteUntil : null };
+        await ChatMember.updateOne({ _id: member._id }, update);
+        broker.publishToUser(req.userId, 'chat:prefs', { chatId: String(chatId), isMuted: update.isMuted }).catch(() => {});
+        res.json({ success: true, data: { isMuted: update.isMuted } });
+    } catch (err) { fail(res, err, 'Failed to toggle mute', 'toggleMute'); }
 };
 
 /** POST /api/chat/:chatId/archive */
 exports.toggleArchive = async (req, res) => {
     try {
         const { chatId } = req.params;
-
-        const member = await ChatMember.findOne({ chat: chatId, user: req.userId }).lean();
-        if (!member) return res.status(403).json({ success: false, message: 'Not a member' });
-
-        await ChatMember.findOneAndUpdate({ chat: chatId, user: req.userId }, {
-            isArchived: !member.isArchived,
-        });
+        const member = await ChatMember.findOne({ chat: chatId, user: req.userId, school: req.schoolId, isActive: true }).lean();
+        if (!member) throw new ChatError(403, 'Not a member');
+        await ChatMember.updateOne({ _id: member._id }, { isArchived: !member.isArchived });
+        broker.publishToUser(req.userId, 'chat:prefs', { chatId: String(chatId), isArchived: !member.isArchived }).catch(() => {});
         res.json({ success: true, data: { isArchived: !member.isArchived } });
-    } catch (err) {
-        console.error('[chatCtrl] toggleArchive:', err);
-        res.status(500).json({ success: false, message: 'Failed to toggle archive' });
-    }
+    } catch (err) { fail(res, err, 'Failed to toggle archive', 'toggleArchive'); }
 };
 
 // ─── File upload ──────────────────────────────────────────────────────────────
@@ -651,7 +488,6 @@ exports.toggleArchive = async (req, res) => {
 exports.uploadFile = async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-
         const isImage = req.file.mimetype.startsWith('image/');
         res.json({
             success: true,
@@ -666,135 +502,98 @@ exports.uploadFile = async (req, res) => {
                 type: isImage ? 'image' : 'file',
             },
         });
+    } catch (err) { fail(res, err, 'Upload failed', 'uploadFile'); }
+};
+
+// ─── Admin oversight ──────────────────────────────────────────────────────────
+
+/** GET /api/chat/admin/people?q=&role=&page=&limit= — everyone who has taken part in a conversation */
+exports.getAdminPeople = async (req, res) => {
+    try {
+        if (!isSchoolAdmin(req)) throw new ChatError(403, 'Admin only');
+        res.json({ success: true, ...(await readModel.adminPeople(req.schoolId, req.query)) });
+    } catch (err) { fail(res, err, 'Failed to load people', 'getAdminPeople'); }
+};
+
+/** GET /api/chat/admin/people/:userId — that person's conversations, direct and group */
+exports.getAdminPersonChats = async (req, res) => {
+    try {
+        if (!isSchoolAdmin(req)) throw new ChatError(403, 'Admin only');
+        const data = await readModel.adminPersonConversations(req.schoolId, req.params.userId);
+        if (!data) throw new ChatError(404, 'User not found');
+        res.json({ success: true, data });
+    } catch (err) { fail(res, err, 'Failed to load conversations', 'getAdminPersonChats'); }
+};
+
+// ─── Class & subject groups (teacher-made) ───────────────────────────────────
+
+/** GET /api/chat/class-groups/options — the class and subject groups this teacher may create */
+exports.getClassGroupOptions = async (req, res) => {
+    try {
+        res.json({ success: true, data: await classGroups.options(actorFromRequest(req)) });
+    } catch (err) { fail(res, err, 'Failed to load class groups', 'getClassGroupOptions'); }
+};
+
+/** GET /api/chat/class-groups/roster?kind=&sectionId=&subjectId= — who the group would hold */
+exports.getClassGroupRoster = async (req, res) => {
+    try {
+        res.json({ success: true, data: await classGroups.roster(actorFromRequest(req), req.query) });
+    } catch (err) { fail(res, err, 'Failed to load the class', 'getClassGroupRoster'); }
+};
+
+/** POST /api/chat/class-groups  { kind, sectionId, subjectId?, name, description, isReadOnly, teacherIds[] } */
+exports.createClassGroup = async (req, res) => {
+    try {
+        const { chatId } = await classGroups.create(actorFromRequest(req), req.body || {});
+        const data = await readModel.chatSummary(req.userId, req.schoolId, chatId);
+        res.status(201).json({ success: true, data });
     } catch (err) {
-        console.error('[chatCtrl] uploadFile:', err);
-        res.status(500).json({ success: false, message: 'Upload failed' });
+        if (err instanceof ChatError && err.chatId) {
+            return res.status(err.status).json({ success: false, message: err.message, chatId: err.chatId });
+        }
+        fail(res, err, 'Failed to create the group', 'createClassGroup');
     }
 };
 
-// Total unread across every chat the user belongs to, in one query — each
-// chat has its own lastReadAt cutoff, so we OR together one (chat, cutoff)
-// condition per membership instead of looping a countDocuments per chat.
-async function totalUnreadForUser(userId, schoolId) {
-    const memberships = await ChatMember.find({
-        user: userId, school: schoolId, isActive: true, isMuted: false,
-    }).select('chat lastReadAt').lean();
-    if (!memberships.length) return 0;
-
-    return Message.countDocuments({
-        sender:    { $ne: userId },
-        isDeleted: false,
-        $or: memberships.map((m) => ({ chat: m.chat, createdAt: { $gt: m.lastReadAt || new Date(0) } })),
-    });
-}
-
-// ─── Unread count (for topbar badge) ─────────────────────────────────────────
-
-/** GET /api/chat/unread-count */
-exports.getUnreadCount = async (req, res) => {
+/** POST /api/chat/group/:chatId/sync — bring a class/subject group back in step with the section */
+exports.syncGroup = async (req, res) => {
     try {
-        const total = await totalUnreadForUser(req.userId, req.schoolId);
-        res.json({ success: true, data: { count: total } });
-    } catch {
-        res.json({ success: true, data: { count: 0 } });
-    }
+        const chat = await requireGroupAdmin(req, req.params.chatId);
+        if (!classGroups.isClassGroup(chat)) throw new ChatError(400, 'Only class and subject groups follow a class roster');
+        res.json({ success: true, data: await classGroups.reconcile(chat) });
+    } catch (err) { fail(res, err, 'Failed to sync the group', 'syncGroup'); }
 };
 
-// ─── Presence heartbeat + unread badge ────────────────────────────────────────
-
-/** POST /api/chat/heartbeat — refresh my presence, return total unread count */
-exports.heartbeat = async (req, res) => {
+/** GET /api/chat/group/:chatId/candidates — who may still be added to a class/subject group */
+exports.getGroupCandidates = async (req, res) => {
     try {
-        await User.updateOne({ _id: req.userId }, { lastSeenAt: new Date() });
-        const unread = await totalUnreadForUser(req.userId, req.schoolId);
-        res.json({ success: true, data: { unread } });
-    } catch {
-        res.json({ success: true, data: { unread: 0 } });
-    }
+        const chat = await requireGroupAdmin(req, req.params.chatId);
+        if (!classGroups.isClassGroup(chat)) throw new ChatError(400, 'Use contacts for this group');
+        res.json({ success: true, data: await classGroups.candidates(chat) });
+    } catch (err) { fail(res, err, 'Failed to load candidates', 'getGroupCandidates'); }
 };
 
-// ─── Chat members (group member list) ─────────────────────────────────────────
-
-/** GET /api/chat/chats/:chatId/members */
-exports.getChatMembers = async (req, res) => {
-    try {
-        const { chatId } = req.params;
-
-        const me = await ChatMember.findOne({ chat: chatId, user: req.userId, isActive: true }).lean();
-        const adminObserver = !me && req.userRole === 'school_admin';
-        if (!me && !adminObserver) return res.status(403).json({ success: false, message: 'Not a member' });
-
-        const members = await ChatMember.find({ chat: chatId, isActive: true })
-            .populate('user', 'name role profileImage email')
-            .lean();
-
-        res.json({ success: true, data: members });
-    } catch (err) {
-        console.error('[chatCtrl] getChatMembers:', err);
-        res.status(500).json({ success: false, message: 'Failed to load members' });
-    }
-};
-
-// ─── Admin: browse school users / oversight ───────────────────────────────────
-
-/** GET /api/chat/admin/school-users?q=<search>  — school_admin only */
+/** GET /api/chat/admin/school-users?q=<search> */
 exports.getSchoolUsers = async (req, res) => {
     try {
-        if (req.userRole !== 'school_admin') {
-            return res.status(403).json({ success: false, message: 'Admin only' });
-        }
-        const q      = (req.query.q || '').trim();
+        if (!isSchoolAdmin(req)) throw new ChatError(403, 'Admin only');
+        const q = (req.query.q || '').trim();
         const filter = { school: req.schoolId };
         if (q) filter.name = { $regex: q, $options: 'i' };
-
-        const users = await User.find(filter)
-            .select('name role profileImage')
-            .limit(40)
-            .lean();
-
+        const users = await User.find(filter).select('name role profileImage').limit(40).lean();
         res.json({ success: true, data: users });
-    } catch (err) {
-        console.error('[chatCtrl] getSchoolUsers:', err);
-        res.status(500).json({ success: false, message: 'Failed' });
-    }
+    } catch (err) { fail(res, err, 'Failed', 'getSchoolUsers'); }
 };
 
-/** GET /api/chat/admin/user-chats?userId=<id>  — school_admin only */
+/** GET /api/chat/admin/user-chats?userId=<id> */
 exports.getAdminUserChats = async (req, res) => {
     try {
-        if (req.userRole !== 'school_admin') {
-            return res.status(403).json({ success: false, message: 'Admin only' });
-        }
+        if (!isSchoolAdmin(req)) throw new ChatError(403, 'Admin only');
         const { userId } = req.query;
-        if (!userId) return res.status(400).json({ success: false, message: 'userId required' });
-
+        if (!userId) throw new ChatError(400, 'userId required');
         const targetUser = await User.findOne({ _id: userId, school: req.schoolId }).select('name role').lean();
-        if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
-
-        const memberships = await ChatMember.find({
-            user: userId, school: req.schoolId, isActive: true,
-        })
-        .populate({
-            path: 'chat',
-            populate: {
-                path: 'lastMessage',
-                select: 'content type sender isDeleted createdAt',
-                populate: { path: 'sender', select: 'name' },
-            },
-        })
-        .lean();
-
-        const results = await Promise.all(
-            memberships
-                .filter(m => m.chat && m.chat._id)
-                .map(m => _enrichChat(m, userId, req.schoolId))
-        );
-
-        results.sort((a, b) => new Date(b.lastActivity || 0) - new Date(a.lastActivity || 0));
-
-        res.json({ success: true, data: { chats: results, user: targetUser } });
-    } catch (err) {
-        console.error('[chatCtrl] getAdminUserChats:', err);
-        res.status(500).json({ success: false, message: 'Failed' });
-    }
+        if (!targetUser) throw new ChatError(404, 'User not found');
+        const chats = await readModel.listChats(userId, req.schoolId, { isAdmin: true });
+        res.json({ success: true, data: { chats, user: targetUser } });
+    } catch (err) { fail(res, err, 'Failed', 'getAdminUserChats'); }
 };
