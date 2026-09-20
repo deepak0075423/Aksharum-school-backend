@@ -14,6 +14,9 @@ const StudentFeeAssignmentSchema = new db.Schema({
     student: { type: db.Types.UUID, ref: 'User', required: true },
     academicYear: { type: db.Types.UUID, ref: 'AcademicYear', required: true },
     feeStructure: { type: db.Types.UUID, ref: 'FeeStructure', default: null },
+    // The month this student starts on the structure — a mid-year admission,
+    // or a move from another structure. Earlier months are not charged.
+    fromMonth: { type: String, default: null },
     useCustom: { type: Boolean, default: false },
     customItems: [CustomItemSchema],
     totalAmount: { type: Number, default: 0 },

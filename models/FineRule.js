@@ -3,6 +3,9 @@ const db = require('../db/orm');
 const FineRuleSchema = new db.Schema({
     school: { type: db.Types.UUID, ref: 'School', required: true },
     name: { type: String, required: true, trim: true },
+    // late_payment: charged for paying after the due date (+ grace).
+    // other: a fixed penalty the office charges by hand (lost ID card, damage).
+    ruleType: { type: String, enum: ['late_payment', 'other'], default: 'late_payment' },
     fineType: { type: String, enum: ['flat', 'per_day'], required: true },
     flatAmount: { type: Number, default: 0, min: 0 },
     perDayAmount: { type: Number, default: 0, min: 0 },
@@ -10,8 +13,13 @@ const FineRuleSchema = new db.Schema({
     maxCap: { type: Number, default: 0, min: 0 }, // 0 = no cap
     // empty array or ['all'] = applies to all fee heads; otherwise specific categories
     applicableCategories: [{ type: String }],
+    // Which students the rule is for.
+    appliesTo: { type: String, enum: ['all', 'classes', 'transport', 'hostel'], default: 'all' },
+    classes:   [{ type: db.Types.UUID, ref: 'Class' }],
+    description: { type: String, default: '' },
     isActive: { type: Boolean, default: true },
     createdBy: { type: db.Types.UUID, ref: 'User' },
+    updatedBy: { type: db.Types.UUID, ref: 'User', default: null },
 }, { timestamps: true });
 
 FineRuleSchema.index({ school: 1, isActive: 1 });

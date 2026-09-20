@@ -7,7 +7,7 @@ const FeeAuditLogSchema = new db.Schema({
     actionType: { type: String, required: true },
     entityType: {
         type: String,
-        enum: ['FeeHead', 'FeeStructure', 'StudentFeeAssignment', 'FineRule', 'FeeConcession',
+        enum: ['FeeCategory', 'FeeHead', 'FeeStructure', 'StudentFeeAssignment', 'FineRule', 'FeeConcession',
                'StudentConcession', 'FeePayment', 'FeeSettings', 'FeeLedger'],
         default: null,
     },

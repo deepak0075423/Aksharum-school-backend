@@ -289,6 +289,68 @@ if (isPrimaryWorker) {
         setInterval(tick, 30 * 60 * 1000);     // then every 30 minutes
     }());
 
+    // ── Monthly fee charging ──────────────────────────────────────────────────
+    // A structure whose demand was generated month by month charges each new
+    // period as its month arrives (services/feeCharging). Every charge carries
+    // its head + period, so a tick, a restart or two workers can never post
+    // one twice; only structures the office generated this way are visited.
+    (function scheduleFeeCharging() {
+        const charging = require('./services/feeCharging');
+        const tick = async () => {
+            try {
+                const schools = await charging.schoolsToCharge();
+                let posted = 0;
+                for (const id of schools) posted += await charging.runChargingSweep(id);
+                if (posted) console.log(`[Fees] monthly charging: ${posted} charge(s) posted across ${schools.length} school(s)`);
+            } catch (err) { console.error('[Fees] monthly charging error:', err.message); }
+        };
+        setTimeout(tick, 90 * 1000);            // once shortly after boot
+        setInterval(tick, 60 * 60 * 1000);      // then hourly
+    }());
+
+    // ── Scheduled fees reports ────────────────────────────────────────────────
+    // Fees → Reports → Schedule Report stores a weekly/monthly email on the
+    // school's FeeSettings. Each schedule remembers the local day it last
+    // went out, so an hourly tick — and any restart — sends it at most once.
+    // Only schools that have saved a schedule are visited.
+    (function scheduleFeesReports() {
+        const feesScreens = require('./controllers/feesAdmin.controller');
+        const tick = async () => {
+            try {
+                const schools = await feesScreens.schoolsWithSchedules();
+                let sent = 0;
+                for (const id of schools) sent += await feesScreens.runScheduledReports(id);
+                if (sent) console.log(`[Fees] scheduled reports: ${sent} sent across ${schools.length} school(s)`);
+            } catch (err) { console.error('[Fees] scheduled report error:', err.message); }
+        };
+        setTimeout(tick, 120 * 1000);          // once shortly after boot
+        setInterval(tick, 60 * 60 * 1000);     // then hourly
+    }());
+
+    // ── Automatic fee reminders ───────────────────────────────────────────────
+    // Fees → Settings → Automatic Reminders. Off for every school until one
+    // switches it on, because this writes to real parents.
+    //
+    // The tick is hourly but a school only sends in its chosen local hour, and
+    // every reminder is written to FeeReminderLog before it goes out, keyed on
+    // (student, month, trigger) behind a partial unique index. So a restart, a
+    // second tick in the same hour, or a re-run of the day changes nothing: a
+    // family is chased once per month per trigger, ever.
+    (function scheduleFeeReminders() {
+        const reminders = require('./services/feeReminders');
+        const tick = async () => {
+            try {
+                const schools = await reminders.schoolsWithAutoReminders();
+                if (!schools.length) return;
+                let sent = 0;
+                for (const id of schools) sent += await reminders.runReminderSweep(id);
+                if (sent) console.log(`[Fees] automatic reminders: ${sent} sent across ${schools.length} school(s)`);
+            } catch (err) { console.error('[Fees] automatic reminder error:', err.message); }
+        };
+        setTimeout(tick, 150 * 1000);          // once shortly after boot
+        setInterval(tick, 60 * 60 * 1000);     // then hourly
+    }());
+
     // ── Substitute subject teacher sweep ──────────────────────────────────────
     // Cover happens because the school day started, not because anyone opened a
     // page: a teacher marked absent at 08:50 needs their 09:10 period covered

@@ -13,6 +13,10 @@ const StudentFeeAssignment = require('../models/StudentFeeAssignment');
 const User                 = require('../models/User');
 const School               = require('../models/School');
 const { generateReceiptPDF } = require('../utils/feeReceiptPdf');
+const { concessionOnItems } = require('../services/feeConcessions');
+const Sched = require('../services/feeSchedule');
+const { buildSchedule, monthsPayment } = require('../services/feeBook');
+const pool = require('../db/pool');
 
 async function getActiveAcademicYear(schoolId) {
     return AcademicYear.findOne({ school: schoolId, status: 'active' });
@@ -42,7 +46,7 @@ async function resolveFeeItems(studentId, academicYearId, schoolId) {
             };
         }
         if (sfa.feeStructure) {
-            return _structureItems(sfa.feeStructure, 'student_structure');
+            return _structureItems(sfa.feeStructure, 'student_structure', sfa.fromMonth || null);
         }
     }
 
@@ -68,10 +72,10 @@ async function resolveFeeItems(studentId, academicYearId, schoolId) {
     return null;
 }
 
-function _structureItems(struct, level) {
+function _structureItems(struct, level, fromMonth = null) {
     return {
         level, sourceType: 'FeeStructure', structureId: struct._id, structureName: struct.name,
-        dueDay: struct.dueDay || null,
+        dueDay: struct.dueDay || null, fromMonth, isActive: struct.isActive !== false,
         items: (struct.items || []).filter(i => i.isActive).map(i => ({
             feeHeadId: i.feeHead?._id, feeName: i.feeHead?.name || '',
             category: i.feeHead?.category?.name || (typeof i.feeHead?.category === 'string' ? i.feeHead?.category : ''),
@@ -93,140 +97,16 @@ function calcFineAmount(dueDay, fineRule) {
     return Math.round(fine * 100) / 100;
 }
 
+// A fixed concession is one sum off the covered heads — this used to take the
+// full fixed amount off EVERY head it covered. Same rule the ledger uses.
 function calcConcessionAmount(items, concessions) {
     let total = 0;
     for (const sc of concessions) {
         const c = sc.concession || sc;
         if (!c || !c.isActive) continue;
-        for (const item of items) {
-            const applicable = c.applicableTo === 'all' ||
-                (c.applicableTo === 'specific_heads' && c.applicableHeads &&
-                 c.applicableHeads.some(h => h.toString() === (item.feeHeadId || '').toString()));
-            if (!applicable) continue;
-            const amt = c.concessionType === 'percentage'
-                ? (item.amount * c.value / 100) : Math.min(c.value, item.amount);
-            total += amt;
-        }
+        total += concessionOnItems(items, c);
     }
     return Math.round(total * 100) / 100;
-}
-
-const MONTH_NAMES = ['January','February','March','April','May','June',
-                     'July','August','September','October','November','December'];
-
-// Build a month-wise fee-book schedule with payment status per month.
-// Returns array of month objects with payStatus: 'paid'|'partial'|'due'|'upcoming'
-async function buildMonthlySchedule(resolved, studentId, academicYearId, schoolId, creditPool = 0) {
-    if (!resolved || !resolved.structureId) return [];
-
-    const structure = await FeeStructure.findById(resolved.structureId).populate('items.feeHead');
-    if (!structure) return [];
-
-    let startDate = structure.demandStartedAt;
-
-    if (!startDate) {
-        const earliest = academicYearId
-            ? await FeeLedger.findOne({ school: schoolId, student: studentId, academicYear: academicYearId, category: 'fee_charged' }).sort({ createdAt: 1 }).select('createdAt')
-            : null;
-        if (earliest) {
-            startDate = new Date(earliest.createdAt.getFullYear(), earliest.createdAt.getMonth(), 1);
-        } else {
-            const now = new Date();
-            startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-        }
-    }
-
-    const sy = startDate.getFullYear(), sm = startDate.getMonth();
-    const now = new Date();
-    const todayMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const totalMonths = 12;
-
-    const newEntries = await FeeLedger.find({
-        school: schoolId, student: studentId, academicYear: academicYearId,
-        category: 'fee_charged', feeItemId: { $ne: null },
-    }).select('feeItemId feePeriod amount createdAt');
-    const chargedSet = new Set(newEntries.map(e => `${e.feeItemId}-${e.feePeriod}`));
-
-    const oldEntries = await FeeLedger.find({
-        school: schoolId, student: studentId, academicYear: academicYearId,
-        category: 'fee_charged', feeItemId: null,
-        referenceType: 'FeeStructure', referenceId: structure._id,
-    }).select('createdAt');
-    const generatedMonthsLegacy = new Set(oldEntries.map(e => {
-        const d = new Date(e.createdAt);
-        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    }));
-
-    const activeItems = (structure.items || []).filter(i => i.isActive && i.feeHead);
-    const scheduleMap = new Map();
-
-    for (let m = 0; m < totalMonths; m++) {
-        const chargeDate = new Date(sy, sm + m, 1);
-        const monthKey = `${chargeDate.getFullYear()}-${String(chargeDate.getMonth() + 1).padStart(2, '0')}`;
-        const isFuture = chargeDate > todayMonthStart;
-        const isCurrentMonth = chargeDate.getTime() === todayMonthStart.getTime();
-
-        for (const item of activeItems) {
-            const feeType = item.feeHead.type || 'recurring';
-            let periodNum = null;
-
-            if      (feeType === 'one_time')    { if (m === 0) periodNum = 0; }
-            else if (feeType === 'recurring')   { periodNum = m; }
-            else if (feeType === 'quarterly')   { if (m % 3 === 0) periodNum = m / 3; }
-            else if (feeType === 'half_yearly') { if (m % 6 === 0) periodNum = m / 6; }
-
-            if (periodNum === null) continue;
-
-            const isGenerated = chargedSet.has(`${item._id}-${periodNum}`)
-                             || generatedMonthsLegacy.has(monthKey);
-
-            if (!scheduleMap.has(monthKey)) {
-                scheduleMap.set(monthKey, {
-                    monthKey, isFuture, isCurrentMonth,
-                    monthLabel: `${MONTH_NAMES[chargeDate.getMonth()]} ${chargeDate.getFullYear()}`,
-                    items: [], chargedAmount: 0, totalAmount: 0,
-                    payStatus: 'upcoming', amountPaid: 0, amountDue: 0,
-                });
-            }
-            const slot = scheduleMap.get(monthKey);
-            slot.items.push({ name: item.feeHead.name, type: feeType, amount: item.amount, isGenerated });
-            slot.totalAmount += item.amount;
-            if (isGenerated) slot.chargedAmount += item.amount;
-        }
-    }
-
-    const schedule = [...scheduleMap.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([, v]) => v);
-
-    // Distribute payments across generated months chronologically
-    let pool = Math.max(0, creditPool);
-    for (const month of schedule) {
-        if (month.chargedAmount === 0) {
-            month.payStatus = 'upcoming';
-            month.amountDue = month.totalAmount;
-            month.amountPaid = 0;
-            continue;
-        }
-        const due = month.chargedAmount;
-        if (pool >= due) {
-            month.payStatus = 'paid';
-            month.amountPaid = due;
-            month.amountDue = 0;
-            pool -= due;
-        } else if (pool > 0) {
-            month.payStatus = 'partial';
-            month.amountPaid = Math.round(pool * 100) / 100;
-            month.amountDue = Math.round((due - pool) * 100) / 100;
-            pool = 0;
-        } else {
-            month.payStatus = month.isFuture ? 'upcoming' : 'due';
-            month.amountPaid = 0;
-            month.amountDue = due;
-        }
-    }
-
-    return schedule;
 }
 
 // Aggregate everything the fee-book screen needs for one student
@@ -249,20 +129,84 @@ async function buildFeeBook(schoolId, studentId) {
     const totalConcession   = calcConcessionAmount(resolved?.items || [], concessions);
     const fineAmt           = resolved && fineRules.length ? calcFineAmount(resolved.dueDay || null, fineRules[0]) : 0;
     const ledgerConcessions = allLedgerEntries.filter(e => e.entryType === 'credit' && e.category === 'concession').reduce((s, e) => s + e.amount, 0);
-    const monthlySchedule   = await buildMonthlySchedule(resolved, studentId, ay?._id, schoolId, totalPaid + ledgerConcessions);
+    void ledgerConcessions;
+    // Money submitted by the family and not yet approved: held against the
+    // months it covers, so nobody is asked to pay them twice meanwhile.
+    const pendingTotal = payments.filter(p => p.paymentStatus === 'pending').reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    const book = await buildSchedule({
+        year: ay, ledger: allLedgerEntries, primaryStructureId: resolved?.structureId || null,
+        fromMonth: resolved?.fromMonth || null, pendingTotal,
+    });
+    const monthlySchedule = book.months;
+    const { otherDue, dueTotal } = book;
 
-    const dueTotal = monthlySchedule.filter(m => m.payStatus === 'due' || m.payStatus === 'partial').reduce((s, m) => s + m.amountDue, 0);
+    // What the school has chosen to show students and parents (Fees → Settings
+    // → Display). Hidden figures are zeroed, not dropped, so every screen that
+    // reads this payload keeps working.
+    const show = { feeHeadDetails: true, concessionDetails: true, fineDetails: true, previousYearDues: true, ...(settings?.display || {}) };
+    if (!show.feeHeadDetails) {
+        for (const m of monthlySchedule) m.items = [{ name: 'School fees', type: 'recurring', amount: m.totalAmount, isGenerated: m.chargedAmount > 0 }];
+    }
+    let previousDue = 0;
+    if (show.previousYearDues && settings?.showPreviousDues !== false && ay) {
+        const { rows } = await pool.query(
+            `SELECT COALESCE(SUM(CASE WHEN l."entryType" = 'debit' THEN l."amount" ELSE -l."amount" END), 0) AS due
+               FROM "${FeeLedger.tableName}" l
+               JOIN "${AcademicYear.tableName}" y ON y."_id" = l."academicYear"
+              WHERE l."school" = $1 AND l."student" = $2 AND y."startDate" < $3`,
+            [String(schoolId), String(studentId), ay.startDate],
+        );
+        previousDue = Math.max(0, Math.round((Number(rows[0]?.due) || 0) * 100) / 100);
+    }
     // Whether fees may take card payments is now the school's call, module by
     // module — FeeSettings no longer carries credentials at all.
-    const school = await School.findById(schoolId).select('paymentGateway').lean();
+    const school = await School.findById(schoolId).select('paymentGateway name address phone email logo').lean();
     const online = paymentGateway.publicGateway(school?.paymentGateway, 'fees');
+
+    // When each month falls due. A structure's `dueDay` is the day of its own
+    // month; with none set the family is simply not given a date rather than
+    // being shown a made-up one.
+    const dueDay = Math.min(28, Math.max(1, Number(resolved?.dueDay) || 0));
+    for (const m of monthlySchedule) {
+        m.dueDate = dueDay ? `${m.monthKey}-${String(dueDay).padStart(2, '0')}` : null;
+    }
+    // The next month a payment is actually owed for.
+    const nextUnpaid = monthlySchedule.find(m => m.payStatus !== 'cancelled' && m.payable > 0.004) || null;
+    const nextDue = nextUnpaid ? {
+        monthKey: nextUnpaid.monthKey, monthLabel: nextUnpaid.monthLabel,
+        date: nextUnpaid.dueDate, amount: nextUnpaid.payable,
+    } : null;
+
+    // Who the receipt is for — the family's screens print a receipt preview
+    // without fetching the rendered HTML for every row.
+    const [me, profile] = await Promise.all([
+        User.findById(studentId).select('name email').lean(),
+        StudentProfile.findOne({ user: studentId, school: schoolId })
+            .select('admissionNumber rollNumber currentSection')
+            .populate({ path: 'currentSection', select: 'sectionName class', populate: { path: 'class', select: 'className classNumber' } })
+            .lean(),
+    ]);
+    const cls = profile?.currentSection?.class;
+    const student = {
+        _id: studentId, name: me?.name || '', email: me?.email || '',
+        admissionNumber: profile?.admissionNumber || '',
+        rollNumber: profile?.rollNumber || '',
+        className: cls ? (cls.className || (cls.classNumber != null ? `Class ${cls.classNumber}` : '')) : '',
+        sectionName: profile?.currentSection?.sectionName || '',
+    };
 
     return {
         activeYear: ay ? { _id: ay._id, yearName: ay.yearName } : null,
-        resolved, balance, totalCharged, totalPaid, totalConcession, fineAmt,
-        monthlySchedule, dueTotal,
+        resolved: show.feeHeadDetails ? resolved : (resolved && { ...resolved, items: [] }),
+        balance, totalCharged, totalPaid,
+        totalConcession: show.concessionDetails ? totalConcession : 0,
+        fineAmt: show.fineDetails ? fineAmt : 0,
+        previousDue,
+        monthlySchedule, dueTotal, otherDue, pendingTotal: book.pendingTotal, advance: book.advance,
+        nextDue, student,
+        school: { name: school?.name || '', address: school?.address || '', phone: school?.phone || '', logo: school?.logo || '' },
         suggestedAmount: dueTotal > 0 ? dueTotal : (balance > 0 ? balance : 0),
-        concessions,
+        concessions: show.concessionDetails ? concessions : [],
         payments,
         // Gateway now belongs to the school and is switched on per module, so
         // this reports what the school has actually opened up for fees.
@@ -339,6 +283,44 @@ exports.downloadMyReceipt = async (req, res) => {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/**
+ * A payment's amount and receipt lines. With `months` the amount is what
+ * those months come to — worked out here, never taken from the page — and
+ * each month is its own receipt line. Without, it is the amount typed, as
+ * one "Fee Payment" line (the mobile app and older screens pay that way).
+ */
+async function paymentFor(schoolId, studentId, { months, amount }) {
+    if (Array.isArray(months) && months.length) {
+        const book = await buildFeeBook(schoolId, studentId);
+        const mp = monthsPayment(book, months);
+        if (mp.error) return mp;
+        if (!(mp.amount > 0)) return { error: 'Those months are already paid' };
+        return { ...mp, months: months.map(String) };
+    }
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) return { error: 'Invalid amount' };
+    return { amount: Math.round(amt * 100) / 100, months: null, lines: [{ feeName: 'Fee Payment', amount: Math.round(amt * 100) / 100 }] };
+}
+
+/**
+ * Fees → Settings rules a family's own payment must obey, the same ones the
+ * office's counter obeys: a minimum amount, and — when part payments are
+ * switched off — the whole outstanding balance at once. Returns the refusal
+ * message, or null when the amount is fine.
+ */
+async function paymentRefusal(schoolId, studentId, amount) {
+    const s = await FeeSettings.findOne({ school: schoolId }).select('allowPartialPayments minPaymentAmount currencySymbol').lean();
+    const sym = s?.currencySymbol || '₹';
+    if (s?.minPaymentAmount > 0 && amount < s.minPaymentAmount) return `The smallest payment the school accepts is ${sym}${s.minPaymentAmount}`;
+    if (s?.allowPartialPayments === false) {
+        const ay = await getActiveAcademicYear(schoolId);
+        const last = ay && await FeeLedger.findOne({ school: schoolId, student: studentId, academicYear: ay._id }, { runningBalance: 1 }, { sort: { createdAt: -1 } });
+        const owed = Math.round((last?.runningBalance || 0) * 100) / 100;
+        if (owed > 0 && amount + 0.004 < owed) return `Part payments are not accepted — please pay the full ${sym}${owed.toLocaleString('en-IN')} due`;
+    }
+    return null;
+}
+
 async function getOrCreateReceiptNumber(schoolId) {
     const settings = await FeeSettings.findOneAndUpdate(
         { school: schoolId },
@@ -349,7 +331,7 @@ async function getOrCreateReceiptNumber(schoolId) {
 }
 
 async function recordCompletedPayment({ schoolId, studentId, academicYearId, amount, paymentMode,
-    gateway, gatewayOrderId, gatewayPaymentId, transactionRef, remarks, collectedBy, studentName, schoolName }) {
+    gateway, gatewayOrderId, gatewayPaymentId, transactionRef, remarks, collectedBy, studentName, schoolName, lines = null, months = null }) {
 
     const receiptNumber = await getOrCreateReceiptNumber(schoolId);
     const prevLedger = await FeeLedger.findOne(
@@ -361,7 +343,8 @@ async function recordCompletedPayment({ schoolId, studentId, academicYearId, amo
     const payment = await FeePayment.create({
         school: schoolId, student: studentId, academicYear: academicYearId,
         receiptNumber, amount,
-        lines: [{ feeName: 'Fee Payment', amount }],
+        lines: lines && lines.length ? lines : [{ feeName: 'Fee Payment', amount }],
+        months: months && months.length ? months : null,
         paymentMode, paymentStatus: 'completed',
         gateway: gateway || 'manual',
         gatewayOrderId: gatewayOrderId || '',
@@ -405,16 +388,19 @@ exports.getPayNow = async (req, res) => {
 // Offline / manual payment submission — goes to admin for verification
 exports.payNow = async (req, res) => {
     try {
-        const { amount, paymentMode, transactionRef, paymentDate, remarks } = req.body;
+        const { amount, paymentMode, transactionRef, paymentDate, remarks, months } = req.body;
         const ay = await getActiveAcademicYear(req.schoolId);
         if (!ay) return res.status(400).json({ success: false, message: 'No active academic year' });
 
-        const payAmt = parseFloat(amount);
-        if (!payAmt || payAmt <= 0) return res.status(400).json({ success: false, message: 'Invalid amount' });
+        const pay = await paymentFor(req.schoolId, req.userId, { months, amount });
+        if (pay.error) return res.status(400).json({ success: false, message: pay.error });
+        const payAmt = pay.amount;
+        const refusal = await paymentRefusal(req.schoolId, req.userId, payAmt);
+        if (refusal) return res.status(400).json({ success: false, message: refusal });
 
         const payment = await FeePayment.create({
             school: req.schoolId, student: req.userId, academicYear: ay._id,
-            amount: payAmt, lines: [{ feeName: 'Fee Payment', amount: payAmt }],
+            amount: payAmt, lines: pay.lines, months: pay.months || null,
             paymentMode: paymentMode || 'cash', paymentStatus: 'pending',
             transactionRef: transactionRef || '', remarks: remarks || '',
             paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
@@ -436,16 +422,20 @@ exports.payNow = async (req, res) => {
 
 // ── Razorpay: create order ───────────────────────────────────────────────────
 
-async function createRazorpayOrderFor(schoolId, studentId, amount, receiptPrefix) {
+async function createRazorpayOrderFor(schoolId, studentId, amount, receiptPrefix, months = null) {
+    const pay = await paymentFor(schoolId, studentId, { months, amount });
+    if (pay.error) return { error: pay.error };
+    const refusal = await paymentRefusal(schoolId, studentId, pay.amount);
+    if (refusal) return { error: refusal };
     return paymentGateway.createOrder(
-        schoolId, 'fees', amount,
+        schoolId, 'fees', pay.amount,
         `${receiptPrefix}-${studentId.toString().slice(-8)}-${Date.now().toString().slice(-8)}`,
     );
 }
 
 exports.createRazorpayOrder = async (req, res) => {
     try {
-        const result = await createRazorpayOrderFor(req.schoolId, req.userId, req.body.amount, 'F');
+        const result = await createRazorpayOrderFor(req.schoolId, req.userId, req.body.amount, 'F', req.body.months);
         if (result.error) return res.status(400).json({ success: false, message: result.error });
         res.json({ success: true, data: result });
     } catch (err) {
@@ -455,7 +445,7 @@ exports.createRazorpayOrder = async (req, res) => {
 };
 
 async function verifyRazorpayAndRecord({ schoolId, studentId, body, schoolName }) {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, amount, remarks } = body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, amount, remarks, months } = body;
 
     const verified = await paymentGateway.verifySignature(schoolId, 'fees', {
         orderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature,
@@ -464,10 +454,19 @@ async function verifyRazorpayAndRecord({ schoolId, studentId, body, schoolName }
 
     const ay      = await getActiveAcademicYear(schoolId);
     const student = await User.findById(studentId).select('name');
+    // The money is taken by now, so months only name the receipt lines; if
+    // they no longer add up to what was paid, the payment is still recorded,
+    // as one line.
+    const paid = parseFloat(amount);
+    let lines = null, paidMonths = null;
+    if (Array.isArray(months) && months.length) {
+        const pay = await paymentFor(schoolId, studentId, { months });
+        if (!pay.error && Math.abs(pay.amount - paid) < 0.01) { lines = pay.lines; paidMonths = pay.months; }
+    }
 
     return recordCompletedPayment({
         schoolId, studentId, academicYearId: ay._id,
-        amount: parseFloat(amount),
+        amount: paid, lines, months: paidMonths,
         paymentMode: 'online', gateway: 'razorpay',
         gatewayOrderId: razorpay_order_id,
         gatewayPaymentId: razorpay_payment_id,
@@ -495,6 +494,8 @@ exports.verifyRazorpay = async (req, res) => {
 async function createStripeIntentFor(schoolId, studentId, amount, extraMeta = {}) {
     const payAmt = parseFloat(amount);
     if (!payAmt || payAmt <= 0) return { error: 'Invalid amount' };
+    const refusal = await paymentRefusal(schoolId, studentId, payAmt);
+    if (refusal) return { error: refusal };
 
     const resolved = await paymentGateway.resolveGateway(schoolId, 'fees');
     if (!resolved.ok) return { error: resolved.reason };
@@ -611,19 +612,21 @@ exports.postParentPayNow = async (req, res) => {
         if (!await assertParentChild(req.userId, childId, req.schoolId))
             return res.status(403).json({ success: false, message: 'Not your child' });
 
-        const { amount, paymentMode, transactionRef, paymentDate, remarks } = req.body;
+        const { amount, paymentMode, transactionRef, paymentDate, remarks, months } = req.body;
         const ay = await getActiveAcademicYear(req.schoolId);
         if (!ay) return res.status(400).json({ success: false, message: 'No active academic year' });
 
-        const payAmt = parseFloat(amount);
-        if (!payAmt || payAmt <= 0) return res.status(400).json({ success: false, message: 'Invalid amount' });
-
         const student = await User.findOne({ _id: childId, school: req.schoolId, role: 'student' }).select('name');
         if (!student) return res.status(404).json({ success: false, message: 'Child not found' });
+        const pay = await paymentFor(req.schoolId, childId, { months, amount });
+        if (pay.error) return res.status(400).json({ success: false, message: pay.error });
+        const payAmt = pay.amount;
+        const refusal = await paymentRefusal(req.schoolId, childId, payAmt);
+        if (refusal) return res.status(400).json({ success: false, message: refusal });
 
         const payment = await FeePayment.create({
             school: req.schoolId, student: childId, academicYear: ay._id,
-            amount: payAmt, lines: [{ feeName: 'Fee Payment', amount: payAmt }],
+            amount: payAmt, lines: pay.lines, months: pay.months || null,
             paymentMode: paymentMode || 'cash', paymentStatus: 'pending',
             transactionRef: transactionRef || '', remarks: remarks || '',
             paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
@@ -649,7 +652,7 @@ exports.parentCreateRazorpayOrder = async (req, res) => {
         if (!await assertParentChild(req.userId, childId, req.schoolId))
             return res.status(403).json({ success: false, message: 'Not your child' });
 
-        const result = await createRazorpayOrderFor(req.schoolId, childId, req.body.amount, 'P');
+        const result = await createRazorpayOrderFor(req.schoolId, childId, req.body.amount, 'P', req.body.months);
         if (result.error) return res.status(400).json({ success: false, message: result.error });
         res.json({ success: true, data: result });
     } catch (err) {
@@ -742,3 +745,9 @@ exports.downloadParentReceipt = async (req, res) => {
         res.status(500).json({ success: false, message: 'Download failed' });
     }
 };
+
+// Shared with the office's counter (fees.controller.recordPayment) and the
+// admin student card, so every payer pays months by the same rule.
+exports.buildFeeBook = buildFeeBook;
+exports.monthsPayment = monthsPayment;
+exports.paymentFor = paymentFor;

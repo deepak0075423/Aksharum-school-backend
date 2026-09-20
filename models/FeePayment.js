@@ -13,9 +13,13 @@ const FeePaymentSchema = new db.Schema({
     receiptNumber: { type: String, default: null },
     amount: { type: Number, required: true, min: 0 },
     lines: [PaymentLineSchema],
+    // The months this payment was made for ('YYYY-MM'), when it was paid by
+    // picking months rather than typing an amount. The receipt and the
+    // family's payment history say exactly what was settled.
+    months: { type: db.Types.JSON, default: null },
     paymentMode: {
         type: String,
-        enum: ['cash', 'cheque', 'bank_transfer', 'online', 'dd', 'upi'],
+        enum: ['cash', 'cheque', 'bank_transfer', 'online', 'dd', 'upi', 'card'],
         required: true,
     },
     paymentStatus: {
@@ -32,6 +36,7 @@ const FeePaymentSchema = new db.Schema({
     collectedBy: { type: db.Types.UUID, ref: 'User', default: null },
     idempotencyKey: { type: String, default: null },
     isRefunded: { type: Boolean, default: false },
+    voidReason: { type: String, default: '' },
     refundedAt: { type: Date, default: null },
     refundedBy: { type: db.Types.UUID, ref: 'User', default: null },
     ledgerEntry: { type: db.Types.UUID, ref: 'FeeLedger', default: null },

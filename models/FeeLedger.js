@@ -22,6 +22,7 @@ const FeeLedgerSchema = new db.Schema({
     feeItemId:   { type: db.Types.UUID, default: null }, // FeeStructure item subdoc _id
     feePeriod:   { type: Number, default: null },   // 0-based period index for idempotency
     periodLabel: { type: String, default: '' },     // human label: "January 2026", "Quarter 2 — July 2026"
+    periodStart: { type: Date, default: null },     // first day of the month the charge belongs to
     runningBalance: { type: Number, default: 0 }, // positive = owes money, negative = credit/overpaid
     feeHeadName: { type: String, default: '' },
     createdBy: { type: db.Types.UUID, ref: 'User', default: null },
