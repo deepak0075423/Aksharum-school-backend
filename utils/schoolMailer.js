@@ -62,7 +62,9 @@ async function getMailContext(schoolId) {
 
 // Send one email on behalf of a school (uses its SMTP when configured).
 // Never throws unless `rethrow` is set — most emails are fire-and-forget.
-async function sendSchoolMail(schoolId, { to, subject, html, fromName, rethrow = false }) {
+// `attachments` is nodemailer's own shape: [{ filename, content, contentType }].
+// Used by payroll to send the payslip itself rather than only a link to it.
+async function sendSchoolMail(schoolId, { to, subject, html, fromName, attachments, rethrow = false }) {
     try {
         const ctx = await getMailContext(schoolId);
         const info = await ctx.transporter.sendMail({
@@ -70,6 +72,7 @@ async function sendSchoolMail(schoolId, { to, subject, html, fromName, rethrow =
             to,
             subject,
             html,
+            ...(attachments && attachments.length ? { attachments } : {}),
         });
         console.log(`[mail] sent to ${to} — ${info.messageId}`);
         return info;

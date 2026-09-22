@@ -102,7 +102,7 @@ function notify(opts) {
         console.error('[notify] failed:', e.message)));
 }
 
-async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false, link = null, priority = null }) {
+async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false, link = null, priority = null, attachmentFor = null }) {
     if (!sender || !title || !body) return;
 
     const ids = [...new Set(
@@ -173,6 +173,19 @@ async function _notify({ school, sender, senderRole, title, body, recipients = [
             for (const u of users) {
                 if (!u.email) continue;
                 const receiptId = receiptOf.get(String(u._id));
+                // `attachmentFor` builds the file for THIS recipient, so a
+                // payslip is never mailed to the wrong person. It is async and
+                // may return null; a failure to build one must not stop the
+                // notice going out.
+                let attachments;
+                if (attachmentFor) {
+                    try {
+                        const built = await attachmentFor(u);
+                        if (built) attachments = Array.isArray(built) ? built : [built];
+                    } catch (err) {
+                        console.error('[notify] attachment build failed:', err.message);
+                    }
+                }
                 sendSchoolMail(school, {
                     to:      u.email,
                     subject: `[${schoolDoc?.name || 'Notification'}] ${title}`,
@@ -180,6 +193,7 @@ async function _notify({ school, sender, senderRole, title, body, recipients = [
                         school: schoolDoc, recipientName: u.name, title, body,
                         openUrl: receiptId ? notificationLinks.receiptUrl(receiptId) : null,
                     }),
+                    attachments,
                 });
             }
         } catch (e) {

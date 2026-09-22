@@ -31,10 +31,18 @@ const EmployeeSalaryAssignmentSchema = new db.Schema({
     employee:         { type: db.Types.UUID, ref: 'User', required: true },
     school:           { type: db.Types.UUID, ref: 'School', required: true },
     structure:        { type: db.Types.UUID, ref: 'SalaryStructure', required: true },
+    // The year the assignment belongs to. Stamped on create so a school can
+    // carry assignments forward year by year and still see last year's.
+    academicYear:     { type: db.Types.UUID, ref: 'AcademicYear', default: null },
     effectiveDate:    { type: Date, required: true },
+    // Null = open-ended. A run only pays an assignment whose window covers the
+    // pay month, which is what makes a mid-year leaver stop being paid.
+    endDate:          { type: Date, default: null },
     ctc:              { type: Number, default: 0 },   // Annual CTC — always the CURRENT active value
     ctcRevisions:     [CtcRevisionSchema],
     componentOverrides: [OverrideSchema],
+    // How this person is paid. The bank file only lists bank_transfer rows.
+    paymentMode:      { type: String, enum: ['bank_transfer', 'cash', 'cheque'], default: 'bank_transfer' },
     isActive:         { type: Boolean, default: true },
     assignedBy:       { type: db.Types.UUID, ref: 'User' },
     notes:            { type: String, default: '' },
@@ -44,20 +52,42 @@ const EmployeeSalaryAssignmentSchema = new db.Schema({
 EmployeeSalaryAssignmentSchema.index({ school: 1, employee: 1 });
 EmployeeSalaryAssignmentSchema.index({ school: 1, isActive: 1 });
 
-// Returns the active annual CTC for a given payroll month/year
-EmployeeSalaryAssignmentSchema.methods.getActiveCTC = function (targetYear, targetMonth) {
-    if (!this.ctcRevisions || !this.ctcRevisions.length) return this.ctc || 0;
-    const eligible = this.ctcRevisions
+/**
+ * The active annual CTC for a pay month.
+ *
+ * Exported as a free function too (`activeCtc`), because every caller that
+ * matters reads assignments with .lean() — and a lean row has no methods, so
+ * for two years this method was silently never called and every back-dated run
+ * used the CURRENT CTC. Use the function; the method stays for compatibility.
+ */
+function activeCtc(asgn, targetYear, targetMonth) {
+    if (!asgn) return 0;
+    const revs = asgn.ctcRevisions || [];
+    if (!revs.length) return asgn.ctc || 0;
+    const eligible = revs
         .filter(r =>
             r.effectiveYear < targetYear ||
             (r.effectiveYear === targetYear && r.effectiveMonth <= targetMonth)
         )
+        // Newest effective date first, and for two revisions effective in the
+        // SAME month, the one recorded last. Without that tiebreak the winner
+        // was whichever order the sort happened to leave them in — so
+        // correcting a revision by entering another for the same month might
+        // or might not take effect.
         .sort((a, b) =>
-            b.effectiveYear !== a.effectiveYear
-                ? b.effectiveYear - a.effectiveYear
-                : b.effectiveMonth - a.effectiveMonth
+            (b.effectiveYear - a.effectiveYear)
+            || (b.effectiveMonth - a.effectiveMonth)
+            || (new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))
         );
-    return eligible.length > 0 ? eligible[0].annualCtc : (this.ctc || 0);
+    // No revision has taken effect yet: nothing is payable from this timeline,
+    // so fall back to the stored current value rather than inventing one.
+    return eligible.length > 0 ? eligible[0].annualCtc : (asgn.ctc || 0);
+}
+
+EmployeeSalaryAssignmentSchema.methods.getActiveCTC = function (targetYear, targetMonth) {
+    return activeCtc(this, targetYear, targetMonth);
 };
 
-module.exports = db.model('EmployeeSalaryAssignment', EmployeeSalaryAssignmentSchema);
+const Model = db.model('EmployeeSalaryAssignment', EmployeeSalaryAssignmentSchema);
+Model.activeCtc = activeCtc;
+module.exports = Model;

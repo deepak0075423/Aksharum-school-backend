@@ -20,6 +20,13 @@ const C = {
 const INR = (n) =>
     '₹ ' + (n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+/** "XXXX XXXX 4521" — enough to confirm the account, and nothing more. */
+const _mask = (v) => {
+    const raw = String(v || '').replace(/\s+/g, '');
+    if (!raw) return '';
+    return raw.length <= 4 ? 'X'.repeat(raw.length) : `XXXX ${raw.slice(-4)}`;
+};
+
 const MONTH_NAMES = [
     '', 'January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December',
@@ -71,25 +78,45 @@ function _drawPayslip(doc, payslip, school = null) {
        .text('SALARY SLIP', tableX, 62, { width: tableW, align: 'center' });
 
     const monthLabel = `${MONTH_NAMES[payslip.month] || ''} ${payslip.year}`;
+    // The slip number is the document's own reference — the screen has always
+    // shown it and the printable copy never did, which made the two impossible
+    // to quote against each other.
+    const ref = payslip.slipNo ? `  ·  Slip ${payslip.slipNo}` : '';
     doc.font('Helvetica').fontSize(8.5).fillColor('#BFDBFE')
-       .text(`For the period: ${monthLabel}`, tableX, 78, { width: tableW, align: 'center' });
+       .text(`For the period: ${monthLabel}${ref}`, tableX, 78, { width: tableW, align: 'center' });
 
     let y = 120;
 
     // ── Employee details box ──────────────────────────────────────
-    doc.rect(tableX, y, tableW, 72).fill(C.lightBg);
-    doc.rect(tableX, y, tableW, 72).stroke(C.border).lineWidth(0.5);
+    // Three rows, not two: the days a month was paid for are the first thing
+    // anybody checks on a short month, and they were nowhere on the document.
+    const boxH = 102;
+    doc.rect(tableX, y, tableW, boxH).fill(C.lightBg);
+    doc.rect(tableX, y, tableW, boxH).stroke(C.border).lineWidth(0.5);
 
     const emp = payslip.employeeSnapshot || {};
     const leftX  = tableX + 12;
     const rightX = tableX + colW + 12;
 
+    const shortDays = (payslip.lopDays || 0) + (payslip.notEmployedDays || 0);
+    const daysLabel = payslip.workingDays
+        ? `${payslip.paidDays ?? payslip.workingDays} of ${payslip.workingDays}`
+        : '—';
+    const whyShort = [
+        (payslip.notEmployedDays || 0) > 0 ? `${payslip.notEmployedDays} not employed` : '',
+        (payslip.lopDays || 0) > 0 ? `${payslip.lopDays} unpaid leave` : '',
+    ].filter(Boolean).join(', ');
+
     _detailCell(doc, leftX,  y + 10, 'EMPLOYEE NAME',  emp.name        || '—');
     _detailCell(doc, rightX, y + 10, 'EMPLOYEE ID',    emp.employeeId  || '—');
     _detailCell(doc, leftX,  y + 40, 'DESIGNATION',    emp.designation || '—');
     _detailCell(doc, rightX, y + 40, 'DEPARTMENT',     emp.department  || '—');
+    _detailCell(doc, leftX,  y + 70, 'PAID DAYS',      shortDays > 0 ? `${daysLabel}  (${whyShort})` : daysLabel);
+    _detailCell(doc, rightX, y + 70, 'PAID BY',
+        emp.bankAccountNumber ? `${_mask(emp.bankAccountNumber)}${emp.bankIfsc ? `  ${emp.bankIfsc}` : ''}`
+            : (emp.paymentMode === 'cash' ? 'Cash' : emp.paymentMode === 'cheque' ? 'Cheque' : '—'));
 
-    y += 84;
+    y += boxH + 12;
 
     // ── Earnings / Deductions table header ────────────────────────
     doc.rect(tableX,        y, colW, 22).fill(C.primary);
@@ -103,10 +130,14 @@ function _drawPayslip(doc, payslip, school = null) {
     const earnings   = payslip.earnings   || [];
     const deductions = payslip.deductions || [];
 
-    // Add LOP to deductions display list
+    // The deductions column shows everything that reduced the net, in the same
+    // order the screen lists them, so the two can be read side by side.
     const dispDeductions = [...deductions];
     if ((payslip.lopDays || 0) > 0) {
         dispDeductions.push({ name: `LOP (${payslip.lopDays} days)`, amount: payslip.lopAmount || 0 });
+    }
+    if ((payslip.otherDeductions || 0) > 0) {
+        dispDeductions.push({ name: 'Other deductions', amount: payslip.otherDeductions });
     }
 
     const maxRows = Math.max(earnings.length, dispDeductions.length);
@@ -162,14 +193,43 @@ function _drawPayslip(doc, payslip, school = null) {
     y += 54;
 
     // ── Extras row (arrears / bonus) if present ───────────────────
-    if ((payslip.arrears || 0) > 0 || (payslip.bonus || 0) > 0) {
+    const extras = [
+        (payslip.arrears || 0) > 0 ? `Arrears: ${INR(payslip.arrears)}` : '',
+        (payslip.bonus   || 0) > 0 ? `Bonus: ${INR(payslip.bonus)}`     : '',
+    ].filter(Boolean);
+    if (extras.length) {
         doc.rect(tableX, y, tableW, 20).fill(C.lightBg);
         doc.font('Helvetica').fontSize(8).fillColor(C.textMuted)
-           .text(
-               `Arrears: ${INR(payslip.arrears)}   |   Bonus: ${INR(payslip.bonus)}`,
-               tableX, y + 6, { width: tableW, align: 'center' }
-           );
+           .text(extras.join('   |   '), tableX, y + 6, { width: tableW, align: 'center' });
         y += 26;
+    }
+
+    /**
+     * Employer contributions. Part of CTC, paid by the school, never deducted
+     * from the employee — and therefore stated separately and plainly, so
+     * nobody reads them as money taken off their pay.
+     */
+    const employer = payslip.employerContributions || [];
+    if (employer.length) {
+        doc.rect(tableX, y, tableW, 18).fill('#F1F5F9');
+        doc.font('Helvetica-Bold').fontSize(8).fillColor(C.textDark)
+           .text('PAID BY THE SCHOOL ON YOUR BEHALF (not deducted from your salary)', tableX + 8, y + 5);
+        y += 18;
+        for (const line of employer) {
+            doc.font('Helvetica').fontSize(8).fillColor(C.textMuted)
+               .text(line.name, tableX + 8, y + 4, { width: tableW * 0.6 });
+            doc.font('Helvetica').fontSize(8).fillColor(C.textDark)
+               .text(INR(line.amount), tableX + tableW * 0.6, y + 4, { width: tableW * 0.4 - 8, align: 'right' });
+            y += 14;
+        }
+        y += 6;
+    }
+
+    // Anything the admin recorded against this month, in their own words.
+    if (payslip.remarks) {
+        doc.font('Helvetica-Oblique').fontSize(8).fillColor(C.textMuted)
+           .text(`Remarks: ${payslip.remarks}`, tableX + 8, y, { width: tableW - 16 });
+        y += 18;
     }
 
     y += 10;
@@ -193,4 +253,26 @@ function _detailCell(doc, x, y, label, value) {
     doc.font('Helvetica').fontSize(9.5).fillColor(C.textDark).text(value, x, y + 11);
 }
 
-module.exports = { generatePayslipPDF };
+/**
+ * The same payslip, as a Buffer instead of a response — so it can be attached
+ * to the email that tells someone it exists, rather than only linked to.
+ */
+function renderPayslipBuffer(payslip, school = null) {
+    return new Promise((resolve, reject) => {
+        try {
+            const doc = new PDFDocument({
+                size: 'A4',
+                margins: { top: 40, bottom: 40, left: 50, right: 50 },
+                bufferPages: true, autoFirstPage: true,
+            });
+            const chunks = [];
+            doc.on('data', (c) => chunks.push(c));
+            doc.on('end', () => resolve(Buffer.concat(chunks)));
+            doc.on('error', reject);
+            _drawPayslip(doc, payslip, school);
+            doc.end();
+        } catch (e) { reject(e); }
+    });
+}
+
+module.exports = { generatePayslipPDF, renderPayslipBuffer };

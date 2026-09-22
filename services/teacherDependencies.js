@@ -34,6 +34,9 @@ const Subject             = require('../models/Subject');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const AcademicYear        = require('../models/AcademicYear');
 const LibraryIssuance     = require('../models/LibraryIssuance');
+const EmployeeSalaryAssignment = require('../models/EmployeeSalaryAssignment');
+const PayrollEntry        = require('../models/PayrollEntry');
+const Payslip             = require('../models/Payslip');
 const Timetable           = require('../models/Timetable');
 const TimetableEntry      = require('../models/TimetableEntry');
 
@@ -128,7 +131,35 @@ async function collect(teacherId, schoolId) {
         library.count = library.books.length;
     }
 
-    // ── 3. Timetable ─────────────────────────────────────────────────────────
+    // ── 3. Payroll ───────────────────────────────────────────────────────────
+    // Financial records, and the only family here that is about history rather
+    // than about the current year. Deleting the User row does not delete the
+    // assignment, the payroll entries or the payslips — and every payroll
+    // report INNER JOINs users, so the person would silently drop out of every
+    // month they were ever paid in while the run totals still counted them.
+    // Published months would stop reconciling, quietly, forever.
+    let payroll = { enabled: !!modules.payroll, assignment: null, entries: 0, payslips: 0, count: 0 };
+    if (modules.payroll) {
+        const [live, entries, payslips] = await Promise.all([
+            EmployeeSalaryAssignment.findOne({ school: schoolId, employee: teacherId, isActive: true })
+                .populate('structure', 'name').lean(),
+            PayrollEntry.countDocuments({ school: schoolId, employee: teacherId }),
+            Payslip.countDocuments({ school: schoolId, employee: teacherId }),
+        ]);
+        payroll.assignment = live ? {
+            assignmentId: String(live._id),
+            structure:    live.structure?.name || '',
+            ctc:          live.ctc || 0,
+            effectiveDate: live.effectiveDate || null,
+        } : null;
+        payroll.entries  = entries;
+        payroll.payslips = payslips;
+        // A live assignment is a thing to end; paid history is a reason never to
+        // delete the account at all. Both block, and neither can be forced.
+        payroll.count = (live ? 1 : 0) + (payslips > 0 ? 1 : 0);
+    }
+
+    // ── 4. Timetable ─────────────────────────────────────────────────────────
     let timetable = { enabled: !!modules.timetable, periods: [], count: 0 };
     if (modules.timetable) {
         timetable.periods = await teacherPeriods(teacherId, schoolId, activeYear);
@@ -143,18 +174,21 @@ async function collect(teacherId, schoolId) {
     const blockedByAssignments = assignmentCount > 0;
     const blockedByLibrary     = library.count > 0;
     const blockedByTimetable   = timetable.count > 0;
+    const blockedByPayroll     = payroll.count > 0;
 
     return {
         assignments: { classTeacher, viceClassTeacher, subjects, subjectTeacher, count: assignmentCount },
         library,
+        payroll,
         timetable,
-        blocked: blockedByAssignments || blockedByLibrary || blockedByTimetable,
+        blocked: blockedByAssignments || blockedByLibrary || blockedByTimetable || blockedByPayroll,
         blockedBy: [
             ...(blockedByAssignments ? ['assignments'] : []),
             ...(blockedByLibrary     ? ['library']     : []),
+            ...(blockedByPayroll     ? ['payroll']     : []),
             ...(blockedByTimetable   ? ['timetable']   : []),
         ],
-        canForce: blockedByTimetable && !blockedByAssignments && !blockedByLibrary,
+        canForce: blockedByTimetable && !blockedByAssignments && !blockedByLibrary && !blockedByPayroll,
     };
 }
 
@@ -265,6 +299,8 @@ function summarise(report) {
     const bits = [];
     if (report.assignments.count) bits.push(`${report.assignments.count} class/subject assignment(s)`);
     if (report.library.count)     bits.push(`${report.library.count} book(s) on loan`);
+    if (report.payroll?.assignment) bits.push('an active salary assignment');
+    if (report.payroll?.payslips)   bits.push(`${report.payroll.payslips} payslip(s) on record`);
     if (report.timetable.count)   bits.push(`${report.timetable.count} timetable period(s)`);
     return bits.join(', ');
 }

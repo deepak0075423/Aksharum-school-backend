@@ -1,566 +1,186 @@
 'use strict';
-const SalaryStructure          = require('../models/SalaryStructure');
-const EmployeeSalaryAssignment = require('../models/EmployeeSalaryAssignment');
-const PayrollRun               = require('../models/PayrollRun');
-const PayrollEntry             = require('../models/PayrollEntry');
-const PayrollAuditLog          = require('../models/PayrollAuditLog');
-const Payslip                  = require('../models/Payslip');
-const User                     = require('../models/User');
-const TeacherProfile           = require('../models/TeacherProfile');
-const School                   = require('../models/School');
-const { notify }               = require('../services/notifyService');
-
-const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-
-// ── Salary calculation ────────────────────────────────────────────────────────
-
 /**
- * Unpaid leave days per employee for a pay month, keyed by employee id.
+ * Payroll — the teacher's own view, plus the compatibility surface.
  *
- * Returns an EMPTY object when the Leave module is off for the school, so every
- * caller falls straight back to the hand-entered figure and payroll behaves
- * exactly as it did before this link existed. Any failure does the same — a
- * leave lookup must never be the reason a payroll run cannot be processed.
+ * Every admin action now lives in payrollAdmin.controller.js, which is where
+ * the raw-SQL read models and the corrected writers are. This file keeps the
+ * employee-facing endpoints and re-exports the admin handlers under their old
+ * names, so the mobile app's existing routes keep working unchanged while the
+ * web screens move to the new ones.
+ *
+ * The salary maths that used to live here — computeSalaryBreakdown — is gone.
+ * It ignored the employee's CTC entirely (see services/payrollCalc.js), so a
+ * teacher's "My CTC" screen showed the same figures as every colleague on the
+ * same structure. It now reads the same engine the payroll run does.
  */
-async function leaveLopDaysFor(schoolId, year, month) {
+const EmployeeSalaryAssignment = require('../models/EmployeeSalaryAssignment');
+const PayrollEntry             = require('../models/PayrollEntry');
+const SalaryStructure          = require('../models/SalaryStructure');
+const TeacherProfile           = require('../models/TeacherProfile');
+const User                     = require('../models/User');
+const admin                    = require('./payrollAdmin.controller');
+const calc                     = require('../services/payrollCalc');
+
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const r2  = (n) => Math.round(num(n) * 100) / 100;
+const trim = (s) => String(s ?? '').trim();
+
+/** "XXXX XXXX 4521" — enough to tell which account, and nothing more. */
+const maskAccount = (v) => {
+    const raw = trim(v).replace(/\s+/g, '');
+    if (!raw) return '';
+    if (raw.length <= 4) return 'X'.repeat(raw.length);
+    return `XXXX XXXX ${raw.slice(-4)}`;
+};
+
+// ── Teacher: my CTC ──────────────────────────────────────────────────────────
+
+exports.getMyCtc = async (req, res) => {
     try {
-        const School = require('../models/School');
-        const { schoolModuleFlags } = require('../config/modules');
-        const school = await School.findById(schoolId).select('modules').lean();
-        if (!schoolModuleFlags(school).leave) return {};
-
-        const LeaveApplication = require('../models/LeaveApplication');
-        const monthStart = new Date(Date.UTC(year, month - 1, 1));
-        const monthEnd   = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
-
-        const apps = await LeaveApplication.find({
-            school: schoolId, status: 'approved',
-            lopDays: { $gt: 0 },
-            fromDate: { $lte: monthEnd }, toDate: { $gte: monthStart },
-        }).select('teacher lopDays fromDate toDate totalDays').lean();
-
-        const out = {};
-        for (const a of apps) {
-            // A leave spanning a month boundary is charged pro-rata to the part
-            // that falls inside this pay month, so no day is deducted twice.
-            const from = new Date(Math.max(new Date(a.fromDate), monthStart));
-            const to   = new Date(Math.min(new Date(a.toDate), monthEnd));
-            const inMonth = Math.max(0, Math.round((to - from) / 86400000) + 1);
-            const span    = Math.max(1, Math.round((new Date(a.toDate) - new Date(a.fromDate)) / 86400000) + 1);
-            const share   = span > 0 ? (a.lopDays * inMonth) / span : a.lopDays;
-            out[String(a.teacher)] = Math.round(((out[String(a.teacher)] || 0) + share) * 100) / 100;
-        }
-        return out;
-    } catch (err) {
-        console.error('[payroll←leave] LOP lookup failed:', err.message);
-        return {};
-    }
-}
-
-function computeSalaryBreakdown(structure, monthlyCtc, overrides = [], lopDays = 0) {
-    const workingDays = 26;
-    const resolved    = { CTC: monthlyCtc };
-
-    const overrideMap = Object.fromEntries(overrides.map(o => [o.componentName, o.value]));
-
-    const earnings    = [];
-    const deductions  = [];
-
-    const components = [...(structure.components || [])].sort((a, b) => a.order - b.order);
-
-    for (const comp of components) {
-        if (!comp.isActive) continue;
-        let amount = overrideMap[comp.name] ?? 0;
-
-        if (!overrideMap.hasOwnProperty(comp.name)) {
-            if (comp.calculationType === 'fixed') {
-                amount = comp.value || 0;
-            } else {
-                const base = resolved[comp.percentageOf] ?? 0;
-                amount = ((comp.percentage || 0) / 100) * base;
-            }
-        }
-        amount = Math.round(amount * 100) / 100;
-        resolved[comp.name] = amount;
-
-        if (comp.type === 'earning')    earnings.push({ name: comp.name, amount });
-        else if (comp.type === 'deduction') deductions.push({ name: comp.name, amount });
-    }
-
-    let grossSalary     = earnings.reduce((s, e) => s + e.amount, 0);
-    let totalDeductions = deductions.reduce((s, d) => s + d.amount, 0);
-
-    let lopAmount = 0;
-    if (lopDays > 0) {
-        lopAmount = Math.round((grossSalary / workingDays) * lopDays * 100) / 100;
-        grossSalary -= lopAmount;
-    }
-
-    return { earnings, deductions, grossSalary: Math.round(grossSalary * 100) / 100, totalDeductions: Math.round(totalDeductions * 100) / 100, netSalary: Math.round((grossSalary - totalDeductions) * 100) / 100, lopAmount };
-}
-
-async function logAudit(schoolId, userId, actionType, entityType, entityId, note) {
-    try {
-        await PayrollAuditLog.create({ school: schoolId, user: userId, actionType, entityType, entityId });
-    } catch { /* non-critical */ }
-}
-
-// ── Dashboard ─────────────────────────────────────────────────────────────────
-
-exports.getDashboard = async (req, res) => {
-    try {
-        const now     = new Date();
-        const month   = now.getMonth() + 1;
-        const year    = now.getFullYear();
-
-        const [totalEmployees, activeAssignments, currentRun, recentRuns] = await Promise.all([
-            User.countDocuments({ school: req.schoolId, role: 'teacher', isActive: true }),
-            EmployeeSalaryAssignment.countDocuments({ school: req.schoolId, isActive: true }),
-            PayrollRun.findOne({ school: req.schoolId, year, month }).lean(),
-            PayrollRun.find({ school: req.schoolId }).sort({ year: -1, month: -1 }).limit(6).lean(),
+        const [asgn, user, profile] = await Promise.all([
+            EmployeeSalaryAssignment.findOne({ employee: req.userId, school: req.schoolId, isActive: true })
+                .populate('structure', 'name type description components payBasis rate rateUnit')
+                .lean(),
+            User.findById(req.userId).select('name email').lean(),
+            TeacherProfile.findOne({ user: req.userId, school: req.schoolId })
+                .select('employeeId designation department joiningDate bankAccountNumber bankIfsc bankBranch panNumber uanNumber').lean(),
         ]);
+        const who = {
+            name: user?.name || '', email: user?.email || '',
+            employeeId: profile?.employeeId || '', designation: profile?.designation || '',
+            department: profile?.department || '', joiningDate: profile?.joiningDate || null,
+            bankAccount: maskAccount(profile?.bankAccountNumber), bankIfsc: profile?.bankIfsc || '',
+            bankBranch: profile?.bankBranch || '',
+            panNumber: profile?.panNumber ? `XXXXX${trim(profile.panNumber).slice(-4)}` : '',
+            uanNumber: profile?.uanNumber || '',
+        };
+        /**
+         * Someone with no assignment still gets their own details back, so the
+         * screen can say who it could not find a salary for rather than
+         * rendering an anonymous empty state.
+         *
+         * `data` is an OBJECT, never null. hooks/useFetch does
+         * `res?.data ?? res`, and `??` only falls through on null — so an
+         * endpoint that answers `data: null` hands the caller the whole
+         * envelope instead, and every `if (!data)` guard downstream reads
+         * false. `hasSalary` is the flag to test.
+         */
+        if (!asgn || !asgn.structure) {
+            return res.json({ success: true, data: { hasSalary: false, employee: who } });
+        }
 
-        res.json({ success: true, data: { totalEmployees, activeAssignments, currentRun, recentRuns } });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
+        const settings = await admin.settingsFor(req.schoolId);
+        const now   = new Date();
+        const year  = now.getFullYear(), month = now.getMonth() + 1;
+        // The CTC in force THIS month, not whatever the current column holds —
+        // a revision dated next April must not show up in March's figures.
+        const annualCtc = EmployeeSalaryAssignment.activeCtc(asgn, year, month);
+        const workingDays = await calc.workingDaysFor(req.schoolId, year, month, settings);
 
-// ── Salary Structures ─────────────────────────────────────────────────────────
-
-exports.getStructures = async (req, res) => {
-    try {
-        const structures = await SalaryStructure.find({ school: req.schoolId }).sort({ name: 1 }).lean();
-        res.json({ success: true, data: structures });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.createStructure = async (req, res) => {
-    try {
-        const { name, description, components } = req.body;
-        if (!name?.trim()) return res.status(400).json({ success: false, message: 'Name is required' });
-
-        const structure = await SalaryStructure.create({
-            school: req.schoolId, name: name.trim(),
-            description: description || '',
-            components: components || [],
-            createdBy: req.userId,
+        const breakdown = calc.computePay({
+            structure: asgn.structure,
+            annualCtc,
+            overrides: asgn.componentOverrides || [],
+            workingDays,
+            roundTo: settings.roundTo,
         });
-        logAudit(req.schoolId, req.userId, 'STRUCTURE_CREATED', 'SalaryStructure', structure._id);
-        res.status(201).json({ success: true, data: structure });
-    } catch (e) {
-        if (e.code === 11000) return res.status(400).json({ success: false, message: 'Structure name already exists' });
-        res.status(500).json({ success: false, message: e.message });
-    }
-};
 
-exports.updateStructure = async (req, res) => {
-    try {
-        const { name, description, components } = req.body;
-        const update = {};
-        if (name        !== undefined) update.name        = name.trim();
-        if (description !== undefined) update.description = description;
-        if (components  !== undefined) update.components  = components;
+        // What this person was actually PAID — entries of runs that have been
+        // published, which is exactly the ones that issued a payslip. Reading
+        // every entry would have put a draft month the office is still working
+        // on under a heading that says "what you were actually paid".
+        const recent = await PayrollEntry.find({
+            employee: req.userId, school: req.schoolId, payslip: { $ne: null },
+        }).sort({ year: -1, month: -1 }).limit(6).lean();
 
-        const structure = await SalaryStructure.findOneAndUpdate(
-            { _id: req.params.id, school: req.schoolId },
-            update,
-            { new: true, runValidators: true }
-        ).lean();
-        if (!structure) return res.status(404).json({ success: false, message: 'Structure not found' });
-        logAudit(req.schoolId, req.userId, 'STRUCTURE_UPDATED', 'SalaryStructure', structure._id);
-        res.json({ success: true, data: structure });
+        // A revision already on the timeline but not yet in force. Showing the
+        // stored CTC beside a breakdown built from a different one is how the
+        // admin panel used to contradict itself.
+        const pending = [...(asgn.ctcRevisions || [])]
+            .filter(r => r.effectiveYear > year || (r.effectiveYear === year && r.effectiveMonth > month))
+            .sort((a, b) => (a.effectiveYear - b.effectiveYear) || (a.effectiveMonth - b.effectiveMonth))[0] || null;
+
+        // Six months of net pay, oldest first and zero-filled, for the chart.
+        const byKey = new Map(recent.map(e => [`${e.year}-${e.month}`, e]));
+        const series = [];
+        for (let i = 5; i >= 0; i--) {
+            const d = new Date(Date.UTC(year, month - 1 - i, 1));
+            const m = d.getUTCMonth() + 1, y = d.getUTCFullYear();
+            const e = byKey.get(`${y}-${m}`);
+            series.push({
+                month: m, year: y, label: `${MONTHS_SHORT[m - 1]} ${y}`,
+                gross: r2(e?.grossSalary), deductions: r2(e?.totalDeductions), net: r2(e?.netSalary),
+            });
+        }
+
+        res.json({
+            success: true,
+            data: {
+                hasSalary: true,
+                employee: who,
+                assignment: asgn,
+                structure: {
+                    _id: asgn.structure._id, name: asgn.structure.name, type: asgn.structure.type || 'general',
+                    description: asgn.structure.description || '',
+                    payBasis: asgn.structure.payBasis || 'monthly',
+                    rate: r2(asgn.structure.rate), rateUnit: asgn.structure.rateUnit || 'class',
+                },
+                annualCtc,
+                monthlyCtc: breakdown.monthlyCtc,
+                monthLabel: `${['January','February','March','April','May','June','July','August','September','October','November','December'][month - 1]} ${year}`,
+                effectiveDate: asgn.effectiveDate, endDate: asgn.endDate,
+                paymentMode: asgn.paymentMode || 'bank_transfer',
+                pendingRevision: pending ? {
+                    annualCtc: r2(pending.annualCtc),
+                    effectiveLabel: `${['January','February','March','April','May','June','July','August','September','October','November','December'][pending.effectiveMonth - 1]} ${pending.effectiveYear}`,
+                    note: pending.note || '',
+                } : null,
+                breakdown,
+                series,
+                revisions: [...(asgn.ctcRevisions || [])].sort((a, b) =>
+                    (b.effectiveYear - a.effectiveYear) || (b.effectiveMonth - a.effectiveMonth))
+                    .map(r => ({
+                        ...r,
+                        effectiveLabel: `${MONTHS_SHORT[r.effectiveMonth - 1]} ${r.effectiveYear}`,
+                    })),
+                recent: recent.map(e => ({
+                    month: e.month, year: e.year, label: `${MONTHS_SHORT[e.month - 1]} ${e.year}`,
+                    gross: r2(e.grossSalary), deductions: r2(e.totalDeductions), net: r2(e.netSalary),
+                    lopDays: num(e.lopDays),
+                })),
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-exports.toggleStructure = async (req, res) => {
-    try {
-        const s = await SalaryStructure.findOne({ _id: req.params.id, school: req.schoolId });
-        if (!s) return res.status(404).json({ success: false, message: 'Structure not found' });
-        s.isActive = !s.isActive;
-        await s.save();
-        res.json({ success: true, data: s });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
+// ── Compatibility: the admin handlers under their previous names ─────────────
+
+exports.getDashboard            = admin.getDashboard;
+exports.getStructures           = admin.listStructures;
+exports.createStructure         = admin.createStructure;
+exports.updateStructure         = admin.updateStructure;
+exports.toggleStructure         = admin.toggleStructure;
+exports.getAssignments          = admin.listAssignments;
+exports.assignEmployee          = admin.assignEmployee;
+exports.updateAssignment        = admin.updateAssignment;
+exports.deactivateAssignment    = admin.setAssignmentActive;
+exports.getUpdateCtc            = admin.getAssignment;
+exports.updateCtc               = admin.updateCtc;
+exports.getCtcHistory           = admin.getCtcHistory;
+exports.getPayrollRuns          = admin.listRuns;
+exports.createRun               = admin.createRun;
+exports.getRunDetail            = admin.getRun;
+exports.updateRunStatus         = admin.updateRunStatus;
+exports.publishRun              = admin.publishRun;
+exports.updateEntry             = admin.updateEntry;
+exports.getReports              = admin.listReports;
+exports.getAuditLog             = admin.getAuditLog;
 
 exports.getStructureComponents = async (req, res) => {
     try {
         const s = await SalaryStructure.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!s) return res.status(404).json({ success: false, message: 'Structure not found' });
-        res.json({ success: true, data: s.components });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-// ── Assignments ───────────────────────────────────────────────────────────────
-
-exports.getAssignments = async (req, res) => {
-    try {
-        const { isActive } = req.query;
-        const filter = { school: req.schoolId };
-        if (isActive !== undefined) filter.isActive = isActive !== 'false';
-
-        const assignments = await EmployeeSalaryAssignment.find(filter)
-            .populate('employee',  'name email employeeId')
-            .populate('structure', 'name')
-            .populate('assignedBy','name')
-            .sort({ createdAt: -1 })
-            .lean();
-        res.json({ success: true, data: assignments });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.assignEmployee = async (req, res) => {
-    try {
-        const { employeeId, structureId, effectiveDate, annualCtc, notes } = req.body;
-        if (!employeeId || !structureId || !effectiveDate || annualCtc === undefined)
-            return res.status(400).json({ success: false, message: 'employeeId, structureId, effectiveDate and annualCtc are required' });
-
-        const effDate = new Date(effectiveDate);
-        const month   = effDate.getMonth() + 1;
-        const year    = effDate.getFullYear();
-
-        const assignment = await EmployeeSalaryAssignment.create({
-            employee: employeeId, school: req.schoolId, structure: structureId,
-            effectiveDate: effDate, ctc: annualCtc,
-            ctcRevisions: [{ annualCtc, previousCtc: 0, incrementType: 'initial', incrementValue: 0, effectiveMonth: month, effectiveYear: year, updatedBy: req.userId }],
-            assignedBy: req.userId, notes: notes || '',
-        });
-        logAudit(req.schoolId, req.userId, 'ASSIGNMENT_CREATED', 'EmployeeSalaryAssignment', assignment._id);
-        res.status(201).json({ success: true, data: assignment });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.updateAssignment = async (req, res) => {
-    try {
-        const { structureId, componentOverrides, notes } = req.body;
-        const update = {};
-        if (structureId         !== undefined) update.structure          = structureId;
-        if (componentOverrides  !== undefined) update.componentOverrides = componentOverrides;
-        if (notes               !== undefined) update.notes              = notes;
-
-        const asgn = await EmployeeSalaryAssignment.findOneAndUpdate(
-            { _id: req.params.id, school: req.schoolId },
-            update,
-            { new: true }
-        ).populate('employee', 'name').populate('structure', 'name').lean();
-        if (!asgn) return res.status(404).json({ success: false, message: 'Assignment not found' });
-        res.json({ success: true, data: asgn });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.deactivateAssignment = async (req, res) => {
-    try {
-        const asgn = await EmployeeSalaryAssignment.findOneAndUpdate(
-            { _id: req.params.id, school: req.schoolId },
-            { isActive: false },
-            { new: true }
-        ).lean();
-        if (!asgn) return res.status(404).json({ success: false, message: 'Assignment not found' });
-        res.json({ success: true, data: asgn });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.getUpdateCtc = async (req, res) => {
-    try {
-        const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId })
-            .populate('employee', 'name email employeeId').lean();
-        if (!asgn) return res.status(404).json({ success: false, message: 'Assignment not found' });
-        res.json({ success: true, data: asgn });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.updateCtc = async (req, res) => {
-    try {
-        const { annualCtc, incrementType, effectiveMonth, effectiveYear, note } = req.body;
-        if (!annualCtc || !effectiveMonth || !effectiveYear)
-            return res.status(400).json({ success: false, message: 'annualCtc, effectiveMonth and effectiveYear are required' });
-
-        const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId });
-        if (!asgn) return res.status(404).json({ success: false, message: 'Assignment not found' });
-
-        const prevCtc = asgn.ctc || 0;
-        const diff    = annualCtc - prevCtc;
-        asgn.ctc      = annualCtc;
-        asgn.ctcRevisions.push({
-            annualCtc, previousCtc: prevCtc,
-            incrementType: incrementType || 'manual',
-            incrementValue: diff,
-            effectiveMonth: +effectiveMonth, effectiveYear: +effectiveYear,
-            note: note || '', updatedBy: req.userId,
-        });
-        await asgn.save();
-        logAudit(req.schoolId, req.userId, 'CTC_UPDATED', 'EmployeeSalaryAssignment', asgn._id, `CTC updated to ${annualCtc}`);
-        res.json({ success: true, data: asgn });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.getCtcHistory = async (req, res) => {
-    try {
-        const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId })
-            .populate('employee', 'name').lean();
-        if (!asgn) return res.status(404).json({ success: false, message: 'Assignment not found' });
-        res.json({ success: true, data: asgn.ctcRevisions });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-// ── Payroll Runs ──────────────────────────────────────────────────────────────
-
-exports.getPayrollRuns = async (req, res) => {
-    try {
-        const { year, page = 1, limit = 20 } = req.query;
-        const filter = { school: req.schoolId };
-        if (year) filter.year = +year;
-
-        const [runs, total] = await Promise.all([
-            PayrollRun.find(filter)
-                .populate('processedBy','name')
-                .populate('approvedBy', 'name')
-                .sort({ year: -1, month: -1 })
-                .skip((+page - 1) * +limit)
-                .limit(+limit)
-                .lean(),
-            PayrollRun.countDocuments(filter),
-        ]);
-        res.json({ success: true, data: runs, total, page: +page, pages: Math.ceil(total / +limit) });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.createRun = async (req, res) => {
-    try {
-        const { month, year, notes } = req.body;
-        if (!month || !year) return res.status(400).json({ success: false, message: 'month and year are required' });
-
-        const existing = await PayrollRun.findOne({ school: req.schoolId, year: +year, month: +month });
-        if (existing) return res.status(400).json({ success: false, message: 'Payroll run for this month already exists' });
-
-        // Compute entries for all active assignments
-        const assignments = await EmployeeSalaryAssignment.find({ school: req.schoolId, isActive: true })
-            .populate('structure').lean();
-
-        const run = await PayrollRun.create({
-            school: req.schoolId, month: +month, year: +year,
-            status: 'draft', processedBy: req.userId, processedAt: new Date(), notes: notes || '',
-        });
-
-        let totalGross = 0, totalDeductions = 0, totalNet = 0;
-        const entryDocs = [];
-
-        // Loss-of-pay days come from approved leave when the Leave module is on
-        // for this school. Without it — or for an employee with no unpaid leave
-        // — the figure falls back to whatever the payroll form supplied, which
-        // is exactly how this worked before leave was wired in.
-        const lopFromLeave = await leaveLopDaysFor(req.schoolId, +year, +month);
-
-        for (const asgn of assignments) {
-            if (!asgn.structure) continue;
-            const annualCtc  = asgn.getActiveCTC ? asgn.getActiveCTC(+year, +month) : (asgn.ctc || 0);
-            const monthlyCtc = annualCtc / 12;
-            const lopDays    = lopFromLeave[String(asgn.employee)] ?? (req.body[`lop_${asgn.employee}`] || 0);
-            const breakdown  = computeSalaryBreakdown(asgn.structure, monthlyCtc, asgn.componentOverrides || [], lopDays);
-
-            totalGross      += breakdown.grossSalary;
-            totalDeductions += breakdown.totalDeductions;
-            totalNet        += breakdown.netSalary;
-
-            entryDocs.push({
-                payrollRun: run._id, employee: asgn.employee, school: req.schoolId,
-                month: +month, year: +year, salaryAssignment: asgn._id,
-                earnings: breakdown.earnings, deductions: breakdown.deductions,
-                grossSalary: breakdown.grossSalary, totalDeductions: breakdown.totalDeductions,
-                netSalary: breakdown.netSalary, lopAmount: breakdown.lopAmount, lopDays,
-            });
-        }
-
-        if (entryDocs.length) await PayrollEntry.insertMany(entryDocs);
-        await PayrollRun.updateOne({ _id: run._id }, {
-            totalEmployees: entryDocs.length,
-            totalGross:     Math.round(totalGross * 100) / 100,
-            totalDeductions:Math.round(totalDeductions * 100) / 100,
-            totalNet:       Math.round(totalNet * 100) / 100,
-        });
-
-        const updated = await PayrollRun.findById(run._id).lean();
-        logAudit(req.schoolId, req.userId, 'RUN_CREATED', 'PayrollRun', run._id);
-        res.status(201).json({ success: true, data: updated });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.getRunDetail = async (req, res) => {
-    try {
-        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId })
-            .populate('processedBy','name')
-            .populate('approvedBy', 'name')
-            .lean();
-        if (!run) return res.status(404).json({ success: false, message: 'Payroll run not found' });
-
-        const entries = await PayrollEntry.find({ payrollRun: run._id })
-            .populate('employee','name email employeeId')
-            .lean();
-
-        // Attach payslip ids (exist once the run is published) so the admin can download PDFs
-        const payslips = await Payslip.find({ payrollEntry: { $in: entries.map(e => e._id) } })
-            .select('payrollEntry status').lean();
-        const slipByEntry = Object.fromEntries(payslips.map(p => [p.payrollEntry.toString(), p]));
-        const withSlips = entries.map(e => ({
-            ...e,
-            payslip: slipByEntry[e._id.toString()] || null,
-        }));
-
-        res.json({ success: true, data: { ...run, entries: withSlips } });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.updateRunStatus = async (req, res) => {
-    try {
-        const { status } = req.body;
-        const allowed = ['reviewed', 'approved'];
-        if (!allowed.includes(status)) return res.status(400).json({ success: false, message: `Status must be one of: ${allowed.join(', ')}` });
-
-        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId });
-        if (!run) return res.status(404).json({ success: false, message: 'Run not found' });
-
-        const update = { status };
-        if (status === 'reviewed') { update.reviewedBy = req.userId; update.reviewedAt = new Date(); }
-        if (status === 'approved') { update.approvedBy = req.userId; update.approvedAt = new Date(); }
-
-        const updated = await PayrollRun.findByIdAndUpdate(run._id, update, { new: true }).lean();
-        logAudit(req.schoolId, req.userId, `RUN_${status.toUpperCase()}`, 'PayrollRun', run._id);
-        res.json({ success: true, data: updated });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.publishRun = async (req, res) => {
-    try {
-        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId });
-        if (!run) return res.status(404).json({ success: false, message: 'Run not found' });
-        if (run.status !== 'approved') return res.status(400).json({ success: false, message: 'Run must be approved before publishing' });
-
-        run.status      = 'published';
-        run.publishedBy = req.userId;
-        run.publishedAt = new Date();
-        await run.save();
-
-        // Generate payslips for all entries
-        const entries = await PayrollEntry.find({ payrollRun: run._id }).lean();
-        const school  = await School.findById(req.schoolId).lean();
-
-        // Batch employee + profile lookups (was 2 round trips per staff member)
-        const employeeIds = [...new Set(entries.map(e => String(e.employee)))];
-        const [emps, profiles] = await Promise.all([
-            User.find({ _id: { $in: employeeIds } }).lean(),
-            TeacherProfile.find({ user: { $in: employeeIds } }).lean(),
-        ]);
-        const empById     = new Map(emps.map(u => [String(u._id), u]));
-        const profileById = new Map(profiles.map(p => [String(p.user), p]));
-
-        for (const entry of entries) {
-            const emp     = empById.get(String(entry.employee));
-            const profile = profileById.get(String(entry.employee));
-
-            const payslip = await Payslip.create({
-                payrollEntry: entry._id, employee: entry.employee, school: req.schoolId,
-                month: run.month, year: run.year,
-                employeeSnapshot: {
-                    name:        emp?.name || '',
-                    email:       emp?.email || '',
-                    employeeId:  emp?.employeeId || '',
-                    designation: profile?.designation || '',
-                    department:  profile?.department || '',
-                    joiningDate: profile?.joiningDate || null,
-                },
-                schoolSnapshot: {
-                    name:    school?.name    || '',
-                    address: school?.address || '',
-                    email:   school?.email   || '',
-                    phone:   school?.phone   || '',
-                },
-                earnings:        entry.earnings,
-                deductions:      entry.deductions,
-                grossSalary:     entry.grossSalary,
-                totalDeductions: entry.totalDeductions,
-                netSalary:       entry.netSalary,
-                lopDays:         entry.lopDays,
-                lopAmount:       entry.lopAmount,
-                generatedBy:     req.userId,
-            });
-            await PayrollEntry.updateOne({ _id: entry._id }, { payslip: payslip._id });
-
-            notify({
-                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-                title: '💵 Payslip published',
-                body: `Your payslip for ${MONTHS[(run.month || 1) - 1]} ${run.year} is now available.\nNet salary: ₹${(entry.netSalary || 0).toLocaleString('en-IN')}`,
-                recipients: [entry.employee],
-                email: true,
-                // The teacher's list is of payslips, not runs — name the row
-                // they will actually be looking at.
-                link: { type: 'payroll.payslips', entityId: payslip._id },
-            });
-        }
-
-        logAudit(req.schoolId, req.userId, 'RUN_PUBLISHED', 'PayrollRun', run._id);
-        res.json({ success: true, data: run });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.updateEntry = async (req, res) => {
-    try {
-        const { lopDays, arrears, bonus, earnings, deductions } = req.body;
-        const entry = await PayrollEntry.findOne({ _id: req.params.entryId, payrollRun: req.params.id, school: req.schoolId });
-        if (!entry) return res.status(404).json({ success: false, message: 'Entry not found' });
-
-        if (earnings    !== undefined) entry.earnings    = earnings;
-        if (deductions  !== undefined) entry.deductions  = deductions;
-        if (lopDays     !== undefined) entry.lopDays     = +lopDays;
-        if (arrears     !== undefined) entry.arrears     = +arrears;
-        if (bonus       !== undefined) entry.bonus       = +bonus;
-
-        entry.grossSalary     = entry.earnings.reduce((s, e) => s + e.amount, 0);
-        entry.totalDeductions = entry.deductions.reduce((s, d) => s + d.amount, 0);
-        entry.netSalary       = entry.grossSalary - entry.totalDeductions + (entry.arrears || 0) + (entry.bonus || 0);
-        await entry.save();
-        res.json({ success: true, data: entry });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-// ── Reports & Audit ───────────────────────────────────────────────────────────
-
-exports.getReports = async (req, res) => {
-    try {
-        const { year } = req.query;
-        const filter = { school: req.schoolId };
-        if (year) filter.year = +year;
-
-        const runs = await PayrollRun.find(filter).sort({ year: -1, month: -1 }).lean();
-        res.json({ success: true, data: runs });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.getAuditLog = async (req, res) => {
-    try {
-        const { page = 1, limit = 30 } = req.query;
-        const [logs, total] = await Promise.all([
-            PayrollAuditLog.find({ school: req.schoolId })
-                .populate('user','name')
-                .sort({ createdAt: -1 })
-                .skip((+page - 1) * +limit)
-                .limit(+limit)
-                .lean(),
-            PayrollAuditLog.countDocuments({ school: req.schoolId }),
-        ]);
-        res.json({ success: true, data: logs, total, page: +page, pages: Math.ceil(total / +limit) });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-// ── Teacher: My CTC ───────────────────────────────────────────────────────────
-
-exports.getMyCtc = async (req, res) => {
-    try {
-        const asgn = await EmployeeSalaryAssignment.findOne({ employee: req.userId, school: req.schoolId, isActive: true })
-            .populate('structure', 'name components')
-            .lean();
-        if (!asgn) return res.json({ success: true, data: null });
-
-        const monthlyCtc  = (asgn.ctc || 0) / 12;
-        const breakdown   = computeSalaryBreakdown(asgn.structure, monthlyCtc, asgn.componentOverrides || []);
-
-        res.json({ success: true, data: { assignment: asgn, monthlyCtc, breakdown } });
+        res.json({ success: true, data: s.components || [] });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

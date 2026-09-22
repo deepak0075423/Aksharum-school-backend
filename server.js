@@ -308,6 +308,23 @@ if (isPrimaryWorker) {
         setInterval(tick, 60 * 60 * 1000);      // then hourly
     }());
 
+    // ── Payroll: open the month, and say when it is due ───────────────────────
+    // Only for schools that asked for it, and nothing automatic ever gets past
+    // `draft` — see services/payrollSweep.js.
+    (function schedulePayrollSweep() {
+        const sweep = require('./services/payrollSweep');
+        const tick = async () => {
+            try {
+                const schools = await sweep.schoolsToSweep();
+                let did = 0;
+                for (const id of schools) did += await sweep.sweepSchool(id);
+                if (did) console.log(`[Payroll] sweep: ${did} action(s) across ${schools.length} school(s)`);
+            } catch (err) { console.error('[Payroll] sweep error:', err.message); }
+        };
+        setTimeout(tick, 150 * 1000);          // once shortly after boot
+        setInterval(tick, 60 * 60 * 1000);     // then hourly
+    }());
+
     // ── Scheduled fees reports ────────────────────────────────────────────────
     // Fees → Reports → Schedule Report stores a weekly/monthly email on the
     // school's FeeSettings. Each schedule remembers the local day it last
