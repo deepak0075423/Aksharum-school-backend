@@ -36,6 +36,11 @@ const TransportTripSchema = new db.Schema({
     driver: { type: db.Types.UUID, ref: 'TransportStaff', default: null },
     attendant: { type: db.Types.UUID, ref: 'TransportStaff', default: null },
 
+    // Regular trips are generated from routes; the rest are one-offs an admin
+    // schedules (an excursion, an exam shuttle) and they are NOT regenerated.
+    tripType: { type: String, enum: ['regular', 'special', 'excursion', 'event', 'exam'], default: 'regular' },
+    title: { type: String, default: '' },                    // names a one-off trip
+
     date: { type: Date, required: true, index: true },       // trip day (local midnight)
     shift: { type: String, enum: ['morning', 'evening'], required: true },
     direction: { type: String, enum: ['pickup', 'drop'], required: true },

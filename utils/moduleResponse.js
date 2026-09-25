@@ -15,15 +15,17 @@ const School = require('../models/School');
 const designations = require('../services/designationService');
 const { MODULE_KEYS } = require('../config/modules');
 const { hasMySection } = require('../services/teacherOwnSections');
+const { transportRole } = require('../services/transportEnrolment');
 
 async function buildModuleResponse(req) {
     const isTeacher = req.userRole === 'teacher';
-    const [access, school, mySection] = await Promise.all([
+    const [access, school, mySection, transport] = await Promise.all([
         designations.requestAccess(req),
         req.schoolId
             ? School.findById(req.schoolId).select('leaveSettings').lean()
             : Promise.resolve(null),
         isTeacher ? hasMySection(req.schoolId, req.userId) : Promise.resolve(false),
+        transportRole(req.schoolId, req.userId, req.userRole),
     ]);
 
     const ls = school?.leaveSettings ?? {};
@@ -56,6 +58,15 @@ async function buildModuleResponse(req) {
         // here because every client already gates its menus on this payload.
         // The page's endpoint enforces the same rule (services/teacherOwnSections).
         hasMySection: mySection,
+        // Not a module either: whether this person is enrolled in the transport
+        // service (a student or teacher who rides, a parent whose child rides,
+        // or a member of the crew). Hides the Transport entry for everyone else,
+        // and services/transportEnrolment enforces the same rule on the routes.
+        transportEnrolled: transport.enrolled,
+        // ...and, for a teacher, WHICH of the two reasons. A driver wants the
+        // duty screen, a teacher who rides wants the rider screen, and the nav
+        // cannot tell them apart from `transportEnrolled` alone.
+        transportCrew: transport.crew,
         saturdayConfig: {
             working: ls.saturdayWorking !== false,
             mode:    ls.saturdayMode    || 'all',

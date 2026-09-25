@@ -10,7 +10,11 @@ const TransportIncidentSchema = new db.Schema({
     driver: { type: db.Types.UUID, ref: 'TransportStaff', default: null },
 
     date: { type: Date, default: Date.now },
-    type: { type: String, enum: ['accident', 'breakdown', 'medical', 'safety', 'fire', 'other'], default: 'accident' },
+    type: {
+        type: String,
+        enum: ['accident', 'breakdown', 'medical', 'safety', 'fire', 'delay', 'route_deviation', 'behavior', 'other'],
+        default: 'accident',
+    },
     severity: { type: String, enum: ['minor', 'major', 'critical'], default: 'minor' },
 
     location: {
@@ -36,6 +40,11 @@ const TransportIncidentSchema = new db.Schema({
         station: { type: String, default: '' },
     },
     repairCost: { type: Number, default: 0 },
+    // Counted on its own tile — "0 student injuries" is the number a head
+    // teacher is asked for, and deriving it from studentsInvolved[] would count
+    // every child who was merely on board.
+    injuredCount: { type: Number, default: 0 },
+    resolvedAt: { type: Date, default: null },
     actionsTaken: { type: String, default: '' },
 
     status: { type: String, enum: ['reported', 'investigating', 'resolved', 'closed'], default: 'reported' },

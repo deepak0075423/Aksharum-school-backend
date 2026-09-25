@@ -20,7 +20,8 @@ const TransportComplaintSchema = new db.Schema({
 
     category: {
         type: String,
-        enum: ['late_bus', 'driver_behavior', 'bus_condition', 'safety', 'delay', 'lost_item', 'overcrowding', 'other'],
+        enum: ['late_bus', 'driver_behavior', 'bus_condition', 'safety', 'delay',
+               'route_deviation', 'lost_item', 'overcrowding', 'other'],
         default: 'other',
     },
     subject: { type: String, required: true, trim: true },
@@ -35,6 +36,9 @@ const TransportComplaintSchema = new db.Schema({
     assignedTo: { type: db.Types.UUID, ref: 'User', default: null },
     resolution: { type: String, default: '' },
     rating: { type: Number, default: null },                 // parent satisfaction after resolution
+    // Stamped when the complaint is resolved so "average resolution time" is a
+    // real measurement rather than createdAt→now on a row closed weeks ago.
+    resolvedAt: { type: Date, default: null },
 
     attachments: { type: [String], default: [] },
     timeline: [TimelineSchema],

@@ -28,6 +28,10 @@ const TransportRouteSchema = new db.Schema({
     description: { type: String, default: '' },
 
     shift: { type: String, enum: ['morning', 'evening', 'both'], default: 'both' },
+    // The zone the route serves ("South Kolkata") and the colour every screen
+    // draws its R-badge, map line and chart bar in — one route, one colour.
+    zone: { type: String, default: '' },
+    color: { type: String, default: '' },
     routeType: { type: String, enum: ['regular', 'holiday', 'temporary', 'alternative'], default: 'regular' },
 
     // Assigned resources (a route with no vehicle/driver is a "draft").
@@ -44,11 +48,21 @@ const TransportRouteSchema = new db.Schema({
 
     stops: [StopSchema],
 
+    // Published start/end of each shift. The stop times say when the bus is at
+    // a stop; this says when the route as a whole runs, which is what the
+    // Routes screen shows and what "on time" is measured against.
+    schedule: {
+        morningStart: { type: String, default: '' },   // "07:00"
+        morningEnd: { type: String, default: '' },     // "08:05"
+        eveningStart: { type: String, default: '' },
+        eveningEnd: { type: String, default: '' },
+    },
+
     // For temporary/alternative routes.
     effectiveFrom: { type: Date, default: null },
     effectiveTo: { type: Date, default: null },
 
-    status: { type: String, enum: ['active', 'inactive', 'draft'], default: 'active' },
+    status: { type: String, enum: ['active', 'inactive', 'draft', 'maintenance'], default: 'active' },
     isActive: { type: Boolean, default: true },
     createdBy: { type: db.Types.UUID, ref: 'User' },
 }, { timestamps: true });

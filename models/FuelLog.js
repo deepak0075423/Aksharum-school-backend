@@ -17,8 +17,11 @@ const FuelLogSchema = new db.Schema({
     distance: { type: Number, default: 0 },                  // odometer - previous
     mileage: { type: Number, default: 0 },                   // distance / litres (km/l)
 
-    vendor: { type: String, default: '' },
-    receipt: { type: String, default: '' },
+    vendor: { type: String, default: '' },                    // the filling station
+    receipt: { type: String, default: '' },                   // bill number
+    // Who was driving when it was filled. `filledBy` is the admin who typed the
+    // entry in — a different person, and the one the audit trail wants.
+    driver: { type: db.Types.UUID, ref: 'TransportStaff', default: null },
     filledBy: { type: db.Types.UUID, ref: 'User', default: null },
     note: { type: String, default: '' },
 }, { timestamps: true });

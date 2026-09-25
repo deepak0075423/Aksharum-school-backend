@@ -41,6 +41,27 @@ const LEGACY_ADMIN_GRANTS = {
     'headmistress':     ['feedback'],
 };
 
+// The other half of the story. A designation with no row falls back to
+// defaultPermissionsFor(), which grants USER on EVERY module — the right answer
+// for a school upgrading into this feature, because it changes nobody's access.
+// It is the wrong answer for a designation that exists to do one job: a driver,
+// a conductor and a crew member crew a bus. They are employees — they clock in,
+// apply for leave and draw a salary — but they have no business in Results,
+// Fees, the Library or the Aptitude exams, and nothing would ever have told an
+// admin they were there: an unconfigured designation does not appear in the
+// matrix, so there is no row to notice and no row to tighten.
+//
+// Named here rather than left to the admin because the fallback fires before
+// anyone has had the chance to configure anything.
+const CREW_MODULES = ['transport', 'attendance', 'leave', 'payroll', 'holiday', 'notification', 'document'];
+const RESTRICTED_DEFAULTS = {
+    'driver':      CREW_MODULES,
+    'conductor':   CREW_MODULES,
+    'crew member': CREW_MODULES,
+    'helper':      CREW_MODULES,
+    'attendant':   CREW_MODULES,   // the original word for a helper
+};
+
 const DEFAULT_DESIGNATIONS = ['Teacher', 'Class Teacher', 'Librarian', 'Principal', 'Vice Principal'];
 
 // A starting line for the designations a school is likely to have, so the list
@@ -63,6 +84,11 @@ const DEFAULT_DESCRIPTIONS = {
     'lab assistant':    'Supports laboratory equipment and practicals',
     'sports teacher':   'Runs physical education and sports activities',
     'receptionist':     'Front desk, visitors and enquiries',
+    'driver':           'Drives a school bus on its route',
+    'conductor':        'Rides with the bus and accounts for every child',
+    'crew member':      'Assists the driver and conductor on the route',
+    'helper':           'Assists the driver and conductor on the route',
+    'attendant':        'Assists the driver and conductor on the route',
 };
 
 const defaultDescriptionFor = (name) => DEFAULT_DESCRIPTIONS[key(name)] || '';
@@ -92,6 +118,14 @@ function sanitizePermissions(raw) {
 // What a brand-new designation gets: normal access everywhere, plus the
 // administrative grants its name historically implied.
 function defaultPermissionsFor(name) {
+    // A job-specific designation starts closed and is opened by an admin, the
+    // opposite way round from a teaching one.
+    const only = RESTRICTED_DEFAULTS[key(name)];
+    if (only) {
+        const out = emptyPermissions();
+        for (const k of only) if (isModuleKey(k)) out[k] = USER;
+        return out;
+    }
     const out = Object.fromEntries(MODULE_KEYS.map((k) => [k, USER]));
     for (const mod of (LEGACY_ADMIN_GRANTS[key(name)] || [])) out[mod] = ADMIN;
     return out;

@@ -20,8 +20,10 @@ const TransportSettings    = require('../models/TransportSettings');
 const TransportAuditLog    = require('../models/TransportAuditLog');
 const StudentProfile       = require('../models/StudentProfile');
 const User                 = require('../models/User');
+const Holiday              = require('../models/Holiday');
 
 const { notify, withParents } = require('../services/notifyService');
+const { syncOccupancy } = require('../services/transportSeats');
 const { resolvePage } = require('../utils/focusPage');
 
 // ── tiny helpers ─────────────────────────────────────────────────────────────
@@ -59,6 +61,53 @@ function dayRange(dateLike) {
 function monthStart(offset = 0) {
     const d = new Date();
     return new Date(d.getFullYear(), d.getMonth() - offset, 1);
+}
+
+// "07:15" → minutes since midnight; null for anything unparseable, so a blank
+// stop time is never read as midnight.
+function hhmmToMin(v) {
+    const m = /^(\d{1,2}):(\d{2})/.exec(String(v || '').trim());
+    if (!m) return null;
+    const h = +m[1], mi = +m[2];
+    return h > 23 || mi > 59 ? null : h * 60 + mi;
+}
+
+/**
+ * How late this trip is running, in minutes.
+ *
+ * NOTHING used to write `delayMinutes`. Five screens read it — the dashboard's
+ * delayed-trips tile, the live map's Delayed state, the Trips list and its two
+ * charts, and every on-time percentage in Reports — so all of them reported a
+ * permanently punctual fleet. It is measured here against the timetable: the
+ * worst lateness across the stops actually reached, and, before any stop is
+ * reached, how late the trip started against the route's published time.
+ *
+ * Running early is not negative lateness: a bus fifteen minutes early is not
+ * "-15 late", it is on time, so the floor is zero.
+ */
+function computeDelayMinutes(trip, route) {
+    const at = trip.date ? new Date(trip.date) : new Date();
+    const dayMin = (d) => { const x = new Date(d); return x.getHours() * 60 + x.getMinutes(); };
+    let worst = 0;
+    let measured = false;
+
+    for (const ev of trip.stopEvents || []) {
+        if (ev.status !== 'reached' || !ev.reachedAt) continue;
+        const planned = hhmmToMin(ev.plannedTime);
+        if (planned == null) continue;
+        measured = true;
+        worst = Math.max(worst, dayMin(ev.reachedAt) - planned);
+    }
+    if (!measured && trip.startTime) {
+        const sched = trip.shift === 'morning' ? route?.schedule?.morningStart : route?.schedule?.eveningStart;
+        const planned = hhmmToMin(sched)
+            ?? hhmmToMin([...(route?.stops || [])].sort((a, b) => a.sequence - b.sequence)[0]?.[trip.shift === 'morning' ? 'arrivalTime' : 'eveningTime']);
+        if (planned != null) { measured = true; worst = dayMin(trip.startTime) - planned; }
+    }
+    // Same-day comparison only: a trip whose date is not today would compare
+    // clock times across days and produce nonsense.
+    void at;
+    return measured ? Math.max(0, Math.round(worst)) : (trip.delayMinutes || 0);
 }
 
 // Resolve the payable amount for an assignment under its fee plan (spec §14).
@@ -103,12 +152,26 @@ exports.getMeta = async (req, res) => {
         const [vehicles, drivers, attendants, routes, feePlans, students] = await Promise.all([
             Vehicle.find({ school, isActive: true }).select('vehicleNumber registrationNumber capacity status').sort('vehicleNumber').lean(),
             TransportStaff.find({ school, isActive: true, staffType: 'driver' }).select('name employeeId status').sort('name').lean(),
-            TransportStaff.find({ school, isActive: true, staffType: 'attendant' }).select('name employeeId status').sort('name').lean(),
+            // Conductors AND helpers, plus the legacy 'attendant' spelling — see
+            // models/TransportStaff. Querying 'attendant' alone matched nothing.
+            TransportStaff.find({ school, isActive: true, staffType: { $in: ['conductor', 'helper', 'attendant'] } })
+                .select('name employeeId status staffType').sort('name').lean(),
             TransportRoute.find({ school, isActive: true }).select('name routeCode shift stops vehicle').sort('name').lean(),
             TransportFeePlan.find({ school, isActive: true }).select('name basis amount frequency').sort('name').lean(),
             User.find({ school, role: 'student', isActive: true }).select('name email').sort('name').lean(),
         ]);
-        ok(res, { vehicles, drivers, attendants, routes, feePlans, students });
+        // The campus pin travels with the meta so every form that opens a map
+        // picker has something to place against without its own round trip.
+        const settings = await getOrCreateSettings(school);
+        ok(res, {
+            vehicles, drivers, attendants, routes, feePlans, students,
+            school: { latitude: settings.schoolLatitude ?? null, longitude: settings.schoolLongitude ?? null },
+            map: {
+                provider: settings.mapProvider || 'openfreemap',
+                tiles: (settings.mapProvider || 'openfreemap') !== 'builtin',
+                apiKey: settings.mapProvider === 'google' ? (settings.mapApiKey || '') : '',
+            },
+        });
     } catch (e) { fail(res, e); }
 };
 
@@ -136,7 +199,7 @@ exports.getDashboard = async (req, res) => {
             Vehicle.countDocuments({ school, isActive: true, status: 'maintenance' }),
             TransportStaff.countDocuments({ school, isActive: true, staffType: 'driver' }),
             TransportStaff.countDocuments({ school, isActive: true, staffType: 'driver', status: 'active' }),
-            TransportStaff.countDocuments({ school, isActive: true, staffType: 'attendant' }),
+            TransportStaff.countDocuments({ school, isActive: true, staffType: { $in: ['conductor', 'helper', 'attendant'] } }),
             TransportTrip.countDocuments({ school, date: { $gte: todayStart, $lt: todayEnd } }),
             TransportTrip.countDocuments({ school, date: { $gte: todayStart, $lt: todayEnd }, delayMinutes: { $gt: settings.delayThresholdMin } }),
             TransportTrip.countDocuments({ school, date: { $gte: todayStart, $lt: todayEnd }, status: 'completed' }),
@@ -334,7 +397,7 @@ exports.createStaff = async (req, res) => {
     try {
         const b = req.body;
         if (!b.name || !b.staffType) return bad(res, 'Name and staff type are required');
-        const prefix = b.staffType === 'driver' ? 'DRV' : 'ATT';
+        const prefix = { driver: 'DRV', conductor: 'CND', helper: 'HLP' }[b.staffType] || 'ATT';
         const employeeId = b.employeeId || await nextNumber(TransportStaff, req.schoolId, prefix);
         const exists = await TransportStaff.findOne({ school: req.schoolId, employeeId });
         if (exists) return bad(res, 'Employee ID already exists');
@@ -421,8 +484,14 @@ exports.updateRoute = async (req, res) => {
             { _id: req.params.id, school: req.schoolId }, { $set: b }, { new: true });
         if (!r) return bad(res, 'Route not found', 404);
         // keep vehicle denormalised on active assignments in sync
-        if (b.vehicle !== undefined)
+        if (b.vehicle !== undefined) {
+            const moved = await TransportAssignment.find({ school: req.schoolId, route: r._id, status: 'active' }).select('vehicle').lean();
             await TransportAssignment.updateMany({ school: req.schoolId, route: r._id, status: 'active' }, { $set: { vehicle: b.vehicle || null } });
+            // Both the vehicle they left and the one they joined now hold the
+            // wrong seat count — moving a route's bus used to leave the old bus
+            // looking full for ever.
+            await syncOccupancy(req.schoolId, [...moved.map((a) => a.vehicle), b.vehicle]);
+        }
         await logAudit(req, 'update', 'Route', r._id, `Updated route ${r.name}`);
         ok(res, r);
     } catch (e) { fail(res, e); }
@@ -494,9 +563,18 @@ exports.getAssignments = async (req, res) => {
 exports.createAssignment = async (req, res) => {
     try {
         const b = req.body;
-        if (!b.student || !b.route) return bad(res, 'Student and route are required');
+        if (!b.student || !b.route) return bad(res, 'Pick a person and a route');
+        // Students and staff both ride; `personType` is checked against the
+        // account so the two can never drift apart.
+        const personType = b.personType === 'teacher' ? 'teacher' : 'student';
+        const person = await User.findOne({ _id: b.student, school: req.schoolId }).select('name role').lean();
+        if (!person) return bad(res, 'That person is not on this school\'s roll', 404);
+        const isStudentAccount = person.role === 'student';
+        if (personType === 'student' && !isStudentAccount) return bad(res, `${person.name} is not a student account`);
+        if (personType === 'teacher' && isStudentAccount) return bad(res, `${person.name} is a student account`);
+
         const dup = await TransportAssignment.findOne({ school: req.schoolId, student: b.student, status: 'active' });
-        if (dup) return bad(res, 'Student already has an active transport assignment');
+        if (dup) return bad(res, `${person.name} already has an active transport enrolment`);
         const route = await TransportRoute.findOne({ _id: b.route, school: req.schoolId }).lean();
         if (!route) return bad(res, 'Route not found');
         const vehicle = b.vehicle || route.vehicle;
@@ -504,16 +582,24 @@ exports.createAssignment = async (req, res) => {
         // Capacity + seat checks (spec §8).
         if (vehicle) {
             const veh = await Vehicle.findById(vehicle).lean();
+            const settings = await TransportSettings.findOne({ school: req.schoolId }).lean();
+            const cap = veh?.capacity || settings?.maxStudentsPerBus || 0;
             const occupied = await TransportAssignment.countDocuments({ school: req.schoolId, vehicle, status: 'active' });
-            if (veh?.capacity && occupied >= veh.capacity) return bad(res, `Vehicle is full (${occupied}/${veh.capacity})`);
+            // A school that has turned overbooking on is saying it will put
+            // children on laps for a week; it is a setting, so it is honoured.
+            if (cap && occupied >= cap && !settings?.allowOverbooking) return bad(res, `Vehicle is full (${occupied}/${cap})`);
             if (b.seatNumber) {
                 const taken = await TransportAssignment.findOne({ school: req.schoolId, vehicle, seatNumber: b.seatNumber, status: 'active' });
                 if (taken) return bad(res, `Seat ${b.seatNumber} is already taken`);
             }
         }
-        const a = await TransportAssignment.create({ ...b, vehicle, school: req.schoolId, createdBy: req.userId });
+        const a = await TransportAssignment.create({
+            ...b, personType, vehicle, school: req.schoolId, createdBy: req.userId,
+        });
         if (vehicle) await Vehicle.updateOne({ _id: vehicle }, { $inc: { currentOccupancy: 1 } });
-        await logAudit(req, 'create', 'Assignment', a._id, `Assigned transport for a student on route ${route.name}`);
+        await logAudit(req, 'create', 'Assignment', a._id,
+            `Enrolled ${person.name} (${personType}) on route ${route.name}`);
+        // A staff rider has no parents to copy; withParents returns just them.
         withParents([b.student]).then(targets => notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '🚌 Transport assigned',
@@ -526,9 +612,49 @@ exports.createAssignment = async (req, res) => {
 };
 exports.updateAssignment = async (req, res) => {
     try {
+        const before = await TransportAssignment.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!before) return bad(res, 'Assignment not found', 404);
+        const b = { ...req.body };
+        // None of these may be re-pointed by an edit.
+        delete b.school; delete b.student; delete b.personType;
+        delete b._id; delete b.createdBy; delete b.createdAt;
+
+        // Moving a child to another route moves them to that route's bus unless
+        // the caller names one; the edit used to change the route and leave the
+        // child recorded on the old vehicle.
+        if (b.route && String(b.route) !== String(before.route)) {
+            const route = await TransportRoute.findOne({ _id: b.route, school: req.schoolId }).lean();
+            if (!route) return bad(res, 'Route not found');
+            if (b.vehicle === undefined) b.vehicle = route.vehicle || null;
+        }
+        const targetVehicle = b.vehicle !== undefined ? b.vehicle : before.vehicle;
+        const nextStatus = b.status || before.status;
+
+        // The same seat and capacity checks a new assignment gets — an edit was
+        // the way round both.
+        if (targetVehicle && nextStatus === 'active') {
+            const veh = await Vehicle.findOne({ _id: targetVehicle, school: req.schoolId }).lean();
+            if (!veh) return bad(res, 'Vehicle not found');
+            if (String(targetVehicle) !== String(before.vehicle) || before.status !== 'active') {
+                const occupied = await TransportAssignment.countDocuments({
+                    school: req.schoolId, vehicle: targetVehicle, status: 'active', _id: { $ne: before._id },
+                });
+                const st = await TransportSettings.findOne({ school: req.schoolId }).lean();
+                const cap = veh.capacity || st?.maxStudentsPerBus || 0;
+                if (cap && !st?.allowOverbooking && occupied >= cap) return bad(res, `Vehicle is full (${occupied}/${cap})`);
+            }
+            const seat = b.seatNumber !== undefined ? b.seatNumber : before.seatNumber;
+            if (seat) {
+                const taken = await TransportAssignment.findOne({
+                    school: req.schoolId, vehicle: targetVehicle, seatNumber: seat, status: 'active', _id: { $ne: before._id },
+                }).lean();
+                if (taken) return bad(res, `Seat ${seat} is already taken on that vehicle`);
+            }
+        }
+
         const a = await TransportAssignment.findOneAndUpdate(
-            { _id: req.params.id, school: req.schoolId }, { $set: req.body }, { new: true });
-        if (!a) return bad(res, 'Assignment not found', 404);
+            { _id: req.params.id, school: req.schoolId }, { $set: b }, { new: true });
+        await syncOccupancy(req.schoolId, [before.vehicle, targetVehicle]);
         await logAudit(req, 'update', 'Assignment', a._id, 'Updated transport assignment');
         ok(res, a);
     } catch (e) { fail(res, e); }
@@ -581,6 +707,20 @@ exports.generateTrips = async (req, res) => {
     try {
         const date = req.body.date ? new Date(req.body.date) : new Date();
         const { start, end } = dayRange(date);
+        const settings = await getOrCreateSettings(req.schoolId);
+
+        // A school that does not run buses on Sundays does not want a silent
+        // set of Sunday trips sitting in its register marked "scheduled".
+        // `force` is how the Trips screen overrides for a working Saturday.
+        if (!req.body.force) {
+            if (settings.skipWeekends && [0, 6].includes(start.getDay())) {
+                return ok(res, { created: 0, skipped: 'weekend', message: `${start.toDateString()} is a weekend — no trips were generated.` });
+            }
+            if (settings.skipHolidays) {
+                const holiday = await Holiday.findOne({ school: req.schoolId, startDate: { $lte: start }, endDate: { $gte: start } }).select('name').lean();
+                if (holiday) return ok(res, { created: 0, skipped: 'holiday', message: `${start.toDateString()} is a holiday (${holiday.name}) — no trips were generated.` });
+            }
+        }
         const routes = await TransportRoute.find({ school: req.schoolId, isActive: true, status: 'active', vehicle: { $ne: null } }).lean();
         const routeIds = routes.map(r => r._id);
 
@@ -687,8 +827,27 @@ exports.tripAction = async (req, res) => {
             case 'cancel': t.status = 'cancelled'; t.cancellationReason = reason; break;
             default: return bad(res, 'Invalid action');
         }
+        const route = await TransportRoute.findById(t.route).select('stops schedule').lean();
+        t.delayMinutes = computeDelayMinutes(t, route);
         await t.save();
         await logAudit(req, `trip_${action}`, 'Trip', t._id, `Trip ${t.tripCode} ${action}`);
+
+        // Trip-start and arrival messages are settings, and they were never
+        // sent — the flags existed with nothing reading them.
+        const settings = await getOrCreateSettings(req.schoolId);
+        const wants = (action === 'start' && settings.notifyOnTripStart)
+            || (action === 'complete' && settings.notifyOnReachSchool);
+        if (wants) {
+            const studentIds = (t.studentAttendance || []).map((s) => s.student).filter(Boolean);
+            if (studentIds.length) withParents(studentIds).then((targets) => notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: action === 'start' ? '🚌 Bus has started' : '🚌 Trip completed',
+                body: action === 'start'
+                    ? `The ${t.shift === 'morning' ? 'morning' : 'afternoon'} bus has started its trip.`
+                    : `The ${t.shift === 'morning' ? 'morning' : 'afternoon'} trip has been completed.`,
+                recipients: targets, link: { type: 'transport.mine', entityId: t._id },
+            })).catch(() => {});
+        }
         ok(res, t);
     } catch (e) { fail(res, e); }
 };
@@ -698,13 +857,36 @@ exports.reachStop = async (req, res) => {
         const { stopId, status = 'reached', latitude, longitude } = req.body;
         const t = await TransportTrip.findOne({ _id: req.params.id, school: req.schoolId });
         if (!t) return bad(res, 'Trip not found', 404);
-        const ev = t.stopEvents.id(stopId) || t.stopEvents.find(s => String(s.stop) === String(stopId));
+        // `.id()` is a Mongoose subdocument-array helper that the Postgres ORM
+        // does not implement, so this THREW for every caller rather than falling
+        // through to the || — reachStop could never have worked since the
+        // migration. Match on either the event's own id or the route stop it
+        // points at, because callers have one or the other to hand.
+        const ev = (t.stopEvents || []).find((x) => String(x._id) === String(stopId))
+            || (t.stopEvents || []).find((x) => String(x.stop) === String(stopId));
         if (!ev) return bad(res, 'Stop not found on this trip');
         ev.status = status; ev.reachedAt = new Date();
         if (latitude != null) ev.latitude = latitude;
         if (longitude != null) ev.longitude = longitude;
         if (status === 'skipped' && !t.missedStops.includes(ev.name)) t.missedStops.push(ev.name);
+        const route = await TransportRoute.findById(t.route).select('stops schedule').lean();
+        t.delayMinutes = computeDelayMinutes(t, route);
         await t.save();
+
+        // A bus that has fallen behind its timetable is the one thing families
+        // most want told to them, and the flag for it was never read.
+        const settings = await getOrCreateSettings(req.schoolId);
+        if (settings.notifyOnDelay && t.delayMinutes > settings.delayThresholdMin && !t.notes.includes('[delay-notified]')) {
+            t.notes = `${t.notes || ''} [delay-notified]`.trim();
+            await t.save();
+            const studentIds = (t.studentAttendance || []).map((s) => s.student).filter(Boolean);
+            if (studentIds.length) withParents(studentIds).then((targets) => notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: '🚌 Bus running late',
+                body: `Today's ${t.shift === 'morning' ? 'morning' : 'afternoon'} bus is running about ${t.delayMinutes} minutes late.`,
+                recipients: targets, link: { type: 'transport.track', entityId: t._id },
+            })).catch(() => {});
+        }
         ok(res, t);
     } catch (e) { fail(res, e); }
 };
@@ -726,7 +908,24 @@ exports.markTripAttendance = async (req, res) => {
             if (['dropped'].includes(e.status)) sa.dropTime = now;
         });
         await t.save();
-        // NOTE: parent board/drop notifications (spec §19) fire here in production.
+
+        // These two flags shipped with a comment where the send should have
+        // been, so a parent who had asked to be told when their child boarded
+        // was never told. Only the children whose status changed in THIS call
+        // are announced, so re-saving a register does not re-notify a family.
+        const settings = await getOrCreateSettings(req.schoolId);
+        const boarded = entries.filter((e) => e.status === 'boarded').map((e) => e.student);
+        const dropped = entries.filter((e) => e.status === 'dropped').map((e) => e.student);
+        const send = (ids, title, body) => {
+            if (!ids.length) return;
+            withParents(ids).then((targets) => notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title, body, recipients: targets, link: { type: 'transport.track', entityId: t._id },
+            })).catch(() => {});
+        };
+        if (settings.notifyOnBoard) send(boarded, '🚌 Boarded the bus', 'Your child has boarded the school bus.');
+        if (settings.notifyOnDrop) send(dropped, '🚌 Dropped off', 'Your child has been dropped off at their stop.');
+
         await logAudit(req, 'attendance', 'Trip', t._id, `Marked attendance on trip ${t.tripCode}`);
         ok(res, t);
     } catch (e) { fail(res, e); }
@@ -793,7 +992,12 @@ exports.createFuelLog = async (req, res) => {
     try {
         const b = req.body;
         if (!b.vehicle || !b.litres) return bad(res, 'Vehicle and litres are required');
-        const prev = await FuelLog.findOne({ school: req.schoolId, vehicle: b.vehicle }).sort('-date').lean();
+        // The reading before THIS fill, not simply the newest on file — a fill
+        // entered late was being measured against a later one and produced a
+        // negative distance, which the Math.max below silently turned into 0 km
+        // and a mileage of 0.
+        const when = b.date ? new Date(b.date) : new Date();
+        const prev = await FuelLog.findOne({ school: req.schoolId, vehicle: b.vehicle, date: { $lt: when } }).sort('-date').lean();
         const previousOdometer = prev?.odometer || 0;
         const distance = b.odometer && previousOdometer ? Math.max(0, b.odometer - previousOdometer) : 0;
         const totalCost = b.totalCost || (b.litres * (b.pricePerLitre || 0));
@@ -801,7 +1005,12 @@ exports.createFuelLog = async (req, res) => {
         const log = await FuelLog.create({
             ...b, school: req.schoolId, previousOdometer, distance, totalCost, mileage, filledBy: req.userId,
         });
-        if (b.odometer) await Vehicle.updateOne({ _id: b.vehicle }, { $set: { odometer: b.odometer, ...(mileage ? { mileage } : {}) } });
+        // An odometer only ever goes up: entering last month's receipt must not
+        // wind the vehicle back and make every later reading look like a rollover.
+        if (b.odometer) {
+            await Vehicle.updateOne({ _id: b.vehicle, odometer: { $lt: b.odometer } }, { $set: { odometer: b.odometer } });
+            if (mileage) await Vehicle.updateOne({ _id: b.vehicle }, { $set: { mileage } });
+        }
         await logAudit(req, 'create', 'Fuel', log._id, `Fuel entry ${b.litres}L`);
         ok(res, log);
     } catch (e) { fail(res, e); }
@@ -893,8 +1102,15 @@ exports.createIncident = async (req, res) => {
 };
 exports.updateIncident = async (req, res) => {
     try {
+        const patch = { ...req.body };
+        // The row is found by school, but nothing stopped the patch from
+        // RE-POINTING it: `$set: { school }` moved the incident to another
+        // school's books. Identity fields are never editable by an update.
+        delete patch.school; delete patch._id; delete patch.incidentCode;
+        delete patch.createdBy; delete patch.createdAt;
+        if (['resolved', 'closed'].includes(patch.status)) patch.resolvedAt = patch.resolvedAt || new Date();
         const i = await TransportIncident.findOneAndUpdate(
-            { _id: req.params.id, school: req.schoolId }, { $set: req.body }, { new: true });
+            { _id: req.params.id, school: req.schoolId }, { $set: patch }, { new: true });
         if (!i) return bad(res, 'Incident not found', 404);
         await logAudit(req, 'update', 'Incident', i._id, `Updated incident ${i.incidentCode}`);
         ok(res, i);
@@ -950,8 +1166,10 @@ exports.actOnComplaint = async (req, res) => {
         if (!c) return bad(res, 'Complaint not found', 404);
         if (action === 'assign')      { c.status = 'assigned'; c.assignedTo = assignedTo || null; }
         else if (action === 'progress') c.status = 'in_progress';
-        else if (action === 'resolve') { c.status = 'resolved'; c.resolution = resolution || note; }
-        else if (action === 'close')    c.status = 'closed';
+        // Without this stamp, "average resolution time" had to fall back to
+        // updatedAt, which every later edit moved.
+        else if (action === 'resolve') { c.status = 'resolved'; c.resolution = resolution || note; c.resolvedAt = c.resolvedAt || new Date(); }
+        else if (action === 'close')    { c.status = 'closed'; c.resolvedAt = c.resolvedAt || new Date(); }
         else if (action !== 'comment')  return bad(res, 'Invalid action');
         c.timeline.push({ action, by: req.userId, note });
         await c.save();
@@ -969,7 +1187,9 @@ exports.getFeePlans = async (req, res) => {
 exports.createFeePlan = async (req, res) => {
     try {
         if (!req.body.name) return bad(res, 'Plan name is required');
-        const p = await TransportFeePlan.create({ ...req.body, school: req.schoolId, createdBy: req.userId });
+        const body = { ...req.body };
+        delete body._id; delete body.createdAt;
+        const p = await TransportFeePlan.create({ ...body, school: req.schoolId, createdBy: req.userId });
         await logAudit(req, 'create', 'FeePlan', p._id, `Created fee plan ${p.name}`);
         ok(res, p);
     } catch (e) { fail(res, e); }
@@ -1037,6 +1257,7 @@ exports.generateInvoices = async (req, res) => {
             const inv = new TransportFeeInvoice({
                 school: req.schoolId, invoiceNumber: `TF-${ym}-${String(invSeq).padStart(4, '0')}`,
                 student: a.student, assignment: a._id, feePlan: a.feePlan._id,
+                route: a.route?._id || a.route || null,
                 period: { month, year, label: `${MONTHS[month - 1]} ${year}` },
                 amount, dueDate, generatedBy: req.userId,
             });
@@ -1085,7 +1306,11 @@ exports.getRequests = async (req, res) => {
             await resolvePage(TransportRequest, q, { createdAt: -1 }, +limit, focus, page);
         const [rows, total] = await Promise.all([
             TransportRequest.find(q).sort('-createdAt').skip((effectivePage - 1) * limit).limit(+limit)
-                .populate('requestedBy', 'name role').populate('student', 'name')
+                .populate('requestedBy', 'name role')
+                // Resolves against User now that the model's ref is right; it
+                // used to point at StudentProfile, which has no name, so this
+                // column was blank on every row.
+                .populate('student', 'name')
                 .populate('details.route', 'name routeCode stops').lean(),
             TransportRequest.countDocuments(q),
         ]);

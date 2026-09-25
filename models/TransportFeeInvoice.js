@@ -20,6 +20,10 @@ const TransportFeeInvoiceSchema = new db.Schema({
     student: { type: db.Types.UUID, ref: 'User', required: true, index: true }, // User w/ role student
     assignment: { type: db.Types.UUID, ref: 'TransportAssignment', default: null },
     feePlan: { type: db.Types.UUID, ref: 'TransportFeePlan', default: null },
+    // Denormalised from the assignment at generation time: an invoice is billed
+    // for the route the child rode THAT month, and reassigning them later must
+    // not rewrite last month's books.
+    route: { type: db.Types.UUID, ref: 'TransportRoute', default: null },
 
     period: {
         month: { type: Number, default: null },              // 1-12 (null for yearly)
@@ -37,6 +41,8 @@ const TransportFeeInvoiceSchema = new db.Schema({
     status: { type: String, enum: ['pending', 'partial', 'paid', 'overdue', 'cancelled'], default: 'pending' },
     payments: [PaymentSchema],
     generatedBy: { type: db.Types.UUID, ref: 'User' },
+    remindersSent: { type: Number, default: 0 },
+    lastReminderAt: { type: Date, default: null },
 }, { timestamps: true });
 
 // Keep netAmount/paidAmount/status consistent on every save (sync pre-save hook).
