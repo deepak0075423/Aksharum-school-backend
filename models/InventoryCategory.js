@@ -7,6 +7,21 @@ const InventoryCategorySchema = new db.Schema({
     name: { type: String, required: true, trim: true },
     parent: { type: db.Types.UUID, ref: 'InventoryCategory', default: null },
     description: { type: String, default: '' },
+
+    // The redesign draws a category everywhere its items appear — in the item
+    // row, the donut legend, the budget row — so the mark is stored once here
+    // rather than being re-picked per screen. `icon` is a key into the module's
+    // own glyph set (invUI → GLYPHS); `color` seeds the tint behind it.
+    icon: { type: String, default: 'box' },
+    color: { type: String, default: '' },
+
+    // Defaults a new item in this category inherits, so "Set default purchase
+    // and accounting preferences" on the Categories screen means something.
+    defaultUnit: { type: String, default: '' },
+    defaultGst: { type: Number, default: 0 },
+    defaultHsnCode: { type: String, default: '' },
+    defaultWarehouse: { type: db.Types.UUID, ref: 'InventoryWarehouse', default: null },
+
     isActive: { type: Boolean, default: true },
     createdBy: { type: db.Types.UUID, ref: 'User' },
 }, { timestamps: true });

@@ -210,6 +210,20 @@ const ROUTES = {
         school_admin: { web: '/admin/inventory/issues',     mobile: '/modules/admin/inventory' },
         teacher:      { web: '/teacher/inventory/requests', mobile: '/modules/inventory-requests' },
     },
+    // Where the automatic alerts land. Each takes the reader to the screen that
+    // can actually do something about what it is reporting.
+    'inventory.stock': {
+        school_admin: { web: '/admin/inventory/stock',      mobile: '/modules/admin/inventory' },
+    },
+    'inventory.orders': {
+        school_admin: { web: '/admin/inventory/orders',     mobile: '/modules/admin/inventory' },
+    },
+    'inventory.budgets': {
+        school_admin: { web: '/admin/inventory/budgets',    mobile: '/modules/admin/inventory' },
+    },
+    'inventory.warehouses': {
+        school_admin: { web: '/admin/inventory/warehouses', mobile: '/modules/admin/inventory' },
+    },
 
     // ── Transport ────────────────────────────────────────────────────────────
     'transport.mine': {

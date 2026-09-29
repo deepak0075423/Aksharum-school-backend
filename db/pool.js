@@ -37,4 +37,30 @@ async function end() {
     if (pool) { await pool.end(); pool = null; }
 }
 
-module.exports = { getPool, query, end };
+/**
+ * Run `fn` inside one transaction on ONE checked-out client.
+ *
+ * Everything else in this app is a single unnamed statement through
+ * pool.query(), which is what PgBouncer's transaction pooling wants. A real
+ * multi-statement transaction has to hold one backend for its whole life, so
+ * it takes a client of its own — see the note at the top of this file.
+ *
+ * `fn` is given a `q(text, params)` that runs on that client. Throwing rolls
+ * the whole thing back.
+ */
+async function withTransaction(fn) {
+    const client = await getPool().connect();
+    try {
+        await client.query('BEGIN');
+        const out = await fn((text, params) => client.query(text, params));
+        await client.query('COMMIT');
+        return out;
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch { /* the client is going back anyway */ }
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
+module.exports = { getPool, query, end, withTransaction };

@@ -33,6 +33,18 @@ const allowedOrigins = [
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
+// A developer's own machine, on whatever port the dev server picked.
+//
+// This list did not include the Vite dev server (5173), and the gap was
+// invisible: a same-origin GET carries no Origin header at all, so every READ
+// went through and only WRITES were refused — with "Not allowed by CORS",
+// which reads like a deployment problem rather than a missing port. Nothing in
+// development could save anything.
+//
+// Production is unchanged: it matches the list above and nothing else.
+const isDev = process.env.NODE_ENV !== 'production';
+const LOCAL = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
 app.use(cors({
   origin: function (origin, callback) {
 
@@ -42,7 +54,7 @@ app.use(cors({
       return callback(null, true);
     }
 
-    if (allowedOrigins.includes(origin)) {
+    if (allowedOrigins.includes(origin) || (isDev && LOCAL.test(origin))) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
@@ -365,6 +377,33 @@ if (isPrimaryWorker) {
             } catch (err) { console.error('[Fees] automatic reminder error:', err.message); }
         };
         setTimeout(tick, 150 * 1000);          // once shortly after boot
+        setInterval(tick, 60 * 60 * 1000);     // then hourly
+    }());
+
+    // ── Inventory watchman ────────────────────────────────────────────────────
+    // Every threshold the module asks a school to set — a reorder level, a
+    // budget's alert percentage, a store's capacity limit, an expected return
+    // date, a batch expiry — was a number nothing ever read. A school could set
+    // a reorder level and find out at zero that it had never been told, because
+    // the only code that looked at stock ran when somebody opened a page.
+    //
+    // Each alert is written to InventoryAlert before it goes out, keyed on
+    // (kind, subject, severity) behind a unique index, and the record is
+    // cleared when the condition clears. So a tick, a restart or two workers
+    // report a condition once, and the same item running low next term is
+    // reported again. See services/inventoryAlerts.
+    (function scheduleInventorySweep() {
+        const alerts = require('./services/inventoryAlerts');
+        const tick = async () => {
+            try {
+                const schools = await alerts.schoolsToSweep();
+                if (!schools.length) return;
+                let sent = 0;
+                for (const id of schools) sent += (await alerts.runInventorySweep(id)).total;
+                if (sent) console.log(`[Inventory] watchman: ${sent} alert(s) across ${schools.length} school(s)`);
+            } catch (err) { console.error('[Inventory] watchman error:', err.message); }
+        };
+        setTimeout(tick, 180 * 1000);          // once shortly after boot
         setInterval(tick, 60 * 60 * 1000);     // then hourly
     }());
 

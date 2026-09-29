@@ -44,6 +44,16 @@ const PurchaseRequestSchema = new db.Schema({
         possibleDuplicate: { type: Boolean, default: false },
     },
     purchaseOrder: { type: db.Types.UUID, ref: 'PurchaseOrder', default: null },
+
+    // What approving this request put on hold. Approved stock is spoken for but
+    // still on the shelf, so it is held rather than moved; this records exactly
+    // what was held and where, so it can be given back when the request is
+    // issued, ordered instead, rejected or cancelled.
+    reservations: [new db.Schema({
+        item: { type: db.Types.UUID, ref: 'InventoryItem', required: true },
+        warehouse: { type: db.Types.UUID, ref: 'InventoryWarehouse', required: true },
+        quantity: { type: Number, default: 0 },
+    }, { _id: false })],
 }, { timestamps: true });
 
 PurchaseRequestSchema.index({ school: 1, createdAt: -1 });

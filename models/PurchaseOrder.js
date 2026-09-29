@@ -16,6 +16,7 @@ const PurchaseOrderSchema = new db.Schema({
     poNumber: { type: String, required: true },
     vendor: { type: db.Types.UUID, ref: 'InventoryVendor', required: true },
     department: { type: db.Types.UUID, ref: 'InventoryDepartment', default: null },
+    budget: { type: db.Types.UUID, ref: 'InventoryBudget', default: null },
     purchaseRequest: { type: db.Types.UUID, ref: 'PurchaseRequest', default: null },
     warehouse: { type: db.Types.UUID, ref: 'InventoryWarehouse', default: null }, // receiving store
 
@@ -30,12 +31,21 @@ const PurchaseOrderSchema = new db.Schema({
     expectedDelivery: { type: Date, default: null },
     signature: { type: String, default: '' },
 
-    // ordered → partially_received → received → cancelled
+    // The full life of an order, as the Purchase Orders screen tabs it:
+    //   pending_approval → approved → in_transit → partially_received/received
+    // `ordered` is what the pre-redesign code wrote for every new PO and is
+    // kept so old rows still read — it means "approved and placed", and the
+    // In Transit tab counts it alongside `in_transit`.
     status: {
         type: String,
-        enum: ['ordered', 'partially_received', 'received', 'cancelled'],
-        default: 'ordered',
+        enum: ['draft', 'pending_approval', 'approved', 'ordered', 'in_transit', 'partially_received', 'received', 'cancelled'],
+        default: 'pending_approval',
     },
+    approvedBy: { type: db.Types.UUID, ref: 'User', default: null },
+    approvedAt: { type: Date, default: null },
+    dispatchedAt: { type: Date, default: null },
+    cancelledAt: { type: Date, default: null },
+    cancelReason: { type: String, default: '' },
     // Invoice details (may be captured via OCR-assisted entry, spec §10).
     invoice: {
         number: { type: String, default: '' },
