@@ -24,8 +24,10 @@ const HostelIncident       = require('../models/HostelIncident');
 const HostelAsset          = require('../models/HostelAsset');
 const HostelMessMember     = require('../models/HostelMessMember');
 const HostelMenu           = require('../models/HostelMenu');
+const HostelMessAttendance = require('../models/HostelMessAttendance');
 const HostelMovement       = require('../models/HostelMovement');
 const HostelDocument       = require('../models/HostelDocument');
+const HostelTransferRequest = require('../models/HostelTransferRequest');
 const User                 = require('../models/User');
 const StudentProfile       = require('../models/StudentProfile');
 
@@ -35,7 +37,7 @@ const svc   = require('../services/hostelService');
 const alloc = require('../services/hostelAllocation');
 const admin = require('./hostel.controller');
 
-const { ok, bad, fail, dayRange, getSettings, nextNumber, logAudit,
+const { ok, bad, fail, dayRange, atTime, signedFileUrl, getSettings, nextNumber, logAudit,
         notifyHostelStaff, studentSnapshot, childIdsOfParent } = svc;
 
 const handle = (res, e) => (e instanceof alloc.RuleError || e.status === 400) ? bad(res, e.message) : fail(res, e);
@@ -44,11 +46,13 @@ const num = (v, d = 0) => (v === '' || v == null || Number.isNaN(Number(v)) ? d 
 /**
  * The student whose hostel data this request may touch.
  *   student — always themselves, whatever the query says
+ *   teacher — themselves too: staff can be residents (admin gives them a bed)
  *   parent  — the requested child, but only if they are on the ParentProfile
  * Returns null when the caller has no legitimate subject.
  */
 async function subjectStudent(req) {
-    if (req.userRole === 'student') return String(req.userId);
+    // A member of staff who lives in the hostel acts for themselves, like a student.
+    if (req.userRole === 'student' || req.userRole === 'teacher') return String(req.userId);
     if (req.userRole === 'parent') {
         const children = await childIdsOfParent(req.userId);
         if (!children.length) return null;
@@ -59,6 +63,21 @@ async function subjectStudent(req) {
     return null;
 }
 
+/**
+ * The attachments a request may carry: only files this same account uploaded
+ * through the resident endpoint, at most ten. A stored filename is guessable
+ * from the list screens, so a name the caller did not upload is dropped rather
+ * than letting one resident's request point at another resident's file.
+ */
+async function ownUploads(req, names) {
+    const want = [...new Set((Array.isArray(names) ? names : []).map(String).filter(Boolean))].slice(0, 10);
+    if (!want.length) return [];
+    const rows = await HostelDocument.find({ school: req.schoolId, uploadedBy: req.userId, storedName: { $in: want } })
+        .select('storedName').lean();
+    const mine = new Set(rows.map((r) => r.storedName));
+    return want.filter((n) => mine.has(n));
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  MY HOSTEL — the student's own profile (spec §9)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -67,7 +86,7 @@ exports.myHostel = async (req, res) => {
         const studentId = await subjectStudent(req);
         if (!studentId) return bad(res, 'No hostel record is linked to this account', 404);
 
-        const [snapshot, current, admissions, settings] = await Promise.all([
+        const [snapshot, current, admissions, settings, guardian] = await Promise.all([
             studentSnapshot(req.schoolId, studentId),
             HostelAllocation.findOne({ school: req.schoolId, student: studentId, status: { $in: ['pending', 'active'] } })
                 .populate('hostel', 'name code contactNumber email address facilities rules entryTime exitTime curfewTime warden assistantWarden')
@@ -76,17 +95,21 @@ exports.myHostel = async (req, res) => {
             HostelAdmission.find({ school: req.schoolId, student: studentId }).sort('-createdAt')
                 .populate('hostel', 'name').populate('academicYear', 'yearName').lean(),
             getSettings(req.schoolId),
+            // The first contact on the parent's profile, to pre-fill the request forms.
+            admin._guardianOf(req.schoolId, studentId),
         ]);
 
         if (!current) {
             return ok(res, {
-                student: snapshot, resident: false, current: null, admissions,
+                student: snapshot, resident: false, current: null, admissions, guardian,
                 rules: { entryTime: settings.entryTime, exitTime: settings.exitTime, curfewTime: settings.curfewTime },
-                canApply: settings.allowStudentSelfApplication || req.userRole === 'parent',
+                // Staff do not apply: the hostel office gives a teacher a bed directly.
+                canApply: req.userRole !== 'teacher' && (settings.allowStudentSelfApplication || req.userRole === 'parent'),
+                kind: req.userRole === 'teacher' ? 'teacher' : 'student',
             });
         }
 
-        const [warden, roommates, mess, assets, attendance] = await Promise.all([
+        const [warden, roommates, mess, assets, attendance, pendingLeaves, openOutpasses, openComplaints, dues, roomChange] = await Promise.all([
             current.hostel?.warden ? User.findById(current.hostel.warden).select('name email phone profileImage').lean() : null,
             HostelAllocation.find({ school: req.schoolId, room: current.room?._id || current.room, status: 'active', student: { $ne: studentId } })
                 .populate('student', 'name profileImage').populate('bed', 'bedNumber').lean(),
@@ -94,12 +117,32 @@ exports.myHostel = async (req, res) => {
                 .populate('mess', 'name code mealTimings').lean(),
             HostelAsset.find({ school: req.schoolId, issuedTo: studentId, status: 'issued' }).lean(),
             HostelAttendance.find({ school: req.schoolId, student: studentId }).sort('-date').limit(30).lean(),
+            // The page's headline figures: what is waiting on someone.
+            HostelLeave.countDocuments({ school: req.schoolId, student: studentId, status: { $in: ['pending', 'parent_approved'] } }),
+            HostelOutpass.countDocuments({ school: req.schoolId, student: studentId, status: { $in: ['pending', 'approved', 'active', 'overdue'] } }),
+            HostelComplaint.countDocuments({ school: req.schoolId, student: studentId, status: { $in: ['open', 'assigned', 'in_progress', 'reopened'] } }),
+            HostelFeeInvoice.find({ school: req.schoolId, student: studentId, status: { $in: ['pending', 'partial', 'overdue'] } })
+                .select('netAmount paidAmount dueDate').lean(),
+            // The resident's latest room-change request, so the page can say where it stands.
+            HostelTransferRequest.find({ school: req.schoolId, student: studentId }).sort('-createdAt').limit(1)
+                .select('requestNumber status reason preference decisionRemark createdAt decidedAt').lean(),
         ]);
 
         const attendanceSummary = attendance.reduce((m, a) => { m[a.status] = (m[a.status] || 0) + 1; return m; }, {});
+        const owed = dues.map((i) => Math.max(0, (i.netAmount || 0) - (i.paidAmount || 0))).filter((n) => n > 0);
+        const stats = {
+            // Over the last 30 roll calls; null when none was taken — "no data" is not 0%.
+            presentPct: attendance.length ? Math.round(((attendanceSummary.present || 0) + (attendanceSummary.late || 0)) * 100 / attendance.length) : null,
+            rollCalls: attendance.length,
+            pendingLeaves, openOutpasses, openComplaints,
+            outstanding: Math.round(owed.reduce((s, n) => s + n, 0) * 100) / 100,
+            dueInvoices: owed.length,
+            overdueInvoices: dues.filter((i) => i.dueDate && new Date(i.dueDate) < new Date() && (i.netAmount || 0) > (i.paidAmount || 0)).length,
+        };
         ok(res, {
-            student: snapshot, resident: true, current, warden, roommates, mess, assets,
-            attendance, attendanceSummary,
+            student: snapshot, resident: true, kind: current.residentType === 'teacher' ? 'teacher' : 'student',
+            current, warden, roommates, mess, assets,
+            attendance, attendanceSummary, guardian, stats, roomChange: roomChange[0] || null,
             admissions,
             rules: {
                 entryTime: current.hostel?.entryTime || settings.entryTime,
@@ -148,6 +191,7 @@ exports.applyForHostel = async (req, res) => {
         if (!studentId) return bad(res, 'No student is linked to this account', 404);
 
         const settings = await getSettings(req.schoolId);
+        if (req.userRole === 'teacher') return bad(res, 'Staff do not apply here — the hostel office allocates a bed to a teacher directly');
         if (req.userRole === 'student' && !settings.allowStudentSelfApplication) {
             return bad(res, 'Students cannot apply for hostel accommodation directly at this school');
         }
@@ -158,13 +202,14 @@ exports.applyForHostel = async (req, res) => {
         const b = req.body;
         if (!b.hostel || !b.academicYear) return bad(res, 'Hostel and academic year are required');
 
-        const [hostel, profile, open] = await Promise.all([
+        const [hostel, profile, open, guardian] = await Promise.all([
             Hostel.findOne({ _id: b.hostel, school: req.schoolId }).lean(),
             StudentProfile.findOne({ user: studentId, school: req.schoolId }).lean(),
             HostelAdmission.findOne({
                 school: req.schoolId, student: studentId, academicYear: b.academicYear,
                 status: { $in: ['draft', 'applied', 'pending_approval', 'approved'] },
             }).lean(),
+            admin._guardianOf(req.schoolId, studentId),
         ]);
         if (!hostel) return bad(res, 'Hostel not found');
         if (!hostel.isActive || hostel.status !== 'active') return bad(res, 'This hostel is not accepting applications');
@@ -194,12 +239,13 @@ exports.applyForHostel = async (req, res) => {
             student: studentId,
             applicationNumber: await nextNumber(HostelAdmission, req.schoolId, 'HA'),
             status: settings.admissionRequiresApproval ? 'pending_approval' : 'approved',
-            guardianName:  b.guardianName  || profile?.guardianName  || profile?.fatherName  || '',
-            guardianPhone: b.guardianPhone || profile?.guardianPhone || profile?.fatherPhone || '',
-            guardianRelation: b.guardianRelation || profile?.guardianRelation || '',
-            emergencyContactName:     b.emergencyContactName     || profile?.emergencyContactName     || '',
-            emergencyContactPhone:    b.emergencyContactPhone    || profile?.emergencyContactPhone    || '',
-            emergencyContactRelation: b.emergencyContactRelation || profile?.emergencyContactRelation || '',
+            // The student profile has no parent fields: the parent's profile is the record.
+            guardianName:  b.guardianName  || guardian?.name     || '',
+            guardianPhone: b.guardianPhone || guardian?.phone    || '',
+            guardianRelation: b.guardianRelation || guardian?.relation || '',
+            emergencyContactName:     b.emergencyContactName     || '',
+            emergencyContactPhone:    b.emergencyContactPhone    || '',
+            emergencyContactRelation: b.emergencyContactRelation || '',
             appliedBy: req.userId, appliedAt: new Date(), createdBy: req.userId,
         });
 
@@ -283,12 +329,15 @@ exports.applyLeave = async (req, res) => {
             fromDate: b.fromDate, toDate: b.toDate, reason: b.reason,
             destination: b.destination || '',
             guardianName: b.guardianName || '', guardianPhone: b.guardianPhone || '',
+            guardianRelation: b.guardianRelation || '',
             emergencyContact: b.emergencyContact || '',
-            school: req.schoolId, hostel: allocation.hostel, allocation: allocation._id,
+            attachments: await ownUploads(req, b.attachments),
+            school: req.schoolId, student: studentId, hostel: allocation.hostel, allocation: allocation._id,
             academicYear: allocation.academicYear,
             leaveNumber: await nextNumber(HostelLeave, req.schoolId, 'HLV'),
             totalDays: days,
-            parentApprovalRequired: settings.leaveRequiresParentApproval,
+            // Parent consent is a rule about students; a teacher's leave goes straight to the warden.
+            parentApprovalRequired: req.userRole !== 'teacher' && settings.leaveRequiresParentApproval,
             // A parent filing the request is itself the parent consent.
             status: (req.userRole === 'parent' && settings.leaveRequiresParentApproval) ? 'parent_approved' : 'pending',
             parentApprovedBy: req.userRole === 'parent' ? req.userId : null,
@@ -369,9 +418,13 @@ exports.applyOutpass = async (req, res) => {
             schoolId: req.schoolId, studentId,
             departureDate: b.departureDate,
             expectedDepartureTime: b.expectedDepartureTime,
-            expectedReturnTime: b.expectedReturnTime, settings,
+            expectedReturnTime: b.expectedReturnTime,
+            // An overnight or weekend pass comes back on a later day.
+            expectedReturnDate: b.expectedReturnDate && b.expectedReturnDate !== b.departureDate ? b.expectedReturnDate : undefined,
+            settings,
         });
 
+        const needsParent = !!settings.outpassRequiresParentApproval && req.userRole !== 'teacher';
         const row = await HostelOutpass.create({
             outpassType: b.outpassType || 'day',
             purpose: b.purpose, destination: b.destination || '',
@@ -380,8 +433,16 @@ exports.applyOutpass = async (req, res) => {
             expectedReturnTime: b.expectedReturnTime || '',
             expectedReturnAt,
             guardianName: b.guardianName || '', guardianPhone: b.guardianPhone || '',
+            guardianRelation: b.guardianRelation || '',
             emergencyContact: b.emergencyContact || '',
-            school: req.schoolId, hostel: allocation.hostel, allocation: allocation._id,
+            attachments: await ownUploads(req, b.attachments),
+            // A student's pass waits for a parent where the school asks for it;
+            // a parent filing it has consented by doing so. Staff have no parent.
+            parentApprovalRequired: needsParent,
+            parentApprovedBy: needsParent && req.userRole === 'parent' ? req.userId : null,
+            parentApprovedAt: needsParent && req.userRole === 'parent' ? new Date() : null,
+            school: req.schoolId, student: studentId, hostel: allocation.hostel, allocation: allocation._id,
+            academicYear: allocation.academicYear,
             outpassNumber: await nextNumber(HostelOutpass, req.schoolId, 'OP', true),
             requestedBy: req.userId, createdBy: req.userId,
         });
@@ -391,9 +452,74 @@ exports.applyOutpass = async (req, res) => {
             description: `Outpass ${row.outpassNumber} requested by ${req.userRole} for ${student?.name}` });
         await notifyHostelStaff(req, { hostelId: allocation.hostel,
             title: 'Outpass request',
-            body: `${student?.name} requested an outpass for ${new Date(b.departureDate).toDateString()}. Purpose: ${b.purpose}` });
+            body: `${student?.name} requested an outpass for ${new Date(b.departureDate).toDateString()}. Purpose: ${b.purpose}`
+                + (needsParent && req.userRole !== 'parent' ? ' (waiting for parent consent)' : '') });
+        // The parents are asked — that is what the consent setting is for.
+        if (needsParent && req.userRole !== 'parent') {
+            svc.notifyStudentAndParents(req, { studentId, settings,
+                title: 'Outpass needs your consent',
+                body: `${student?.name} has asked for an outpass on ${new Date(b.departureDate).toDateString()} (${b.purpose}). Open Hostel → Outpass to consent or decline.` });
+        }
         ok(res, row);
     } catch (e) { handle(res, e); }
+};
+
+/**
+ * A resident asks to change room. They say why (and what they would like);
+ * where they go is the office's to decide. One request at a time.
+ */
+exports.requestRoomChange = async (req, res) => {
+    try {
+        const studentId = await subjectStudent(req);
+        if (!studentId) return bad(res, 'No student is linked to this account', 404);
+        const reason = String(req.body.reason || '').trim();
+        if (!reason) return bad(res, 'Say why you would like to change room');
+        const allocation = await HostelAllocation.findOne({ school: req.schoolId, student: studentId, status: 'active' }).lean();
+        if (!allocation) return bad(res, 'You are not currently a hostel resident');
+        if (await HostelTransferRequest.exists({ school: req.schoolId, student: studentId, status: 'pending' })) {
+            return bad(res, 'A room change request is already waiting for a decision');
+        }
+        const row = await HostelTransferRequest.create({
+            school: req.schoolId, student: studentId, allocation: allocation._id, hostel: allocation.hostel, fromBed: allocation.bed,
+            reason: reason.slice(0, 500), preference: String(req.body.preference || '').slice(0, 200),
+            requestNumber: await nextNumber(HostelTransferRequest, req.schoolId, 'HTR', false, { fresh: true }),
+            requestedBy: req.userId, requestedByRole: req.userRole,
+        });
+        const student = await User.findById(studentId).select('name').lean();
+        await logAudit(req, { action: 'create', entityType: 'HostelTransferRequest', entityId: row._id, hostel: allocation.hostel,
+            description: `Room change ${row.requestNumber} requested by ${req.userRole} for ${student?.name}` });
+        await notifyHostelStaff(req, { hostelId: allocation.hostel, title: 'Room change requested',
+            body: `${student?.name} asked to change room. ${reason.slice(0, 160)}` });
+        ok(res, row);
+    } catch (e) { fail(res, e); }
+};
+
+/** A parent gives or withholds consent for a child's pending outpass. */
+exports.actOnMyOutpass = async (req, res) => {
+    try {
+        if (req.userRole !== 'parent') return bad(res, 'Only a parent can give consent', 403);
+        const studentId = await subjectStudent(req);
+        const { action, remark = '' } = req.body;
+        const o = await HostelOutpass.findOne({ _id: req.params.id, school: req.schoolId, student: studentId }).lean();
+        if (!o) return bad(res, 'Outpass not found', 404);
+        if (o.status !== 'pending') return bad(res, `This outpass is already ${o.status}`);
+
+        const set = {};
+        if (action === 'parent_approve') {
+            if (o.parentApprovedAt) return bad(res, 'Consent is already recorded');
+            set.parentApprovedBy = req.userId; set.parentApprovedAt = new Date();
+        } else if (action === 'parent_reject') {
+            set.status = 'rejected'; set.rejectedBy = req.userId; set.rejectionReason = remark || 'Declined by a parent';
+        } else return bad(res, 'Unsupported action');
+
+        const updated = await HostelOutpass.findByIdAndUpdate(o._id, { $set: set }, { new: true });
+        await logAudit(req, { action, entityType: 'HostelOutpass', entityId: o._id, hostel: o.hostel,
+            description: `Outpass ${o.outpassNumber} — ${action === 'parent_approve' ? 'parent consent given' : 'declined by a parent'}` });
+        await notifyHostelStaff(req, { hostelId: o.hostel,
+            title: action === 'parent_approve' ? 'Outpass: parent consent given' : 'Outpass declined by a parent',
+            body: `Outpass ${o.outpassNumber} ${action === 'parent_approve' ? 'now waits for the warden\'s approval.' : `was declined.${remark ? ` ${remark}` : ''}`}` });
+        ok(res, updated);
+    } catch (e) { fail(res, e); }
 };
 
 exports.cancelMyOutpass = async (req, res) => {
@@ -473,11 +599,8 @@ exports.requestVisitor = async (req, res) => {
         if (!allocation) return bad(res, 'You are not currently a hostel resident');
 
         const settings = await getSettings(req.schoolId);
-        const blocked = await HostelVisitor.findOne({
-            school: req.schoolId, student: studentId, isTemplate: true, listType: 'restricted',
-            visitorName: new RegExp(String(b.visitorName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'),
-        }).lean();
-        if (blocked) return bad(res, `${b.visitorName} is on the restricted visitor list`);
+        const listed = await admin._listedVisitor(req.schoolId, studentId, b);
+        if (listed?.listType === 'restricted') return bad(res, `${b.visitorName} is on the restricted visitor list`);
 
         if (b.scheduledAt && settings.visitorFrom && settings.visitorTo) {
             const t = new Date(b.scheduledAt);
@@ -494,7 +617,10 @@ exports.requestVisitor = async (req, res) => {
             scheduledAt: b.scheduledAt || null,
             school: req.schoolId, hostel: allocation.hostel, student: studentId,
             passNumber: await nextNumber(HostelVisitor, req.schoolId, 'VP', true),
-            status: 'pending', createdBy: req.userId,
+            // Someone on the approved list needs no fresh approval — as at the office.
+            status: listed?.listType === 'authorized' ? 'approved' : 'pending',
+            qrToken: listed?.listType === 'authorized' ? require('crypto').randomBytes(24).toString('hex') : '',
+            createdBy: req.userId,
         });
         await logAudit(req, { action: 'create', entityType: 'HostelVisitor', entityId: row._id, hostel: allocation.hostel,
             description: `Visitor ${row.visitorName} pre-registered by ${req.userRole}` });
@@ -518,7 +644,8 @@ exports.myAttendance = async (req, res) => {
         const rows = await HostelAttendance.find(q).sort('-date').limit(200).lean();
         const summary = rows.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
         summary.total = rows.length;
-        summary.presentPercent = rows.length ? Math.round(((summary.present || 0) / rows.length) * 100) : 0;
+        // Late is still there. (The page's headline figure counts the same way.)
+        summary.presentPercent = rows.length ? Math.round((((summary.present || 0) + (summary.late || 0)) / rows.length) * 100) : 0;
         ok(res, { rows, summary });
     } catch (e) { fail(res, e); }
 };
@@ -550,7 +677,7 @@ exports.myComplaints = async (req, res) => {
         // Internal staff notes are not the resident's business.
         rows.forEach((r) => {
             r.comments = (r.comments || []).filter((c) => !c.internal);
-            r.attachmentUrls = (r.attachments || []).map((f) => `/uploads/hostel-docs/${f}`);
+            r.attachmentUrls = (r.attachments || []).map((f) => signedFileUrl(f));
         });
         ok(res, rows);
     } catch (e) { fail(res, e); }
@@ -569,7 +696,7 @@ exports.raiseComplaint = async (req, res) => {
         const settings = await getSettings(req.schoolId);
         const row = await HostelComplaint.create({
             category: b.category || 'other', priority: b.priority || 'medium',
-            subject: b.subject || '', description: b.description, attachments: b.attachments || [],
+            subject: b.subject || '', description: b.description, attachments: await ownUploads(req, b.attachments),
             school: req.schoolId, hostel: allocation.hostel, room: allocation.room, student: studentId,
             ticketNumber: await nextNumber(HostelComplaint, req.schoolId, 'HC'),
             dueAt: new Date(Date.now() + (settings.complaintSlaHours || 48) * 36e5),
@@ -627,7 +754,7 @@ exports.uploadAttachment = async (req, res) => {
         ok(res, {
             storedName: req.file.filename,
             originalName: req.file.originalname,
-            url: `/uploads/hostel-docs/${req.file.filename}`,
+            url: signedFileUrl(req.file.filename),
         });
     } catch (e) { fail(res, e); }
 };
@@ -664,7 +791,14 @@ exports.actOnMyComplaint = async (req, res) => {
             await notifyHostelStaff(req, { hostelId: c.hostel,
                 title: 'Hostel complaint reopened', body: `${c.ticketNumber} has been reopened.` });
         }
-        ok(res, updated);
+        if (action === 'comment') {
+            await notifyHostelStaff(req, { hostelId: c.hostel,
+                title: 'Reply on a hostel complaint', body: `${c.ticketNumber}: ${String(comment).slice(0, 180)}` });
+        }
+        // The reply goes back to the resident: staff-only notes stay with staff.
+        // (The list endpoint already filtered them; this one sent the raw row.)
+        const out = updated?.toObject?.() ?? updated;
+        ok(res, { ...out, comments: (out.comments || []).filter((x) => !x.internal) });
     } catch (e) { fail(res, e); }
 };
 
@@ -678,12 +812,62 @@ exports.myMess = async (req, res) => {
 
         const from = req.query.from ? dayRange(req.query.from).start : dayRange().start;
         const to = req.query.to ? dayRange(req.query.to).end : new Date(from.getTime() + 7 * 864e5);
-        const menu = await HostelMenu.find({
-            school: req.schoolId, mess: member.mess?._id || member.mess,
-            isTemplate: false, status: 'published', date: { $gte: from, $lt: to },
-        }).sort('date').lean();
-        ok(res, { member, menu });
+        const [menu, skips, settings] = await Promise.all([
+            HostelMenu.find({
+                school: req.schoolId, mess: member.mess?._id || member.mess,
+                isTemplate: false, status: 'published', date: { $gte: from, $lt: to },
+            }).sort('date').lean(),
+            // Meals the resident has said, in advance, they will not take.
+            HostelMessAttendance.find({ school: req.schoolId, student: studentId, selfMarked: true, date: { $gte: from, $lt: to } })
+                .select('date meal').lean(),
+            getSettings(req.schoolId),
+        ]);
+        ok(res, { member, menu, skips, noticeHours: settings.messLeaveNoticeHours || 0 });
     } catch (e) { fail(res, e); }
+};
+
+/**
+ * "I will not be at this meal" — mess leave, said far enough ahead for the
+ * kitchen to cook less. How far is the school's notice period (Hostel
+ * Settings); inside it the meal is already being prepared and cannot be
+ * skipped, or un-skipped.
+ */
+exports.skipMeal = async (req, res) => {
+    try {
+        const studentId = await subjectStudent(req);
+        if (!studentId) return bad(res, 'No student is linked to this account', 404);
+        const { date, meal, undo = false } = req.body;
+        if (!date || !meal) return bad(res, 'A date and a meal are required');
+        const member = await HostelMessMember.findOne({ school: req.schoolId, student: studentId, status: 'active' })
+            .populate('mess', 'name mealTimings').lean();
+        if (!member) return bad(res, 'You are not enrolled in a mess');
+        const timing = member.mess?.mealTimings?.[meal];
+        if (!timing || timing.enabled === false) return bad(res, `The mess does not serve ${meal}`);
+
+        const settings = await getSettings(req.schoolId);
+        const notice = Number(settings.messLeaveNoticeHours) || 0;
+        const startsAt = atTime(date, timing.start) || dayRange(date).start;
+        if (startsAt - Date.now() < notice * 36e5) {
+            return bad(res, notice ? `A meal can be skipped (or taken back) up to ${notice} hour${notice === 1 ? '' : 's'} before it starts` : 'This meal has already started');
+        }
+        const { start, end } = dayRange(date);
+        const existing = await HostelMessAttendance.findOne({ school: req.schoolId, student: studentId, meal, date: { $gte: start, $lt: end } }).lean();
+        if (undo === true || undo === 'true') {
+            if (existing?.selfMarked) await HostelMessAttendance.deleteOne({ _id: existing._id });
+            return ok(res, { skipped: false });
+        }
+        if (existing && !existing.selfMarked) return bad(res, 'The mess has already recorded this meal');
+        if (!existing) {
+            await HostelMessAttendance.create({
+                school: req.schoolId, mess: member.mess._id, student: studentId, hostel: member.hostel || null,
+                date: start, meal, status: 'skipped', remarks: 'Skipped in advance by the resident', markedBy: req.userId, selfMarked: true,
+            });
+        }
+        ok(res, { skipped: true });
+    } catch (e) {
+        if (e.code === 11000 || e.code === '23505') return ok(res, { skipped: true });
+        fail(res, e);
+    }
 };
 
 /** The student's own discipline, incident and movement record (spec §9). */
@@ -697,7 +881,7 @@ exports.myRecord = async (req, res) => {
             HostelMovement.find({ school: req.schoolId, student: studentId }).sort('-at').limit(50).lean(),
             HostelDocument.find({ school: req.schoolId, student: studentId, isActive: true }).sort('-createdAt').lean(),
         ]);
-        documents.forEach((d) => { d.url = `/uploads/hostel-docs/${d.storedName}`; });
+        documents.forEach((d) => { d.url = signedFileUrl(d.storedName); });
         ok(res, { discipline, incidents, movements, documents });
     } catch (e) { fail(res, e); }
 };

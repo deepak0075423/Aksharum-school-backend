@@ -17,11 +17,13 @@ const HostelSettings        = require('../models/HostelSettings');
 const HostelAuditLog        = require('../models/HostelAuditLog');
 const HostelStaffAssignment = require('../models/HostelStaffAssignment');
 const HostelAllocation      = require('../models/HostelAllocation');
+const HostelCounter         = require('../models/HostelCounter');
 const FeeLedger             = require('../models/FeeLedger');
 const StudentProfile        = require('../models/StudentProfile');
 const ParentProfile         = require('../models/ParentProfile');
 const User                  = require('../models/User');
 const { notify, withParents, schoolAdminIds } = require('./notifyService');
+const pool = require('../db/pool');
 
 // ── response helpers, shared by both hostel controllers ──────────────────────
 const ok   = (res, data)            => res.json({ success: true, data });
@@ -64,12 +66,48 @@ async function getSettings(schoolId) {
 // ── document numbering ───────────────────────────────────────────────────────
 // PREFIX-YYMM-#### (or -YYMMDD when the series is daily), matching the scheme
 // the transport and inventory modules already use.
-async function nextNumber(Model, schoolId, prefix, withDay = false) {
+//
+// The running part comes from a per-school counter (models/HostelCounter), bumped
+// in one UPDATE. It used to be `count of rows + 1`, which hands the same number
+// out twice once a row is deleted or two requests land together. A series seen
+// for the first time starts from the count, so numbering carries on from where
+// the old scheme left it.
+async function bumpCounter(schoolId, key) {
+    try {
+        const { rows } = await pool.query(
+            `UPDATE "${HostelCounter.tableName}" SET "value" = "value" + 1, "updatedAt" = now()
+              WHERE "school" = $1 AND "key" = $2 RETURNING "value"`, [String(schoolId), key]);
+        return rows.length ? Number(rows[0].value) : null;
+    } catch { return null; }                                   // table not created yet: seed it below
+}
+async function nextNumber(Model, schoolId, prefix, withDay = false, { fresh = false } = {}) {
     const d  = new Date();
     const ym = `${String(d.getFullYear()).slice(2)}${String(d.getMonth() + 1).padStart(2, '0')}`
              + (withDay ? String(d.getDate()).padStart(2, '0') : '');
-    const count = await Model.countDocuments({ school: schoolId });
-    return `${prefix}-${ym}-${String(count + 1).padStart(4, '0')}`;
+    let n = await bumpCounter(schoolId, prefix);
+    if (n == null) {
+        // `fresh`: a series that never existed before starts at 1, not at the row count.
+        const seed = fresh ? 1 : (await Model.countDocuments({ school: schoolId })) + 1;
+        try { await HostelCounter.create({ school: schoolId, key: prefix, value: seed }); n = seed; }
+        catch { n = await bumpCounter(schoolId, prefix); }     // somebody else seeded it first
+        if (n == null) throw new Error('Could not allocate a document number');
+    }
+    return `${prefix}-${ym}-${String(n).padStart(4, '0')}`;
+}
+
+/**
+ * The next receipt number, HR-000001 upwards, from a counter on the settings
+ * row bumped in a single UPDATE. The old receipts were numbered from a COUNT
+ * of invoices, so two payments taken between two invoices shared a number;
+ * the counter cannot repeat however the payments interleave.
+ */
+async function nextReceiptNumber(schoolId) {
+    await getSettings(schoolId);                               // the row must exist to be bumped
+    const { rows } = await pool.query(
+        `UPDATE "${HostelSettings.tableName}" SET "lastReceiptNumber" = COALESCE("lastReceiptNumber", 0) + 1
+          WHERE "school" = $1 RETURNING "lastReceiptNumber"`, [String(schoolId)]);
+    if (!rows.length) throw new Error('Could not allocate a receipt number');
+    return `HR-${String(rows[0].lastReceiptNumber).padStart(6, '0')}`;
 }
 
 // ── audit ────────────────────────────────────────────────────────────────────
@@ -133,7 +171,7 @@ async function notifyStudentAndParents(req, { studentId, title, body, settings, 
 }
 
 /** Notify the staff who run a hostel: its warden, assistant and school admins. */
-async function notifyHostelStaff(req, { hostelId, title, body, email = false, link = null }) {
+async function notifyHostelStaff(req, { hostelId, title, body, email = false, link = null, includeSender = false }) {
     try {
         const [h, assigns, admins] = await Promise.all([
             hostelId ? Hostel.findById(hostelId).select('warden assistantWarden').lean() : null,
@@ -151,10 +189,22 @@ async function notifyHostelStaff(req, { hostelId, title, body, email = false, li
         if (!ids.length) return;
         notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-            title, body, recipients: [...new Set(ids)], email,
+            title, body, recipients: [...new Set(ids)], email, includeSender,
             link: link || { type: 'hostel' },
         });
     } catch { /* fire-and-forget */ }
+}
+
+/**
+ * A stand-in request for work nobody asked for — the half-hourly sweep. The
+ * notification service needs a sender, so a school admin lends their id (and
+ * is told too: `includeSender`); the role says it was the system.
+ * Null when the school has no admin to send as.
+ */
+async function systemRequest(schoolId) {
+    const admins = await schoolAdminIds(schoolId);
+    if (!admins.length) return null;
+    return { schoolId, userId: String(admins[0]), userRole: 'system', user: { name: 'System' }, headers: {}, ip: '', system: true };
 }
 
 // ── Fees module integration ──────────────────────────────────────────────────
@@ -172,6 +222,10 @@ async function postToLedger({ schoolId, studentId, academicYearId, entryType, ca
         const s = settings || await getSettings(schoolId);
         if (!s.postToFeeLedger) return null;
         if (!academicYearId || !amount) return null;
+        // The ledger is a STUDENT's fee position. A member of staff living in
+        // the hostel has no row in it, and a charge of theirs must not start one.
+        const account = await User.findOne({ _id: studentId, school: schoolId }).select('role').lean();
+        if (account?.role !== 'student') return null;
 
         const last = await FeeLedger.find({ school: schoolId, student: studentId, academicYear: academicYearId })
             .sort('-createdAt').limit(1).lean();
@@ -215,7 +269,13 @@ async function studentSnapshot(schoolId, studentId) {
             .lean(),
     ]);
     if (!user) return null;
-    return { ...user, profile: profile || null };
+    // A member of staff has no student profile; what identifies them is their
+    // employee record.
+    const staff = user.role === 'teacher'
+        ? await require('../models/TeacherProfile').findOne({ user: studentId })
+            .select('employeeId designation department gender').lean()
+        : null;
+    return { ...user, profile: profile || null, staff: staff || null };
 }
 
 /** Normalised gender token for the allocation gender check. */
@@ -269,6 +329,45 @@ async function scopedFilter(req, base = {}, hostelParam = undefined) {
     return q;
 }
 
+// ── hostel files ─────────────────────────────────────────────────────────────
+/**
+ * A link to a hostel file that works for a few hours and for that file only.
+ *
+ * Hostel papers — ID proofs, medical notes, a child's complaint photo — used
+ * to be served from /uploads to anyone who had the address, logged in or not.
+ * That folder is now closed (server.js). A file is read either with a login
+ * (GET /hostel/files/:name, which checks whose it is) or through one of these
+ * links, which the API hands only to someone it has already checked.
+ */
+const FILE_LINK_HOURS = 6;
+const fileSig = (name, exp) => require('crypto').createHmac('sha256', String(process.env.JWT_SECRET || 'hostel-files'))
+    .update(`${name}|${exp}`).digest('hex').slice(0, 40);
+function signedFileUrl(storedName) {
+    if (!storedName) return '';
+    const name = require('path').basename(String(storedName));
+    const exp = Date.now() + FILE_LINK_HOURS * 36e5;
+    return `/api/hostel/file/${encodeURIComponent(name)}?exp=${exp}&sig=${fileSig(name, exp)}`;
+}
+/**
+ * The hosted checkout page for one order, for a payer with no browser session
+ * of their own — the phone app opens it in the system browser, which cannot
+ * carry a login. Signed like a file link, and good for half an hour. The path
+ * is relative to the API root.
+ */
+function signedPayPath(orderId) {
+    const exp = Date.now() + 30 * 60000;
+    return `/hostel/pay/${encodeURIComponent(orderId)}?exp=${exp}&sig=${fileSig(`pay:${orderId}`, exp)}`;
+}
+const checkPaySig = (orderId, exp, sig) => checkFileSig(`pay:${orderId}`, exp, sig);
+
+/** Is this the signature we gave out for this file, and is it still in date? */
+function checkFileSig(name, exp, sig) {
+    const until = Number(exp);
+    if (!name || !Number.isFinite(until) || until < Date.now()) return false;
+    const want = Buffer.from(fileSig(name, until)); const got = Buffer.from(String(sig || ''));
+    return want.length === got.length && require('crypto').timingSafeEqual(want, got);
+}
+
 /** The student ids a parent is allowed to see, from the existing ParentProfile. */
 async function childIdsOfParent(userId) {
     const p = await ParentProfile.findOne({ user: userId }).select('children').lean();
@@ -278,8 +377,8 @@ async function childIdsOfParent(userId) {
 module.exports = {
     ok, bad, fail, toId, MONTHS,
     dayRange, dayStart, monthStart, atTime, minutesBetween,
-    getSettings, nextNumber, logAudit, diffFields,
+    getSettings, nextNumber, logAudit, systemRequest, diffFields,
     notifyStudentAndParents, notifyHostelStaff,
-    postToLedger, studentSnapshot, genderOf,
-    visibleHostelIds, scopedFilter, childIdsOfParent,
+    postToLedger, nextReceiptNumber, studentSnapshot, genderOf,
+    visibleHostelIds, scopedFilter, childIdsOfParent, signedFileUrl, checkFileSig, signedPayPath, checkPaySig,
 };

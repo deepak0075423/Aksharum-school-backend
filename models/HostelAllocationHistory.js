@@ -11,7 +11,7 @@ const HostelAllocationHistorySchema = new db.Schema({
 
     action: {
         type: String,
-        enum: ['allocated', 'released', 'transferred', 'reserved', 'cancelled', 'maintenance', 'vacated'],
+        enum: ['allocated', 'released', 'transferred', 'reserved', 'cancelled', 'maintenance', 'vacated', 'rolled_over'],
         required: true,
     },
 

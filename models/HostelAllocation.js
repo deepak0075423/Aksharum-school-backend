@@ -7,7 +7,11 @@ const db = require('../db/orm');
 // alone; HostelAllocationHistory records *who did what* on top of that.
 const HostelAllocationSchema = new db.Schema({
     school: { type: db.Types.UUID, ref: 'School', required: true, index: true },
+    // The resident. The column keeps its name — every query and index already
+    // reads it — and `residentType` says which kind of account it points at
+    // (NULL on rows from before staff could be residents = 'student').
     student: { type: db.Types.UUID, ref: 'User', required: true, index: true },
+    residentType: { type: String, enum: ['student', 'teacher'], default: 'student' },
     academicYear: { type: db.Types.UUID, ref: 'AcademicYear', required: true, index: true },
     admission: { type: db.Types.UUID, ref: 'HostelAdmission', default: null },
 
@@ -34,6 +38,9 @@ const HostelAllocationSchema = new db.Schema({
     presence: { type: String, enum: ['in', 'out', 'on_leave'], default: 'in' },
 
     remarks: { type: String, default: '' },
+    // When the hostel was told this resident's school account is no longer
+    // active — so it is told once, not every half hour.
+    inactiveFlaggedAt: { type: Date, default: null },
     approvedBy: { type: db.Types.UUID, ref: 'User', default: null },
     approvedAt: { type: Date, default: null },
     allocatedBy: { type: db.Types.UUID, ref: 'User', default: null },

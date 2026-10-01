@@ -26,6 +26,13 @@ const HostelRoomSchema = new db.Schema({
     occupiedBeds: { type: Number, default: 0 },
     bedCount: { type: Number, default: 0 },
 
+    // How the room is furnished: the beds it lays out take their type from here
+    // (a bunk room alternates lower and upper), and the arrangement is for the plan.
+    bedType: { type: String, enum: ['single', 'bunk', 'other'], default: 'single' },
+    // Who the room's beds are for when they are laid out. Each bed carries its
+    // own copy and can be changed afterwards; NULL reads as 'student'.
+    occupantType: { type: String, enum: ['student', 'teacher', 'both'], default: 'student' },
+    bedArrangement: { type: String, enum: ['single_row', 'double_row', 'l_shape', 'around_walls', 'custom'], default: 'single_row' },
     status: {
         type: String,
         enum: ['available', 'partially_occupied', 'full', 'reserved', 'maintenance', 'inactive'],

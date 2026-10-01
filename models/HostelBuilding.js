@@ -10,6 +10,9 @@ const HostelBuildingSchema = new db.Schema({
     code: { type: String, required: true, trim: true },       // auto BLD-####
     floorCount: { type: Number, default: 0 },
     capacity: { type: Number, default: 0 },
+    // What the building is planned to hold; the live figures come from its rooms.
+    expectedRooms: { type: Number, default: 0 },
+    facilities: { type: [String], default: [] },
     description: { type: String, default: '' },
 
     status: { type: String, enum: ['active', 'inactive', 'maintenance'], default: 'active' },

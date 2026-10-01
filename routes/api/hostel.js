@@ -4,8 +4,9 @@
 //
 //  Three guards, matching the existing module convention:
 //    adminGuard    school_admin, or a teacher whose designation grants
-//                  administrative access to 'hostel'. Wardens fall in here;
-//                  the controller narrows what they see to their own hostels.
+//                  administrative access to 'hostel' — and, for the day-to-day
+//                  routes only, a teacher posted to a hostel as its warden or
+//                  staff; the controller narrows them to their own hostels.
 //    studentGuard  role student + the module enabled for the school
 //    parentGuard   role parent  + the module enabled for the school
 //
@@ -16,19 +17,31 @@ const express = require('express');
 const router  = express.Router();
 const h = require('../../controllers/hostel.controller');
 const p = require('../../controllers/hostelPortal.controller');
+const ha = require('../../controllers/hostelAdmin.controller');
+const hb = require('../../controllers/hostelBoards.controller');
+const hp = require('../../controllers/hostelPayment.controller');
+const hf = require('../../controllers/hostelFiles.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const requireModule = require('../../middleware/requireModule');
-const { allowModuleAdmin } = require('../../middleware/moduleAccess');
+const { hostelDesk } = require('../../middleware/hostelDesk');
 const { uploadHostelDoc } = require('../../middleware/upload');
 
-const adminGuard   = [verifyToken, requirePasswordReset, allowModuleAdmin('hostel')];
+// The module's admins, in full — and a teacher posted to a hostel, for the
+// day-to-day routes of that hostel (middleware/hostelDesk has the list).
+const adminGuard   = [verifyToken, requirePasswordReset, hostelDesk];
 const studentGuard = [verifyToken, requirePasswordReset, requireRole('student'), requireModule('hostel')];
 const parentGuard  = [verifyToken, requirePasswordReset, requireRole('parent'),  requireModule('hostel')];
+// A member of staff who LIVES in the hostel — nothing to do with running it.
+const teacherGuard = [verifyToken, requirePasswordReset, requireRole('teacher'), requireModule('hostel')];
+// Whoever a hostel bill can be paid by: the resident, or a parent for a child.
+const payerGuard   = [verifyToken, requirePasswordReset, requireRole('student', 'teacher', 'parent'), requireModule('hostel')];
 
 // ══ ADMIN / WARDEN ═══════════════════════════════════════════════════════════
 
 // Dashboard, meta, settings, audit (§3, §28, §29)
-router.get('/admin/dashboard', adminGuard, h.getDashboard);
+router.get('/admin/dashboard', adminGuard, h.getDashboard);      // the Nexora-Hives app
+router.get('/admin/overview',  adminGuard, ha.overview);          // the web Dashboard
+router.get('/admin/board/:screen', adminGuard, hb.board);         // every other web list screen
 router.get('/admin/meta',      adminGuard, h.getMeta);
 router.get('/admin/students',  adminGuard, h.searchStudents);
 router.get('/admin/settings',  adminGuard, h.getSettings);
@@ -80,6 +93,12 @@ router.post('/admin/allocations/auto',         adminGuard, h.autoAllocate);
 router.post('/admin/allocations/bulk',         adminGuard, h.bulkAllocate);
 router.post('/admin/allocations/:id/transfer', adminGuard, h.transferAllocation);
 router.post('/admin/allocations/:id/release',  adminGuard, h.releaseAllocation);
+router.post('/admin/allocations/:id/confirm',  adminGuard, h.confirmAllocation);
+router.get('/admin/allocations/:id/checkout',     adminGuard, h.getCheckout);
+router.post('/admin/allocations/rollover',         adminGuard, h.rolloverAllocations);
+// Room changes waiting for a decision. Listed for a posted warden too; decided by the module's admins only.
+router.get('/admin/transfer-requests',             adminGuard, h.getTransferRequests);
+router.post('/admin/transfer-requests/:id/decide', adminGuard, h.decideTransferRequest);
 router.get('/admin/allocations/:id/history',   adminGuard, h.getAllocationHistory);
 router.get('/admin/allocation-history',        adminGuard, h.getAllocationHistory);
 router.get('/admin/students/:studentId/profile', adminGuard, h.getStudentHostelProfile);
@@ -109,6 +128,7 @@ router.post('/admin/outpasses/:id/act', adminGuard, h.actOnOutpass);
 router.get('/admin/visitors',          adminGuard, h.getVisitors);
 router.post('/admin/visitors',         adminGuard, h.createVisitor);
 router.post('/admin/visitors/:id/act', adminGuard, h.actOnVisitor);
+router.get('/admin/visitors/:id/pass', adminGuard, h.visitorPass);
 router.delete('/admin/visitors/:id',   adminGuard, h.deleteVisitor);
 
 // Warden & hostel staff (§14)
@@ -149,6 +169,9 @@ router.post('/admin/invoices/:id/pay',      adminGuard, h.payInvoice);
 router.post('/admin/invoices/:id/discount', adminGuard, h.discountInvoice);
 router.post('/admin/invoices/:id/refund',   adminGuard, h.refundInvoice);
 router.post('/admin/invoices/:id/cancel',   adminGuard, h.cancelInvoice);
+// Online checkouts: what went through, what nobody confirmed, what could not be placed.
+router.get('/admin/online-payments',                adminGuard, h.getOnlinePayments);
+router.post('/admin/online-payments/:orderId/check', adminGuard, h.checkOnlinePayment);
 
 // Complaints (§17)
 router.get('/admin/complaints',          adminGuard, h.getComplaints);
@@ -170,6 +193,7 @@ router.get('/admin/assets/inventory',    adminGuard, h.getAvailableInventoryAsse
 router.post('/admin/assets',             adminGuard, h.createAsset);
 router.put('/admin/assets/:id',          adminGuard, h.updateAsset);
 router.post('/admin/assets/:id/act',     adminGuard, h.actOnAsset);
+router.get('/admin/assets/:id/qr',       adminGuard, h.assetQr);
 
 // Security & movement (§20)
 router.get('/admin/movements',      adminGuard, h.getMovements);
@@ -188,8 +212,16 @@ router.post('/admin/discipline',      adminGuard, h.createDisciplineAction);
 router.put('/admin/discipline/:id',   adminGuard, h.updateDisciplineAction);
 router.get('/admin/discipline/student/:studentId', adminGuard, h.getStudentDiscipline);
 
-// Communication (§24)
-router.post('/admin/announcements', adminGuard, h.sendAnnouncement);
+// Communication (§24) — announcements are kept: drafts, scheduled, sent, archived.
+const an = require('../../controllers/hostelAnnouncements.controller');
+router.get('/admin/announcements/audience',     adminGuard, an.audienceSize);
+router.post('/admin/announcements',             adminGuard, an.createAnnouncement);
+router.get('/admin/announcements/:id',          adminGuard, an.getAnnouncement);
+router.put('/admin/announcements/:id',          adminGuard, an.updateAnnouncement);
+router.post('/admin/announcements/:id/send',    adminGuard, an.sendAnnouncementNow);
+router.post('/admin/announcements/:id/archive', adminGuard, an.archiveAnnouncement);
+router.post('/admin/announcements/:id/restore', adminGuard, an.restoreAnnouncement);
+router.delete('/admin/announcements/:id',       adminGuard, an.deleteAnnouncement);
 
 // Attachments — one upload route serving complaints, incidents, maintenance,
 // leaves and outpasses, all of which store `attachments: [String]`.
@@ -227,6 +259,8 @@ router.get('/student/complaints',  studentGuard, p.myComplaints);
 router.post('/student/complaints', studentGuard, p.raiseComplaint);
 router.post('/student/complaints/:id/act', studentGuard, p.actOnMyComplaint);
 router.get('/student/mess',        studentGuard, p.myMess);
+router.post('/student/mess/skip',   studentGuard, p.skipMeal);
+router.post('/student/room-change', studentGuard, p.requestRoomChange);
 router.get('/student/record',      studentGuard, p.myRecord);
 router.post('/student/attachments', studentGuard, uploadHostelDoc.single('file'), p.uploadAttachment);
 
@@ -244,6 +278,7 @@ router.post('/parent/leaves/:id/act', parentGuard, p.actOnMyLeave);
 router.get('/parent/outpasses',   parentGuard, p.myOutpasses);
 router.post('/parent/outpasses',  parentGuard, p.applyOutpass);
 router.post('/parent/outpasses/:id/cancel', parentGuard, p.cancelMyOutpass);
+router.post('/parent/outpasses/:id/act', parentGuard, p.actOnMyOutpass);
 router.get('/parent/visitors',    parentGuard, p.myVisitors);
 router.post('/parent/visitors',   parentGuard, p.requestVisitor);
 router.get('/parent/fees',        parentGuard, p.myFees);
@@ -251,7 +286,59 @@ router.get('/parent/complaints',  parentGuard, p.myComplaints);
 router.post('/parent/complaints', parentGuard, p.raiseComplaint);
 router.post('/parent/complaints/:id/act', parentGuard, p.actOnMyComplaint);
 router.get('/parent/mess',        parentGuard, p.myMess);
+router.post('/parent/mess/skip',   parentGuard, p.skipMeal);
+router.post('/parent/room-change', parentGuard, p.requestRoomChange);
 router.get('/parent/record',      parentGuard, p.myRecord);
 router.post('/parent/attachments', parentGuard, uploadHostelDoc.single('file'), p.uploadAttachment);
+
+// ══ STAFF RESIDENT PORTAL ════════════════════════════════════════════════════
+// A teacher given a bed sees the same screen a student does. The handlers are
+// keyed on the caller's own id, so they serve staff unchanged; there is no
+// application to file — the hostel office allocates a teacher's bed directly.
+router.get('/teacher/my-hostel',   teacherGuard, p.myHostel);
+router.get('/teacher/attendance',  teacherGuard, p.myAttendance);
+router.get('/teacher/leaves',      teacherGuard, p.myLeaves);
+router.post('/teacher/leaves',     teacherGuard, p.applyLeave);
+router.post('/teacher/leaves/:id/act', teacherGuard, p.actOnMyLeave);
+router.get('/teacher/outpasses',   teacherGuard, p.myOutpasses);
+router.post('/teacher/outpasses',  teacherGuard, p.applyOutpass);
+router.get('/teacher/outpasses/:id/pass', teacherGuard, p.myOutpassPass);
+router.get('/teacher/outpasses/:id/qr.png', teacherGuard, p.myOutpassQr);
+router.post('/teacher/outpasses/:id/cancel', teacherGuard, p.cancelMyOutpass);
+router.get('/teacher/visitors',    teacherGuard, p.myVisitors);
+router.post('/teacher/visitors',   teacherGuard, p.requestVisitor);
+router.get('/teacher/fees',        teacherGuard, p.myFees);
+router.get('/teacher/complaints',  teacherGuard, p.myComplaints);
+router.post('/teacher/complaints', teacherGuard, p.raiseComplaint);
+router.post('/teacher/complaints/:id/act', teacherGuard, p.actOnMyComplaint);
+router.get('/teacher/mess',        teacherGuard, p.myMess);
+router.post('/teacher/mess/skip',   teacherGuard, p.skipMeal);
+router.post('/teacher/room-change', teacherGuard, p.requestRoomChange);
+router.get('/teacher/record',      teacherGuard, p.myRecord);
+router.post('/teacher/attachments', teacherGuard, uploadHostelDoc.single('file'), p.uploadAttachment);
+
+// ══ PAYING A HOSTEL BILL ═════════════════════════════════════════════════════
+// The same three steps for a student, a parent (for a child: ?student=) and a
+// resident teacher; the controller decides whose bills the caller may touch.
+router.get('/my-fees/summary',  payerGuard, hp.mySummary);
+router.post('/my-fees/order',   payerGuard, hp.createOrder);
+router.post('/my-fees/confirm', payerGuard, hp.confirmPayment);
+// The phone: ask what became of an order once its checkout page has closed…
+router.post('/my-fees/check',   payerGuard, hp.checkMyPayment);
+// …and the checkout page itself, with the endpoint it reports to. No login —
+// the system browser has none; the order's signed link stands in for it.
+router.get('/pay/:orderId',          hp.checkoutPage);
+router.post('/pay/:orderId/confirm', hp.checkoutConfirm);
+// A receipt, online or counter. Open to the fee desk too, so it can reprint
+// one; the handler checks the receipt is the caller's to see.
+router.get('/receipts/:receiptNumber', [verifyToken, requirePasswordReset, requireModule('hostel')], hp.getReceipt);
+// A refund's voucher — the same rule about whose it is.
+router.get('/refunds/:voucherNumber',  [verifyToken, requirePasswordReset, requireModule('hostel')], hp.getRefundVoucher);
+
+// ══ HOSTEL FILES ═════════════════════════════════════════════════════════════
+// uploads/hostel-docs is not public (server.js). A file is read with a login —
+// the handler checks whose it is — or through a short-lived signed link.
+router.get('/files/:storedName', [verifyToken, requirePasswordReset], hf.authedFile);
+router.get('/file/:storedName',  hf.signedFile);
 
 module.exports = router;

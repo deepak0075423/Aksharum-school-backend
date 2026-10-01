@@ -17,6 +17,10 @@ const HostelAdmissionSchema = new db.Schema({
         enum: ['single', 'double', 'triple', 'four_bed', 'dormitory', 'custom', ''],
         default: '',
     },
+    // Where the student would like to be, if there is a choice. Allocation still
+    // decides; these only steer it.
+    preferredBuilding: { type: db.Types.UUID, ref: 'HostelBuilding', default: null },
+    preferredFloor: { type: db.Types.UUID, ref: 'HostelFloor', default: null },
 
     admissionDate: { type: Date, default: Date.now },
     joiningDate: { type: Date, default: null },
@@ -48,6 +52,8 @@ const HostelAdmissionSchema = new db.Schema({
     reviewedAt: { type: Date, default: null },
     decisionRemark: { type: String, default: '' },
     waitlistPosition: { type: Number, default: 0 },
+    // Required papers that were still missing when it was approved anyway.
+    missingDocuments: { type: [String], default: [] },
 
     // Set once the approved application is turned into a bed allocation.
     allocation: { type: db.Types.UUID, ref: 'HostelAllocation', default: null },

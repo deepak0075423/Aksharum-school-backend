@@ -4,6 +4,8 @@ const db = require('../db/orm');
 const HostelMessSchema = new db.Schema({
     school: { type: db.Types.UUID, ref: 'School', required: true, index: true },
     hostels: { type: [db.Types.UUID], ref: 'Hostel', default: [] },
+    // 'YYYY-MM-DD:meal' keys already chased for a missing register (see runSweep).
+    attendanceReminders: { type: [String], default: [] },
 
     name: { type: String, required: true, trim: true },
     code: { type: String, required: true, trim: true },        // auto MS-####

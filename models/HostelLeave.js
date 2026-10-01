@@ -28,6 +28,7 @@ const HostelLeaveSchema = new db.Schema({
 
     guardianName: { type: String, default: '' },
     guardianPhone: { type: String, default: '' },
+    guardianRelation: { type: String, default: '' },
     emergencyContact: { type: String, default: '' },
     attachments: { type: [String], default: [] },
 

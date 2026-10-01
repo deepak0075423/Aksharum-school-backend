@@ -46,6 +46,8 @@ const HostelSettingsSchema = new db.Schema({
 
     // ── Attendance ──────────────────────────────────────────────────────────
     attendanceSessions: { type: [String], default: ['morning', 'night'] },
+    // Staff who live in are not on the roll call unless the school wants them there.
+    rollCallIncludesTeachers: { type: Boolean, default: false },
     attendanceCorrectionNeedsApproval: { type: Boolean, default: true },
     attendanceCorrectionWindowDays: { type: Number, default: 7 },
 
@@ -57,7 +59,20 @@ const HostelSettingsSchema = new db.Schema({
     // Post hostel charges to the shared FeeLedger so they appear in the student's
     // overall fee position. Off keeps hostel billing self-contained.
     postToFeeLedger: { type: Boolean, default: true },
+    // Staff residents. Stored as "charge them" so that a settings row from
+    // before this existed (NULL) means what it meant then: nobody bills a
+    // teacher. The screen shows the inverse — "Hostel is free for teachers".
+    chargeTeachers: { type: Boolean, default: false },
+    // Receipt numbers come from this counter, bumped atomically, so two
+    // payments can never share one.
+    lastReceiptNumber: { type: Number, default: 0 },
+    // Above zero, a refundable deposit invoice of this amount is raised when a
+    // bed is allocated, and offered back when the resident checks out.
     securityDepositAmount: { type: Number, default: 0 },
+    // A monthly plan bills only the days stayed in the month someone moves in.
+    prorateFirstMonth: { type: Boolean, default: false },
+    // The half-hourly clock keeps late fees up to date, instead of a button.
+    autoApplyLateFees: { type: Boolean, default: false },
 
     // ── Admission ───────────────────────────────────────────────────────────
     admissionRequiresApproval: { type: Boolean, default: true },

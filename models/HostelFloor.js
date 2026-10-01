@@ -9,6 +9,7 @@ const HostelFloorSchema = new db.Schema({
     name: { type: String, required: true, trim: true },       // "Ground", "First"
     floorNumber: { type: Number, default: 0 },
     capacity: { type: Number, default: 0 },
+    commonRooms: { type: Number, default: 0 },
     supervisor: { type: db.Types.UUID, ref: 'User', default: null },
     facilities: { type: [String], default: [] },
 

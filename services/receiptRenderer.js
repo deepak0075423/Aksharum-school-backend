@@ -81,6 +81,8 @@ const kv = (label, value) => (value
 function renderReceipt(receipt, templateRaw, { school } = {}) {
     const t = { ...defaultTemplate(receipt.module, receipt.paymentMode), ...(templateRaw || {}) };
     const symbol = receipt.currencySymbol || '₹';
+    // The wording of a receipt, which a refund voucher replaces with its own.
+    const L = { number: 'Receipt no.', paidBy: 'Paid by', mode: 'Payment mode', total: 'Total paid', stamp: 'PAID', doc: 'Receipt', ...(receipt.labels || {}) };
     const accent = /^#[0-9a-f]{3,8}$/i.test(t.accentColor || '') ? t.accentColor : '#4F46E5';
 
     const logo = t.showLogo && school?.logoUrl
@@ -92,7 +94,7 @@ function renderReceipt(receipt, templateRaw, { school } = {}) {
              <tbody>${rowsHtml(receipt.lines, symbol)}</tbody>
              <tfoot><tr><td>Total</td><td class="amt">${money(receipt.total, symbol)}</td></tr></tfoot>
            </table>`
-        : `<div class="total-only"><span>Total paid</span><strong>${money(receipt.total, symbol)}</strong></div>`;
+        : `<div class="total-only"><span>${esc(L.total)}</span><strong>${money(receipt.total, symbol)}</strong></div>`;
 
     const signature = t.showSignature
         ? `<div class="sign">
@@ -102,18 +104,18 @@ function renderReceipt(receipt, templateRaw, { school } = {}) {
         : '';
 
     const meta = [
-        kv('Receipt no.', receipt.number),
+        kv(L.number, receipt.number),
         kv('Date', fmtDate(receipt.date)),
-        kv('Paid by', receipt.paidBy),
+        kv(L.paidBy, receipt.paidBy),
         kv(receipt.paidByDetailLabel || 'Details', receipt.paidByDetail),
-        t.showPaymentMode ? kv('Payment mode', receipt.paymentMode === 'online' ? 'Online' : (receipt.offlineModeLabel || 'Cash')) : '',
+        t.showPaymentMode ? kv(L.mode, receipt.paymentMode === 'online' ? 'Online' : (receipt.offlineModeLabel || 'Cash')) : '',
         receipt.reference ? kv('Reference', receipt.reference) : '',
     ].join('');
 
     return `<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Receipt ${esc(receipt.number || '')}</title>
+<title>${esc(L.doc)} ${esc(receipt.number || '')}</title>
 <style>
   :root { --accent: ${accent}; }
   * { box-sizing: border-box; }
@@ -195,7 +197,7 @@ function renderReceipt(receipt, templateRaw, { school } = {}) {
       ${t.headerText ? `<div class="headline">${esc(t.headerText)}</div>` : ''}
     </div>
 
-    <span class="paid">PAID</span>
+    <span class="paid">${esc(L.stamp)}</span>
     <div class="kvs">${meta}</div>
     ${breakdown}
     ${t.notes ? `<div class="notes">${esc(t.notes)}</div>` : ''}
@@ -206,7 +208,17 @@ function renderReceipt(receipt, templateRaw, { school } = {}) {
 }
 
 /** A filled-in sample, so the design screen previews with realistic content. */
-const sampleReceipt = (module) => (module === 'library'
+const sampleReceipt = (module) => (module === 'hostel'
+    ? {
+        module: 'hostel', number: 'HR-000128', date: new Date(),
+        paidBy: 'Aarav Sharma', paidByDetailLabel: 'Room', paidByDetail: 'Boys Hostel · Room 204',
+        title: 'Hostel fee receipt', paymentMode: 'online',
+        reference: 'pay_PkQ2xR7mNc1Abc',
+        lines: [{ label: 'Hostel fee — Oct 2026 (HF-2610-0031)', amount: 6500 },
+                { label: 'Mess — Oct 2026 (HF-2610-0032)', amount: 3200 }],
+        total: 9700,
+    }
+    : module === 'library'
     ? {
         module: 'library', number: 'LIB-REC-000042', date: new Date(),
         paidBy: 'Aarav Sharma', paidByDetailLabel: 'Class', paidByDetail: 'VIII · B',

@@ -37,6 +37,20 @@ const INVENTORY_TABLES = [
     'inventorycategories', 'inventorywarehouses', 'inventoryvendors', 'inventorydepartments',
 ];
 
+/**
+ * Every hostel table, for the hostel tests' scratch school. Deleting by school
+ * is safe because nothing outside the scratch school is ever touched.
+ */
+const HOSTEL_TABLES = [
+    'hostelattendances', 'hostelallocationhistories', 'hostelallocations', 'hosteladmissions',
+    'hosteltransferrequests', 'hostelpaymentorders', 'hostelcounters', 'feeledgers', 'parentprofiles', 'hostelfeeinvoices', 'hostelfeeplans', 'hostelincidents', 'hosteldisciplines', 'hostelleaves',
+    'hosteloutpasses', 'hostelmovements', 'hostelvisitors', 'hostelcomplaints', 'hostelmaintenances',
+    'hostelassets', 'hosteldocuments', 'hostelmessattendances', 'hostelmessexpenses', 'hostelmessmembers',
+    'hostelmenus', 'hostelmesses', 'hostelstaffassignments', 'hostelauditlogs', 'hostelsettingses', 'hostelannouncements',
+    'notificationreceipts', 'notifications',
+    'hostelbeds', 'hostelrooms', 'hostelfloors', 'hostelbuildings', 'hostels', 'academicyears',
+];
+
 /** Give the ORM time to create any table a model needs before the first query. */
 async function ready() {
     for (let i = 0; i < 40; i++) {
@@ -95,7 +109,7 @@ async function makeSchool({ reorderLevel = 10 } = {}) {
 /** Everything this school ever had, gone. */
 async function destroy(schoolId) {
     if (!schoolId) return;
-    for (const t of INVENTORY_TABLES) {
+    for (const t of [...INVENTORY_TABLES, ...HOSTEL_TABLES]) {
         await query(`DELETE FROM "${t}" WHERE "school" = $1`, [String(schoolId)]).catch(() => {});
     }
     await query('DELETE FROM "users" WHERE "school" = $1', [String(schoolId)]).catch(() => {});

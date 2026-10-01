@@ -207,6 +207,7 @@ const SchoolSchema = new db.Schema({
         modules: {
             fees:    { type: Boolean, default: false },
             library: { type: Boolean, default: false },
+            hostel:  { type: Boolean, default: false },
         },
     },
     createdAt: {

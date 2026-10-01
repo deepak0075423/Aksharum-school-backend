@@ -108,6 +108,10 @@ for (const p of ['/api/auth/login', '/api/auth/forgot-password', '/api/auth/veri
 app.post('/api/auth/google', authLimiter);
 
 // ── Static Files (uploads) ────────────────────────────────────────────────────
+// Hostel paperwork — ID proofs, medical notes, a child's complaint photo — is
+// not handed to whoever has the address. It is read through /api/hostel/files
+// (with a login) or a short-lived signed link; see controllers/hostelFiles.
+app.use('/uploads/hostel-docs', (req, res) => res.status(403).json({ success: false, message: 'Hostel files are opened from the hostel screens' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ── API Routes ────────────────────────────────────────────────────────────────
@@ -239,8 +243,10 @@ if (isPrimaryWorker) {
     }());
 
     // ── Hostel overdue & SLA clock ────────────────────────────────────────────
-    // Flips outpasses/leaves whose return time has passed to 'overdue' and
-    // escalates complaints that breached their SLA. Both steps are idempotent
+    // Flips outpasses/leaves whose return time has passed to 'overdue' (and says
+    // so to the warden and the family), closes passes nobody used, marks unpaid
+    // invoices overdue, escalates complaints that breached their SLA and — where
+    // the school switched it on — raises the month's invoices. Every step is idempotent
     // (an overdue row is already overdue; an escalated complaint has its due
     // date pushed with the level), so a restart mid-sweep changes nothing.
     (function scheduleHostelSweep() {
@@ -251,7 +257,7 @@ if (isPrimaryWorker) {
                 const schools = await School.find({ 'modules.hostel': true }).select('_id').lean();
                 let overdue = 0;
                 for (const s of schools) {
-                    const r = await hostel.sweepOverdue(s._id);
+                    const r = await hostel.runSweep(s._id);
                     overdue += (r.outpasses || 0) + (r.leaves || 0);
                 }
                 if (overdue > 0) console.log(`[Hostel] overdue sweep: ${overdue} record(s) across ${schools.length} school(s)`);
@@ -259,6 +265,21 @@ if (isPrimaryWorker) {
         };
         setTimeout(tick, 90 * 1000);           // once shortly after boot
         setInterval(tick, 30 * 60 * 1000);     // then every 30 minutes
+    }());
+
+    // ── Hostel announcements booked for later ─────────────────────────────────
+    // Every minute, so "09:00" goes out at 09:00. Each send claims its row
+    // first, so two instances (or a Send-now click) never deliver one twice.
+    (function scheduleHostelAnnouncements() {
+        const { sweepScheduled } = require('./services/hostelAnnouncements');
+        const tick = async () => {
+            try {
+                const n = await sweepScheduled();
+                if (n > 0) console.log(`[Hostel] sent ${n} scheduled announcement(s)`);
+            } catch (err) { console.error('[Hostel] announcement sweep error:', err.message); }
+        };
+        setTimeout(tick, 20 * 1000);
+        setInterval(tick, 60 * 1000);
     }());
 
     // ── Library clock ─────────────────────────────────────────────────────────

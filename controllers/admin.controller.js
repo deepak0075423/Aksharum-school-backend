@@ -3523,18 +3523,12 @@ exports.getPaymentGateway = async (req, res) => {
             stripePublishableKey: gw.stripePublishableKey || '',
             currency:       gw.currency || 'INR',
             currencySymbol: gw.currencySymbol || '₹',
-            modules: {
-                fees:    !!gw.modules?.fees,
-                library: !!gw.modules?.library,
-            },
+            modules: Object.fromEntries(GATEWAY_MODULES.map((k) => [k, !!gw.modules?.[k]])),
             hasRazorpaySecret: !!gw.razorpayKeySecret,
             hasStripeSecret:   !!gw.stripeSecretKey,
             // Which modules the school runs at all — the screen only offers
             // those, and hides itself entirely when neither is on.
-            availableModules: {
-                fees:    !!school?.modules?.fees,
-                library: !!school?.modules?.library,
-            },
+            availableModules: Object.fromEntries(GATEWAY_MODULES.map((k) => [k, !!school?.modules?.[k]])),
         });
     } catch (e) { jsonErr(res, e); }
 };
@@ -3622,7 +3616,7 @@ exports.updatePaymentGateway = async (req, res) => {
  * not enabled when it had just saved a library design.
  */
 async function receiptTemplatePayload(schoolId, moduleRaw) {
-    const module = ['fees', 'library'].includes(moduleRaw) ? moduleRaw : 'fees';
+    const module = GATEWAY_MODULES.includes(moduleRaw) ? moduleRaw : 'fees';
     const school = await School.findById(schoolId).select('modules').lean();
     if (!school?.modules?.[module]) {
         return { error: `The ${module} module is not enabled for this school` };
@@ -3656,7 +3650,7 @@ exports.getReceiptTemplates = async (req, res) => {
 exports.updateReceiptTemplate = async (req, res) => {
     try {
         const { module, paymentMode, sameForBoth, ...rest } = req.body;
-        if (!['fees', 'library'].includes(module))
+        if (!GATEWAY_MODULES.includes(module))
             return res.status(400).json({ success: false, message: 'Choose a module' });
         if (!sameForBoth && !['online', 'offline'].includes(paymentMode))
             return res.status(400).json({ success: false, message: 'Choose which payments this design is for' });
@@ -3691,7 +3685,7 @@ exports.updateReceiptTemplate = async (req, res) => {
 /** Renders the design against sample data, so the screen previews truthfully. */
 exports.previewReceiptTemplate = async (req, res) => {
     try {
-        const module = ['fees', 'library'].includes(req.query.module) ? req.query.module : 'fees';
+        const module = GATEWAY_MODULES.includes(req.query.module) ? req.query.module : 'fees';
         const school = await School.findById(req.schoolId).select('name address logo').lean();
 
         const design = {};

@@ -13,6 +13,8 @@ const HostelMessAttendanceSchema = new db.Schema({
     guestCount: { type: Number, default: 0 },
     remarks: { type: String, default: '' },
     markedBy: { type: db.Types.UUID, ref: 'User', default: null },
+    // A resident said in advance they would skip this meal (mess leave) — not a mark by the mess staff.
+    selfMarked: { type: Boolean, default: false },
 }, { timestamps: true });
 
 HostelMessAttendanceSchema.index({ student: 1, date: 1, meal: 1 }, { unique: true, name: 'unique_mess_attendance_meal' });

@@ -18,7 +18,7 @@ const HostelDocumentSchema = new db.Schema({
 
     docType: {
         type: String,
-        enum: ['admission', 'id_proof', 'medical', 'parent_authorization', 'undertaking',
+        enum: ['admission', 'academic', 'id_proof', 'photo', 'medical', 'parent_authorization', 'undertaking',
                'agreement', 'fee_receipt', 'outpass', 'incident', 'complaint', 'other'],
         default: 'other',
     },

@@ -16,11 +16,16 @@ const HostelIncidentSchema = new db.Schema({
 
     incidentType: {
         type: String,
+        // 'emergency' is a whole-hostel event — a fire, an evacuation, a flood —
+        // as against 'medical_emergency', which is one resident needing care.
         enum: ['misconduct', 'fighting', 'theft', 'property_damage', 'security',
-               'medical_emergency', 'rule_violation', 'other'],
+               'medical_emergency', 'emergency', 'rule_violation', 'other'],
         default: 'other',
     },
     severity: { type: String, enum: ['low', 'medium', 'high', 'critical'], default: 'low' },
+    // A one-line headline ("Fever and cold"); the description carries the rest.
+    // Older rows have none — the screens fall back to the description's first sentence.
+    title: { type: String, default: '', trim: true },
     date: { type: Date, required: true, default: Date.now },
     time: { type: String, default: '' },                       // "22:40"
     location: { type: String, default: '' },

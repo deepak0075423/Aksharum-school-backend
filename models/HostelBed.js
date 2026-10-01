@@ -17,6 +17,10 @@ const HostelBedSchema = new db.Schema({
     bedNumber: { type: String, required: true, trim: true },   // "1", "A", "Upper"
     code: { type: String, required: true, trim: true },        // auto BD-####
     bedType: { type: String, enum: ['single', 'bunk_upper', 'bunk_lower', 'other'], default: 'single' },
+    // Who the bed may be given to. Beds created before staff could live in the
+    // hostel carry NULL here, which reads as 'student' everywhere (see
+    // services/hostelResident.js) — never branch on this column directly.
+    occupantType: { type: String, enum: ['student', 'teacher', 'both'], default: 'student' },
 
     status: {
         type: String,

@@ -21,6 +21,10 @@ const HostelFeePlanSchema = new db.Schema({
     amount: { type: Number, default: 0 },
     roomTypeRates: { type: db.Types.JSON, default: [] },       // [{roomType, amount}]
 
+    // Whose bills the plan produces. NULL (plans older than staff residents)
+    // reads as 'student', so no existing plan starts billing teachers.
+    appliesTo: { type: String, enum: ['student', 'teacher', 'both'], default: 'student' },
+
     frequency: { type: String, enum: ['one_time', 'monthly', 'quarterly', 'half_yearly', 'annual'], default: 'monthly' },
     dueDayOfMonth: { type: Number, default: 10 },
     isRefundable: { type: Boolean, default: false },           // security deposits

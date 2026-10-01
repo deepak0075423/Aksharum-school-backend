@@ -19,6 +19,7 @@ const HostelBed               = require('../models/HostelBed');
 const HostelAdmission         = require('../models/HostelAdmission');
 const HostelAllocation        = require('../models/HostelAllocation');
 const HostelAllocationHistory = require('../models/HostelAllocationHistory');
+const HostelTransferRequest = require('../models/HostelTransferRequest');
 const HostelAttendance        = require('../models/HostelAttendance');
 const HostelLeave             = require('../models/HostelLeave');
 const HostelOutpass           = require('../models/HostelOutpass');
@@ -43,7 +44,10 @@ const HostelAuditLog          = require('../models/HostelAuditLog');
 
 const User           = require('../models/User');
 const StudentProfile = require('../models/StudentProfile');
+const TeacherProfile        = require('../models/TeacherProfile');
 const AcademicYear   = require('../models/AcademicYear');
+const Class          = require('../models/Class');
+const pool           = require('../db/pool');
 const InventoryAsset = require('../models/InventoryAsset');
 
 const crypto = require('crypto');
@@ -51,15 +55,18 @@ const qrcode = require('../utils/qrcode');
 const { matrixToDataUri } = require('../utils/pngEncoder');
 const svc = require('../services/hostelService');
 const alloc = require('../services/hostelAllocation');
+const overview = require('../services/hostelOverview');
+const resident = require('../services/hostelResident');
+const payments = require('../services/hostelPayments');
 
 const { ok, bad, fail, toId, MONTHS, dayRange, monthStart, atTime, minutesBetween,
         getSettings, nextNumber, logAudit, diffFields, notifyStudentAndParents,
-        notifyHostelStaff, postToLedger, studentSnapshot, scopedFilter, visibleHostelIds } = svc;
+        notifyHostelStaff, postToLedger, studentSnapshot, scopedFilter, visibleHostelIds, systemRequest, signedFileUrl } = svc;
 
 // A RuleError from the allocation engine is a 400 with its own message; anything
 // else is a genuine 500.
-const handle = (res, e) => (e instanceof alloc.RuleError || e.status === 400)
-    ? bad(res, e.message)
+const handle = (res, e) => (e instanceof alloc.RuleError || e instanceof payments.PaymentError || e.status === 400)
+    ? bad(res, e.message, e.status || 400)
     : fail(res, e);
 
 const num  = (v, d = 0) => (v === '' || v == null || Number.isNaN(Number(v)) ? d : Number(v));
@@ -81,21 +88,87 @@ exports.getSettings = async (req, res) => {
     try { ok(res, await getSettings(req.schoolId)); } catch (e) { fail(res, e); }
 };
 
+/**
+ * What each setting may hold. The screen already keeps to these; the server
+ * checks again, because these rules are what every other endpoint obeys.
+ */
+const SETTING_RULES = (() => {
+    const n = (min, max = 1e7, int = true) => ({ kind: 'number', min, max, int });
+    const t = { kind: 'time' }; const b = { kind: 'bool' };
+    const list = (allowed) => ({ kind: 'list', allowed });
+    return {
+        maxHostelCapacity: n(0, 100000), maxRoomCapacity: n(1, 100), enforceGenderRestriction: b, allowOvercapacityAllocation: b,
+        autoAllocateOnApproval: b, allowTransferBetweenHostels: b, transferRequiresApproval: b, allowConcurrentLeaveAndOutpass: b,
+        entryTime: t, exitTime: t, curfewTime: t, visitorFrom: t, visitorTo: t, outpassFrom: t, outpassTo: t,
+        visitorDays: list(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']), maxOutpassHours: n(1, 72),
+        lateReturnGraceMinutes: n(0, 600), lateReturnFine: n(0, 1e6, false), overdueAlertAfterMinutes: n(0, 1440), curfewViolationFine: n(0, 1e6, false),
+        leaveRequiresParentApproval: b, outpassRequiresParentApproval: b, maxLeaveDaysPerRequest: n(1, 365), minLeaveNoticeDays: n(0, 60),
+        maxOpenLeavesPerStudent: n(1, 20),
+        attendanceSessions: list(['morning', 'evening', 'night', 'roll_call']), attendanceCorrectionNeedsApproval: b, attendanceCorrectionWindowDays: n(0, 90),
+        autoGenerateMonthlyFees: b, feeDueDayOfMonth: n(1, 28), lateFeePerDay: n(0, 1e5, false), lateFeeGraceDays: n(0, 60),
+        postToFeeLedger: b, securityDepositAmount: n(0, 1e7, false), chargeTeachers: b, prorateFirstMonth: b, autoApplyLateFees: b,
+        rollCallIncludesTeachers: b,
+        admissionRequiresApproval: b, allowStudentSelfApplication: b, allowParentApplication: b,
+        requiredAdmissionDocuments: list(['admission', 'academic', 'id_proof', 'photo', 'medical', 'parent_authorization', 'undertaking', 'agreement', 'fee_receipt', 'other']),
+        complaintSlaHours: n(1, 720), complaintAutoEscalate: b, complaintEscalateTo: { kind: 'user' },
+        messAttendanceRequired: b, messLeaveNoticeHours: n(0, 168),
+        notifyParentOnLeave: b, notifyParentOnOutpass: b, notifyParentOnLateReturn: b, notifyParentOnIncident: b,
+        notifyParentOnDiscipline: b, notifyOnFeeDue: b, notifyOnVisitor: b, emailNotifications: b,
+    };
+})();
+const LABEL = (k) => k.replace(/([A-Z])/g, ' $1').toLowerCase();
+
+/** The body, checked against SETTING_RULES: { set } or { error }. */
+async function checkSettings(req, body) {
+    const set = {};
+    for (const [k, v] of Object.entries(body || {})) {
+        const rule = SETTING_RULES[k];
+        if (!rule) continue;                                   // ids, timestamps, unknown keys: ignored
+        if (rule.kind === 'bool') set[k] = !!v;
+        else if (rule.kind === 'number') {
+            const x = Number(v);
+            if (v === '' || v === null || !Number.isFinite(x)) return { error: `The ${LABEL(k)} must be a number` };
+            if (x < rule.min || x > rule.max) return { error: `The ${LABEL(k)} must be between ${rule.min} and ${rule.max}` };
+            set[k] = rule.int ? Math.round(x) : x;
+        } else if (rule.kind === 'time') {
+            if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(v))) return { error: `The ${LABEL(k)} must be a time like 21:30` };
+            set[k] = String(v);
+        } else if (rule.kind === 'list') {
+            const arr = Array.isArray(v) ? v.map(String) : [];
+            const bad = arr.find((x) => !rule.allowed.includes(x));
+            if (bad) return { error: `"${bad}" is not an option for the ${LABEL(k)}` };
+            set[k] = [...new Set(arr)];
+        } else if (rule.kind === 'user') {
+            if (v && !await User.exists({ _id: v, school: req.schoolId })) return { error: 'The escalation owner was not found' };
+            set[k] = v || null;
+        }
+    }
+    if (set.attendanceSessions && !set.attendanceSessions.length) return { error: 'Keep at least one roll-call session' };
+    return { set };
+}
+
 exports.updateSettings = async (req, res) => {
     try {
+        // The settings govern every hostel in the school, so only the module's
+        // admins change them — not a warden posted to one hostel.
+        if (await visibleHostelIds(req) !== null) return bad(res, 'Only the hostel module\'s admins can change the hostel settings', 403);
         const before = await getSettings(req.schoolId);
-        const body = { ...req.body };
-        delete body.school; delete body._id;
+        const { set: body, error } = await checkSettings(req, req.body);
+        if (error) return bad(res, error);
         const s = await HostelSettings.findOneAndUpdate(
             { school: req.schoolId },
             { $set: { ...body, updatedBy: req.userId } },
             { new: true, upsert: true },
         );
         const d = diffFields(before, s, Object.keys(body));
-        await logAudit(req, {
-            action: 'update', entityType: 'HostelSettings', entityId: s._id,
-            description: 'Updated hostel settings', before: d.before, after: d.after,
-        });
+        // A save that changed nothing is not an event in the log.
+        if (Object.keys(d.after).length) {
+            await logAudit(req, {
+                action: 'update', entityType: 'HostelSettings', entityId: s._id,
+                description: `Updated hostel settings (${Object.keys(d.after).length} change${Object.keys(d.after).length === 1 ? '' : 's'})`,
+                before: d.before, after: d.after,
+            });
+        }
         ok(res, s);
     } catch (e) { fail(res, e); }
 };
@@ -108,45 +181,116 @@ exports.getMeta = async (req, res) => {
         const hostelQ = { school, isActive: true };
         if (allowed !== null) hostelQ._id = allowed.length ? { $in: allowed } : '__none__';
 
-        const [hostels, buildings, floors, rooms, staff, years, messes, feePlans] = await Promise.all([
+        const [hostels, buildings, floors, rooms, staff, years, messes, feePlans, classes] = await Promise.all([
             Hostel.find(hostelQ).select('name code hostelType gender capacity status').sort('name').lean(),
-            HostelBuilding.find({ school, isActive: true }).select('name code hostel').sort('name').lean(),
-            HostelFloor.find({ school, isActive: true }).select('name floorNumber building hostel').sort('floorNumber').lean(),
-            HostelRoom.find({ school, isActive: true }).select('roomNumber code hostel building floor roomType capacity occupiedBeds status gender').sort('roomNumber').lean(),
-            User.find({ school, role: { $in: ['teacher', 'school_admin'] }, isActive: true }).select('name email role').sort('name').lean(),
+            HostelBuilding.find({ school, isActive: true }).select('name code hostel status floorCount').sort('name').lean(),
+            HostelFloor.find({ school, isActive: true }).select('name floorNumber building hostel status').sort('floorNumber').lean(),
+            HostelRoom.find({ school, isActive: true }).select('roomNumber code hostel building floor roomType capacity occupiedBeds status gender occupantType').sort('roomNumber').lean(),
+            User.find({ school, role: { $in: ['teacher', 'school_admin'] }, isActive: true }).select('name email role phone').sort('name').lean(),
             AcademicYear.find({ school }).select('yearName status startDate endDate').sort('-startDate').lean(),
             HostelMess.find({ school, isActive: true }).select('name code hostels mealTimings').sort('name').lean(),
-            HostelFeePlan.find({ school, isActive: true }).select('name feeType basis amount frequency hostel').sort('name').lean(),
+            HostelFeePlan.find({ school, isActive: true }).select('name feeType basis amount frequency hostel appliesTo').sort('name').lean(),
+            // The classes a list can be filtered by: the ones students are actually
+            // in. A class row exists per academic year, so listing every one would
+            // offer "Class 9" once per year, all but one of them empty.
+            pool.query(
+                `SELECT c."_id", c."className", c."classNumber"
+                   FROM "${Class.tableName}" c
+                  WHERE c."school" = $1
+                    AND EXISTS (SELECT 1 FROM "${StudentProfile.tableName}" p WHERE p."currentClass" = c."_id" AND p."school" = $1)
+                  ORDER BY c."classNumber", c."className"`,
+                [String(school)],
+            ).then((r) => r.rows),
         ]);
-        ok(res, { hostels, buildings, floors, rooms, staff, academicYears: years, messes, feePlans });
+        // On a posting, the dropdowns hold the caller's own hostels' structure only.
+        const mine = (rows) => (allowed === null ? rows : rows.filter((r) => allowed.includes(String(r.hostel))));
+        ok(res, { hostels, buildings: mine(buildings), floors: mine(floors), rooms: mine(rooms), staff, academicYears: years,
+            messes: allowed === null ? messes : [], feePlans: allowed === null ? feePlans : [], classes });
     } catch (e) { fail(res, e); }
 };
 
 // Student picker — students who have no active allocation yet, for allocation screens.
+/**
+ * A student's first contact, from their parent's profile: the named guardian,
+ * else the father, else the mother — whoever has a name on record.
+ * The student profile carries no parent fields of its own.
+ */
+const GUARDIAN_SQL = (studentCol, schoolParam) => `
+    LEFT JOIN LATERAL (
+        SELECT CASE WHEN COALESCE(pp."guardian"->>'name', '') <> '' THEN pp."guardian"->>'name'
+                    WHEN COALESCE(pp."father"->>'name', '') <> '' THEN pp."father"->>'name'
+                    ELSE COALESCE(pp."mother"->>'name', pu."name") END AS "name",
+               CASE WHEN COALESCE(pp."guardian"->>'name', '') <> '' THEN COALESCE(NULLIF(pp."guardian"->>'phone', ''), pu."phone")
+                    WHEN COALESCE(pp."father"->>'name', '') <> '' THEN COALESCE(NULLIF(pp."father"->>'phone', ''), pu."phone")
+                    ELSE COALESCE(NULLIF(pp."mother"->>'phone', ''), pu."phone") END AS "phone",
+               CASE WHEN COALESCE(pp."guardian"->>'name', '') <> '' THEN 'Guardian'
+                    WHEN COALESCE(pp."father"->>'name', '') <> '' THEN 'Father'
+                    WHEN COALESCE(pp."mother"->>'name', '') <> '' THEN 'Mother'
+                    ELSE COALESCE(NULLIF(pp."relationship", ''), 'Parent') END AS "relation"
+          FROM "parentprofiles" pp LEFT JOIN "users" pu ON pu."_id" = pp."user"
+         WHERE pp."school" = ${schoolParam} AND jsonb_typeof(pp."children") = 'array' AND pp."children" ? (${studentCol})::text
+         ORDER BY pp."createdAt" DESC NULLS LAST LIMIT 1) g ON true`;
+
+async function guardianOf(schoolId, studentId) {
+    const { rows: [g] } = await pool.query(
+        `SELECT g."name", g."phone", g."relation" FROM (SELECT $2::uuid AS "sid") s ${GUARDIAN_SQL('s."sid"', '$1')}`,
+        [String(schoolId), String(studentId)]);
+    return g && g.name ? g : null;
+}
+
+/**
+ * The student picker behind every "Search by name, roll no. or admission no."
+ * field: up to 50 matches, with class, gender, the first contact and any bed
+ * they already hold. `onlyUnallocated` is applied BEFORE the limit, so a
+ * school of thousands still finds the students still waiting for a bed.
+ */
 exports.searchStudents = async (req, res) => {
     try {
-        const { search = '', onlyUnallocated = '' } = req.query;
-        const q = { school: req.schoolId, role: 'student', isActive: true };
-        if (search) q.$or = [{ name: rx(search) }, { email: rx(search) }];
-        let rows = await User.find(q).select('name email profileImage').sort('name').limit(100).lean();
-
-        const ids = rows.map((r) => String(r._id));
-        const [allocs, profiles] = await Promise.all([
-            HostelAllocation.find({ school: req.schoolId, student: { $in: ids }, status: { $in: ['pending', 'active'] } })
-                .select('student hostel room bed').lean(),
-            StudentProfile.find({ user: { $in: ids }, school: req.schoolId })
-                .select('user gender admissionNumber currentClass').populate('currentClass', 'className').lean(),
-        ]);
-        const byStudent = Object.fromEntries(allocs.map((a) => [String(a.student), a]));
-        const profByUser = Object.fromEntries(profiles.map((p) => [String(p.user), p]));
-        rows = rows.map((r) => ({
-            ...r,
-            gender: profByUser[String(r._id)]?.gender || '',
-            admissionNumber: profByUser[String(r._id)]?.admissionNumber || '',
-            className: profByUser[String(r._id)]?.currentClass?.className || '',
-            allocation: byStudent[String(r._id)] || null,
-        }));
-        if (onlyUnallocated === 'true') rows = rows.filter((r) => !r.allocation);
+        const { search = '', onlyUnallocated = '', allocated = '', id = '' } = req.query;
+        // `kind=teacher` turns the same picker to the staff register: a member
+        // of staff can hold a bed too. Looking one up by id finds either.
+        const staff = req.query.kind === 'teacher';
+        const params = [String(req.schoolId)];
+        const $ = (v) => { params.push(v); return `$${params.length}`; };
+        let where = `u."school" = $1 AND u."isActive"`;
+        where += id ? ` AND u."role" IN ('student', 'teacher') AND u."_id" = ${$(String(id))}::uuid`
+                    : ` AND u."role" = '${staff ? 'teacher' : 'student'}'`;
+        const term = String(search || '').trim();
+        if (term) {
+            const x = $(`%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+            where += ` AND (u."name" ILIKE ${x} OR u."email" ILIKE ${x} OR sp."admissionNumber" ILIKE ${x} OR sp."rollNumber"::text ILIKE ${x}
+                            OR tp."employeeId" ILIKE ${x} OR tp."designation" ILIKE ${x})`;
+        }
+        if (onlyUnallocated === 'true') where += ` AND al."_id" IS NULL`;
+        if (allocated === 'true') where += ` AND al."_id" IS NOT NULL AND al."status" = 'active'`;
+        // A member of staff shows their employee id where a student shows an
+        // admission number, and their designation where a student shows a class.
+        const { rows } = await pool.query(
+            `SELECT u."_id", u."name", u."email", u."profileImage", u."phone",
+                    CASE WHEN u."role" = 'teacher' THEN 'teacher' ELSE 'student' END AS "kind",
+                    COALESCE(sp."gender", tp."gender", '') AS "gender",
+                    COALESCE(sp."admissionNumber", tp."employeeId", '') AS "admissionNumber",
+                    COALESCE(sp."rollNumber"::text, '') AS "rollNumber",
+                    COALESCE(c."className", tp."designation", '') AS "className",
+                    COALESCE(cs."sectionName", '') AS "sectionName",
+                    COALESCE(tp."department", '') AS "department",
+                    COALESCE(sp."emergencyContactName", '') AS "emergencyContactName", COALESCE(sp."emergencyContactPhone", '') AS "emergencyContactPhone",
+                    COALESCE(sp."emergencyContactRelation", '') AS "emergencyContactRelation",
+                    g."name" AS "guardianName", g."phone" AS "guardianPhone", g."relation" AS "guardianRelation",
+                    CASE WHEN al."_id" IS NULL THEN NULL ELSE jsonb_build_object('_id', al."_id", 'status', al."status", 'hostel', al."hostel",
+                         'hostelName', h."name", 'room', al."room", 'roomNumber', rm."roomNumber", 'bed', al."bed", 'academicYear', al."academicYear") END AS "allocation"
+               FROM "users" u
+               LEFT JOIN LATERAL (SELECT * FROM "studentprofiles" p WHERE p."user" = u."_id" AND u."role" = 'student' ORDER BY p."createdAt" DESC NULLS LAST LIMIT 1) sp ON true
+               LEFT JOIN LATERAL (SELECT * FROM "${TeacherProfile.tableName}" p WHERE p."user" = u."_id" AND u."role" = 'teacher' LIMIT 1) tp ON true
+               LEFT JOIN "classes" c ON c."_id" = sp."currentClass"
+               LEFT JOIN "classsections" cs ON cs."_id" = sp."currentSection"
+               LEFT JOIN LATERAL (SELECT a.* FROM "${HostelAllocation.tableName}" a WHERE a."student" = u."_id" AND a."school" = $1
+                                   AND a."status" IN ('pending', 'active') ORDER BY a."createdAt" DESC LIMIT 1) al ON true
+               LEFT JOIN "${Hostel.tableName}" h ON h."_id" = al."hostel"
+               LEFT JOIN "${HostelRoom.tableName}" rm ON rm."_id" = al."room"
+               ${GUARDIAN_SQL('u."_id"', '$1')}
+              WHERE ${where}
+              ORDER BY lower(u."name") LIMIT ${Math.max(1, Math.min(500, Number(req.query.limit) || 50))}`, params);
         ok(res, rows);
     } catch (e) { fail(res, e); }
 };
@@ -202,17 +346,16 @@ exports.getDashboard = async (req, res) => {
         const availableBeds = bedByStatus.available || 0;
         const reservedBeds  = bedByStatus.reserved || 0;
 
-        // Today's roll call across the caller's hostels.
-        const todayAtt = await HostelAttendance.aggregate([
-            { $match: { school: toId(school), date: { $gte: todayStart, $lt: todayEnd },
-                        ...(allowed === null ? {} : { hostel: { $in: (allowed || []).map(String) } }) } },
-            { $group: { _id: '$status', n: { $sum: 1 } } },
-        ]);
-        const attendanceToday = Object.fromEntries(todayAtt.map((a) => [a._id, a.n]));
+        // Today's roll call across the caller's hostels, counted in STUDENTS —
+        // each under their latest roll call of the day. Counting records made a
+        // hostel with a morning and a night roll call show everyone twice. The
+        // web dashboard reads the same helper, so the two cannot disagree.
+        const attendanceToday = await overview.attendanceOn(school, allowed, 'today');
 
-        // Outstanding hostel fees.
+        // Outstanding hostel fees, in the caller's hostels.
         const feeAgg = await HostelFeeInvoice.aggregate([
-            { $match: { school: toId(school), status: { $in: ['pending', 'partial', 'overdue'] } } },
+            { $match: { school: toId(school), status: { $in: ['pending', 'partial', 'overdue'] },
+                        ...(allowed === null ? {} : { hostel: { $in: (allowed || []).map(String) } }) } },
             { $group: { _id: null, billed: { $sum: '$netAmount' }, paid: { $sum: '$paidAmount' } } },
         ]);
         const outstandingFees = Math.max(0, (feeAgg[0]?.billed || 0) - (feeAgg[0]?.paid || 0));
@@ -313,16 +456,17 @@ exports.getDashboard = async (req, res) => {
             studentsOnLeave: onLeaveNow,
             totalResidents: activeAllocations,
             attendanceToday: {
-                present: attendanceToday.present || 0,
-                absent: attendanceToday.absent || 0,
-                late: attendanceToday.late || 0,
-                excused: attendanceToday.excused || 0,
-                marked: Object.values(attendanceToday).reduce((s, n) => s + n, 0),
+                present: attendanceToday.present,
+                absent: attendanceToday.absent,
+                late: attendanceToday.late,
+                excused: attendanceToday.excused,
+                marked: attendanceToday.marked,
             },
             pendingAdmissions, waitlisted, pendingAllocations,
             pendingLeaves, pendingOutpasses, activeOutpasses, overdueOutpasses,
             todayVisitors, pendingComplaints, openMaintenance,
-            outstandingFees,
+            // A teacher in on a posting runs the hostel's day, not its books.
+            outstandingFees: req.hostelDuty ? null : outstandingFees,
             recentIncidents, recentActivities,
             charts: {
                 occupancy,
@@ -426,6 +570,30 @@ exports.getHostel = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/**
+ * The warden and assistant warden named on a hostel are postings too. Picking
+ * one on the hostel's own form used to set the field and nothing else, so the
+ * person never appeared on the Warden & Staff screen — and whoever held the
+ * post before kept their posting, and with it their access to the hostel.
+ * `before` is the hostel as it was (null when it is new).
+ */
+async function syncWardenPosts(req, hostel, before) {
+    for (const [field, role] of [['warden', 'warden'], ['assistantWarden', 'assistant_warden']]) {
+        const now = hostel[field] ? String(hostel[field]) : '';
+        const was = before?.[field] ? String(before[field]) : '';
+        if (now === was) continue;
+        if (was) {
+            await HostelStaffAssignment.updateMany(
+                { school: req.schoolId, hostel: hostel._id, staff: was, role, status: 'active' },
+                { $set: { status: 'inactive', isActive: false, toDate: new Date() } });
+        }
+        if (now && !await HostelStaffAssignment.exists({ school: req.schoolId, hostel: hostel._id, staff: now, role, status: 'active' })) {
+            await HostelStaffAssignment.create({ school: req.schoolId, hostel: hostel._id, staff: now, role, status: 'active', isActive: true,
+                fromDate: new Date(), createdBy: req.userId });
+        }
+    }
+}
+
 exports.createHostel = async (req, res) => {
     try {
         const b = req.body;
@@ -433,10 +601,15 @@ exports.createHostel = async (req, res) => {
         const code = (b.code || '').trim() || await nextNumber(Hostel, req.schoolId, 'HL');
         if (await Hostel.findOne({ school: req.schoolId, code })) return bad(res, 'A hostel with this code already exists');
 
+        const settings = await getSettings(req.schoolId);
+        if (settings.maxHostelCapacity > 0 && num(b.capacity) > settings.maxHostelCapacity) {
+            return bad(res, `A hostel's capacity cannot exceed the configured maximum of ${settings.maxHostelCapacity}`);
+        }
         const h = await Hostel.create({
             ...b, code, school: req.schoolId, createdBy: req.userId,
             capacity: num(b.capacity),
         });
+        await syncWardenPosts(req, h, null);
         await logAudit(req, { action: 'create', entityType: 'Hostel', entityId: h._id, hostel: h._id,
             description: `Created hostel ${h.name} (${h.code})`, after: { name: h.name, code: h.code, status: h.status } });
         ok(res, h);
@@ -453,9 +626,21 @@ exports.updateHostel = async (req, res) => {
         if (!before) return bad(res, 'Hostel not found', 404);
         const body = { ...req.body };
         delete body.school; delete body._id;
-        if (body.capacity !== undefined) body.capacity = num(body.capacity);
+        if (body.capacity !== undefined) {
+            body.capacity = num(body.capacity);
+            const settings = await getSettings(req.schoolId);
+            if (settings.maxHostelCapacity > 0 && body.capacity > settings.maxHostelCapacity) {
+                return bad(res, `A hostel's capacity cannot exceed the configured maximum of ${settings.maxHostelCapacity}`);
+            }
+        }
+        // Closing a hostel through its edit form is still closing it: not with people living there.
+        if (body.status === 'inactive' || body.isActive === false) {
+            const residents = await HostelAllocation.countDocuments({ school: req.schoolId, hostel: before._id, status: { $in: ['active', 'pending'] } });
+            if (residents) return bad(res, `Cannot make this hostel inactive — ${residents} resident(s) still hold a bed here`);
+        }
 
         const h = await Hostel.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
+        await syncWardenPosts(req, h, before);
         const d = diffFields(before, h, Object.keys(body));
         await logAudit(req, { action: 'update', entityType: 'Hostel', entityId: h._id, hostel: h._id,
             description: `Updated hostel ${h.name}`, before: d.before, after: d.after });
@@ -467,8 +652,8 @@ exports.updateHostel = async (req, res) => {
 exports.deleteHostel = async (req, res) => {
     try {
         if (!await mayTouchHostel(req, req.params.id)) return bad(res, 'You do not have access to this hostel', 403);
-        const residents = await HostelAllocation.countDocuments({ school: req.schoolId, hostel: req.params.id, status: 'active' });
-        if (residents) return bad(res, `Cannot deactivate — ${residents} student(s) are still allocated here`);
+        const residents = await HostelAllocation.countDocuments({ school: req.schoolId, hostel: req.params.id, status: { $in: ['active', 'pending'] } });
+        if (residents) return bad(res, `Cannot deactivate — ${residents} resident(s) still hold a bed here`);
 
         const h = await Hostel.findOneAndUpdate({ _id: req.params.id, school: req.schoolId },
             { $set: { isActive: false, status: 'inactive' } }, { new: true });
@@ -507,6 +692,18 @@ exports.getBuildings = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/** Deactivate the floors, rooms and beds under a building or floor being closed (none is occupied — the caller checked). */
+async function closeBelow(schoolId, where) {
+    const off = { $set: { isActive: false, status: 'inactive' } };
+    if (where.building) await HostelFloor.updateMany({ school: schoolId, building: where.building, isActive: true }, off);
+    await HostelRoom.updateMany({ school: schoolId, ...where, isActive: true }, off);
+    await HostelBed.updateMany({ school: schoolId, ...where, status: { $ne: 'occupied' } }, off);
+}
+
+/** "Ground Floor", "First Floor" … "Twelfth Floor", then "Floor 13". */
+const ORDINALS = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth', 'Seventh', 'Eighth', 'Ninth', 'Tenth', 'Eleventh', 'Twelfth'];
+const floorName = (n) => (n === 0 ? 'Ground Floor' : ORDINALS[n - 1] ? `${ORDINALS[n - 1]} Floor` : `Floor ${n}`);
+
 exports.createBuilding = async (req, res) => {
     try {
         const b = req.body;
@@ -515,14 +712,28 @@ exports.createBuilding = async (req, res) => {
         const hostel = await Hostel.findOne({ _id: b.hostel, school: req.schoolId }).lean();
         if (!hostel) return bad(res, 'Hostel not found');
 
+        const floorCount = num(b.floorCount);
+        if (floorCount < 0 || floorCount > 60) return bad(res, 'A building has between 0 and 60 floors');
         const code = (b.code || '').trim() || await nextNumber(HostelBuilding, req.schoolId, 'BLD');
+        const { createFloors, ...fields } = b;
         const row = await HostelBuilding.create({
-            ...b, code, school: req.schoolId, createdBy: req.userId,
-            floorCount: num(b.floorCount), capacity: num(b.capacity),
+            ...fields, code, school: req.schoolId, createdBy: req.userId,
+            floorCount, capacity: num(b.capacity), expectedRooms: num(b.expectedRooms),
+            facilities: Array.isArray(b.facilities) ? b.facilities.map(String).filter(Boolean) : [],
         });
+        // "Number of floors" can also lay the floors down, numbered from the ground up.
+        const floors = [];
+        if (createFloors && floorCount > 0) {
+            for (let n = 0; n < floorCount; n++) {
+                floors.push(await HostelFloor.create({
+                    school: req.schoolId, hostel: hostel._id, building: row._id, name: floorName(n), floorNumber: n,
+                    status: 'active', createdBy: req.userId,
+                }));
+            }
+        }
         await logAudit(req, { action: 'create', entityType: 'HostelBuilding', entityId: row._id, hostel: hostel._id,
-            description: `Added building ${row.name} to ${hostel.name}` });
-        ok(res, row);
+            description: `Added building ${row.name} to ${hostel.name}${floors.length ? ` with ${floors.length} floor(s)` : ''}` });
+        ok(res, { ...(row.toObject?.() ?? row), floors });
     } catch (e) {
         if (e.code === 11000) return bad(res, 'A building with this code already exists in this hostel');
         fail(res, e);
@@ -536,6 +747,10 @@ exports.updateBuilding = async (req, res) => {
         if (!await mayTouchHostel(req, before.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         const body = { ...req.body };
         delete body.school; delete body._id; delete body.hostel;   // a building never changes hostel
+        if (body.status === 'inactive' || body.isActive === false) {
+            const occupied = await HostelBed.countDocuments({ school: req.schoolId, building: before._id, status: 'occupied' });
+            if (occupied) return bad(res, `Cannot make this building inactive — ${occupied} bed(s) in it are occupied`);
+        }
         const row = await HostelBuilding.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
         await logAudit(req, { action: 'update', entityType: 'HostelBuilding', entityId: row._id, hostel: row.hostel,
@@ -553,6 +768,8 @@ exports.deleteBuilding = async (req, res) => {
         if (occupied) return bad(res, `Cannot deactivate — ${occupied} bed(s) in this building are occupied`);
 
         await HostelBuilding.findByIdAndUpdate(row._id, { $set: { isActive: false, status: 'inactive' } });
+        // Everything inside goes with it — a room in a closed building is not a room anyone can be given.
+        await closeBelow(req.schoolId, { building: row._id });
         await logAudit(req, { action: 'delete', entityType: 'HostelBuilding', entityId: row._id, hostel: row.hostel,
             description: `Deactivated building ${row.name}` });
         ok(res, { _id: row._id });
@@ -596,7 +813,7 @@ exports.createFloor = async (req, res) => {
 
         const row = await HostelFloor.create({
             ...b, school: req.schoolId, hostel: building.hostel, createdBy: req.userId,
-            floorNumber: num(b.floorNumber), capacity: num(b.capacity),
+            floorNumber: num(b.floorNumber), capacity: num(b.capacity), commonRooms: num(b.commonRooms),
         });
         await logAudit(req, { action: 'create', entityType: 'HostelFloor', entityId: row._id, hostel: building.hostel,
             description: `Added floor ${row.name} to ${building.name}` });
@@ -615,6 +832,10 @@ exports.updateFloor = async (req, res) => {
         const body = { ...req.body };
         delete body.school; delete body._id; delete body.hostel; delete body.building;
         if (body.floorNumber !== undefined) body.floorNumber = num(body.floorNumber);
+        if (body.status === 'inactive' || body.isActive === false) {
+            const occupied = await HostelBed.countDocuments({ school: req.schoolId, floor: before._id, status: 'occupied' });
+            if (occupied) return bad(res, `Cannot make this floor inactive — ${occupied} bed(s) on it are occupied`);
+        }
         const row = await HostelFloor.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
         await logAudit(req, { action: 'update', entityType: 'HostelFloor', entityId: row._id, hostel: row.hostel,
@@ -631,6 +852,7 @@ exports.deleteFloor = async (req, res) => {
         const occupied = await HostelBed.countDocuments({ school: req.schoolId, floor: row._id, status: 'occupied' });
         if (occupied) return bad(res, `Cannot deactivate — ${occupied} bed(s) on this floor are occupied`);
         await HostelFloor.findByIdAndUpdate(row._id, { $set: { isActive: false, status: 'inactive' } });
+        await closeBelow(req.schoolId, { floor: row._id });
         await logAudit(req, { action: 'delete', entityType: 'HostelFloor', entityId: row._id, hostel: row.hostel,
             description: `Deactivated floor ${row.name}` });
         ok(res, { _id: row._id });
@@ -713,7 +935,7 @@ exports.createRoom = async (req, res) => {
 
         const code = (b.code || '').trim() || await nextNumber(HostelRoom, req.schoolId, 'RM');
         const room = await HostelRoom.create({
-            ...b, code, capacity,
+            ...b, code, capacity, occupantType: resident.cleanOccupant(b.occupantType) || 'student',
             school: req.schoolId, hostel: floor.hostel, building: floor.building, floor: floor._id,
             createdBy: req.userId,
         });
@@ -742,10 +964,11 @@ async function generateBedsForRoom(req, room, count) {
         const bedNumber = String(i);
         if (taken.has(bedNumber)) continue;
         const code = await nextNumber(HostelBed, req.schoolId, 'BD');
+        const bedType = room.bedType === 'bunk' ? (i % 2 ? 'bunk_lower' : 'bunk_upper') : room.bedType === 'other' ? 'other' : 'single';
         out.push(await HostelBed.create({
             school: req.schoolId, hostel: room.hostel, building: room.building,
             floor: room.floor, room: room._id,
-            bedNumber, code, status: 'available', createdBy: req.userId,
+            bedNumber, code, bedType, occupantType: resident.occupantOf(room), status: 'available', createdBy: req.userId,
         }));
     }
     return out;
@@ -776,11 +999,31 @@ exports.updateRoom = async (req, res) => {
             if (occupied) return bad(res, `Cannot mark this room ${body.status} — ${occupied} bed(s) are occupied`);
         }
 
+        if (body.occupantType !== undefined) {
+            body.occupantType = resident.cleanOccupant(body.occupantType);
+            if (!body.occupantType) return bad(res, 'A room\'s beds are for students, for teachers, or for both');
+        }
+
         const row = await HostelRoom.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
+        // "This room is for teachers" is a statement about its beds, so they
+        // follow — except a bed whose present occupant would no longer fit.
+        let bedsChanged = 0; let bedsKept = 0;
+        if (body.occupantType && body.occupantType !== resident.occupantOf(before)) {
+            const beds = await HostelBed.find({ school: req.schoolId, room: before._id, isActive: true }).select('status student occupantType').lean();
+            const kinds = await resident.kindsOf(req.schoolId, beds.filter((b) => b.status === 'occupied').map((b) => b.student));
+            const change = beds.filter((b) => {
+                const fits = b.status !== 'occupied' || !b.student || resident.bedFits({ occupantType: body.occupantType }, kinds[String(b.student)] || 'student');
+                if (!fits) bedsKept += 1;
+                return fits && resident.occupantOf(b) !== body.occupantType;
+            });
+            if (change.length) await HostelBed.updateMany({ _id: { $in: change.map((b) => String(b._id)) } }, { $set: { occupantType: body.occupantType } });
+            bedsChanged = change.length;
+        }
         const d = diffFields(before, row, Object.keys(body));
         await logAudit(req, { action: 'update', entityType: 'HostelRoom', entityId: row._id, hostel: row.hostel,
-            description: `Updated room ${row.roomNumber}`, before: d.before, after: d.after });
-        ok(res, row);
+            description: `Updated room ${row.roomNumber}${bedsChanged ? ` — ${bedsChanged} bed(s) now for ${body.occupantType === 'both' ? 'students and teachers' : `${body.occupantType}s`}` : ''}`,
+            before: d.before, after: d.after });
+        ok(res, { ...(row.toObject?.() ?? row), bedsChanged, bedsKept });
     } catch (e) { fail(res, e); }
 };
 
@@ -835,6 +1078,8 @@ exports.createBed = async (req, res) => {
         const code = (b.code || '').trim() || await nextNumber(HostelBed, req.schoolId, 'BD');
         const bed = await HostelBed.create({
             ...b, code, school: req.schoolId,
+            // Stated on the form, else whatever the room's beds are for.
+            occupantType: resident.cleanOccupant(b.occupantType) || resident.occupantOf(room),
             hostel: room.hostel, building: room.building, floor: room.floor, room: room._id,
             status: 'available', student: null, allocation: null, createdBy: req.userId,
         });
@@ -874,6 +1119,18 @@ exports.updateBed = async (req, res) => {
         const body = { ...req.body };
         // Occupancy is only ever changed through the allocation engine.
         for (const f of ['school', '_id', 'hostel', 'building', 'floor', 'room', 'status', 'student', 'allocation', 'allocationDate']) delete body[f];
+        if (body.occupantType !== undefined) {
+            body.occupantType = resident.cleanOccupant(body.occupantType);
+            if (!body.occupantType) return bad(res, 'A bed is for students, for teachers, or for both');
+            // A bed cannot be re-labelled out from under the person sleeping in it.
+            if (before.status === 'occupied' && before.student) {
+                const kinds = await resident.kindsOf(req.schoolId, [before.student]);
+                const kind = kinds[String(before.student)] || 'student';
+                if (!resident.bedFits({ occupantType: body.occupantType }, kind)) {
+                    return bad(res, `A ${kind} is in this bed — release them before keeping it for ${body.occupantType === 'teacher' ? 'teachers' : 'students'} only`);
+                }
+            }
+        }
 
         const row = await HostelBed.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
@@ -1008,11 +1265,12 @@ exports.getAdmission = async (req, res) => {
         if (!a) return bad(res, 'Application not found', 404);
         if (!await mayTouchHostel(req, a.hostel?._id || a.hostel)) return bad(res, 'You do not have access to this hostel', 403);
 
-        const [snapshot, documents] = await Promise.all([
+        const [snapshot, documents, papers] = await Promise.all([
             studentSnapshot(req.schoolId, a.student?._id || a.student),
             HostelDocument.find({ school: req.schoolId, entityType: 'HostelAdmission', entityId: a._id, isActive: true }).lean(),
+            admissionPapers(req.schoolId, a, await getSettings(req.schoolId)),
         ]);
-        ok(res, { ...a, studentDetails: snapshot, documents });
+        ok(res, { ...a, studentDetails: snapshot, documents, papers });
     } catch (e) { fail(res, e); }
 };
 
@@ -1042,7 +1300,7 @@ exports.createAdmission = async (req, res) => {
         if (!hostel.isActive || hostel.status !== 'active') return bad(res, 'This hostel is not accepting admissions');
         if (open) return bad(res, 'This student already has an open hostel application for that year');
 
-        const settings = await getSettings(req.schoolId);
+        const [settings, guardian] = await Promise.all([getSettings(req.schoolId), guardianOf(req.schoolId, b.student)]);
         const status = b.status === 'draft' ? 'draft'
             : settings.admissionRequiresApproval ? 'pending_approval' : 'approved';
 
@@ -1051,9 +1309,9 @@ exports.createAdmission = async (req, res) => {
             school: req.schoolId,
             applicationNumber: await nextNumber(HostelAdmission, req.schoolId, 'HA'),
             status,
-            guardianName:  b.guardianName  || profile?.guardianName  || profile?.fatherName  || '',
-            guardianPhone: b.guardianPhone || profile?.guardianPhone || profile?.fatherPhone || '',
-            guardianRelation: b.guardianRelation || profile?.guardianRelation || '',
+            guardianName:  b.guardianName  || guardian?.name || '',
+            guardianPhone: b.guardianPhone || guardian?.phone || '',
+            guardianRelation: b.guardianRelation || guardian?.relation || '',
             emergencyContactName:     b.emergencyContactName     || profile?.emergencyContactName     || '',
             emergencyContactPhone:    b.emergencyContactPhone    || profile?.emergencyContactPhone    || '',
             emergencyContactRelation: b.emergencyContactRelation || profile?.emergencyContactRelation || '',
@@ -1085,7 +1343,17 @@ exports.updateAdmission = async (req, res) => {
             return bad(res, `A ${before.status} application can no longer be edited`);
         }
         const body = { ...req.body };
-        for (const f of ['school', '_id', 'student', 'allocation', 'applicationNumber', 'reviewedBy', 'reviewedAt']) delete body[f];
+        // Editing an application changes what was asked for, never where it stands:
+        // status, the waitlist position and the decision belong to decideAdmission,
+        // which is what notifies the family and allocates the bed.
+        for (const f of ['school', '_id', 'student', 'allocation', 'applicationNumber', 'reviewedBy', 'reviewedAt',
+            'status', 'waitlistPosition', 'decisionRemark', 'appliedBy', 'appliedAt', 'createdBy', 'createdAt']) delete body[f];
+        if (body.hostel && String(body.hostel) !== String(before.hostel)) {
+            if (!await mayTouchHostel(req, body.hostel)) return bad(res, 'You do not have access to that hostel', 403);
+            const target = await Hostel.findOne({ _id: body.hostel, school: req.schoolId, isActive: true }).select('_id').lean();
+            if (!target) return bad(res, 'Hostel not found');
+        }
+        for (const f of ['joiningDate', 'expectedLeavingDate']) if (body[f] === '') body[f] = null;
 
         const row = await HostelAdmission.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
@@ -1103,6 +1371,54 @@ exports.updateAdmission = async (req, res) => {
  * NOT undo the approval — the application stays approved and appears under
  * "pending allocation", which is what a warden expects when the hostel is full.
  */
+/**
+ * The papers the school asks for with an application, and which of them are
+ * on file — attached to the application itself or held for the student.
+ */
+async function admissionPapers(schoolId, a, settings) {
+    const required = (settings.requiredAdmissionDocuments || []).map(String);
+    if (!required.length) return { required: [], missing: [] };
+    const docs = await HostelDocument.find({
+        school: schoolId, isActive: true, docType: { $in: required },
+        $or: [{ entityType: 'HostelAdmission', entityId: a._id }, { student: a.student?._id || a.student }],
+    }).select('docType').lean();
+    const have = new Set(docs.map((d) => d.docType));
+    return { required, missing: required.filter((t) => !have.has(t)) };
+}
+
+/** Renumber a hostel's waiting list 1..n in its existing order. */
+async function closeWaitlistGap(schoolId, hostelId) {
+    const queue = await HostelAdmission.find({ school: schoolId, hostel: hostelId, status: 'waitlisted' })
+        .select('waitlistPosition appliedAt').sort('waitlistPosition').lean();
+    for (const [i, x] of queue.entries()) {
+        if (x.waitlistPosition !== i + 1) await HostelAdmission.findByIdAndUpdate(x._id, { $set: { waitlistPosition: i + 1 } });
+    }
+}
+
+/**
+ * Whatever else follows from somebody becoming a resident: the security
+ * deposit, where the school takes one. Never fails the allocation — a deposit
+ * that could not be raised is logged and can be raised by hand.
+ */
+async function onMovedIn(req, allocation, settings) {
+    try {
+        if (!allocation || allocation.status !== 'active') return null;       // a held bed is not a stay yet
+        return await payments.raiseDeposit(req, {
+            studentId: allocation.student, allocation, kind: resident.residentKind(allocation), settings,
+        });
+    } catch (e) { console.error('[hostel] deposit not raised:', e.message); return null; }
+}
+
+/**
+ * A bed given from the Allocations screen answers an approved application just
+ * as one given from Admissions does. Without this the application sat under
+ * "approved, awaiting a bed" for ever, though the student had moved in.
+ */
+async function settleAdmission(schoolId, studentId, academicYearId, allocationId) {
+    const open = await HostelAdmission.findOne({ school: schoolId, student: studentId, academicYear: academicYearId, status: 'approved', allocation: null }).lean();
+    if (open) await HostelAdmission.findByIdAndUpdate(open._id, { $set: { allocation: allocationId, status: 'completed' } });
+}
+
 exports.decideAdmission = async (req, res) => {
     try {
         const { action, remark = '', bed = null, allocate = false } = req.body;
@@ -1116,15 +1432,33 @@ exports.decideAdmission = async (req, res) => {
 
         const nextStatus = { approve: 'approved', reject: 'rejected', waitlist: 'waitlisted', cancel: 'cancelled' }[action];
         const settings = await getSettings(req.schoolId);
+
+        // Approving with required papers missing is a decision, not an accident:
+        // it has to be said out loud, and what was missing is kept on the record.
+        let missingDocuments = a.missingDocuments || [];
+        if (action === 'approve') {
+            const papers = await admissionPapers(req.schoolId, a, settings);
+            if (papers.missing.length && !req.body.acceptMissingDocuments) {
+                return res.status(400).json({
+                    success: false, code: 'DOCUMENTS_MISSING', missing: papers.missing,
+                    message: `Required documents are missing: ${papers.missing.map((t) => t.replace(/_/g, ' ')).join(', ')}. Upload them, or approve anyway.`,
+                });
+            }
+            missingDocuments = papers.missing;
+        }
         const [student, hostel] = await Promise.all([
             User.findById(a.student).select('name').lean(),
             Hostel.findById(a.hostel).select('name').lean(),
         ]);
 
+        // The end of the queue is one past the LAST position, not the head count:
+        // once somebody leaves the list, count + 1 is a number already taken.
         let waitlistPosition = a.waitlistPosition;
-        if (action === 'waitlist') {
-            waitlistPosition = await HostelAdmission.countDocuments({ school: req.schoolId, hostel: a.hostel, status: 'waitlisted' }) + 1;
+        if (action === 'waitlist' && a.status !== 'waitlisted') {
+            const queue = await HostelAdmission.find({ school: req.schoolId, hostel: a.hostel, status: 'waitlisted' }).select('waitlistPosition').lean();
+            waitlistPosition = queue.reduce((m, x) => Math.max(m, x.waitlistPosition || 0), 0) + 1;
         }
+        if (action !== 'waitlist') waitlistPosition = null;
 
         const updated = await HostelAdmission.findByIdAndUpdate(a._id, {
             $set: {
@@ -1133,12 +1467,15 @@ exports.decideAdmission = async (req, res) => {
                 reviewedAt: new Date(),
                 decisionRemark: remark,
                 waitlistPosition,
+                missingDocuments,
             },
         }, { new: true });
 
         await logAudit(req, { action, entityType: 'HostelAdmission', entityId: a._id, hostel: a.hostel,
-            description: `Application ${a.applicationNumber} ${nextStatus}`,
-            before: { status: a.status }, after: { status: nextStatus, remark } });
+            description: `Application ${a.applicationNumber} ${nextStatus}${action === 'approve' && missingDocuments.length ? ` with ${missingDocuments.length} required document(s) missing` : ''}`,
+            before: { status: a.status }, after: { status: nextStatus, remark, ...(action === 'approve' && missingDocuments.length ? { missingDocuments } : {}) } });
+        // Somebody left the waiting list: everyone behind them moves up.
+        if (a.status === 'waitlisted' && nextStatus !== 'waitlisted') await closeWaitlistGap(req.schoolId, a.hostel);
 
         // Optional allocation on approval.
         let allocation = null; let allocationError = null;
@@ -1159,6 +1496,7 @@ exports.decideAdmission = async (req, res) => {
                     toDate: a.expectedLeavingDate, settings,
                 });
                 allocation = r.allocation;
+                await onMovedIn(req, allocation, settings);
                 await HostelAdmission.findByIdAndUpdate(a._id, { $set: { allocation: allocation._id, status: 'completed' } });
                 await logAudit(req, { action: 'allocate', entityType: 'HostelAllocation', entityId: allocation._id, hostel: a.hostel,
                     description: `Allocated ${student?.name} to ${r.room.roomNumber}/${r.bed.bedNumber}` });
@@ -1221,6 +1559,7 @@ exports.getAllocations = async (req, res) => {
 exports.createAllocation = async (req, res) => {
     try {
         const { student, bed, academicYear, allocationType = 'permanent', fromDate, toDate, remarks = '' } = req.body;
+        const hold = req.body.hold === true || req.body.hold === 'true';
         if (!student || !bed || !academicYear) return bad(res, 'Student, bed and academic year are required');
 
         const bedRow = await HostelBed.findOne({ _id: bed, school: req.schoolId }).lean();
@@ -1231,16 +1570,48 @@ exports.createAllocation = async (req, res) => {
         const r = await alloc.allocateBed({
             schoolId: req.schoolId, studentId: student, bedId: bed, academicYearId: academicYear,
             actorId: req.userId, actorName: req.user?.name || '',
-            allocationType, allocationMode: 'manual', fromDate, toDate, remarks, settings,
+            allocationType, allocationMode: 'manual', fromDate, toDate, remarks, settings, hold,
         });
+        await settleAdmission(req.schoolId, student, academicYear, r.allocation._id);
+        await onMovedIn(req, r.allocation, settings);
 
         await logAudit(req, { action: 'allocate', entityType: 'HostelAllocation', entityId: r.allocation._id, hostel: bedRow.hostel,
-            description: `Allocated ${r.student.name} to ${r.hostel.name} · Room ${r.room.roomNumber} · Bed ${r.bed.bedNumber}`,
-            after: { room: r.room.roomNumber, bed: r.bed.bedNumber } });
+            description: `${hold ? 'Held a bed for' : 'Allocated'} ${r.student.name} ${hold ? 'in' : 'to'} ${r.hostel.name} · Room ${r.room.roomNumber} · Bed ${r.bed.bedNumber}`,
+            after: { room: r.room.roomNumber, bed: r.bed.bedNumber, status: r.allocation.status } });
         await notifyStudentAndParents(req, {
             studentId: student, settings,
+            title: hold ? 'Hostel bed reserved' : 'Hostel room allocated',
+            body: hold
+                ? `A bed is being held for you in ${r.hostel.name}, Room ${r.room.roomNumber}, Bed ${r.bed.bedNumber}. It is confirmed when you arrive.`
+                : `You have been allocated ${r.hostel.name}, Room ${r.room.roomNumber}, Bed ${r.bed.bedNumber}.`,
+        });
+        ok(res, r.allocation);
+    } catch (e) { handle(res, e); }
+};
+
+/**
+ * Confirm a held bed: a PENDING allocation becomes active once the student has
+ * arrived, and from then on they are a resident for every other screen.
+ */
+exports.confirmAllocation = async (req, res) => {
+    try {
+        const current = await HostelAllocation.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!current) return bad(res, 'Allocation not found', 404);
+        if (!await mayTouchHostel(req, current.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+
+        const settings = await getSettings(req.schoolId);
+        const r = await alloc.confirmAllocation({
+            schoolId: req.schoolId, allocationId: req.params.id,
+            actorId: req.userId, actorName: req.user?.name || '', remarks: req.body?.remarks || '',
+        });
+        await onMovedIn(req, r.allocation, settings);
+        await logAudit(req, { action: 'allocate', entityType: 'HostelAllocation', entityId: current._id, hostel: current.hostel,
+            description: `Confirmed ${r.student?.name || 'a student'} in ${r.hostel.name} · Room ${r.room?.roomNumber || '?'} · Bed ${r.bed.bedNumber}`,
+            before: { status: 'pending' }, after: { status: 'active' } });
+        await notifyStudentAndParents(req, {
+            studentId: current.student, settings,
             title: 'Hostel room allocated',
-            body: `You have been allocated ${r.hostel.name}, Room ${r.room.roomNumber}, Bed ${r.bed.bedNumber}.`,
+            body: `Your bed in ${r.hostel.name}, Room ${r.room?.roomNumber || ''}, Bed ${r.bed.bedNumber} is confirmed.`,
         });
         ok(res, r.allocation);
     } catch (e) { handle(res, e); }
@@ -1252,6 +1623,8 @@ exports.autoAllocate = async (req, res) => {
         const { student, academicYear, hostel = null, preferredRoomType = '' } = req.body;
         if (!student || !academicYear) return bad(res, 'Student and academic year are required');
         if (hostel && !await mayTouchHostel(req, hostel)) return bad(res, 'You do not have access to this hostel', 403);
+        // "Any suitable hostel" means any of the school's — which is not a posted warden's to choose from.
+        if (!hostel && await visibleHostelIds(req) !== null) return bad(res, 'Choose the hostel to find a bed in');
 
         const settings = await getSettings(req.schoolId);
         const bed = await alloc.findBestBed({ schoolId: req.schoolId, studentId: student, hostelId: hostel, preferredRoomType, settings });
@@ -1261,6 +1634,8 @@ exports.autoAllocate = async (req, res) => {
             schoolId: req.schoolId, studentId: student, bedId: bed._id, academicYearId: academicYear,
             actorId: req.userId, actorName: req.user?.name || '', allocationMode: 'auto', settings,
         });
+        await settleAdmission(req.schoolId, student, academicYear, r.allocation._id);
+        await onMovedIn(req, r.allocation, settings);
         await logAudit(req, { action: 'allocate', entityType: 'HostelAllocation', entityId: r.allocation._id, hostel: r.hostel._id,
             description: `Auto-allocated ${r.student.name} to Room ${r.room.roomNumber} · Bed ${r.bed.bedNumber}` });
         await notifyStudentAndParents(req, {
@@ -1282,6 +1657,7 @@ exports.bulkAllocate = async (req, res) => {
         const { students = [], academicYear, hostel = null, preferredRoomType = '' } = req.body;
         if (!students.length || !academicYear) return bad(res, 'Students and academic year are required');
         if (hostel && !await mayTouchHostel(req, hostel)) return bad(res, 'You do not have access to this hostel', 403);
+        if (!hostel && await visibleHostelIds(req) !== null) return bad(res, 'Choose the hostel to allocate beds in');
 
         const settings = await getSettings(req.schoolId);
         const allocated = []; const failed = [];
@@ -1294,6 +1670,8 @@ exports.bulkAllocate = async (req, res) => {
                     schoolId: req.schoolId, studentId, bedId: bed._id, academicYearId: academicYear,
                     actorId: req.userId, actorName: req.user?.name || '', allocationMode: 'bulk', settings,
                 });
+                await settleAdmission(req.schoolId, studentId, academicYear, r.allocation._id);
+                await onMovedIn(req, r.allocation, settings);
                 allocated.push({
                     student: studentId, studentName: r.student.name,
                     hostel: r.hostel.name, room: r.room.roomNumber, bed: r.bed.bedNumber,
@@ -1330,6 +1708,34 @@ exports.transferAllocation = async (req, res) => {
         if (!await mayTouchHostel(req, target.hostel)) return bad(res, 'You do not have access to the destination hostel', 403);
 
         const settings = await getSettings(req.schoolId);
+
+        // The module's admins move people directly. A teacher in on a posting
+        // asks, where the school wants transfers approved: the move waits in
+        // the transfer requests for an admin to carry out.
+        if (settings.transferRequiresApproval && req.hostelDuty) {
+            if (!String(reason).trim()) return bad(res, 'Say why the resident should move — the request goes to the hostel administrators');
+            // Refused now if it could never be carried out (wrong kind of bed, full room, gender).
+            await alloc.validateAllocation({ schoolId: req.schoolId, studentId: current.student, bedId: bed, settings, ignoreAllocationId: current._id });
+            if (!settings.allowTransferBetweenHostels && String(current.hostel) !== String(target.hostel)) {
+                return bad(res, 'Transfers between hostels are switched off in hostel settings');
+            }
+            if (await HostelTransferRequest.exists({ school: req.schoolId, allocation: current._id, status: 'pending' })) {
+                return bad(res, 'A room change is already waiting for approval for this resident');
+            }
+            const row = await HostelTransferRequest.create({
+                school: req.schoolId, student: current.student, allocation: current._id, hostel: current.hostel,
+                fromBed: current.bed, toBed: target._id, toHostel: target.hostel, reason,
+                requestNumber: await nextNumber(HostelTransferRequest, req.schoolId, 'HTR', false, { fresh: true }),
+                requestedBy: req.userId, requestedByRole: 'warden',
+            });
+            const who = await User.findById(current.student).select('name').lean();
+            await logAudit(req, { action: 'create', entityType: 'HostelTransferRequest', entityId: row._id, hostel: current.hostel,
+                description: `Asked to move ${who?.name} (${row.requestNumber})`, meta: { reason } });
+            notifyHostelStaff(req, { hostelId: current.hostel, title: 'Room change waiting for approval',
+                body: `${req.user?.name || 'A warden'} asked to move ${who?.name}. ${reason}` });
+            return ok(res, { pending: true, request: row });
+        }
+
         const r = await alloc.transferBed({
             schoolId: req.schoolId, allocationId: req.params.id, toBedId: bed,
             actorId: req.userId, actorName: req.user?.name || '', reason, effectiveDate, settings,
@@ -1353,10 +1759,229 @@ exports.transferAllocation = async (req, res) => {
     } catch (e) { handle(res, e); }
 };
 
+/** What a checkout has to settle: dues, the deposit held, items on issue, and what will be ended. */
+async function checkoutSummary(schoolId, studentId) {
+    const mine = { school: schoolId, student: studentId };
+    const [dues, dep, assets, mess, leaves, passes, visits] = await Promise.all([
+        HostelFeeInvoice.find({ ...mine, status: { $in: ['pending', 'partial', 'overdue'] }, feeType: { $ne: 'security_deposit' } }).select('netAmount paidAmount').lean(),
+        payments.deposits(schoolId, studentId),
+        HostelAsset.find({ school: schoolId, issuedTo: studentId, status: 'issued' }).select('name assetCode').lean(),
+        HostelMessMember.countDocuments({ ...mine, status: 'active' }),
+        HostelLeave.countDocuments({ ...mine, status: { $in: ['pending', 'parent_approved', 'approved'] } }),
+        HostelOutpass.countDocuments({ ...mine, status: { $in: ['pending', 'approved'] } }),
+        HostelVisitor.countDocuments({ ...mine, isTemplate: false, status: { $in: ['pending', 'approved'] } }),
+    ]);
+    return {
+        outstandingDues: payments.round2(dues.reduce((t, i) => t + Math.max(0, (i.netAmount || 0) - (i.paidAmount || 0)), 0)),
+        depositHeld: dep.total,
+        depositInvoices: dep.held.map((x) => ({ _id: x.invoice._id, invoiceNumber: x.invoice.invoiceNumber, held: x.held,
+            online: (x.invoice.payments || []).some((p) => p.mode === 'online' && p.gatewayPaymentId) })),
+        unpaidDeposits: dep.unpaid.length,
+        unreturnedAssets: assets,
+        willEnd: { messEnrolments: mess, leaves, outpasses: passes, visits },
+    };
+}
+
+exports.getCheckout = async (req, res) => {
+    try {
+        const a = await HostelAllocation.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!a) return bad(res, 'Allocation not found', 404);
+        if (!await mayTouchHostel(req, a.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+        ok(res, await checkoutSummary(req.schoolId, a.student));
+    } catch (e) { fail(res, e); }
+};
+
+/**
+ * Year-end rollover: each resident of the closing year either carries on in
+ * the same bed under the new academic year, or checks out.
+ *
+ * A stay belongs to an academic year (fees, reports and the admissions of the
+ * year are read by it), so without this every resident stays filed under a
+ * year that has ended. Carrying forward keeps the bed and the allocation — it
+ * is the same stay — and writes a history line; checking out goes through the
+ * ordinary release, with everything that implies.
+ */
+exports.rolloverAllocations = async (req, res) => {
+    try {
+        const { toYear, carry = [], vacate = [], reason = '' } = req.body;
+        if (!toYear) return bad(res, 'Choose the academic year to carry residents into');
+        const year = await AcademicYear.findOne({ _id: toYear, school: req.schoolId }).select('yearName').lean();
+        if (!year) return bad(res, 'Academic year not found');
+        const ids = [...new Set([...carry, ...vacate].map(String))];
+        if (!ids.length) return bad(res, 'Pick at least one resident');
+        if (carry.some((id) => vacate.map(String).includes(String(id)))) return bad(res, 'A resident is either carried forward or checked out, not both');
+
+        const rows = await HostelAllocation.find({ _id: { $in: ids }, school: req.schoolId, status: 'active' }).lean();
+        const byId = Object.fromEntries(rows.map((a) => [String(a._id), a]));
+        const names = Object.fromEntries((await User.find({ _id: { $in: rows.map((a) => String(a.student)) } }).select('name').lean()).map((u) => [String(u._id), u.name]));
+        const carried = []; const vacated = []; const failed = [];
+
+        for (const id of carry.map(String)) {
+            const a = byId[id];
+            if (!a) { failed.push({ allocation: id, reason: 'Not an active allocation' }); continue; }
+            if (String(a.academicYear) === String(toYear)) { failed.push({ allocation: id, studentName: names[String(a.student)], reason: `Already in ${year.yearName}` }); continue; }
+            await HostelAllocation.findByIdAndUpdate(a._id, { $set: { academicYear: toYear } });
+            await HostelAllocationHistory.create({
+                school: req.schoolId, student: a.student, allocation: a._id, academicYear: toYear, action: 'rolled_over',
+                toHostel: a.hostel, toRoom: a.room, toBed: a.bed, studentName: names[String(a.student)] || '',
+                reason: reason || `Carried forward to ${year.yearName}`, effectiveDate: new Date(),
+                performedBy: req.userId, performedByName: req.user?.name || '',
+            });
+            carried.push(id);
+        }
+        for (const id of vacate.map(String)) {
+            const a = byId[id];
+            if (!a) { failed.push({ allocation: id, reason: 'Not an active allocation' }); continue; }
+            try {
+                await alloc.releaseBed({ schoolId: req.schoolId, allocationId: id, actorId: req.userId, actorName: req.user?.name || '',
+                    reason: reason || 'Year-end checkout', status: 'vacated' });
+                const mine = { school: req.schoolId, student: a.student };
+                const gone = new Date();
+                await Promise.all([
+                    HostelMessMember.updateMany({ ...mine, status: 'active' }, { $set: { status: 'ended', toDate: gone } }),
+                    HostelLeave.updateMany({ ...mine, status: { $in: ['pending', 'parent_approved', 'approved'] } }, { $set: { status: 'cancelled', cancelledAt: gone } }),
+                    HostelOutpass.updateMany({ ...mine, status: { $in: ['pending', 'approved'] } }, { $set: { status: 'cancelled', qrToken: '' } }),
+                    HostelVisitor.updateMany({ ...mine, isTemplate: false, status: { $in: ['pending', 'approved'] } }, { $set: { status: 'cancelled', qrToken: '' } }),
+                ]);
+                vacated.push(id);
+            } catch (err) { failed.push({ allocation: id, studentName: names[String(a.student)], reason: err.message }); }
+        }
+        await logAudit(req, { action: 'rollover', entityType: 'HostelAllocation',
+            description: `Year-end rollover to ${year.yearName}: ${carried.length} carried forward, ${vacated.length} checked out${failed.length ? `, ${failed.length} not done` : ''}`,
+            meta: { toYear, carried: carried.length, vacated: vacated.length, failed: failed.length } });
+        ok(res, { carried: carried.length, vacated: vacated.length, failed });
+    } catch (e) { handle(res, e); }
+};
+
+// ── Online payments, for the fee desk ────────────────────────────────────────
+/**
+ * Every online checkout: the ones that went through, the ones nobody confirmed
+ * (the money may or may not have moved), and money taken that could not be
+ * placed. This is the list that says whether the gateway and the books agree.
+ */
+exports.getOnlinePayments = async (req, res) => {
+    try {
+        const params = [String(req.schoolId)];
+        let where = 'x."school" = $1';
+        const tab = String(req.query.tab || 'open');
+        if (tab === 'open') where += ` AND (x."status" = 'created' OR COALESCE(x."unapplied", 0) > 0)`;
+        else if (['paid', 'expired', 'created'].includes(tab)) { params.push(tab); where += ` AND x."status" = $${params.length}`; }
+        const { rows } = await pool.query(
+            `SELECT x."_id", x."orderId", x."amount", x."status", x."paymentId", x."receiptNumber", x."paidAt", x."unapplied", x."lines",
+                    x."createdAt", x."lastCheckedAt", x."confirmedBy", x."openedByRole",
+                    u."_id" AS "studentId", u."name" AS "studentName", u."profileImage" AS "studentPhoto",
+                    CASE WHEN u."role" = 'teacher' THEN 'teacher' ELSE 'student' END AS "studentKind", ob."name" AS "openedByName"
+               FROM "${require('../models/HostelPaymentOrder').tableName}" x
+               LEFT JOIN "users" u ON u."_id" = x."student"
+               LEFT JOIN "users" ob ON ob."_id" = x."openedBy"
+              WHERE ${where} ORDER BY x."createdAt" DESC LIMIT 300`, params);
+        const { rows: [c] } = await pool.query(
+            `SELECT count(*) FILTER (WHERE "status" = 'created')::int AS "unconfirmed",
+                    count(*) FILTER (WHERE COALESCE("unapplied", 0) > 0)::int AS "unapplied",
+                    count(*) FILTER (WHERE "status" = 'paid')::int AS "paid",
+                    count(*) FILTER (WHERE "status" = 'expired')::int AS "expired"
+               FROM "${require('../models/HostelPaymentOrder').tableName}" WHERE "school" = $1`, [String(req.schoolId)]);
+        ok(res, { rows, counts: c });
+    } catch (e) { fail(res, e); }
+};
+
+/** Ask the gateway about one unconfirmed checkout, now. */
+exports.checkOnlinePayment = async (req, res) => {
+    try {
+        const r = await payments.reconcileOrder(req, String(req.params.orderId));
+        if (r.error) return bad(res, `The gateway could not be asked: ${r.error}`);
+        ok(res, r);
+    } catch (e) { handle(res, e); }
+};
+
+// ── Room changes waiting for a decision ─────────────────────────────────────
+/** The requests, newest first — a warden's own hostels, or the whole school. */
+exports.getTransferRequests = async (req, res) => {
+    try {
+        const allowed = await visibleHostelIds(req);
+        const params = [String(req.schoolId)];
+        let where = 'x."school" = $1';
+        if (allowed !== null) { params.push(allowed.map(String)); where += ` AND x."hostel" = ANY($${params.length}::uuid[])`; }
+        if (['pending', 'approved', 'rejected', 'cancelled'].includes(req.query.status)) { params.push(req.query.status); where += ` AND x."status" = $${params.length}`; }
+        const { rows } = await pool.query(
+            `SELECT x.*, u."name" AS "studentName", u."profileImage" AS "studentPhoto",
+                    CASE WHEN u."role" = 'teacher' THEN 'teacher' ELSE 'student' END AS "studentKind",
+                    rq."name" AS "requestedByName", db."name" AS "decidedByName",
+                    fh."name" AS "fromHostelName", fr."roomNumber" AS "fromRoom", fb."bedNumber" AS "fromBedNumber",
+                    th."name" AS "toHostelName", tr."roomNumber" AS "toRoom", tb."bedNumber" AS "toBedNumber", tb."status" AS "toBedStatus"
+               FROM "${HostelTransferRequest.tableName}" x
+               LEFT JOIN "users" u ON u."_id" = x."student"
+               LEFT JOIN "users" rq ON rq."_id" = x."requestedBy"
+               LEFT JOIN "users" db ON db."_id" = x."decidedBy"
+               LEFT JOIN "${HostelBed.tableName}" fb ON fb."_id" = x."fromBed"
+               LEFT JOIN "${HostelRoom.tableName}" fr ON fr."_id" = fb."room"
+               LEFT JOIN "${Hostel.tableName}" fh ON fh."_id" = x."hostel"
+               LEFT JOIN "${HostelBed.tableName}" tb ON tb."_id" = x."toBed"
+               LEFT JOIN "${HostelRoom.tableName}" tr ON tr."_id" = tb."room"
+               LEFT JOIN "${Hostel.tableName}" th ON th."_id" = COALESCE(x."toHostel", x."hostel")
+              WHERE ${where}
+              ORDER BY (x."status" = 'pending') DESC, x."createdAt" DESC LIMIT 200`, params);
+        ok(res, { rows, pending: rows.filter((r) => r.status === 'pending').length });
+    } catch (e) { fail(res, e); }
+};
+
+/**
+ * Approve (and carry out) or reject a room change. Approving a resident's own
+ * request needs a bed — they said why, the office says where.
+ */
+exports.decideTransferRequest = async (req, res) => {
+    try {
+        const { action, remark = '', bed = null } = req.body;
+        if (!['approve', 'reject'].includes(action)) return bad(res, 'Action must be approve or reject');
+        const t = await HostelTransferRequest.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!t) return bad(res, 'Request not found', 404);
+        if (t.status !== 'pending') return bad(res, `This request is already ${t.status}`);
+
+        const settings = await getSettings(req.schoolId);
+        const set = { status: action === 'approve' ? 'approved' : 'rejected', decidedBy: req.userId, decidedAt: new Date(), decisionRemark: remark };
+        let moved = null;
+        if (action === 'approve') {
+            const toBed = bed || t.toBed;
+            if (!toBed) return bad(res, 'Choose the bed to move them to');
+            const current = await HostelAllocation.findOne({ _id: t.allocation, school: req.schoolId }).lean();
+            if (!current || !['pending', 'active'].includes(current.status)) {
+                return bad(res, 'This resident no longer holds the bed the request was made from — reject it instead');
+            }
+            moved = await alloc.transferBed({
+                schoolId: req.schoolId, allocationId: t.allocation, toBedId: toBed,
+                actorId: req.userId, actorName: req.user?.name || '', reason: t.reason || t.preference || 'Room change approved', settings,
+            });
+            set.toBed = toBed; set.toHostel = moved.to.hostel; set.newAllocation = moved.allocation._id;
+        } else if (!String(remark).trim()) return bad(res, 'Say why the request is turned down');
+
+        const updated = await HostelTransferRequest.findByIdAndUpdate(t._id, { $set: set }, { new: true });
+        const who = await User.findById(t.student).select('name').lean();
+        await logAudit(req, { action, entityType: 'HostelTransferRequest', entityId: t._id, hostel: t.hostel,
+            description: `Room change ${t.requestNumber} for ${who?.name} ${set.status}`, meta: { remark } });
+        if (moved) {
+            const [room, hostel] = await Promise.all([
+                HostelRoom.findById(moved.to.room).select('roomNumber').lean(), Hostel.findById(moved.to.hostel).select('name').lean(),
+            ]);
+            await notifyStudentAndParents(req, { studentId: t.student, settings, title: 'Hostel transfer',
+                body: `You have been moved to ${hostel?.name}, Room ${room?.roomNumber}.` });
+        } else {
+            await notifyStudentAndParents(req, { studentId: t.student, settings, title: 'Room change not approved',
+                body: `The room change request ${t.requestNumber} was not approved. ${remark}` });
+        }
+        // Whoever asked hears the answer.
+        if (t.requestedBy && String(t.requestedBy) !== String(t.student)) {
+            const { notify } = require('../services/notifyService');
+            notify({ school: req.schoolId, sender: req.userId, senderRole: req.userRole, recipients: [String(t.requestedBy)],
+                title: `Room change ${set.status}`, body: `${t.requestNumber} for ${who?.name} was ${set.status}.${remark ? ` ${remark}` : ''}`, link: { type: 'hostel' } });
+        }
+        ok(res, updated);
+    } catch (e) { handle(res, e); }
+};
+
 // Release / vacate — the allocation closes, the bed frees, history is kept.
 exports.releaseAllocation = async (req, res) => {
     try {
-        const { reason = '', status = 'vacated', vacatedDate = null } = req.body;
+        const { reason = '', status = 'vacated', vacatedDate = null, refundDeposit = false, refundReference = '', refundViaGateway = false } = req.body;
         const current = await HostelAllocation.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!current) return bad(res, 'Allocation not found', 404);
         if (!await mayTouchHostel(req, current.hostel)) return bad(res, 'You do not have access to this hostel', 403);
@@ -1376,6 +2001,45 @@ exports.releaseAllocation = async (req, res) => {
             description: `${status === 'cancelled' ? 'Cancelled' : 'Vacated'} allocation for ${student?.name}`,
             before: { status: current.status }, after: { status }, meta: { reason } });
 
+        // What only a resident can hold ends with the stay: the mess enrolment
+        // (or they stay on the meal register), and requests not yet used — an
+        // approved pass would otherwise still open the gate for someone who
+        // no longer lives here.
+        const gone = new Date();
+        const mine = { school: req.schoolId, student: current.student };
+        const [mess, leavesOff, passesOff, visitsOff] = await Promise.all([
+            HostelMessMember.updateMany({ ...mine, status: 'active' }, { $set: { status: 'ended', toDate: gone } }),
+            HostelLeave.updateMany({ ...mine, status: { $in: ['pending', 'parent_approved', 'approved'] } }, { $set: { status: 'cancelled', cancelledAt: gone } }),
+            HostelOutpass.updateMany({ ...mine, status: { $in: ['pending', 'approved'] } }, { $set: { status: 'cancelled', qrToken: '' } }),
+            HostelVisitor.updateMany({ ...mine, isTemplate: false, status: { $in: ['pending', 'approved'] } }, { $set: { status: 'cancelled', qrToken: '' } }),
+        ]);
+        const n = (r) => r?.modifiedCount ?? r?.nModified ?? r?.rowCount ?? 0;
+        const ended = { messEnrolments: n(mess), leaves: n(leavesOff), outpasses: n(passesOff), visits: n(visitsOff) };
+
+        // The deposit. One billed and never paid is no longer owed; one that was
+        // paid is handed back here when the form says so — otherwise it stays
+        // held, and the reply says how much.
+        const dep = await payments.deposits(req.schoolId, current.student);
+        for (const inv of dep.unpaid) {
+            inv.status = 'cancelled';
+            await inv.save();
+            await postToLedger({ schoolId: req.schoolId, studentId: inv.student, academicYearId: inv.academicYear,
+                entryType: 'credit', category: 'adjustment', amount: inv.netAmount,
+                description: `Hostel deposit ${inv.invoiceNumber} cancelled at checkout`, invoiceId: inv._id, createdBy: req.userId, settings });
+        }
+        let depositRefunded = 0; let depositHeld = dep.total; const vouchers = [];
+        if (refundDeposit === true || refundDeposit === 'true') {
+            for (const { invoice, held } of dep.held) {
+                try {
+                    const r = await payments.refund(req, invoice, held, {
+                        reference: refundReference, reason: 'Security deposit returned at checkout',
+                        viaGateway: (refundViaGateway === true || refundViaGateway === 'true') && (invoice.payments || []).some((p) => p.mode === 'online' && p.gatewayPaymentId),
+                    });
+                    depositRefunded += held; depositHeld -= held; vouchers.push(r.voucherNumber);
+                } catch (err) { ended.depositError = err.message; }
+            }
+        }
+
         // Outstanding money and unreturned assets follow the student out.
         const [dues, assets] = await Promise.all([
             HostelFeeInvoice.aggregate([
@@ -1385,15 +2049,21 @@ exports.releaseAllocation = async (req, res) => {
             HostelAsset.countDocuments({ school: req.schoolId, issuedTo: current.student, status: 'issued' }),
         ]);
         const outstanding = Math.max(0, (dues[0]?.billed || 0) - (dues[0]?.paid || 0));
+        if (depositHeld > 0) {
+            await notifyHostelStaff(req, { hostelId: current.hostel, includeSender: true,
+                title: 'Security deposit still held',
+                body: `${student?.name} has checked out of ${hostel?.name} with a deposit of ${depositHeld} still held. Refund it from Hostel Fees.` });
+        }
 
         await notifyStudentAndParents(req, {
             studentId: current.student, settings,
             title: 'Hostel checkout',
             body: `Your stay at ${hostel?.name} has been closed.`
                 + (outstanding ? ` Outstanding hostel dues: ${outstanding}.` : '')
-                + (assets ? ` ${assets} hostel item(s) are still on issue.` : ''),
+                + (assets ? ` ${assets} hostel item(s) are still on issue.` : '')
+                + (depositRefunded ? ` Your security deposit of ${depositRefunded} has been refunded.` : depositHeld > 0 ? ` Your security deposit of ${depositHeld} will be refunded by the hostel office.` : ''),
         });
-        ok(res, { allocation: closed, outstandingDues: outstanding, unreturnedAssets: assets });
+        ok(res, { allocation: closed, outstandingDues: outstanding, unreturnedAssets: assets, ended, depositRefunded, depositHeld, vouchers });
     } catch (e) { handle(res, e); }
 };
 
@@ -1402,6 +2072,12 @@ exports.getAllocationHistory = async (req, res) => {
         const q = { school: req.schoolId };
         if (req.query.student) q.student = req.query.student;
         if (req.params.id) q.allocation = req.params.id;
+        // On a posting: only moves into or out of the caller's own hostels.
+        const allowed = await visibleHostelIds(req);
+        if (allowed !== null) {
+            if (!allowed.length) return ok(res, []);
+            q.$or = [{ toHostel: { $in: allowed } }, { fromHostel: { $in: allowed } }];
+        }
         const rows = await HostelAllocationHistory.find(q).sort('-createdAt').limit(200)
             .populate('performedBy', 'name')
             .populate('fromRoom', 'roomNumber').populate('toRoom', 'roomNumber')
@@ -1493,10 +2169,13 @@ exports.getAttendanceRegister = async (req, res) => {
         if (floor) q.floor = floor;
         if (building) q.building = building;
 
-        const residents = await HostelAllocation.find(q)
+        const settings = await getSettings(req.schoolId);
+        const residents = (await HostelAllocation.find(q)
             .populate('student', 'name email profileImage')
             .populate('room', 'roomNumber').populate('floor', 'name floorNumber')
-            .populate('building', 'name').sort('createdAt').lean();
+            .populate('building', 'name').sort('createdAt').lean())
+            // Staff who live in are not called at roll call, unless the school asks for it.
+            .filter((r) => settings.rollCallIncludesTeachers || resident.residentKind(r) !== 'teacher');
 
         const studentIds = residents.map((r) => String(r.student?._id || r.student));
         const [marked, onLeave, onOutpass] = await Promise.all([
@@ -1562,6 +2241,13 @@ exports.markAttendance = async (req, res) => {
         }).lean();
         const byStudent = Object.fromEntries(allocations.map((a) => [String(a.student), a]));
 
+        // One read for everything already marked, rather than one per student.
+        const marked = await HostelAttendance.find({
+            school: req.schoolId, student: { $in: records.map((r) => String(r.student)) },
+            date: { $gte: start, $lt: end }, session,
+        }).lean();
+        const existingBy = Object.fromEntries(marked.map((m) => [String(m.student), m]));
+
         let created = 0; let updated = 0; const skipped = [];
         for (const r of records) {
             const a = byStudent[String(r.student)];
@@ -1569,16 +2255,20 @@ exports.markAttendance = async (req, res) => {
             if (!['present', 'absent', 'late', 'excused', 'on_leave'].includes(r.status)) {
                 skipped.push({ student: r.student, reason: `Unsupported status '${r.status}'` }); continue;
             }
-            const existing = await HostelAttendance.findOne({
-                school: req.schoolId, student: r.student, date: { $gte: start, $lt: end }, session,
-            }).lean();
+            const existing = existingBy[String(r.student)];
 
             if (existing) {
                 // A re-submit is an ordinary edit; a later change of mind goes
                 // through the correction endpoint, which keeps the old value.
-                if (existing.status !== r.status) {
+                // A remark is part of the mark: changing only the remark (or
+                // clearing it) is saved too, which the old `||` silently dropped.
+                const remarks = r.remarks === undefined ? existing.remarks : String(r.remarks || '');
+                const statusChanged = existing.status !== r.status;
+                if (statusChanged || remarks !== (existing.remarks || '')) {
                     await HostelAttendance.findByIdAndUpdate(existing._id, {
-                        $set: { status: r.status, remarks: r.remarks || existing.remarks, markedBy: req.userId, markedAt: new Date() },
+                        $set: statusChanged
+                            ? { status: r.status, remarks, markedBy: req.userId, markedAt: new Date() }
+                            : { remarks },
                     });
                     updated += 1;
                 }
@@ -1662,6 +2352,7 @@ exports.approveAttendanceCorrection = async (req, res) => {
         const { approve = true, remark = '' } = req.body;
         const row = await HostelAttendance.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!row) return bad(res, 'Attendance record not found', 404);
+        if (!await mayTouchHostel(req, row.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         if (row.approvalStatus !== 'pending') return bad(res, 'This record has no correction awaiting approval');
 
         const updated = await HostelAttendance.findByIdAndUpdate(row._id, {
@@ -1706,6 +2397,11 @@ exports.getAttendanceHistory = async (req, res) => {
 //  LEAVE (spec §12)
 // ═════════════════════════════════════════════════════════════════════════════
 const LEAVE_OPEN = ['pending', 'parent_approved', 'approved', 'active'];
+/** What a leave or outpass form may never set: the workflow owns these. */
+const WORKFLOW_FIELDS = ['_id', 'school', 'status', 'qrToken', 'approvedBy', 'approvedAt', 'wardenApprovedBy', 'wardenApprovedAt',
+    'parentApprovedBy', 'parentApprovedAt', 'rejectedBy', 'rejectedAt', 'rejectionReason', 'cancelledAt', 'departedAt', 'returnedAt',
+    'returnConfirmedBy', 'isOverdue', 'actualDepartureAt', 'actualReturnAt', 'verifiedOutBy', 'verifiedInBy', 'lateReturnMinutes',
+    'leaveNumber', 'outpassNumber', 'totalDays', 'expectedReturnAt', 'createdAt', 'updatedAt'];
 
 /**
  * Everything that must hold before a hostel leave is filed. Shared with the
@@ -1738,17 +2434,30 @@ async function validateLeave({ schoolId, studentId, fromDate, toDate, settings, 
     if (overlapping.some((l) => String(l._id) !== String(ignoreId || ''))) {
         throw new alloc.RuleError('This student already has leave covering those dates');
     }
-    const open = await HostelLeave.countDocuments({ school: schoolId, student: studentId, status: { $in: ['pending', 'parent_approved'] } });
+    // "Open" means still waiting AND still ahead: a request for dates already
+    // gone, that nobody ever decided, must not use up the allowance for ever.
+    const open = await HostelLeave.countDocuments({
+        school: schoolId, student: studentId, status: { $in: ['pending', 'parent_approved'] }, toDate: { $gte: dayRange().start },
+    });
     if (settings.maxOpenLeavesPerStudent && open >= settings.maxOpenLeavesPerStudent && !ignoreId) {
         throw new alloc.RuleError(`Only ${settings.maxOpenLeavesPerStudent} leave request(s) may be open at a time`);
     }
 
     // Concurrent outpass (spec §31) — configurable.
+    // Only an outpass that touches these dates: one being used now while the
+    // leave starts today, or one booked for a day inside the leave. A pass for
+    // this afternoon says nothing about a leave next month.
     if (!settings.allowConcurrentLeaveAndOutpass) {
-        const activeOutpass = await HostelOutpass.countDocuments({
-            school: schoolId, student: studentId, status: { $in: ['approved', 'active', 'overdue'] },
-        });
-        if (activeOutpass) throw new alloc.RuleError('This student has an active outpass — it must be closed before leave can start');
+        const startsNow = dayRange(from).start <= dayRange().start;
+        const [outNow, booked] = await Promise.all([
+            startsNow ? HostelOutpass.countDocuments({ school: schoolId, student: studentId, status: { $in: ['active', 'overdue'] } }) : 0,
+            HostelOutpass.countDocuments({
+                school: schoolId, student: studentId, status: { $in: ['approved', 'active', 'overdue'] },
+                departureDate: { $gte: dayRange(from).start, $lt: dayRange(to).end },
+            }),
+        ]);
+        if (outNow) throw new alloc.RuleError('This resident is out on an outpass — it must be closed before leave can start');
+        if (booked) throw new alloc.RuleError('This resident has an outpass on one of those days — cancel it or change the dates');
     }
     return { allocation, days };
 }
@@ -1789,13 +2498,19 @@ exports.createLeave = async (req, res) => {
         });
         if (!await mayTouchHostel(req, allocation.hostel)) return bad(res, 'You do not have access to this hostel', 403);
 
+        // Where a request stands is decided by actOnLeave, never by the form.
+        const fields = { ...b };
+        for (const f of WORKFLOW_FIELDS) delete fields[f];
+        // Parent consent is a rule about students. A member of staff has no
+        // parent to ask, and a leave that waits for one would wait for ever.
+        const kind = resident.residentKind(allocation);
         const row = await HostelLeave.create({
-            ...b,
+            ...fields,
             school: req.schoolId, hostel: allocation.hostel, allocation: allocation._id,
             academicYear: allocation.academicYear,
             leaveNumber: await nextNumber(HostelLeave, req.schoolId, 'HLV'),
-            totalDays: days,
-            parentApprovalRequired: b.parentApprovalRequired ?? settings.leaveRequiresParentApproval,
+            totalDays: days, status: 'pending',
+            parentApprovalRequired: kind === 'teacher' ? false : (b.parentApprovalRequired ?? settings.leaveRequiresParentApproval),
             appliedBy: req.userId, createdBy: req.userId,
         });
 
@@ -1896,15 +2611,20 @@ exports.actOnLeave = async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 //  OUTPASS (spec §12) — with QR gate verification
 // ═════════════════════════════════════════════════════════════════════════════
+/** When a pass stops being usable: its stated return, else the end of its day. */
+const passEnd = (o) => (o.expectedReturnAt ? new Date(o.expectedReturnAt) : dayRange(o.departureDate).end);
+
 /** Shared outpass validation, used by the admin and the student/parent surface. */
-async function validateOutpass({ schoolId, studentId, departureDate, expectedDepartureTime, expectedReturnTime, settings }) {
+async function validateOutpass({ schoolId, studentId, departureDate, expectedDepartureTime, expectedReturnTime, expectedReturnDate, settings }) {
     const allocation = await HostelAllocation.findOne({ school: schoolId, student: studentId, status: 'active' }).lean();
     if (!allocation) throw new alloc.RuleError('This student is not currently a hostel resident');
 
     const depAt = atTime(departureDate, expectedDepartureTime);
-    const retAt = atTime(departureDate, expectedReturnTime);
+    const retAt = atTime(expectedReturnDate || departureDate, expectedReturnTime);
     if (depAt && retAt && retAt <= depAt) {
         // An evening pass returning after midnight is legitimate — roll it over.
+        // A return DATE was stated, though: a return before leaving is a mistake.
+        if (expectedReturnDate) throw new alloc.RuleError('The expected return must be after the departure');
         retAt.setDate(retAt.getDate() + 1);
     }
     if (depAt && retAt && settings.maxOutpassHours) {
@@ -1920,20 +2640,32 @@ async function validateOutpass({ schoolId, studentId, departureDate, expectedDep
         }
     }
 
-    const openPass = await HostelOutpass.countDocuments({
+    // One open outpass at a time — "open" being out right now, or asked for
+    // and not yet past. A pass that was approved and never used must not block
+    // every later request (the sweep also cancels those, see sweepOverdue).
+    const passes = await HostelOutpass.find({
         school: schoolId, student: studentId, status: { $in: ['pending', 'approved', 'active', 'overdue'] },
-    });
-    if (openPass) throw new alloc.RuleError('This student already has an open outpass');
+    }).select('status expectedReturnAt departureDate').lean();
+    if (passes.some((o) => ['active', 'overdue'].includes(o.status) || passEnd(o) > new Date())) {
+        throw new alloc.RuleError('This student already has an open outpass');
+    }
 
+    // On leave ON THAT DAY, or away on leave right now — not "has a leave approved for next month".
     if (!settings.allowConcurrentLeaveAndOutpass) {
-        const onLeave = await HostelLeave.countDocuments({
-            school: schoolId, student: studentId, status: { $in: ['approved', 'active'] },
-        });
-        if (onLeave) throw new alloc.RuleError('This student is on leave — an outpass cannot run at the same time');
+        const day = dayRange(departureDate);
+        const [away, thatDay] = await Promise.all([
+            HostelLeave.countDocuments({ school: schoolId, student: studentId, status: { $in: ['active', 'overdue'] } }),
+            HostelLeave.countDocuments({
+                school: schoolId, student: studentId, status: { $in: ['approved', 'active'] },
+                fromDate: { $lt: day.end }, toDate: { $gte: day.start },
+            }),
+        ]);
+        if (away || thatDay) throw new alloc.RuleError('This student is on leave then — an outpass cannot run at the same time');
     }
     return { allocation, expectedReturnAt: retAt };
 }
 exports._validateOutpass = validateOutpass;
+exports._guardianOf = guardianOf;
 
 exports.getOutpasses = async (req, res) => {
     try {
@@ -1966,13 +2698,18 @@ exports.createOutpass = async (req, res) => {
             schoolId: req.schoolId, studentId: b.student,
             departureDate: b.departureDate,
             expectedDepartureTime: b.expectedDepartureTime,
-            expectedReturnTime: b.expectedReturnTime, settings,
+            expectedReturnTime: b.expectedReturnTime, expectedReturnDate: b.expectedReturnDate, settings,
         });
         if (!await mayTouchHostel(req, allocation.hostel)) return bad(res, 'You do not have access to this hostel', 403);
 
+        const { expectedReturnDate, ...fields } = b;
+        for (const f of WORKFLOW_FIELDS) delete fields[f];
+        // Where the school asks for a parent's consent, a student's pass waits
+        // for it. Staff have no parent to ask.
+        const needsParent = !!settings.outpassRequiresParentApproval && resident.residentKind(allocation) !== 'teacher';
         const row = await HostelOutpass.create({
-            ...b,
-            school: req.schoolId, hostel: allocation.hostel, allocation: allocation._id,
+            ...fields, status: 'pending', parentApprovalRequired: needsParent, parentApprovedBy: null, parentApprovedAt: null,
+            school: req.schoolId, hostel: allocation.hostel, allocation: allocation._id, academicYear: allocation.academicYear,
             outpassNumber: await nextNumber(HostelOutpass, req.schoolId, 'OP', true),
             expectedReturnAt,
             requestedBy: b.requestedBy || req.userId,
@@ -1983,8 +2720,11 @@ exports.createOutpass = async (req, res) => {
             description: `Outpass ${row.outpassNumber} requested for ${student?.name}` });
         await notifyStudentAndParents(req, {
             studentId: b.student, settings, settingKey: 'notifyParentOnOutpass',
-            title: 'Outpass requested',
-            body: `An outpass has been requested for ${new Date(b.departureDate).toDateString()}. Purpose: ${b.purpose}`,
+            title: needsParent ? 'Outpass needs your consent' : 'Outpass requested',
+            body: `An outpass has been requested for ${new Date(b.departureDate).toDateString()}. Purpose: ${b.purpose}`
+                + (needsParent ? ' A parent\'s consent is needed before the warden can approve it.' : ''),
+            // The consent IS the point of this message: it goes to the parents whatever the notify switch says.
+            ...(needsParent ? { settingKey: undefined } : {}),
         });
         ok(res, row);
     } catch (e) { handle(res, e); }
@@ -1997,7 +2737,7 @@ exports.createOutpass = async (req, res) => {
 exports.actOnOutpass = async (req, res) => {
     try {
         const { action, remark = '' } = req.body;
-        const valid = ['approve', 'reject', 'cancel'];
+        const valid = ['approve', 'reject', 'cancel', 'parent_approve'];
         if (!valid.includes(action)) return bad(res, `Action must be one of: ${valid.join(', ')}`);
 
         const o = await HostelOutpass.findOne({ _id: req.params.id, school: req.schoolId }).lean();
@@ -2005,8 +2745,16 @@ exports.actOnOutpass = async (req, res) => {
         if (!await mayTouchHostel(req, o.hostel)) return bad(res, 'You do not have access to this hostel', 403);
 
         const set = {};
-        if (action === 'approve') {
+        if (action === 'parent_approve') {
+            // The office records a consent given in person or on the phone.
+            if (o.status !== 'pending') return bad(res, 'Only a pending outpass can receive parent consent');
+            if (o.parentApprovedAt) return bad(res, 'Parent consent is already recorded');
+            set.parentApprovedBy = req.userId; set.parentApprovedAt = new Date();
+        } else if (action === 'approve') {
             if (o.status !== 'pending') return bad(res, `A ${o.status} outpass cannot be approved`);
+            if (o.parentApprovalRequired && !o.parentApprovedAt) {
+                return bad(res, 'Parent consent is required before this outpass can be approved');
+            }
             set.status = 'approved'; set.approvedBy = req.userId; set.approvedAt = new Date();
             set.qrToken = crypto.randomBytes(24).toString('hex');
         } else if (action === 'reject') {
@@ -2014,20 +2762,24 @@ exports.actOnOutpass = async (req, res) => {
             set.status = 'rejected'; set.rejectedBy = req.userId; set.rejectionReason = remark;
         } else {
             if (['returned', 'cancelled', 'rejected'].includes(o.status)) return bad(res, `This outpass is already ${o.status}`);
+            // Out, or out and late: the pass can only be closed by their return —
+            // cancelling it would leave them marked outside with nothing to close.
+            if (['active', 'overdue'].includes(o.status)) return bad(res, 'This student is currently out — record their return instead');
             set.status = 'cancelled'; set.qrToken = '';
-            if (o.status === 'active') return bad(res, 'This student is currently out — record their return instead');
         }
 
         const updated = await HostelOutpass.findByIdAndUpdate(o._id, { $set: set }, { new: true });
         if (updated && set.qrToken) updated.qrImage = passImage(set.qrToken);
         const settings = await getSettings(req.schoolId);
+        const done = set.status || 'parent consent recorded';
         await logAudit(req, { action, entityType: 'HostelOutpass', entityId: o._id, hostel: o.hostel,
-            description: `Outpass ${o.outpassNumber} ${set.status}`,
-            before: { status: o.status }, after: { status: set.status }, meta: { remark } });
+            description: `Outpass ${o.outpassNumber} ${done}`,
+            before: { status: o.status }, after: { status: set.status || o.status }, meta: { remark } });
         await notifyStudentAndParents(req, {
             studentId: o.student, settings, settingKey: 'notifyParentOnOutpass',
-            title: `Outpass ${set.status}`,
-            body: `Outpass ${o.outpassNumber} is ${set.status}.${remark ? ` ${remark}` : ''}`,
+            title: set.status ? `Outpass ${set.status}` : 'Outpass: parent consent recorded',
+            body: set.status ? `Outpass ${o.outpassNumber} is ${set.status}.${remark ? ` ${remark}` : ''}`
+                : `Parent consent has been recorded for outpass ${o.outpassNumber}. It now waits for the warden.`,
         });
         ok(res, updated);
     } catch (e) { fail(res, e); }
@@ -2056,6 +2808,9 @@ exports.gateScan = async (req, res) => {
 
         if (direction === 'out') {
             if (o.status !== 'approved') return bad(res, `This pass is ${o.status} — it cannot be used to exit`);
+            // An approved pass opens the gate on its own day, until its return time.
+            if (now < dayRange(o.departureDate).start) return bad(res, `This pass is for ${new Date(o.departureDate).toDateString()} — it cannot be used before then`);
+            if (now > passEnd(o)) return bad(res, 'This pass has expired — its return time has already passed');
             set.status = 'active'; set.actualDepartureAt = now; set.verifiedOutBy = req.userId;
         } else {
             if (!['active', 'overdue'].includes(o.status)) return bad(res, `This pass is ${o.status} — there is no exit to close`);
@@ -2121,6 +2876,7 @@ exports.outpassQr = async (req, res) => {
     try {
         const o = await HostelOutpass.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!o) return bad(res, 'Outpass not found', 404);
+        if (!await mayTouchHostel(req, o.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         if (!o.qrToken) return bad(res, 'This outpass has no active pass');
         const { matrixToPng } = require('../utils/pngEncoder');
         const png = matrixToPng(qrcode.encode(o.qrToken), { scale: 8, quietZone: 4 });
@@ -2137,6 +2893,8 @@ exports.verifyOutpass = async (req, res) => {
             .populate('student', 'name profileImage email')
             .populate('hostel', 'name').lean();
         if (!o) return bad(res, 'This pass is not valid', 404);
+        // A pass for another hostel is not this gate's to read — or to wave through.
+        if (!await mayTouchHostel(req, o.hostel?._id || o.hostel)) return bad(res, 'This pass belongs to another hostel', 403);
         const room = await HostelAllocation.findOne({ _id: o.allocation }).populate('room', 'roomNumber').lean();
         ok(res, {
             ...o, room: room?.room || null,
@@ -2167,7 +2925,54 @@ async function sweepOverdue(schoolId) {
 
     for (const p of passes) await HostelOutpass.findByIdAndUpdate(p._id, { $set: { status: 'overdue' } });
     for (const l of leaves) await HostelLeave.findByIdAndUpdate(l._id, { $set: { status: 'overdue', isOverdue: true } });
-    return { outpasses: passes.length, leaves: leaves.length, passes, leaveRows: leaves };
+
+    // Say so — once. A row is only picked up while it is still 'active', so the
+    // flip above is what keeps this from repeating on the next sweep. Somebody
+    // not back when they should be is the one thing a hostel must hear about.
+    if (passes.length || leaves.length) {
+        const sys = await systemRequest(schoolId);
+        if (sys) {
+            const people = await User.find({ _id: { $in: [...passes, ...leaves].map((x) => String(x.student)) } }).select('name').lean();
+            const nameOf = Object.fromEntries(people.map((u) => [String(u._id), u.name]));
+            const at = (d) => new Date(d).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+            for (const p of passes) {
+                const who = nameOf[String(p.student)] || 'A resident';
+                notifyHostelStaff(sys, { hostelId: p.hostel, includeSender: true, title: 'Resident overdue from outpass',
+                    body: `${who} was due back by ${at(p.expectedReturnAt)} on outpass ${p.outpassNumber} and has not returned.` });
+                notifyStudentAndParents(sys, { studentId: p.student, settings, settingKey: 'notifyParentOnLateReturn',
+                    title: 'Overdue from hostel outpass',
+                    body: `Outpass ${p.outpassNumber} expected a return by ${at(p.expectedReturnAt)}, and no return has been recorded at the hostel gate.` });
+            }
+            for (const l of leaves) {
+                const who = nameOf[String(l.student)] || 'A resident';
+                notifyHostelStaff(sys, { hostelId: l.hostel, includeSender: true, title: 'Resident overdue from leave',
+                    body: `${who} was due back from leave ${l.leaveNumber} on ${new Date(l.toDate).toDateString()} and has not returned.` });
+                notifyStudentAndParents(sys, { studentId: l.student, settings, settingKey: 'notifyParentOnLateReturn',
+                    title: 'Overdue from hostel leave',
+                    body: `Leave ${l.leaveNumber} ended on ${new Date(l.toDate).toDateString()}, and no return has been recorded at the hostel.` });
+            }
+        }
+    }
+
+    // A pass asked for (or approved) and never used, a day past its time: closed,
+    // and its QR with it — otherwise it would open the gate on some later day.
+    const dayAgo = new Date(now - 24 * 36e5);
+    const stale = (await HostelOutpass.find({ school: schoolId, status: { $in: ['pending', 'approved'] } })
+        .select('status expectedReturnAt departureDate remarks').lean()).filter((o) => passEnd(o) < dayAgo);
+    for (const o of stale) {
+        await HostelOutpass.findByIdAndUpdate(o._id, { $set: {
+            status: 'cancelled', qrToken: '',
+            remarks: [o.remarks, o.status === 'approved' ? 'Expired — the pass was not used' : 'Expired — not decided in time'].filter(Boolean).join(' · '),
+        } });
+    }
+
+    // An invoice's stored status only moves when it is saved, so one nobody
+    // touched stays 'pending' past its due date. The figures count by status.
+    const { rowCount: invoices } = await pool.query(
+        `UPDATE "${HostelFeeInvoice.tableName}" SET "status" = 'overdue', "updatedAt" = now()
+          WHERE "school" = $1 AND "status" = 'pending' AND "dueDate" IS NOT NULL AND "dueDate" < now()`, [String(schoolId)]);
+
+    return { outpasses: passes.length, leaves: leaves.length, expired: stale.length, invoices, passes, leaveRows: leaves };
 }
 exports.sweepOverdue = sweepOverdue;
 
@@ -2205,6 +3010,24 @@ exports.getVisitors = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/**
+ * Is this the person on a standing list? By mobile number when both have one,
+ * else by name — the whole name, not a fragment: "Ram" is not "Ramesh Kumar",
+ * and the old substring test both blocked the wrong people and let a listed
+ * "Ram Kumar" in as "Ram".
+ */
+const squash = (v) => String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const digits = (v) => String(v || '').replace(/\D/g, '').slice(-10);
+const sameVisitor = (a, b) => (digits(a.mobile).length >= 7 && digits(a.mobile) === digits(b.mobile))
+    || (!!squash(a.visitorName) && squash(a.visitorName) === squash(b.visitorName));
+/** The standing-list entry for this visitor of this resident, if there is one. Restricted wins. */
+async function listedVisitor(schoolId, studentId, visitor) {
+    const lists = await HostelVisitor.find({ school: schoolId, student: studentId, isTemplate: true }).lean();
+    const hits = lists.filter((t) => sameVisitor(t, visitor));
+    return hits.find((t) => t.listType === 'restricted') || hits[0] || null;
+}
+exports._listedVisitor = listedVisitor;
+
 exports.createVisitor = async (req, res) => {
     try {
         const b = req.body;
@@ -2220,10 +3043,7 @@ exports.createVisitor = async (req, res) => {
         // Standing lists decide the outcome before anyone is troubled for approval.
         let status = b.status || 'pending';
         if (!isTemplate) {
-            const listed = await HostelVisitor.findOne({
-                school: req.schoolId, student: b.student, isTemplate: true,
-                visitorName: rx(b.visitorName),
-            }).lean();
+            const listed = await listedVisitor(req.schoolId, b.student, b);
             if (listed?.listType === 'restricted') return bad(res, `${b.visitorName} is on this student's restricted visitor list`);
             if (listed?.listType === 'authorized') status = 'approved';
 
@@ -2297,6 +3117,15 @@ exports.actOnVisitor = async (req, res) => {
             set.status = 'cancelled'; set.qrToken = '';
         } else if (action === 'block') {
             set.status = 'blocked'; set.listType = 'restricted'; set.qrToken = '';
+            // Blocking a visit must stop the next one too. The restricted LIST is
+            // what registration checks, and this visit row is not on it.
+            if (!v.isTemplate && v.student && (await listedVisitor(req.schoolId, v.student, v))?.listType !== 'restricted') {
+                await HostelVisitor.create({
+                    school: req.schoolId, hostel: v.hostel, student: v.student, visitorName: v.visitorName, mobile: v.mobile || '',
+                    relationship: v.relationship || '', isTemplate: true, listType: 'restricted', status: 'blocked',
+                    remarks: remark || `Blocked after visit ${v.passNumber || ''}`.trim(), createdBy: req.userId,
+                });
+            }
         }
 
         const updated = await HostelVisitor.findByIdAndUpdate(v._id, { $set: set }, { new: true });
@@ -2325,10 +3154,29 @@ exports.actOnVisitor = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/**
+ * A visitor's gate pass as a scannable image. The token never leaves the server
+ * as text on a list: the screen asks for the image only when somebody opens it.
+ */
+exports.visitorPass = async (req, res) => {
+    try {
+        const v = await HostelVisitor.findOne({ _id: req.params.id, school: req.schoolId })
+            .populate('student', 'name').lean();
+        if (!v) return bad(res, 'Visitor record not found', 404);
+        if (!await mayTouchHostel(req, v.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+        ok(res, {
+            _id: v._id, passNumber: v.passNumber, visitorName: v.visitorName, studentName: v.student?.name || '',
+            status: v.status, entryTime: v.entryTime, exitTime: v.exitTime, scheduledAt: v.scheduledAt,
+            qrImage: v.qrToken ? passImage(v.qrToken) : null,
+        });
+    } catch (e) { fail(res, e); }
+};
+
 exports.deleteVisitor = async (req, res) => {
     try {
         const v = await HostelVisitor.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!v) return bad(res, 'Visitor record not found', 404);
+        if (!await mayTouchHostel(req, v.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         if (!v.isTemplate) return bad(res, 'A visit record is history and cannot be deleted — cancel it instead');
         await HostelVisitor.deleteOne({ _id: v._id });
         await logAudit(req, { action: 'delete', entityType: 'HostelVisitor', entityId: v._id, hostel: v.hostel,
@@ -2371,6 +3219,13 @@ exports.createStaffAssignment = async (req, res) => {
         }).lean();
         if (duplicate) return bad(res, 'This employee already holds that role here');
 
+        // A hostel has one warden. Naming a new one ends the last one's posting —
+        // otherwise they stay posted, and keep their access, with nobody noticing.
+        if (b.role === 'warden') {
+            await HostelStaffAssignment.updateMany(
+                { school: req.schoolId, hostel: b.hostel, role: 'warden', status: 'active', staff: { $ne: b.staff } },
+                { $set: { status: 'inactive', isActive: false, toDate: new Date() } });
+        }
         const row = await HostelStaffAssignment.create({ ...b, school: req.schoolId, createdBy: req.userId });
 
         // Warden / assistant warden also sit on the hostel itself, because the
@@ -2388,14 +3243,53 @@ exports.createStaffAssignment = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/**
+ * The warden and assistant warden also sit on the hostel itself, because the
+ * rest of the module reads them from there. Keep that in step with a change to
+ * an assignment: `before` and `after` are the assignment either side of it.
+ *
+ * A post is only ever cleared when it still names THIS person — ending an old
+ * warden's assignment must not unseat whoever holds the post now.
+ */
+async function syncHostelPosts(before, after) {
+    const holds = (a, role) => !!a && a.status === 'active' && a.role === role;
+    for (const [role, field] of [['warden', 'warden'], ['assistant_warden', 'assistantWarden']]) {
+        if (holds(after, role)) {
+            await Hostel.findByIdAndUpdate(after.hostel, { $set: { [field]: after.staff } });
+        } else if (holds(before, role)) {
+            await Hostel.updateOne({ _id: before.hostel, [field]: before.staff }, { $set: { [field]: null } });
+        }
+    }
+}
+
+const STAFF_EDITABLE = ['building', 'floor', 'role', 'shift', 'shiftStart', 'shiftEnd', 'responsibilities', 'fromDate', 'remarks', 'status'];
+
 exports.updateStaffAssignment = async (req, res) => {
     try {
         const before = await HostelStaffAssignment.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!before) return bad(res, 'Assignment not found', 404);
         if (!await mayTouchHostel(req, before.hostel)) return bad(res, 'You do not have access to this hostel', 403);
-        const body = { ...req.body };
-        for (const f of ['school', '_id', 'staff', 'hostel']) delete body[f];
+
+        const body = {};
+        for (const f of STAFF_EDITABLE) if (req.body[f] !== undefined) body[f] = req.body[f];
+        for (const f of ['building', 'floor']) if (body[f] === '') body[f] = null;
+        if (body.fromDate === '') delete body.fromDate;
+        if (body.status !== undefined && !['active', 'inactive'].includes(body.status)) return bad(res, 'Status must be active or inactive');
+        // Status carries the two fields that say the same thing.
+        if (body.status === 'active' && before.status !== 'active') { body.isActive = true; body.toDate = null; }
+        if (body.status === 'inactive' && before.status !== 'inactive') { body.isActive = false; body.toDate = new Date(); }
+
+        const next = { ...before, ...body };
+        if (next.status === 'active') {
+            const clash = await HostelStaffAssignment.findOne({
+                school: req.schoolId, hostel: before.hostel, staff: before.staff, role: next.role,
+                floor: next.floor || null, status: 'active', _id: { $ne: before._id },
+            }).lean();
+            if (clash) return bad(res, 'This employee already holds that role here');
+        }
+
         const row = await HostelStaffAssignment.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
+        await syncHostelPosts(before, next);
         const d = diffFields(before, row, Object.keys(body));
         await logAudit(req, { action: 'update', entityType: 'HostelStaffAssignment', entityId: row._id, hostel: row.hostel,
             description: 'Updated hostel staff assignment', before: d.before, after: d.after });
@@ -2410,8 +3304,7 @@ exports.endStaffAssignment = async (req, res) => {
         if (!await mayTouchHostel(req, row.hostel)) return bad(res, 'You do not have access to this hostel', 403);
 
         await HostelStaffAssignment.findByIdAndUpdate(row._id, { $set: { status: 'inactive', isActive: false, toDate: new Date() } });
-        if (row.role === 'warden') await Hostel.findByIdAndUpdate(row.hostel, { $set: { warden: null } });
-        if (row.role === 'assistant_warden') await Hostel.findByIdAndUpdate(row.hostel, { $set: { assistantWarden: null } });
+        await syncHostelPosts(row, { ...row, status: 'inactive' });
 
         await logAudit(req, { action: 'unassign', entityType: 'HostelStaffAssignment', entityId: row._id, hostel: row.hostel,
             description: `Ended ${row.role.replace(/_/g, ' ')} assignment` });
@@ -2485,6 +3378,9 @@ exports.deleteMess = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/** A mess of THIS school, or null — every mess write starts from one. */
+const ownMess = (req, id) => (id ? HostelMess.findOne({ _id: id, school: req.schoolId, isActive: true }).lean() : null);
+
 // ── Mess membership (student mess allocation + dietary profile) ───────────────
 exports.getMessMembers = async (req, res) => {
     try {
@@ -2507,8 +3403,13 @@ exports.enrolMessMember = async (req, res) => {
     try {
         const b = req.body;
         if (!b.student || !b.mess) return bad(res, 'Student and mess are required');
+        if (!await ownMess(req, b.mess)) return bad(res, 'Mess not found', 404);
         const allocation = await HostelAllocation.findOne({ school: req.schoolId, student: b.student, status: 'active' }).lean();
         if (!allocation) return bad(res, 'Only a current hostel resident can be enrolled in a mess');
+        const mess = await ownMess(req, b.mess);
+        if ((mess.hostels || []).length && !mess.hostels.map(String).includes(String(allocation.hostel))) {
+            return bad(res, `${mess.name} does not serve this resident's hostel`);
+        }
 
         const existing = await HostelMessMember.findOne({ school: req.schoolId, student: b.student, status: 'active' }).lean();
         if (existing) return bad(res, 'This student is already enrolled in a mess — end that enrolment first');
@@ -2531,13 +3432,20 @@ exports.updateMessMember = async (req, res) => {
         const before = await HostelMessMember.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!before) return bad(res, 'Enrolment not found', 404);
         const body = { ...req.body };
-        for (const f of ['school', '_id', 'student']) delete body[f];
+        for (const f of ['school', '_id', 'student', 'hostel', 'allocation', 'createdBy']) delete body[f];
+        if (body.mess && !await ownMess(req, body.mess)) return bad(res, 'Mess not found', 404);
+        // Ending or suspending an enrolment dates it; bringing it back clears the date.
+        if (body.status && body.status !== before.status) body.toDate = body.status === 'active' ? null : new Date();
         const row = await HostelMessMember.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
         await logAudit(req, { action: 'update', entityType: 'HostelMessMember', entityId: row._id, hostel: row.hostel,
             description: 'Updated mess enrolment', before: d.before, after: d.after });
         ok(res, row);
-    } catch (e) { fail(res, e); }
+    } catch (e) {
+        // One active enrolment per student — reactivating a second one trips the index.
+        if (e.code === 11000 || e.code === '23505') return bad(res, 'This student is already enrolled in a mess — end that enrolment first');
+        fail(res, e);
+    }
 };
 
 // ── Menus (daily / weekly template / monthly view) ───────────────────────────
@@ -2565,6 +3473,7 @@ exports.saveMenu = async (req, res) => {
     try {
         const b = req.body;
         if (!b.mess || !b.meal) return bad(res, 'Mess and meal are required');
+        if (!await ownMess(req, b.mess)) return bad(res, 'Mess not found', 404);
         if (!b.isTemplate && !b.date) return bad(res, 'A dated menu needs a date');
         if (b.isTemplate && b.dayOfWeek == null) return bad(res, 'A template menu needs a day of week');
 
@@ -2669,23 +3578,35 @@ exports.markMessAttendance = async (req, res) => {
     try {
         const { mess, date, meal, records = [] } = req.body;
         if (!mess || !meal || !records.length) return bad(res, 'Mess, meal and records are required');
+        if (!await ownMess(req, mess)) return bad(res, 'Mess not found', 404);
         const { start, end } = dayRange(date);
-        let created = 0; let updated = 0;
+        if (start > new Date()) return bad(res, 'Meal attendance cannot be marked for a future date');
+        let created = 0; let updated = 0; const skipped = [];
+
+        // Two reads for the whole register, rather than two per student.
+        const ids = records.map((r) => String(r.student));
+        const [members, marked] = await Promise.all([
+            HostelMessMember.find({ school: req.schoolId, mess, status: 'active', student: { $in: ids } }).lean(),
+            HostelMessAttendance.find({ school: req.schoolId, student: { $in: ids }, meal, date: { $gte: start, $lt: end } }).lean(),
+        ]);
+        const memberOf = Object.fromEntries(members.map((m) => [String(m.student), m]));
+        const existingOf = Object.fromEntries(marked.map((m) => [String(m.student), m]));
 
         for (const r of records) {
-            const existing = await HostelMessAttendance.findOne({
-                school: req.schoolId, student: r.student, meal, date: { $gte: start, $lt: end },
-            }).lean();
+            const member = memberOf[String(r.student)];
+            // Only somebody enrolled in THIS mess can be marked at it.
+            if (!member) { skipped.push({ student: r.student, reason: 'Not enrolled in this mess' }); continue; }
+            const status = ['taken', 'skipped', 'on_leave', 'guest'].includes(r.status) ? r.status : 'taken';
+            const existing = existingOf[String(r.student)];
             if (existing) {
                 await HostelMessAttendance.findByIdAndUpdate(existing._id, {
-                    $set: { status: r.status || 'taken', guestCount: num(r.guestCount), remarks: r.remarks || '', markedBy: req.userId },
+                    $set: { status, guestCount: num(r.guestCount), remarks: r.remarks || '', markedBy: req.userId, selfMarked: false },
                 });
                 updated += 1;
             } else {
-                const member = await HostelMessMember.findOne({ school: req.schoolId, student: r.student, mess, status: 'active' }).lean();
                 await HostelMessAttendance.create({
-                    school: req.schoolId, mess, student: r.student, hostel: member?.hostel || null,
-                    date: start, meal, status: r.status || 'taken',
+                    school: req.schoolId, mess, student: r.student, hostel: member.hostel || null,
+                    date: start, meal, status,
                     guestCount: num(r.guestCount), remarks: r.remarks || '', markedBy: req.userId,
                 });
                 created += 1;
@@ -2693,7 +3614,7 @@ exports.markMessAttendance = async (req, res) => {
         }
         await logAudit(req, { action: 'mark_mess_attendance', entityType: 'HostelMessAttendance',
             description: `Marked ${meal} mess attendance: ${created} new, ${updated} updated` });
-        ok(res, { created, updated });
+        ok(res, { created, updated, skipped });
     } catch (e) { fail(res, e); }
 };
 
@@ -2725,6 +3646,8 @@ exports.createMessExpense = async (req, res) => {
     try {
         const b = req.body;
         if (!b.mess || !b.amount) return bad(res, 'Mess and amount are required');
+        if (num(b.amount) <= 0) return bad(res, 'The amount must be more than zero');
+        if (!await ownMess(req, b.mess)) return bad(res, 'Mess not found', 404);
         const row = await HostelMessExpense.create({ ...b, amount: num(b.amount), school: req.schoolId, recordedBy: req.userId });
         await logAudit(req, { action: 'create', entityType: 'HostelMessExpense', entityId: row._id,
             description: `Recorded mess expense of ${row.amount} (${row.category})` });
@@ -2763,7 +3686,8 @@ exports.createFeePlan = async (req, res) => {
         if (b.basis === 'room_type' && !(b.roomTypeRates || []).length) {
             return bad(res, 'A room-type plan needs at least one rate band');
         }
-        const row = await HostelFeePlan.create({ ...b, amount: num(b.amount), school: req.schoolId, createdBy: req.userId });
+        const row = await HostelFeePlan.create({ ...b, amount: num(b.amount), appliesTo: resident.cleanOccupant(b.appliesTo) || 'student',
+            school: req.schoolId, createdBy: req.userId });
         await logAudit(req, { action: 'create', entityType: 'HostelFeePlan', entityId: row._id, hostel: row.hostel,
             description: `Created fee plan ${row.name} (${row.feeType})`, after: { amount: row.amount, basis: row.basis } });
         ok(res, row);
@@ -2777,6 +3701,10 @@ exports.updateFeePlan = async (req, res) => {
         const body = { ...req.body };
         delete body.school; delete body._id;
         if (body.amount !== undefined) body.amount = num(body.amount);
+        if (body.appliesTo !== undefined) {
+            body.appliesTo = resident.cleanOccupant(body.appliesTo);
+            if (!body.appliesTo) return bad(res, 'A fee plan bills students, teachers, or both');
+        }
         const row = await HostelFeePlan.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
         // Fee changes must be audited (spec §31) — the before/after amounts are kept.
@@ -2842,7 +3770,11 @@ exports.getInvoices = async (req, res) => {
 exports.createInvoice = async (req, res) => {
     try {
         const b = req.body;
-        if (!b.student || b.amount == null) return bad(res, 'Student and amount are required');
+        if (!b.student || b.amount == null) return bad(res, 'A resident and an amount are required');
+        if (num(b.amount) <= 0) return bad(res, 'The amount must be more than zero');
+        // Billed to a student or a member of staff — which one comes from the account.
+        const account = await resident.residentAccount(req.schoolId, b.student);
+        if (!account) return bad(res, 'That person is not a student or teacher of this school');
         const allocation = await HostelAllocation.findOne({
             school: req.schoolId, student: b.student, status: { $in: ['active', 'pending'] },
         }).lean();
@@ -2851,6 +3783,8 @@ exports.createInvoice = async (req, res) => {
         const row = await HostelFeeInvoice.create({
             ...b,
             school: req.schoolId,
+            residentType: account.kind,
+            payments: [], paidAmount: 0, refundedAmount: 0, status: 'pending',   // never taken from the request
             hostel: b.hostel || allocation?.hostel || null,
             allocation: allocation?._id || null,
             academicYear: b.academicYear || allocation?.academicYear || null,
@@ -2884,9 +3818,117 @@ exports.createInvoice = async (req, res) => {
 };
 
 /**
- * Bill every current resident for a period (spec §16). Idempotent per
- * student+plan+period, so re-running a month cannot double-charge.
+ * Bill every current resident a plan covers for one period (spec §16).
+ * Idempotent per resident + plan + period, so re-running a month cannot
+ * double-charge — which is what lets the clock call it as well as a person.
+ *
+ * Who is billed:
+ *   · residents of the kind the plan is written for (students / teachers / both);
+ *   · a teacher only when the school charges its staff at all;
+ *   · for a MESS plan, only residents enrolled in a mess — the mess is opt-in,
+ *     and a plan that billed the whole hostel charged people who never ate there.
  */
+/**
+ * When this unbroken stay began. A room change closes one allocation and opens
+ * another on the same day, so the row someone holds now may be younger than
+ * their stay; walking back through the transfers finds the day they moved in.
+ */
+async function stayStart(schoolId, a) {
+    let start = dayRange(a.fromDate).start;
+    const earlier = await HostelAllocation.find({ school: schoolId, student: a.student, status: 'transferred' }).select('fromDate vacatedDate').lean();
+    for (let guard = 0; guard < 20; guard++) {
+        const prev = earlier.find((x) => x.vacatedDate && Math.abs(dayRange(x.vacatedDate).start - start) <= 864e5 && dayRange(x.fromDate).start < start);
+        if (!prev) break;
+        start = dayRange(prev.fromDate).start;
+    }
+    return start;
+}
+
+async function billPlan(req, { plan, month, year, hostel = null, dueDate = null, settings, scope = null }) {
+    const q = { school: req.schoolId, status: 'active' };
+    if (hostel) q.hostel = hostel;
+    else if (scope !== null) q.hostel = scope.length ? { $in: scope } : '__none__';
+    else if (plan.hostel) q.hostel = plan.hostel;
+
+    const allocations = await HostelAllocation.find(q).populate('room', 'roomType').lean();
+    const label = month ? `${MONTHS[num(month) - 1]} ${year}` : String(year);
+    const created = []; const skipped = [];
+    // Who each resident is comes from their account, not from the row.
+    const kinds = await resident.kindsOf(req.schoolId, allocations.map((a) => a.student));
+    const inMess = plan.feeType === 'mess'
+        ? new Set((await HostelMessMember.find({ school: req.schoolId, status: 'active', student: { $in: allocations.map((a) => String(a.student)) } })
+            .select('student').lean()).map((m) => String(m.student)))
+        : null;
+
+    for (const a of allocations) {
+        const kind = kinds[String(a.student)] || 'student';
+        if (!resident.planCovers(plan, kind)) continue;
+        if (kind === 'teacher' && !settings.chargeTeachers) {
+            skipped.push({ student: a.student, reason: 'The hostel is free for teachers (Hostel Settings)' });
+            continue;
+        }
+        if (inMess && !inMess.has(String(a.student))) {
+            skipped.push({ student: a.student, reason: 'Not enrolled in a mess' });
+            continue;
+        }
+        const existing = await HostelFeeInvoice.findOne({
+            school: req.schoolId, student: a.student, feePlan: plan._id,
+            'period.year': num(year), 'period.month': month ? num(month) : null,
+        }).lean();
+        if (existing) { skipped.push({ student: a.student, reason: 'Already billed for this period' }); continue; }
+
+        let amount = resolvePlanAmount(plan, a.room?.roomType);
+        if (!amount) { skipped.push({ student: a.student, reason: 'The plan resolves to a zero amount' }); continue; }
+
+        // A month is billed to someone who was here for it. Moved in later:
+        // not billed for that month at all. Moved in part-way: the days stayed,
+        // where the school has asked for part-month billing.
+        let partMonth = '';
+        if (month) {
+            const first = new Date(num(year), num(month) - 1, 1);
+            const daysIn = new Date(num(year), num(month), 0).getDate();
+            const monthEnd = new Date(num(year), num(month) - 1, daysIn, 23, 59, 59);
+            let from = a.fromDate ? dayRange(a.fromDate).start : null;
+            if (from && from > first) from = await stayStart(req.schoolId, a);     // a room change is not a new stay
+            if (from && from > monthEnd) { skipped.push({ student: a.student, reason: 'Moved in after this period' }); continue; }
+            if (from && from > first && settings.prorateFirstMonth && plan.frequency === 'monthly') {
+                const days = daysIn - from.getDate() + 1;
+                amount = Math.round((amount * days / daysIn) * 100) / 100;
+                partMonth = `Part month: ${days} of ${daysIn} days, from ${from.toDateString()}`;
+            }
+        }
+
+        const inv = await HostelFeeInvoice.create({
+            school: req.schoolId, student: a.student, residentType: kind, hostel: a.hostel, allocation: a._id,
+            academicYear: a.academicYear, feePlan: plan._id, feeType: plan.feeType,
+            invoiceNumber: await nextNumber(HostelFeeInvoice, req.schoolId, 'HF'),
+            period: { month: month ? num(month) : null, year: num(year), label },
+            remarks: partMonth,
+            amount,
+            dueDate: dueDate ? new Date(dueDate)
+                : month ? new Date(num(year), num(month) - 1, plan.dueDayOfMonth || settings.feeDueDayOfMonth) : null,
+            isRefundable: plan.isRefundable,
+            generatedBy: req.system ? null : req.userId,
+        });
+        await postToLedger({
+            schoolId: req.schoolId, studentId: a.student, academicYearId: a.academicYear,
+            entryType: 'debit', category: 'fee_charged', amount: inv.netAmount,
+            description: `Hostel ${plan.feeType.replace(/_/g, ' ')} ${label} — ${inv.invoiceNumber}`,
+            invoiceId: inv._id, feeHeadName: `Hostel ${plan.feeType.replace(/_/g, ' ')}`,
+            createdBy: req.userId, settings,
+        });
+        created.push(inv);
+        if (settings.notifyOnFeeDue) {
+            notifyStudentAndParents(req, {
+                studentId: a.student, settings,
+                title: 'Hostel fee due',
+                body: `Hostel ${plan.feeType.replace(/_/g, ' ')} for ${label}: ${inv.netAmount}. Invoice ${inv.invoiceNumber}.`,
+            });
+        }
+    }
+    return { created, skipped, label };
+}
+
 exports.generateInvoices = async (req, res) => {
     try {
         const { feePlan, hostel = null, month, year, dueDate = null } = req.body;
@@ -2895,53 +3937,9 @@ exports.generateInvoices = async (req, res) => {
         if (!plan) return bad(res, 'Fee plan not found');
 
         const settings = await getSettings(req.schoolId);
-        const q = { school: req.schoolId, status: 'active' };
-        const allowed = await visibleHostelIds(req);
-        if (hostel) q.hostel = hostel;
-        else if (allowed !== null) q.hostel = allowed.length ? { $in: allowed } : '__none__';
-        else if (plan.hostel) q.hostel = plan.hostel;
-
-        const allocations = await HostelAllocation.find(q).populate('room', 'roomType').lean();
-        const label = month ? `${MONTHS[num(month) - 1]} ${year}` : String(year);
-        const created = []; const skipped = [];
-
-        for (const a of allocations) {
-            const existing = await HostelFeeInvoice.findOne({
-                school: req.schoolId, student: a.student, feePlan: plan._id,
-                'period.year': num(year), 'period.month': month ? num(month) : null,
-            }).lean();
-            if (existing) { skipped.push({ student: a.student, reason: 'Already billed for this period' }); continue; }
-
-            const amount = resolvePlanAmount(plan, a.room?.roomType);
-            if (!amount) { skipped.push({ student: a.student, reason: 'The plan resolves to a zero amount' }); continue; }
-
-            const inv = await HostelFeeInvoice.create({
-                school: req.schoolId, student: a.student, hostel: a.hostel, allocation: a._id,
-                academicYear: a.academicYear, feePlan: plan._id, feeType: plan.feeType,
-                invoiceNumber: await nextNumber(HostelFeeInvoice, req.schoolId, 'HF'),
-                period: { month: month ? num(month) : null, year: num(year), label },
-                amount,
-                dueDate: dueDate ? new Date(dueDate)
-                    : month ? new Date(num(year), num(month) - 1, plan.dueDayOfMonth || settings.feeDueDayOfMonth) : null,
-                isRefundable: plan.isRefundable,
-                generatedBy: req.userId,
-            });
-            await postToLedger({
-                schoolId: req.schoolId, studentId: a.student, academicYearId: a.academicYear,
-                entryType: 'debit', category: 'fee_charged', amount: inv.netAmount,
-                description: `Hostel ${plan.feeType.replace(/_/g, ' ')} ${label} — ${inv.invoiceNumber}`,
-                invoiceId: inv._id, feeHeadName: `Hostel ${plan.feeType.replace(/_/g, ' ')}`,
-                createdBy: req.userId, settings,
-            });
-            created.push(inv);
-            if (settings.notifyOnFeeDue) {
-                notifyStudentAndParents(req, {
-                    studentId: a.student, settings,
-                    title: 'Hostel fee due',
-                    body: `Hostel ${plan.feeType.replace(/_/g, ' ')} for ${label}: ${inv.netAmount}. Invoice ${inv.invoiceNumber}.`,
-                });
-            }
-        }
+        const { created, skipped, label } = await billPlan(req, {
+            plan, month, year, hostel, dueDate, settings, scope: await visibleHostelIds(req),
+        });
         await logAudit(req, { action: 'generate', entityType: 'HostelFeeInvoice', hostel,
             description: `Generated ${created.length} hostel invoice(s) for ${label}`,
             meta: { plan: plan.name, created: created.length, skipped: skipped.length } });
@@ -2959,37 +3957,28 @@ exports.payInvoice = async (req, res) => {
         const { amount, mode = 'cash', reference = '', note = '' } = req.body;
         const paid = num(amount);
         if (paid <= 0) return bad(res, 'A positive amount is required');
+        // The counter takes cash, a cheque, UPI, a card or a transfer. 'online'
+        // is recorded only by the gateway, with its own proof of payment.
+        if (!payments.OFFLINE_MODES.includes(mode)) return bad(res, 'Choose how the payment was made: cash, cheque, UPI, card or bank transfer');
+        if (mode !== 'cash' && !String(reference).trim()) return bad(res, `Enter the ${payments.MODE_LABEL[mode].toLowerCase()} reference`);
 
         const inv = await HostelFeeInvoice.findOne({ _id: req.params.id, school: req.schoolId });
         if (!inv) return bad(res, 'Invoice not found', 404);
+        if (inv.hostel && !await mayTouchHostel(req, inv.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         if (inv.status === 'cancelled') return bad(res, 'This invoice has been cancelled');
-        const due = Math.max(0, (inv.netAmount || 0) - (inv.paidAmount || 0));
+        const due = payments.outstandingOf(inv);
         if (paid > due) return bad(res, `The outstanding amount is ${due}`);
 
-        const receiptNumber = await nextNumber(HostelFeeInvoice, req.schoolId, 'HR');
-        inv.payments = [...(inv.payments || []), {
-            amount: paid, mode, reference, receiptNumber, paidAt: new Date(), receivedBy: req.userId, note,
-        }];
-        await inv.save();                       // the pre-save hook re-derives status
-
-        const settings = await getSettings(req.schoolId);
-        await postToLedger({
-            schoolId: req.schoolId, studentId: inv.student, academicYearId: inv.academicYear,
-            entryType: 'credit', category: 'payment', amount: paid,
-            description: `Hostel fee payment — receipt ${receiptNumber}`,
-            invoiceId: inv._id, feeHeadName: `Hostel ${inv.feeType.replace(/_/g, ' ')}`,
-            createdBy: req.userId, settings,
+        const r = await payments.settle(req, {
+            lines: [{ invoice: inv, amount: paid }], mode, reference: String(reference).trim(), note, receivedBy: req.userId,
         });
-        await logAudit(req, { action: 'payment', entityType: 'HostelFeeInvoice', entityId: inv._id, hostel: inv.hostel,
-            description: `Payment of ${paid} against ${inv.invoiceNumber} (${mode})`,
-            before: { paidAmount: inv.paidAmount - paid }, after: { paidAmount: inv.paidAmount, receiptNumber } });
         await notifyStudentAndParents(req, {
-            studentId: inv.student, settings,
+            studentId: inv.student, settings: r.settings,
             title: 'Hostel fee payment received',
-            body: `Payment of ${paid} received against ${inv.invoiceNumber}. Receipt ${receiptNumber}.`,
+            body: `Payment of ${paid} received against ${inv.invoiceNumber}. Receipt ${r.receiptNumber}.`,
         });
-        ok(res, { invoice: inv.toObject ? inv.toObject() : inv, receiptNumber });
-    } catch (e) { fail(res, e); }
+        ok(res, { invoice: inv.toObject ? inv.toObject() : inv, receiptNumber: r.receiptNumber });
+    } catch (e) { handle(res, e); }
 };
 
 /** Concession / scholarship / waiver on an invoice (spec §16) — always audited. */
@@ -3015,11 +4004,13 @@ exports.discountInvoice = async (req, res) => {
 
         const settings = await getSettings(req.schoolId);
         const delta = before.netAmount - inv.netAmount;
-        if (delta > 0) {
+        if (delta !== 0) {
+            // A concession credits the ledger; taking one back debits it again —
+            // only the first half used to be posted, so the ledger drifted.
             await postToLedger({
                 schoolId: req.schoolId, studentId: inv.student, academicYearId: inv.academicYear,
-                entryType: 'credit', category: 'concession', amount: delta,
-                description: `Hostel fee concession on ${inv.invoiceNumber}${reason ? ` — ${reason}` : ''}`,
+                entryType: delta > 0 ? 'credit' : 'debit', category: delta > 0 ? 'concession' : 'adjustment', amount: Math.abs(delta),
+                description: `Hostel fee concession ${delta > 0 ? 'on' : 'reduced on'} ${inv.invoiceNumber}${reason ? ` — ${reason}` : ''}`,
                 invoiceId: inv._id, createdBy: req.userId, settings,
             });
         }
@@ -3030,39 +4021,18 @@ exports.discountInvoice = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
-/** Refund — used for security deposits at checkout and for over-collection. */
+/**
+ * Refund — for a security deposit at checkout, and for over-collection.
+ * `viaGateway: true` sends it back to the online payment it came from.
+ */
 exports.refundInvoice = async (req, res) => {
     try {
-        const { amount, reference = '', reason = '' } = req.body;
-        const value = num(amount);
+        const { amount, reference = '', reason = '', viaGateway = false } = req.body;
         const inv = await HostelFeeInvoice.findOne({ _id: req.params.id, school: req.schoolId });
         if (!inv) return bad(res, 'Invoice not found', 404);
-        const refundable = (inv.paidAmount || 0) - (inv.refundedAmount || 0);
-        if (value <= 0 || value > refundable) return bad(res, `At most ${refundable} can be refunded`);
-
-        inv.refundedAmount = (inv.refundedAmount || 0) + value;
-        inv.refundedAt = new Date();
-        inv.refundReference = reference;
-        if (inv.refundedAmount >= inv.paidAmount) inv.status = 'refunded';
-        await inv.save();
-
-        const settings = await getSettings(req.schoolId);
-        await postToLedger({
-            schoolId: req.schoolId, studentId: inv.student, academicYearId: inv.academicYear,
-            entryType: 'debit', category: 'refund', amount: value,
-            description: `Hostel refund on ${inv.invoiceNumber}${reason ? ` — ${reason}` : ''}`,
-            invoiceId: inv._id, createdBy: req.userId, settings,
-        });
-        await logAudit(req, { action: 'refund', entityType: 'HostelFeeInvoice', entityId: inv._id, hostel: inv.hostel,
-            description: `Refunded ${value} against ${inv.invoiceNumber}`,
-            after: { refundedAmount: inv.refundedAmount, reference, reason } });
-        await notifyStudentAndParents(req, {
-            studentId: inv.student, settings,
-            title: 'Hostel refund processed',
-            body: `A refund of ${value} has been processed against ${inv.invoiceNumber}.`,
-        });
-        ok(res, inv.toObject ? inv.toObject() : inv);
-    } catch (e) { fail(res, e); }
+        const r = await payments.refund(req, inv, num(amount), { reference, reason, viaGateway: viaGateway === true || viaGateway === 'true' });
+        ok(res, { ...(inv.toObject ? inv.toObject() : inv), voucherNumber: r.voucherNumber });
+    } catch (e) { handle(res, e); }
 };
 
 exports.cancelInvoice = async (req, res) => {
@@ -3127,32 +4097,48 @@ exports.raiseFine = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/** Bring late fees up to date for a school. Idempotent — a fee already right is left alone. */
+async function lateFeesFor(req, settings) {
+    if (!settings.lateFeePerDay) return 0;
+    const cutoff = new Date(Date.now() - (settings.lateFeeGraceDays || 0) * 864e5);
+    const overdue = await HostelFeeInvoice.find({
+        school: req.schoolId, status: { $in: ['pending', 'partial', 'overdue'] },
+        dueDate: { $ne: null, $lt: cutoff },
+    });
+    let updated = 0;
+    for (const inv of overdue) {
+        // A fine is not charged a fine for being late.
+        if (['fine', 'late_fee', 'security_deposit'].includes(inv.feeType)) continue;
+        const days = Math.floor((Date.now() - new Date(inv.dueDate)) / 864e5) - (settings.lateFeeGraceDays || 0);
+        if (days <= 0) continue;
+        // Never more than the bill itself: a daily fee with no ceiling
+        // overtakes the charge it is a penalty on.
+        const want = Math.min(days * settings.lateFeePerDay, Math.max(0, (inv.amount || 0) - (inv.discount || 0)));
+        if (inv.lateFee === want) continue;      // already at the right amount
+        const before = inv.lateFee || 0;
+        inv.lateFee = want;
+        await inv.save();
+        updated += 1;
+        // The late fee is money owed like any other: the ledger moves with it.
+        await postToLedger({
+            schoolId: req.schoolId, studentId: inv.student, academicYearId: inv.academicYear,
+            entryType: want > before ? 'debit' : 'credit', category: want > before ? 'fine' : 'adjustment', amount: Math.abs(want - before),
+            description: `Late fee on ${inv.invoiceNumber} (${days} day(s) overdue)`,
+            invoiceId: inv._id, feeHeadName: 'Hostel late fee', createdBy: req.userId, settings,
+        });
+        await logAudit(req, { action: 'late_fee', entityType: 'HostelFeeInvoice', entityId: inv._id, hostel: inv.hostel,
+            description: `Late fee on ${inv.invoiceNumber} updated to ${want} (${days} day(s) overdue)`,
+            before: { lateFee: before }, after: { lateFee: want } });
+    }
+    return updated;
+}
+
 /** Apply the configured late fee to invoices past their due date. Idempotent. */
 exports.applyLateFees = async (req, res) => {
     try {
         const settings = await getSettings(req.schoolId);
         if (!settings.lateFeePerDay) return ok(res, { updated: 0, message: 'No late fee is configured' });
-
-        const cutoff = new Date(Date.now() - (settings.lateFeeGraceDays || 0) * 864e5);
-        const overdue = await HostelFeeInvoice.find({
-            school: req.schoolId, status: { $in: ['pending', 'partial', 'overdue'] },
-            dueDate: { $ne: null, $lt: cutoff },
-        });
-        let updated = 0;
-        for (const inv of overdue) {
-            const days = Math.floor((Date.now() - new Date(inv.dueDate)) / 864e5) - (settings.lateFeeGraceDays || 0);
-            if (days <= 0) continue;
-            const want = days * settings.lateFeePerDay;
-            if (inv.lateFee === want) continue;      // already at the right amount
-            const before = inv.lateFee;
-            inv.lateFee = want;
-            await inv.save();
-            updated += 1;
-            await logAudit(req, { action: 'late_fee', entityType: 'HostelFeeInvoice', entityId: inv._id, hostel: inv.hostel,
-                description: `Late fee on ${inv.invoiceNumber} updated to ${want} (${days} day(s) overdue)`,
-                before: { lateFee: before }, after: { lateFee: want } });
-        }
-        ok(res, { updated });
+        ok(res, { updated: await lateFeesFor(req, settings) });
     } catch (e) { fail(res, e); }
 };
 
@@ -3198,7 +4184,7 @@ exports.getComplaint = async (req, res) => {
         ]);
         ok(res, {
             ...c, maintenance, documents,
-            attachmentUrls: (c.attachments || []).map((f) => `/uploads/hostel-docs/${f}`),
+            attachmentUrls: (c.attachments || []).map((f) => signedFileUrl(f)),
         });
     } catch (e) { fail(res, e); }
 };
@@ -3208,10 +4194,20 @@ exports.createComplaint = async (req, res) => {
         const b = req.body;
         if (!b.description || !b.hostel) return bad(res, 'Hostel and description are required');
         if (!await mayTouchHostel(req, b.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+        // A complaint raised for a room or on behalf of a resident must be about
+        // THIS hostel — otherwise it lands in a warden's list it has nothing to do with.
+        if (b.room) {
+            const room = await HostelRoom.findOne({ _id: b.room, school: req.schoolId, hostel: b.hostel }).select('_id').lean();
+            if (!room) return bad(res, 'That room is not in this hostel');
+        }
+        if (b.student) {
+            const lives = await HostelAllocation.findOne({ school: req.schoolId, student: b.student, hostel: b.hostel, status: 'active' }).select('_id').lean();
+            if (!lives) return bad(res, 'That student does not live in this hostel');
+        }
 
         const settings = await getSettings(req.schoolId);
         const row = await HostelComplaint.create({
-            ...b, school: req.schoolId,
+            ...b, school: req.schoolId, status: 'open', escalationLevel: 0,
             ticketNumber: await nextNumber(HostelComplaint, req.schoolId, 'HC'),
             dueAt: new Date(Date.now() + (settings.complaintSlaHours || 48) * 36e5),
             raisedBy: req.userId, raisedByRole: req.userRole,
@@ -3265,6 +4261,7 @@ exports.actOnComplaint = async (req, res) => {
             if (c.status === 'closed') return bad(res, 'This complaint is already closed');
             set.status = 'closed';
         } else if (action === 'reject') {
+            if (['resolved', 'closed', 'rejected'].includes(c.status)) return bad(res, `A ${c.status} complaint cannot be rejected`);
             set.status = 'rejected'; set.resolution = resolution || comment;
         } else if (action === 'escalate') {
             const settings = await getSettings(req.schoolId);
@@ -3314,38 +4311,165 @@ exports.actOnComplaint = async (req, res) => {
  * past `dueAt` and escalated once has its due date pushed with the level, so it
  * does not re-escalate on every sweep.
  */
+async function escalateOverdue(req, settings) {
+    const due = await HostelComplaint.find({
+        school: req.schoolId,
+        status: { $in: ['open', 'assigned', 'in_progress', 'reopened'] },
+        dueAt: { $ne: null, $lt: new Date() },
+    }).lean();
+
+    for (const c of due) {
+        await HostelComplaint.findByIdAndUpdate(c._id, {
+            $set: {
+                escalationLevel: (c.escalationLevel || 0) + 1,
+                escalatedAt: new Date(),
+                escalatedTo: settings.complaintEscalateTo || null,
+                priority: c.priority === 'urgent' ? 'urgent' : c.priority === 'high' ? 'urgent' : 'high',
+                dueAt: new Date(Date.now() + (settings.complaintSlaHours || 48) * 36e5),
+            },
+        });
+        notifyHostelStaff(req, { hostelId: c.hostel, includeSender: !!req.system,
+            title: 'Hostel complaint escalated',
+            body: `${c.ticketNumber} (${c.category}) passed its ${settings.complaintSlaHours}h SLA and has been escalated.` });
+    }
+    if (due.length) {
+        await logAudit(req, { action: 'escalate', entityType: 'HostelComplaint',
+            description: `Auto-escalated ${due.length} overdue complaint(s)` });
+    }
+    return due.length;
+}
+
 exports.escalateOverdueComplaints = async (req, res) => {
     try {
         const settings = await getSettings(req.schoolId);
         if (!settings.complaintAutoEscalate) return ok(res, { escalated: 0, message: 'Auto-escalation is switched off' });
-
-        const due = await HostelComplaint.find({
-            school: req.schoolId,
-            status: { $in: ['open', 'assigned', 'in_progress', 'reopened'] },
-            dueAt: { $ne: null, $lt: new Date() },
-        }).lean();
-
-        for (const c of due) {
-            await HostelComplaint.findByIdAndUpdate(c._id, {
-                $set: {
-                    escalationLevel: (c.escalationLevel || 0) + 1,
-                    escalatedAt: new Date(),
-                    escalatedTo: settings.complaintEscalateTo || null,
-                    priority: c.priority === 'urgent' ? 'urgent' : c.priority === 'high' ? 'urgent' : 'high',
-                    dueAt: new Date(Date.now() + (settings.complaintSlaHours || 48) * 36e5),
-                },
-            });
-            notifyHostelStaff(req, { hostelId: c.hostel,
-                title: 'Hostel complaint escalated',
-                body: `${c.ticketNumber} (${c.category}) passed its ${settings.complaintSlaHours}h SLA and has been escalated.` });
-        }
-        if (due.length) {
-            await logAudit(req, { action: 'escalate', entityType: 'HostelComplaint',
-                description: `Auto-escalated ${due.length} overdue complaint(s)` });
-        }
-        ok(res, { escalated: due.length });
+        ok(res, { escalated: await escalateOverdue(req, settings) });
     } catch (e) { fail(res, e); }
 };
+
+/**
+ * Everything the half-hourly clock does for one school: overdue passes and
+ * leaves (with their alerts), unused passes, overdue invoices — and the two
+ * automations a school switches on in Hostel Settings, which until now were
+ * switches with nothing behind them: complaint escalation and monthly billing.
+ */
+exports.runSweep = async (schoolId) => {
+    const r = await sweepOverdue(schoolId);
+    const settings = await getSettings(schoolId);
+    const out = { ...r, escalated: 0, billed: 0, lateFees: 0, reconciled: 0, flagged: 0, mealsChased: 0 };
+    const sys = await systemRequest(schoolId);
+    if (!sys) return out;                                       // nobody to act as: a school with no admin
+
+    if (settings.complaintAutoEscalate) out.escalated = await escalateOverdue(sys, settings);
+
+    if (settings.autoGenerateMonthlyFees) {
+        // This month's bill for every monthly plan. billPlan skips anyone
+        // already billed for the period, so running it every half hour
+        // bills a resident once — including one who moved in mid-month.
+        const now = new Date();
+        const plans = await HostelFeePlan.find({ school: schoolId, isActive: true, frequency: 'monthly' }).lean();
+        for (const plan of plans.filter((x) => x.status !== 'inactive')) {
+            const done = await billPlan(sys, { plan, month: now.getMonth() + 1, year: now.getFullYear(), settings, scope: null });
+            out.billed += done.created.length;
+        }
+        if (out.billed) {
+            await logAudit(sys, { action: 'generate', entityType: 'HostelFeeInvoice',
+                description: `Raised ${out.billed} monthly hostel invoice(s) automatically` });
+        }
+    }
+
+    // Late fees kept up to date without the button, where the school asks for that.
+    if (settings.autoApplyLateFees) out.lateFees = await lateFeesFor(sys, settings);
+
+    // Online checkouts nobody confirmed: ask the gateway whether the money moved.
+    try { out.reconciled = (await payments.reconcileOpen(sys)).paid; }
+    catch (e) { console.error('[hostel] reconcile sweep:', e.message); }
+
+    out.flagged = await flagInactiveResidents(sys);
+    if (settings.messAttendanceRequired) out.mealsChased = await chaseMealRegisters(sys);
+    return out;
+};
+
+/**
+ * Residents whose school account is no longer active.
+ *
+ * Nothing outside the hostel knows about beds, so a student struck off in
+ * Students — or a teacher who has left — went on holding one. The hostel is
+ * told, once per stay (the stamp on the allocation is what makes it once), and
+ * decides: a deactivation may be temporary, so the bed is not taken away here.
+ * An account that no longer exists at all cannot come back; that bed is freed.
+ */
+async function flagInactiveResidents(req) {
+    // Back in good standing: forget the flag, so a later lapse is reported again.
+    await pool.query(
+        `UPDATE "${HostelAllocation.tableName}" a SET "inactiveFlaggedAt" = NULL
+           FROM "users" u WHERE u."_id" = a."student" AND u."isActive" AND a."school" = $1 AND a."inactiveFlaggedAt" IS NOT NULL`, [String(req.schoolId)]);
+    const { rows } = await pool.query(
+        `SELECT a."_id", a."student", a."hostel", u."name", (u."_id" IS NULL) AS "gone", h."name" AS "hostelName", r."roomNumber", b."bedNumber"
+           FROM "${HostelAllocation.tableName}" a
+           LEFT JOIN "users" u ON u."_id" = a."student"
+           LEFT JOIN "${Hostel.tableName}" h ON h."_id" = a."hostel"
+           LEFT JOIN "${HostelRoom.tableName}" r ON r."_id" = a."room"
+           LEFT JOIN "${HostelBed.tableName}" b ON b."_id" = a."bed"
+          WHERE a."school" = $1 AND a."status" IN ('pending', 'active') AND a."inactiveFlaggedAt" IS NULL
+            AND (u."_id" IS NULL OR u."isActive" = false)`, [String(req.schoolId)]);
+    for (const x of rows) {
+        if (x.gone) {
+            try {
+                await alloc.releaseBed({ schoolId: req.schoolId, allocationId: x._id, actorId: req.userId, actorName: 'System',
+                    reason: 'The account no longer exists', status: 'vacated' });
+                await logAudit(req, { action: 'release', entityType: 'HostelAllocation', entityId: x._id, hostel: x.hostel,
+                    description: `Freed ${x.hostelName} · ${x.roomNumber} · Bed ${x.bedNumber}: the resident's account no longer exists` });
+            } catch (e) { console.error('[hostel] could not free an orphaned bed:', e.message); }
+            continue;
+        }
+        await HostelAllocation.findByIdAndUpdate(x._id, { $set: { inactiveFlaggedAt: new Date() } });
+        notifyHostelStaff(req, { hostelId: x.hostel, includeSender: true, title: 'Resident\'s account is inactive',
+            body: `${x.name}'s school account has been deactivated, but they still hold ${x.hostelName} · ${x.roomNumber} · Bed ${x.bedNumber}. Vacate the bed from Allocations if they have left.` });
+    }
+    return rows.length;
+}
+
+/**
+ * "Mess attendance required": a meal whose time has passed with nobody marked
+ * is chased — once per mess, meal and day — so a register that was simply
+ * forgotten is noticed the same day rather than at the month's reckoning.
+ */
+async function chaseMealRegisters(req) {
+    const now = new Date();
+    const { start, end } = dayRange(now);
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const messes = await HostelMess.find({ school: req.schoolId, isActive: true }).lean();
+    let chased = 0;
+    for (const mess of messes) {
+        const members = await HostelMessMember.countDocuments({ school: req.schoolId, mess: mess._id, status: 'active' });
+        if (!members) continue;
+        for (const [meal, t] of Object.entries(mess.mealTimings || {})) {
+            if (!t || t.enabled === false || !t.end) continue;
+            const over = atTime(now, t.end);
+            if (!over || now - over < 30 * 60000) continue;         // not over yet, or only just
+            const key = `${today}:${meal}`;
+            if ((mess.attendanceReminders || []).includes(key)) continue;
+            const { rows: [m] } = await pool.query(
+                `SELECT count(*)::int AS "n" FROM "${HostelMessAttendance.tableName}"
+                  WHERE "school" = $1 AND "mess" = $2 AND "meal" = $3 AND "date" >= $4 AND "date" < $5 AND COALESCE("selfMarked", false) = false`,
+                [String(req.schoolId), String(mess._id), meal, start, end]);
+            // Asked once whether or not it was marked: a marked meal needs no chasing later either.
+            await HostelMess.findByIdAndUpdate(mess._id, { $set: { attendanceReminders: [...(mess.attendanceReminders || []), key].slice(-40) } });
+            mess.attendanceReminders = [...(mess.attendanceReminders || []), key];
+            if (m.n > 0) continue;
+            chased += 1;
+            const { notify } = require('../services/notifyService');
+            const admins = await require('../services/notifyService').schoolAdminIds(req.schoolId);
+            notify({ school: req.schoolId, sender: req.userId, senderRole: 'system', includeSender: true,
+                recipients: [...new Set([mess.inCharge, ...admins].filter(Boolean).map(String))],
+                title: 'Meal attendance not recorded',
+                body: `${meal[0].toUpperCase()}${meal.slice(1)} at ${mess.name} ended at ${t.end} and no attendance has been recorded for its ${members} member(s).`,
+                link: { type: 'hostel' } });
+        }
+    }
+    return chased;
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  MAINTENANCE (spec §18)
@@ -3493,6 +4617,7 @@ exports.deleteMaintenance = async (req, res) => {
     try {
         const m = await HostelMaintenance.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!m) return bad(res, 'Maintenance request not found', 404);
+        if (!await mayTouchHostel(req, m.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         if (m.status === 'completed') return bad(res, 'A completed request is history and cannot be deleted');
         await HostelMaintenance.findByIdAndUpdate(m._id, { $set: { status: 'cancelled' } });
         await logAudit(req, { action: 'cancel', entityType: 'HostelMaintenance', entityId: m._id, hostel: m.hostel,
@@ -3584,18 +4709,36 @@ exports.updateAsset = async (req, res) => {
 };
 
 /** Issue / return / transfer / damage / replace / repair an asset (spec §19). */
+/**
+ * An asset's label: its code as a QR image, to print and stick on it. Scanning
+ * the label on the Assets screen finds the asset again.
+ */
+exports.assetQr = async (req, res) => {
+    try {
+        const a = await HostelAsset.findOne({ _id: req.params.id, school: req.schoolId }).select('name assetCode hostel').lean();
+        if (!a) return bad(res, 'Asset not found', 404);
+        if (!await mayTouchHostel(req, a.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+        const code = a.assetCode || `HA:${a._id}`;
+        ok(res, { code, name: a.name, qrImage: matrixToDataUri(qrcode.encode(code), { scale: 6, quietZone: 4 }) });
+    } catch (e) { fail(res, e); }
+};
+
 exports.actOnAsset = async (req, res) => {
     try {
         const { action, student = null, room = null, note = '', damageCharge = null, condition = null } = req.body;
-        const valid = ['issue', 'return', 'transfer', 'damage', 'replace', 'repair', 'dispose'];
+        const valid = ['issue', 'return', 'transfer', 'damage', 'replace', 'repair', 'restore', 'dispose'];
         if (!valid.includes(action)) return bad(res, `Action must be one of: ${valid.join(', ')}`);
 
         const a = await HostelAsset.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!a) return bad(res, 'Asset not found', 404);
         if (!await mayTouchHostel(req, a.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+        if (['replaced', 'disposed'].includes(a.status)) return bad(res, `This asset has been ${a.status} — it can no longer be changed`);
 
         const now = new Date();
-        const set = { remarks: note || a.remarks };
+        // The note describes THIS step and goes to the activity log. It used to
+        // overwrite `remarks`, which is the asset's own description — issuing a
+        // bed "for exam week" renamed the bed.
+        const set = {};
 
         if (action === 'issue') {
             if (!student) return bad(res, 'A student is required to issue an asset');
@@ -3611,14 +4754,20 @@ exports.actOnAsset = async (req, res) => {
             if (!room) return bad(res, 'A destination room is required');
             const target = await HostelRoom.findOne({ _id: room, school: req.schoolId }).lean();
             if (!target) return bad(res, 'Destination room not found');
+            if (!await mayTouchHostel(req, target.hostel)) return bad(res, 'You do not have access to that hostel', 403);
             set.room = target._id; set.hostel = target.hostel; set.building = target.building; set.floor = target.floor;
         } else if (action === 'damage') {
             set.status = 'damaged'; set.condition = 'damaged';
             set.damageNote = note; set.damageCharge = num(damageCharge);
         } else if (action === 'replace') {
-            set.status = 'replaced'; set.condition = condition || 'scrapped';
+            set.status = 'replaced'; set.condition = condition || 'scrapped'; set.issuedTo = null;
         } else if (action === 'repair') {
             set.status = 'under_repair';
+        } else if (action === 'restore') {
+            // Back from the workshop: in service again, with whoever held it.
+            if (!['under_repair', 'damaged'].includes(a.status)) return bad(res, 'Only an asset that is damaged or under repair can be put back in service');
+            set.status = a.issuedTo ? 'issued' : 'in_room';
+            set.condition = ['new', 'good', 'fair'].includes(condition) ? condition : 'good';
         } else if (action === 'dispose') {
             set.status = 'disposed'; set.condition = 'scrapped'; set.issuedTo = null;
         }
@@ -3627,7 +4776,7 @@ exports.actOnAsset = async (req, res) => {
 
         // Keep the Inventory record in step when this maps to one.
         if (a.inventoryAsset) {
-            const invStatus = { issue: 'assigned', return: 'assigned', repair: 'under_repair', dispose: 'disposed', damage: 'under_repair' }[action];
+            const invStatus = { issue: 'assigned', return: 'assigned', restore: 'assigned', repair: 'under_repair', dispose: 'disposed', damage: 'under_repair' }[action];
             if (invStatus) await InventoryAsset.findByIdAndUpdate(a.inventoryAsset, { $set: { status: invStatus } });
         }
 
@@ -3641,8 +4790,8 @@ exports.actOnAsset = async (req, res) => {
             });
         }
         await logAudit(req, { action, entityType: 'HostelAsset', entityId: a._id, hostel: a.hostel,
-            description: `Asset ${a.name} — ${action}`,
-            before: { status: a.status, issuedTo: a.issuedTo }, after: { status: set.status || a.status, issuedTo: set.issuedTo } });
+            description: `Asset ${a.name} — ${action}${note ? `: ${String(note).slice(0, 160)}` : ''}`,
+            before: { status: a.status, issuedTo: a.issuedTo }, after: { status: set.status || a.status, issuedTo: set.issuedTo }, meta: { note } });
         ok(res, { asset: updated, fine });
     } catch (e) { fail(res, e); }
 };
@@ -3723,12 +4872,21 @@ exports.recordMovement = async (req, res) => {
             entityType: 'HostelMovement', entityId: row._id, hostel: row.hostel,
             description: `Gate ${b.direction} recorded${afterCurfew ? ' after curfew' : ''}`, meta: { gate: b.gate } });
 
+        let fine = null;
         if (afterCurfew && b.student) {
             await notifyHostelStaff(req, { hostelId: row.hostel,
                 title: 'After-curfew movement',
                 body: `A resident moved ${b.direction} at ${hhmm}, after the ${settings.curfewTime} curfew.` });
+            // Coming in after curfew is the violation the fine in Hostel Settings is
+            // for. (A late return on an outpass is billed by the gate scan instead.)
+            if (b.direction === 'in' && settings.curfewViolationFine > 0) {
+                fine = await raiseFine(req, {
+                    studentId: b.student, hostelId: row.hostel, allocationId: allocation._id,
+                    amount: settings.curfewViolationFine, remarks: `Returned at ${hhmm}, after the ${settings.curfewTime} curfew`, settings,
+                });
+            }
         }
-        ok(res, row);
+        ok(res, fine ? { ...(row.toObject?.() ?? row), fine } : row);
     } catch (e) { fail(res, e); }
 };
 
@@ -3793,7 +4951,7 @@ exports.getIncident = async (req, res) => {
         ]);
         ok(res, {
             ...i, studentDetails: medical, discipline, documents,
-            attachmentUrls: (i.attachments || []).map((f) => `/uploads/hostel-docs/${f}`),
+            attachmentUrls: (i.attachments || []).map((f) => signedFileUrl(f)),
         });
     } catch (e) { fail(res, e); }
 };
@@ -3815,7 +4973,7 @@ exports.createIncident = async (req, res) => {
 
         await notifyHostelStaff(req, { hostelId: row.hostel,
             title: `Hostel incident — ${row.incidentType.replace(/_/g, ' ')}`,
-            body: `${row.incidentNumber} (${row.severity}): ${String(row.description).slice(0, 200)}`,
+            body: `${row.incidentNumber} (${row.severity}): ${row.title ? `${row.title} — ` : ''}${String(row.description).slice(0, 200)}`,
             email: ['high', 'critical'].includes(row.severity) });
 
         // Parents hear about anything involving their child, and immediately for
@@ -3826,7 +4984,7 @@ exports.createIncident = async (req, res) => {
                 studentId: row.student, settings, settingKey: 'notifyParentOnIncident',
                 title: medical ? 'Medical attention at the hostel' : 'Hostel incident reported',
                 body: medical
-                    ? `${row.description}${row.treatmentGiven ? ` Treatment: ${row.treatmentGiven}.` : ''}${row.hospitalName ? ` Hospital: ${row.hospitalName}.` : ''}`
+                    ? `${row.title ? `${row.title}. ` : ''}${row.description}${row.treatmentGiven ? ` Treatment: ${row.treatmentGiven}.` : ''}${row.hospitalName ? ` Hospital: ${row.hospitalName}.` : ''}`
                     : `An incident (${row.incidentType.replace(/_/g, ' ')}) involving your ward has been recorded at the hostel.`,
                 email: true,
             });
@@ -3842,8 +5000,13 @@ exports.updateIncident = async (req, res) => {
         if (!before) return bad(res, 'Incident not found', 404);
         if (!await mayTouchHostel(req, before.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         const body = { ...req.body };
-        for (const f of ['school', '_id', 'incidentNumber', 'reportedBy']) delete body[f];
-        if (body.status === 'resolved' && before.status !== 'resolved') body.resolvedAt = new Date();
+        for (const f of ['school', '_id', 'incidentNumber', 'reportedBy', 'reportedByName', 'resolvedAt', 'parentNotifiedAt']) delete body[f];
+        if (body.hostel && String(body.hostel) !== String(before.hostel) && !await mayTouchHostel(req, body.hostel)) {
+            return bad(res, 'You do not have access to that hostel', 403);
+        }
+        // Resolved or closed carries the day it was dealt with; reopening clears it.
+        if (['resolved', 'closed'].includes(body.status) && !before.resolvedAt) body.resolvedAt = new Date();
+        if (['reported', 'investigating', 'action_taken'].includes(body.status)) body.resolvedAt = null;
 
         const row = await HostelIncident.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
@@ -3883,10 +5046,13 @@ exports.getDisciplineActions = async (req, res) => {
  */
 exports.createDisciplineAction = async (req, res) => {
     try {
-        const b = req.body;
+        const b = { ...req.body };
         if (!b.student || !b.violation || !b.actionType) {
             return bad(res, 'Student, violation and action type are required');
         }
+        // Settled here, never taken from the form.
+        for (const f of ['fineInvoice', 'parentNotified', 'parentNotifiedAt', 'status', 'escalatedToPrincipal', 'escalatedAt']) delete b[f];
+        if (b.incident && !await HostelIncident.exists({ _id: b.incident, school: req.schoolId })) return bad(res, 'That incident was not found', 404);
         const allocation = await HostelAllocation.findOne({ school: req.schoolId, student: b.student, status: 'active' }).lean();
         const hostelId = b.hostel || allocation?.hostel;
         if (!hostelId) return bad(res, 'This student is not a hostel resident and no hostel was given');
@@ -3948,7 +5114,10 @@ exports.updateDisciplineAction = async (req, res) => {
         if (!await mayTouchHostel(req, before.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         const body = { ...req.body };
         // The fine and its invoice are settled at issue time and never re-edited.
-        for (const f of ['school', '_id', 'student', 'actionNumber', 'fineAmount', 'fineInvoice', 'priorCount']) delete body[f];
+        for (const f of ['school', '_id', 'student', 'actionNumber', 'fineAmount', 'fineInvoice', 'priorCount', 'isRepeatOffence', 'issuedBy', 'issuedByName']) delete body[f];
+        if (body.hostel && String(body.hostel) !== String(before.hostel) && !await mayTouchHostel(req, body.hostel)) {
+            return bad(res, 'You do not have access to that hostel', 403);
+        }
 
         const row = await HostelDiscipline.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, { $set: body }, { new: true });
         const d = diffFields(before, row, Object.keys(body));
@@ -3961,7 +5130,8 @@ exports.updateDisciplineAction = async (req, res) => {
 /** A student's disciplinary record with the repeat-offence roll-up. */
 exports.getStudentDiscipline = async (req, res) => {
     try {
-        const rows = await HostelDiscipline.find({ school: req.schoolId, student: req.params.studentId })
+        const q = await scopedFilter(req, { student: req.params.studentId });
+        const rows = await HostelDiscipline.find(q)
             .sort('-date').populate('issuedBy', 'name').populate('incident', 'incidentNumber').lean();
         const byType = rows.reduce((m, r) => { m[r.actionType] = (m[r.actionType] || 0) + 1; return m; }, {});
         const totalFines = rows.reduce((s, r) => s + (r.fineAmount || 0), 0);
@@ -3982,8 +5152,16 @@ exports.getDocuments = async (req, res) => {
         const q = { school: req.schoolId, isActive: true };
         const allowed = await visibleHostelIds(req);
         if (allowed !== null && !req.query.student) q.hostel = allowed.length ? { $in: allowed } : '__none__';
-        if (req.query.hostel) q.hostel = req.query.hostel;
-        if (req.query.student) q.student = req.query.student;
+        if (req.query.hostel) q.hostel = (allowed === null || allowed.includes(String(req.query.hostel))) ? req.query.hostel : '__none__';
+        if (req.query.student) {
+            q.student = req.query.student;
+            // Asking by student used to skip the hostel scope altogether, so a
+            // warden could read the papers of any student in the school.
+            if (allowed !== null) {
+                const lives = await HostelAllocation.exists({ school: req.schoolId, student: req.query.student, hostel: { $in: allowed }, status: { $in: ['active', 'pending'] } });
+                if (!lives) return ok(res, paged([], 0, p));
+            }
+        }
         if (req.query.docType) q.docType = req.query.docType;
         if (req.query.entityType) { q.entityType = req.query.entityType; q.entityId = req.query.entityId; }
         if (req.query.verificationStatus) q.verificationStatus = req.query.verificationStatus;
@@ -3996,7 +5174,7 @@ exports.getDocuments = async (req, res) => {
                 .populate('verifiedBy', 'name').lean(),
             HostelDocument.countDocuments(q),
         ]);
-        rows.forEach((r) => { r.url = `/uploads/hostel-docs/${r.storedName}`; });
+        rows.forEach((r) => { r.url = signedFileUrl(r.storedName); });
         ok(res, paged(rows, total, p));
     } catch (e) { fail(res, e); }
 };
@@ -4041,7 +5219,7 @@ exports.uploadAttachment = async (req, res) => {
             originalName: req.file.originalname,
             mimeType: req.file.mimetype,
             size: req.file.size,
-            url: `/uploads/hostel-docs/${req.file.filename}`,
+            url: signedFileUrl(req.file.filename),
             document: document?._id || null,
         });
     } catch (e) { fail(res, e); }
@@ -4053,6 +5231,28 @@ exports.uploadDocument = async (req, res) => {
         if (!req.file) return bad(res, 'A file is required');
         const b = req.body;
         if (!b.title) return bad(res, 'A document title is required');
+        if (b.hostel && !await mayTouchHostel(req, b.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+
+        // A new version of an existing document: it takes over the old one's
+        // holder and type, and the old one leaves the register (kept, inactive).
+        // A staff document hangs off the member's hostel post, and is filed under that hostel.
+        if (!b.replacesDocument && b.entityType === 'HostelStaffAssignment') {
+            const post = b.entityId && await HostelStaffAssignment.findOne({ _id: b.entityId, school: req.schoolId }).lean();
+            if (!post) return bad(res, 'That staff post was not found', 404);
+            if (!await mayTouchHostel(req, post.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+            b.hostel = post.hostel; b.student = null;
+        }
+        if (!b.replacesDocument && b.student && !await User.exists({ _id: b.student, school: req.schoolId })) {
+            return bad(res, 'That student was not found', 404);
+        }
+        let previous = null;
+        if (b.replacesDocument) {
+            previous = await HostelDocument.findOne({ _id: b.replacesDocument, school: req.schoolId, isActive: true }).lean();
+            if (!previous) return bad(res, 'The document being replaced was not found', 404);
+            if (!await mayTouchHostel(req, previous.hostel)) return bad(res, 'You do not have access to this hostel', 403);
+            Object.assign(b, { hostel: previous.hostel, student: previous.student, entityType: previous.entityType,
+                               entityId: previous.entityId, docType: b.docType || previous.docType });
+        }
 
         const row = await HostelDocument.create({
             school: req.schoolId,
@@ -4068,12 +5268,15 @@ exports.uploadDocument = async (req, res) => {
             mimeType: req.file.mimetype,
             fileSize: req.file.size,
             expiryDate: b.expiryDate ? new Date(b.expiryDate) : null,
+            version: previous ? (previous.version || 1) + 1 : 1,
+            replacesDocument: previous ? previous._id : null,
             uploadedBy: req.userId,
             uploaderRole: req.userRole,
         });
+        if (previous) await HostelDocument.findByIdAndUpdate(previous._id, { $set: { isActive: false } });
         await logAudit(req, { action: 'upload', entityType: 'HostelDocument', entityId: row._id, hostel: row.hostel,
-            description: `Uploaded ${row.docType} document: ${row.title}` });
-        ok(res, { ...row.toObject?.() ?? row, url: `/uploads/hostel-docs/${row.storedName}` });
+            description: previous ? `Uploaded version ${row.version} of "${previous.title}"` : `Uploaded ${row.docType} document: ${row.title}` });
+        ok(res, { ...row.toObject?.() ?? row, url: signedFileUrl(row.storedName) });
     } catch (e) { fail(res, e); }
 };
 
@@ -4083,6 +5286,7 @@ exports.verifyDocument = async (req, res) => {
         if (!['verified', 'rejected', 'pending'].includes(status)) return bad(res, 'Unsupported verification status');
         const d = await HostelDocument.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!d) return bad(res, 'Document not found', 404);
+        if (!await mayTouchHostel(req, d.hostel)) return bad(res, 'You do not have access to this hostel', 403);
 
         const row = await HostelDocument.findByIdAndUpdate(d._id, {
             $set: {
@@ -4102,6 +5306,7 @@ exports.deleteDocument = async (req, res) => {
     try {
         const d = await HostelDocument.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!d) return bad(res, 'Document not found', 404);
+        if (!await mayTouchHostel(req, d.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         await HostelDocument.findByIdAndUpdate(d._id, { $set: { isActive: false } });
         await logAudit(req, { action: 'delete', entityType: 'HostelDocument', entityId: d._id, hostel: d.hostel,
             description: `Removed document "${d.title}"` });
@@ -4113,6 +5318,7 @@ exports.downloadDocument = async (req, res) => {
     try {
         const d = await HostelDocument.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!d) return bad(res, 'Document not found', 404);
+        if (!await mayTouchHostel(req, d.hostel)) return bad(res, 'You do not have access to this hostel', 403);
         const file = path.join(__dirname, '..', 'uploads', 'hostel-docs', d.storedName);
         if (!fs.existsSync(file)) return bad(res, 'The stored file is missing', 404);
         res.download(file, d.originalName || d.storedName);
@@ -4122,58 +5328,7 @@ exports.downloadDocument = async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 //  COMMUNICATION (spec §24) — announcements through the existing notifier
 // ═════════════════════════════════════════════════════════════════════════════
-/**
- * Send a hostel announcement. Audience is resolved from live allocations and
- * staff assignments, then handed to notifyService — which already owns in-app
- * delivery, the unread badge, the WebSocket push and the school's SMTP.
- */
-exports.sendAnnouncement = async (req, res) => {
-    try {
-        const { hostel = null, audience = 'residents', title, body, email = false, urgent = false } = req.body;
-        if (!title || !body) return bad(res, 'A title and message are required');
-        if (hostel && !await mayTouchHostel(req, hostel)) return bad(res, 'You do not have access to this hostel', 403);
-
-        const scope = await scopedFilter(req, { status: 'active' }, hostel);
-        const allocations = await HostelAllocation.find(scope).select('student hostel').lean();
-        const studentIds = allocations.map((a) => String(a.student));
-
-        let recipients = [];
-        if (audience === 'residents') recipients = studentIds;
-        else if (audience === 'parents') {
-            const { withParents } = require('../services/notifyService');
-            recipients = (await withParents(studentIds)).filter((id) => !studentIds.includes(String(id)));
-        } else if (audience === 'residents_and_parents') {
-            const { withParents } = require('../services/notifyService');
-            recipients = await withParents(studentIds);
-        } else if (audience === 'staff') {
-            const staffScope = await scopedFilter(req, { status: 'active' }, hostel);
-            const [assigns, hostels] = await Promise.all([
-                HostelStaffAssignment.find(staffScope).select('staff').lean(),
-                Hostel.find(hostel ? { _id: hostel, school: req.schoolId } : { school: req.schoolId, isActive: true })
-                    .select('warden assistantWarden').lean(),
-            ]);
-            recipients = [
-                ...assigns.map((a) => String(a.staff)),
-                ...hostels.flatMap((h) => [h.warden, h.assistantWarden].filter(Boolean).map(String)),
-            ];
-        } else return bad(res, 'Unsupported audience');
-
-        recipients = [...new Set(recipients.filter(Boolean))];
-        if (!recipients.length) return bad(res, 'That audience has no one in it');
-
-        const { notify } = require('../services/notifyService');
-        notify({
-            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-            title: urgent ? `🚨 ${title}` : title,
-            body, recipients, email: !!email || urgent,
-            link: { type: 'hostel' },
-        });
-        await logAudit(req, { action: 'announce', entityType: 'HostelCommunication', hostel,
-            description: `Announcement "${title}" sent to ${recipients.length} recipient(s) (${audience})`,
-            meta: { audience, recipients: recipients.length, urgent } });
-        ok(res, { sent: recipients.length, audience });
-    } catch (e) { fail(res, e); }
-};
+// Announcements live in hostelAnnouncements.controller.js — they are kept now, not just sent.
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  REPORTS (spec §26)
@@ -4355,7 +5510,7 @@ async function buildReport(req) {
             };
         }
         case 'mess': {
-            const rows = await HostelMessAttendance.find({ school, ...dated('date') })
+            const rows = await HostelMessAttendance.find({ school, ...(scope.hostel ? { hostel: scope.hostel } : {}), ...dated('date') })
                 .populate('student', 'name').populate('mess', 'name').sort('-date').limit(10000).lean();
             const byMeal = rows.reduce((m, r) => { m[r.meal] = (m[r.meal] || 0) + 1; return m; }, {});
             return {
@@ -4466,9 +5621,11 @@ async function buildReport(req) {
             };
         }
         case 'expenses': {
+            // Mess spending is the whole school's kitchen: only the module's admins see it here.
+            const whole = !scope.hostel || (await visibleHostelIds(req)) === null;
             const [mess, maint] = await Promise.all([
-                HostelMessExpense.find({ school, ...dated('date') }).populate('mess', 'name').sort('-date').lean(),
-                HostelMaintenance.find({ school, status: 'completed', ...(hasRange ? { completedAt: range } : {}) })
+                whole ? HostelMessExpense.find({ school, ...dated('date') }).populate('mess', 'name').sort('-date').lean() : [],
+                HostelMaintenance.find({ ...scope, status: 'completed', ...(hasRange ? { completedAt: range } : {}) })
                     .populate('hostel', 'name').lean(),
             ]);
             const rows = [
@@ -4486,7 +5643,7 @@ async function buildReport(req) {
             };
         }
         case 'warden_activity': {
-            const rows = await HostelAuditLog.find({ school, ...(hasRange ? { createdAt: range } : {}) })
+            const rows = await HostelAuditLog.find({ ...scope, ...(hasRange ? { createdAt: range } : {}) })
                 .populate('user', 'name').sort('-createdAt').limit(5000).lean();
             const byUser = rows.reduce((m, r) => {
                 const k = r.userName || nameOf(r.user) || 'System';

@@ -13,7 +13,10 @@ const PaymentSchema = new db.Schema({
     reference: { type: String, default: '' },
     receiptNumber: { type: String, default: '' },
     paidAt: { type: Date, default: Date.now },
-    receivedBy: { type: db.Types.UUID, ref: 'User', default: null },
+    receivedBy: { type: db.Types.UUID, ref: 'User', default: null },   // the cashier, for a counter payment
+    paidBy: { type: db.Types.UUID, ref: 'User', default: null },       // who paid online: the resident or a parent
+    gatewayOrderId: { type: String, default: '' },
+    gatewayPaymentId: { type: String, default: '' },
     note: { type: String, default: '' },
 }, { _id: true });
 
@@ -21,7 +24,8 @@ const HostelFeeInvoiceSchema = new db.Schema({
     school: { type: db.Types.UUID, ref: 'School', required: true, index: true },
     invoiceNumber: { type: String, default: '' },              // HF-YYMM-####
 
-    student: { type: db.Types.UUID, ref: 'User', required: true, index: true },
+    student: { type: db.Types.UUID, ref: 'User', required: true, index: true },   // the resident billed
+    residentType: { type: String, enum: ['student', 'teacher'], default: 'student' },
     hostel: { type: db.Types.UUID, ref: 'Hostel', default: null, index: true },
     allocation: { type: db.Types.UUID, ref: 'HostelAllocation', default: null },
     academicYear: { type: db.Types.UUID, ref: 'AcademicYear', default: null, index: true },
@@ -58,6 +62,10 @@ const HostelFeeInvoiceSchema = new db.Schema({
     isRefundable: { type: Boolean, default: false },
     refundedAt: { type: Date, default: null },
     refundReference: { type: String, default: '' },
+    // Every refund, in order — the three fields above only remember the last.
+    // [{ amount, mode: 'offline' | 'gateway', reference, reason, voucherNumber,
+    //    gatewayRefundId, gatewayPaymentId, refundedAt, refundedBy }]
+    refunds: { type: db.Types.JSON, default: [] },
 
     payments: [PaymentSchema],
     remarks: { type: String, default: '' },

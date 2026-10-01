@@ -16,16 +16,20 @@ const designations = require('../services/designationService');
 const { MODULE_KEYS } = require('../config/modules');
 const { hasMySection } = require('../services/teacherOwnSections');
 const { transportRole } = require('../services/transportEnrolment');
+const { staffHasHostel } = require('../services/hostelResident');
+const { onHostelDuty } = require('../middleware/hostelDesk');
 
 async function buildModuleResponse(req) {
     const isTeacher = req.userRole === 'teacher';
-    const [access, school, mySection, transport] = await Promise.all([
+    const [access, school, mySection, transport, staffHostel, hostelDuty] = await Promise.all([
         designations.requestAccess(req),
         req.schoolId
             ? School.findById(req.schoolId).select('leaveSettings').lean()
             : Promise.resolve(null),
         isTeacher ? hasMySection(req.schoolId, req.userId) : Promise.resolve(false),
         transportRole(req.schoolId, req.userId, req.userRole),
+        isTeacher && req.schoolId ? staffHasHostel(req.schoolId, req.userId).catch(() => false) : Promise.resolve(false),
+        isTeacher && req.schoolId ? onHostelDuty(req.schoolId, req.userId).catch(() => false) : Promise.resolve(false),
     ]);
 
     const ls = school?.leaveSettings ?? {};
@@ -67,6 +71,15 @@ async function buildModuleResponse(req) {
         // duty screen, a teacher who rides wants the rider screen, and the nav
         // cannot tell them apart from `transportEnrolled` alone.
         transportCrew: transport.crew,
+        // Whether this member of staff lives in the hostel (or has a hostel bill).
+        // It opens "My Hostel" for them; running the hostel is `moduleAdmin.hostel`,
+        // a different thing, and a warden may be one, both or neither.
+        hostelResident: staffHostel,
+        // ...and whether they are POSTED to a hostel — its warden, assistant or
+        // staff. That opens the day-to-day management screens for that hostel
+        // (middleware/hostelDesk enforces the same rule on the routes), without
+        // the designation that administering the whole module takes.
+        hostelDuty: !!(hostelDuty && access.moduleFlags.hostel),
         saturdayConfig: {
             working: ls.saturdayWorking !== false,
             mode:    ls.saturdayMode    || 'all',

@@ -1,6 +1,6 @@
 const db = require('../db/orm');
 
-// One saved receipt design, per school, per module ('fees' | 'library'), per
+// One saved receipt design, per school, per module ('fees' | 'library' | 'hostel'), per
 // payment mode ('online' | 'offline'). A school that wants one design for both
 // modes saves the same choice twice — which the controller does for them when
 // "use the same for both" is ticked — so the render path never has to ask which
@@ -14,7 +14,7 @@ const ReceiptTemplateSchema = new db.Schema({
     },
     module: {
         type: String,
-        enum: ['fees', 'library'],
+        enum: ['fees', 'library', 'hostel'],
         required: true,
     },
     // Which payments this design is used for.

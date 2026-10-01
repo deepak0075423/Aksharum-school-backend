@@ -12,7 +12,7 @@ const HostelOutpassSchema = new db.Schema({
     outpassNumber: { type: String, default: '' },              // OP-YYMMDD-####
     outpassType: {
         type: String,
-        enum: ['day', 'night', 'medical', 'emergency', 'academic', 'market', 'other'],
+        enum: ['day', 'night', 'weekend', 'medical', 'emergency', 'academic', 'market', 'other'],
         default: 'day',
     },
     purpose: { type: String, required: true, trim: true },
@@ -28,6 +28,13 @@ const HostelOutpassSchema = new db.Schema({
 
     guardianName: { type: String, default: '' },
     guardianPhone: { type: String, default: '' },
+    guardianRelation: { type: String, default: '' },
+    // Parent consent, where the school asks for it (students only). The pass
+    // stays 'pending' until it is given; the warden cannot approve before.
+    parentApprovalRequired: { type: Boolean, default: false },
+    parentApprovedBy: { type: db.Types.UUID, ref: 'User', default: null },
+    parentApprovedAt: { type: Date, default: null },
+    academicYear: { type: db.Types.UUID, ref: 'AcademicYear', default: null },
     emergencyContact: { type: String, default: '' },
     remarks: { type: String, default: '' },
     attachments: { type: [String], default: [] },

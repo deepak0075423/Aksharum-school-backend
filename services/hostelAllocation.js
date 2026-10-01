@@ -18,15 +18,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
 const Hostel                  = require('../models/Hostel');
 const HostelRoom              = require('../models/HostelRoom');
+const HostelFloor             = require('../models/HostelFloor');
+const HostelBuilding          = require('../models/HostelBuilding');
 const HostelBed               = require('../models/HostelBed');
 const HostelAllocation        = require('../models/HostelAllocation');
 const HostelAllocationHistory = require('../models/HostelAllocationHistory');
 const HostelSettings          = require('../models/HostelSettings');
 const User                    = require('../models/User');
-const StudentProfile          = require('../models/StudentProfile');
 
 const { withTransaction, lock, insertRow, qi } = require('./dbTx');
 const { getSettings, genderOf } = require('./hostelService');
+const { residentAccount, bedFits, occupantOf } = require('./hostelResident');
 
 const BED   = qi(HostelBed.tableName);
 const ROOM  = qi(HostelRoom.tableName);
@@ -64,15 +66,21 @@ async function validateAllocation({ schoolId, studentId, bedId, settings, ignore
     if (bed.status === 'maintenance') throw new RuleError('This bed is under maintenance');
     if (bed.status === 'inactive') throw new RuleError('This bed is not in service');
 
-    const [hostel, room, student, profile] = await Promise.all([
+    // The resident is a student or a member of staff; which one is read off
+    // the account, so the bed check below cannot be talked round.
+    const [hostel, room, account] = await Promise.all([
         Hostel.findOne({ _id: bed.hostel, school: schoolId }).lean(),
         HostelRoom.findOne({ _id: bed.room, school: schoolId }).lean(),
-        User.findOne({ _id: studentId, school: schoolId, role: 'student' }).lean(),
-        StudentProfile.findOne({ user: studentId, school: schoolId }).select('gender').lean(),
+        residentAccount(schoolId, studentId),
     ]);
 
-    if (!student) throw new RuleError('Student not found in this school');
-    if (!student.isActive) throw new RuleError('This student account is inactive');
+    if (!account) throw new RuleError('That person is not a student or teacher of this school');
+    const { user: student, profile, kind } = account;
+    if (!student.isActive) throw new RuleError(`This ${kind} account is inactive`);
+    if (!bedFits(bed, kind)) {
+        const o = occupantOf(bed);
+        throw new RuleError(`Bed ${bed.bedNumber} is kept for ${o === 'teacher' ? 'teachers' : 'students'} — pick a bed marked for ${kind === 'teacher' ? 'teachers' : 'students'} or for both`);
+    }
 
     if (!hostel) throw new RuleError('Hostel not found');
     if (!hostel.isActive || hostel.status !== 'active') throw new RuleError('This hostel is not active — allocations are not allowed');
@@ -80,14 +88,25 @@ async function validateAllocation({ schoolId, studentId, bedId, settings, ignore
     if (!room) throw new RuleError('Room not found');
     if (!room.isActive) throw new RuleError('This room is inactive');
     if (['maintenance', 'inactive'].includes(room.status)) throw new RuleError(`This room is marked ${room.status}`);
+    // The floor and the building it stands in must be open too: a room is not
+    // offered just because nobody remembered to close it along with its floor.
+    const [floor, building] = await Promise.all([
+        HostelFloor.findOne({ _id: bed.floor, school: schoolId }).select('name status isActive').lean(),
+        HostelBuilding.findOne({ _id: bed.building, school: schoolId }).select('name status isActive').lean(),
+    ]);
+    for (const [what, row] of [['building', building], ['floor', floor]]) {
+        if (row && (!row.isActive || ['maintenance', 'inactive'].includes(row.status))) {
+            throw new RuleError(`${row.name} is ${row.isActive ? `marked ${row.status}` : 'closed'} — beds on this ${what} cannot be allocated`);
+        }
+    }
 
     // Gender restriction — the room narrows the hostel when it states one.
     if (s.enforceGenderRestriction) {
         const want = String(room.gender || '') || String(hostel.gender || '');
         const have = genderOf(profile);
         if (want && !['any', 'co_ed'].includes(want)) {
-            if (!have) throw new RuleError('The student has no gender on record, so the hostel gender restriction cannot be checked');
-            if (have !== want) throw new RuleError(`This is a ${want} hostel — the student cannot be allocated here`);
+            if (!have) throw new RuleError(`The ${kind} has no gender on record, so the hostel gender restriction cannot be checked`);
+            if (have !== want) throw new RuleError(`This is a ${want} hostel — the ${kind} cannot be allocated here`);
         }
     }
 
@@ -102,7 +121,8 @@ async function validateAllocation({ schoolId, studentId, bedId, settings, ignore
 
     // Hostel capacity.
     if (hostel.capacity) {
-        const inHostel = await HostelAllocation.countDocuments({ school: schoolId, hostel: bed.hostel, status: 'active' });
+        // A held (pending) bed is a place already promised, so it counts too.
+        const inHostel = await HostelAllocation.countDocuments({ school: schoolId, hostel: bed.hostel, status: { $in: ['pending', 'active'] } });
         if (!s.allowOvercapacityAllocation && inHostel >= hostel.capacity) {
             throw new RuleError(`${hostel.name} is at its capacity of ${hostel.capacity}`);
         }
@@ -113,10 +133,10 @@ async function validateAllocation({ schoolId, studentId, bedId, settings, ignore
         school: schoolId, student: studentId, status: { $in: ['pending', 'active'] },
     }).lean();
     if (existing && String(existing._id) !== String(ignoreAllocationId || '')) {
-        throw new RuleError('This student already has an active hostel allocation — transfer them instead');
+        throw new RuleError(`This ${kind} already has an active hostel allocation — transfer them instead`);
     }
 
-    return { bed, room, hostel, student, profile };
+    return { bed, room, hostel, student, profile, kind };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,11 +144,15 @@ async function validateAllocation({ schoolId, studentId, bedId, settings, ignore
 // ─────────────────────────────────────────────────────────────────────────────
 /**
  * Give `bedId` to `studentId` and open an allocation. Atomic.
+ *
+ * `hold` opens it as PENDING instead of active: the bed is taken (nobody else
+ * can be given it) but the student is not a resident yet — they are on no roll
+ * call and can ask for no leave — until confirmAllocation() says they arrived.
  * @returns {Promise<{allocation: object, bed: object, room: object, hostel: object}>}
  */
-async function allocateBed({ schoolId, studentId, bedId, academicYearId, admissionId = null, actorId = null, actorName = '', allocationType = 'permanent', allocationMode = 'manual', fromDate = null, toDate = null, remarks = '', settings = null }) {
+async function allocateBed({ schoolId, studentId, bedId, academicYearId, admissionId = null, actorId = null, actorName = '', allocationType = 'permanent', allocationMode = 'manual', fromDate = null, toDate = null, remarks = '', settings = null, hold = false }) {
     const s = settings || await getSettings(schoolId);
-    const { bed, room, hostel, student } = await validateAllocation({ schoolId, studentId, bedId, settings: s });
+    const { bed, room, hostel, student, kind } = await validateAllocation({ schoolId, studentId, bedId, settings: s });
 
     const result = await withTransaction(async (q) => {
         await lock(q, `hostel-alloc:${bed.hostel}`);
@@ -146,6 +170,7 @@ async function allocateBed({ schoolId, studentId, bedId, academicYearId, admissi
         const allocation = await insertRow(q, HostelAllocation, {
             school: schoolId,
             student: studentId,
+            residentType: kind,
             academicYear: academicYearId,
             admission: admissionId,
             hostel: bed.hostel,
@@ -157,7 +182,7 @@ async function allocateBed({ schoolId, studentId, bedId, academicYearId, admissi
             allocationMode,
             fromDate: fromDate ? new Date(fromDate) : new Date(),
             toDate: toDate ? new Date(toDate) : null,
-            status: 'active',
+            status: hold ? 'pending' : 'active',
             presence: 'in',
             remarks,
             allocatedBy: actorId,
@@ -182,7 +207,7 @@ async function allocateBed({ schoolId, studentId, bedId, academicYearId, admissi
             student: studentId,
             allocation: allocation._id,
             academicYear: academicYearId,
-            action: 'allocated',
+            action: hold ? 'reserved' : 'allocated',
             toHostel: bed.hostel, toRoom: bed.room, toBed: bed._id,
             toLabel: `${hostel.name} · Room ${room.roomNumber} · Bed ${bed.bedNumber}`,
             studentName: student.name,
@@ -195,7 +220,59 @@ async function allocateBed({ schoolId, studentId, bedId, academicYearId, admissi
         return allocation;
     });
 
-    return { allocation: result, bed, room, hostel, student };
+    return { allocation: result, bed, room, hostel, student, kind };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Confirm a held bed
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Turn a PENDING allocation into an active one — the student has arrived. The
+ * bed was already theirs, so only the allocation moves; the history gets the
+ * 'allocated' entry the hold deliberately did not write.
+ */
+async function confirmAllocation({ schoolId, allocationId, actorId = null, actorName = '', remarks = '' }) {
+    const allocation = await HostelAllocation.findOne({ _id: allocationId, school: schoolId }).lean();
+    if (!allocation) throw new RuleError('Allocation not found');
+    if (allocation.status !== 'pending') throw new RuleError(`Only a pending allocation can be confirmed — this one is ${allocation.status}`);
+
+    const [room, hostel, bed, student] = await Promise.all([
+        HostelRoom.findById(allocation.room).lean(),
+        Hostel.findById(allocation.hostel).lean(),
+        HostelBed.findById(allocation.bed).lean(),
+        User.findById(allocation.student).select('name').lean(),
+    ]);
+    if (!hostel || hostel.status !== 'active') throw new RuleError(`${hostel?.name || 'The hostel'} is not active`);
+    if (!bed || String(bed.allocation) !== String(allocation._id)) {
+        throw new RuleError('This bed is no longer held for them — allocate another');
+    }
+
+    return withTransaction(async (q) => {
+        await lock(q, `hostel-alloc:${allocation.hostel}`);
+        const now = new Date();
+        const { rowCount } = await q(
+            `UPDATE ${ALLOC} SET "status" = 'active', "presence" = 'in', "approvedBy" = $1::uuid, "approvedAt" = $2, "updatedAt" = now()
+              WHERE "_id" = $3::uuid AND "status" = 'pending'`,
+            [actorId ? String(actorId) : null, now, String(allocationId)],
+        );
+        if (!rowCount) throw new RuleError('This allocation was changed by someone else');
+
+        await insertRow(q, HostelAllocationHistory, {
+            school: schoolId,
+            student: allocation.student,
+            allocation: allocation._id,
+            academicYear: allocation.academicYear,
+            action: 'allocated',
+            toHostel: allocation.hostel, toRoom: allocation.room, toBed: allocation.bed,
+            toLabel: `${hostel.name} · Room ${room?.roomNumber || '?'} · Bed ${bed.bedNumber}`,
+            studentName: student?.name || '',
+            reason: remarks || 'Held bed confirmed',
+            effectiveDate: now,
+            performedBy: actorId,
+            performedByName: actorName,
+        });
+        return { allocation: { ...allocation, status: 'active', approvedBy: actorId, approvedAt: now }, bed, room, hostel, student };
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -279,11 +356,11 @@ async function transferBed({ schoolId, allocationId, toBedId, actorId = null, ac
     const current = await HostelAllocation.findOne({ _id: allocationId, school: schoolId }).lean();
     if (!current) throw new RuleError('Allocation not found');
     if (!['pending', 'active'].includes(current.status)) throw new RuleError('Only an active allocation can be transferred');
-    if (String(current.bed) === String(toBedId)) throw new RuleError('The student is already in that bed');
+    if (String(current.bed) === String(toBedId)) throw new RuleError('They are already in that bed');
 
     // The student legitimately holds an allocation right now, so it is excluded
     // from the "already allocated" check.
-    const { bed: toBed, room: toRoom, hostel: toHostel, student } = await validateAllocation({
+    const { bed: toBed, room: toRoom, hostel: toHostel, student, kind } = await validateAllocation({
         schoolId, studentId: current.student, bedId: toBedId, settings: s, ignoreAllocationId: allocationId,
     });
 
@@ -334,6 +411,7 @@ async function transferBed({ schoolId, allocationId, toBedId, actorId = null, ac
         const allocation = await insertRow(q, HostelAllocation, {
             school: schoolId,
             student: current.student,
+            residentType: kind,
             academicYear: current.academicYear,
             admission: current.admission,
             hostel: toBed.hostel,
@@ -395,7 +473,7 @@ async function setBedState({ schoolId, bedId, status, actorId = null, actorName 
     }
     const bed = await HostelBed.findOne({ _id: bedId, school: schoolId }).lean();
     if (!bed) throw new RuleError('Bed not found');
-    if (bed.status === 'occupied') throw new RuleError('Release the student from this bed first');
+    if (bed.status === 'occupied') throw new RuleError('Release the resident from this bed first');
 
     const room = await HostelRoom.findById(bed.room).lean();
 
@@ -439,8 +517,9 @@ async function setBedState({ schoolId, bedId, status, actorId = null, actorName 
  */
 async function findBestBed({ schoolId, studentId, hostelId = null, preferredRoomType = '', settings = null }) {
     const s = settings || await getSettings(schoolId);
-    const profile = await StudentProfile.findOne({ user: studentId, school: schoolId }).select('gender').lean();
-    const gender = genderOf(profile);
+    const account = await residentAccount(schoolId, studentId);
+    if (!account) return null;
+    const gender = genderOf(account.profile);
 
     const hostelQ = { school: schoolId, isActive: true, status: 'active' };
     if (hostelId) hostelQ._id = hostelId;
@@ -469,13 +548,22 @@ async function findBestBed({ schoolId, studentId, hostelId = null, preferredRoom
         rooms = rooms.filter((r) => !r.gender || ['any', gender].includes(String(r.gender)));
     }
     if (!rooms.length) return null;
+    // Not rooms on a floor or in a building that is closed or under maintenance.
+    const [shutFloors, shutBuildings] = await Promise.all([
+        HostelFloor.find({ school: schoolId, hostel: { $in: hostelIds }, $or: [{ isActive: false }, { status: { $in: ['maintenance', 'inactive'] } }] }).select('_id').lean(),
+        HostelBuilding.find({ school: schoolId, hostel: { $in: hostelIds }, $or: [{ isActive: false }, { status: { $in: ['maintenance', 'inactive'] } }] }).select('_id').lean(),
+    ]);
+    const shut = new Set([...shutFloors, ...shutBuildings].map((x) => String(x._id)));
+    rooms = rooms.filter((r) => !shut.has(String(r.floor)) && !shut.has(String(r.building)));
+    if (!rooms.length) return null;
 
-    const beds = await HostelBed.find({
+    // Only beds meant for this kind of resident (or for both) are candidates.
+    const beds = (await HostelBed.find({
         school: schoolId,
         room: { $in: rooms.map((r) => String(r._id)) },
         status: 'available',
         isActive: true,
-    }).lean();
+    }).lean()).filter((b) => bedFits(b, account.kind));
     if (!beds.length) return null;
 
     const roomById = Object.fromEntries(rooms.map((r) => [String(r._id), r]));
@@ -502,5 +590,5 @@ async function findBestBed({ schoolId, studentId, hostelId = null, preferredRoom
 
 module.exports = {
     RuleError, roomStatusFor,
-    validateAllocation, allocateBed, releaseBed, transferBed, setBedState, findBestBed,
+    validateAllocation, allocateBed, confirmAllocation, releaseBed, transferBed, setBedState, findBestBed,
 };
