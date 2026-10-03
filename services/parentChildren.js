@@ -106,4 +106,51 @@ async function parentsOf(studentIds, schoolId) {
     return out;
 }
 
-module.exports = { childrenOf, childCards, parentsOf };
+/**
+ * A person's children at EVERY school they are a parent at.
+ *
+ * One person can hold a parent post at several schools — a User row per school,
+ * all on the same email address (services/accountIdentity: credentials belong
+ * to the address, so the rows are one person). Each post has its own children,
+ * so "my children" is the union over the person's live parent posts, each child
+ * carrying the school it belongs to.
+ *
+ * Which other posts count is decided exactly as the school switcher decides it
+ * (accountIdentity.switchTargets): the same address, a live membership, a live
+ * school — and the same password hash as the row this session was opened with.
+ * An address alone is not proof: a post that somehow holds another password is
+ * one this session never opened, and its children are not shown on the strength
+ * of a sibling's sign-in. Students are never linked by address, so a child whose
+ * admission form carries the parent's email is not mistaken for a post.
+ *
+ * The current school's children come first, then the other schools by name.
+ *   → [{ _id, name, className, sectionName, schoolId, schoolName, modules }]
+ */
+async function childrenAcrossSchools(userId, schoolId) {
+    const pool = require('../db/pool');
+    const School = require('../models/School');
+    const T = (M) => `"${M.tableName}"`;
+    const { rows: posts } = await pool.query(
+        `SELECT u."_id", u."school", s."name" AS "schoolName", s."modules"
+           FROM ${T(User)} me
+           JOIN ${T(User)} u ON u."_id" = me."_id"
+                OR (me."email" <> '' AND u."email" = me."email" AND u."isActive" IS TRUE
+                    AND u."password" <> '' AND u."password" = me."password")
+           JOIN ${T(School)} s ON s."_id" = u."school"
+          WHERE me."_id" = $1::uuid AND u."role" = 'parent' AND s."isActive" IS NOT FALSE
+          ORDER BY (u."school" = $2::uuid) DESC, s."name", u."_id"`,
+        [String(userId), String(schoolId)],
+    );
+    const out = [];
+    const seen = new Set();
+    for (const post of posts) {
+        for (const c of await childCards(post._id, post.school)) {
+            if (seen.has(c._id)) continue;
+            seen.add(c._id);
+            out.push({ ...c, schoolId: String(post.school), schoolName: post.schoolName || '', modules: post.modules || {} });
+        }
+    }
+    return out;
+}
+
+module.exports = { childrenOf, childCards, parentsOf, childrenAcrossSchools };

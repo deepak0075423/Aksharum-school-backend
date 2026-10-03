@@ -134,6 +134,7 @@ app.use('/api/employee-directory', require('./routes/api/employeeDirectory'));
 app.use('/api/chat',          require('./routes/api/chat'));
 app.use('/api/notifications', require('./routes/api/notifications'));
 app.use('/api/profile',       require('./routes/api/profile'));
+app.use('/api/public',        require('./routes/api/public'));
 app.use('/internal',          require('./routes/api/internal'));
 
 // ── Health Check ──────────────────────────────────────────────────────────────
@@ -265,6 +266,49 @@ if (isPrimaryWorker) {
         };
         setTimeout(tick, 90 * 1000);           // once shortly after boot
         setInterval(tick, 30 * 60 * 1000);     // then every 30 minutes
+    }());
+
+    // ── Promotion on final results ────────────────────────────────────────────
+    // A final exam set to promote moves the students who passed up a class on
+    // the day its results reach families — often a result date weeks after the
+    // office pressed Publish, with nobody at a screen. Each run claims its exam
+    // first and counts a student it already moved as done, so two instances or
+    // a restart mid-run never move anyone twice. One waiting for next year's
+    // class to be set up is looked at again hourly.
+    (function scheduleResultPromotions() {
+        const { sweepDue } = require('./services/resultPromotion');
+        const { releaseSweep } = require('./services/resultExams');
+        // Each school's own clock (services/schoolClock), loaded once and kept fresh.
+        require('./services/schoolClock').start();
+        const tick = async () => {
+            try {
+                const r = await sweepDue();
+                if (r.moved > 0) console.log(`[Results] promoted ${r.moved} student(s) on ${r.exams} final exam(s)`);
+            } catch (err) { console.error('[Results] promotion sweep error:', err.message); }
+            // Results published with a later result date: families are told on the day.
+            try {
+                const r = await releaseSweep();
+                if (r.exams > 0) console.log(`[Results] told families of ${r.exams} exam(s) released today`);
+            } catch (err) { console.error('[Results] release sweep error:', err.message); }
+        };
+        setTimeout(tick, 45 * 1000);           // once shortly after boot
+        setInterval(tick, 10 * 60 * 1000);     // then every 10 minutes
+    }());
+
+    // ── Reminders about marks still owed ──────────────────────────────────────
+    // By each school's own settings (Results → Settings): subject teachers about
+    // sheets not yet in, class teachers about marks waiting to be validated.
+    // Each reminder is claimed in SQL first, so two instances send it once.
+    (function scheduleResultReminders() {
+        const { sweep } = require('./services/resultReminders');
+        const tick = async () => {
+            try {
+                const r = await sweep();
+                if (r.sheets || r.validations) console.log(`[Results] reminded: ${r.sheets} sheet(s), ${r.validations} validation(s)`);
+            } catch (err) { console.error('[Results] reminder sweep error:', err.message); }
+        };
+        setTimeout(tick, 90 * 1000);           // once shortly after boot
+        setInterval(tick, 60 * 60 * 1000);     // then hourly
     }());
 
     // ── Hostel announcements booked for later ─────────────────────────────────

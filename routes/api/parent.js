@@ -6,6 +6,7 @@ const attendanceCtrl = require('../../controllers/attendance.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
+const resultPortal   = require('../../controllers/resultPortal.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const docViewer      = require('../../controllers/documentViewer.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
@@ -45,8 +46,14 @@ router.get('/child-attendance/requests', attendanceGuard, attendanceCtrl.getPare
 router.get('/exams', examGuard, examCtrl.getParentExamResults);
 
 // Results
+router.get('/results/overview',    resultGuard, resultPortal.parentOverview);
+router.get('/results/schedule',    resultGuard, resultPortal.parentSchedule);
+router.get('/results/admit-card',  resultGuard, resultPortal.parentAdmitCard);
+router.get('/results/report-card', resultGuard, resultPortal.parentReportCard);
+router.get('/results/report-card/pdf', resultGuard, resultPortal.parentReportCardPdf);
 router.get('/results',             resultGuard, formalExamCtrl.parentGetResults);
 router.get('/results/class-tests', resultGuard, classTestCtrl.parentGetClassTests);
+router.post('/results/recheck',    resultGuard, resultPortal.parentRecheck);
 router.get('/results/:resultId',   resultGuard, formalExamCtrl.parentGetResultDetail);
 
 // Documents

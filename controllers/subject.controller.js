@@ -9,6 +9,7 @@ const TeacherProfile        = require('../models/TeacherProfile');
 const User                  = require('../models/User');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
+const { accessChanged } = require('../services/accessChanged');
 
 /**
  * Adds department and designation to teachers already populated on a document.
@@ -453,6 +454,9 @@ exports.assignSubjectTeacher = async (req, res) => {
         await ensureClassSubject(req.params.sectionId, req.body.subject);
         // Keep teacher-made class/subject groups of the section in step
         syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
+        // Taking a subject in a section is what puts it in the teacher's
+        // My Section — their open session is told, not left on the old menu.
+        accessChanged(req.body.teacher, 'subject-post');
         ok(res, sst, 201);
     } catch (e) { err(res, e, 400); }
 };
@@ -521,6 +525,7 @@ exports.assignSubjectToSections = async (req, res) => {
         for (const sid of toCreate) {
             syncSectionChatGroup(sid, req.schoolId).catch(() => {});
         }
+        if (toCreate.length) accessChanged(teacher, 'subject-post');
 
         ok(res, { ...payload, preview: false, created: toCreate.length }, 201);
     } catch (e) {
@@ -567,9 +572,14 @@ async function pruneClassSubject(sectionId, subjectId) {
 
 exports.removeSectionSubject = async (req, res) => {
     try {
+        // Who taught it there, read before the rows go: each of them has just
+        // lost this section from their My Section.
+        const gone = await SectionSubjectTeacher.find({ section: req.params.sectionId, subject: req.params.subjectId })
+            .select('teacher').lean();
         await SectionSubjectTeacher.deleteMany({ section: req.params.sectionId, subject: req.params.subjectId });
         const pruned = await pruneClassSubject(req.params.sectionId, req.params.subjectId);
         syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
+        accessChanged(gone.map((g) => g.teacher), 'subject-post');
         res.json({ success: true, ...pruned });
     } catch (e) { err(res, e); }
 };
@@ -584,6 +594,7 @@ exports.removeSectionSubjectTeacher = async (req, res) => {
         // the class no longer teaches it either.
         const pruned = await pruneClassSubject(req.params.sectionId, req.params.subjectId);
         syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
+        accessChanged(req.params.teacherId, 'subject-post');
         res.json({ success: true, ...pruned });
     } catch (e) { err(res, e); }
 };

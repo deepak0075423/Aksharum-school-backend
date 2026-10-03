@@ -19,9 +19,9 @@
 const Attendance       = require('../models/Attendance');
 const AttendanceRecord = require('../models/AttendanceRecord');
 const AptitudeExam     = require('../models/AptitudeExam');
-const FormalExam       = require('../models/FormalExam');
 const FormalResult     = require('../models/FormalResult');
 const sa               = require('./studentAttendance');
+const { visibleToFamilies } = require('./resultExams');
 
 /**
  * Late counts as attended and a half day as half — services/studentAttendance.
@@ -141,32 +141,31 @@ async function upcomingExams(schoolId, sectionId, limit = 3) {
  * Published formal results, oldest first, plus the subject breakdown of the
  * most recent one.
  *
- * Only FINAL_APPROVED exams past their publish date are readable — the same two
- * conditions studentGetResults enforces, kept here so no dashboard can show a
- * mark the results page would still be hiding.
+ * Only what the results page itself would show is readable here — published,
+ * not kept off the portal, past its result date (resultExams.visibleToFamilies)
+ * — so no dashboard can show a mark the results page would still be hiding.
+ * The rank goes too when the exam hides ranks.
  */
 async function performance(schoolId, sectionId, studentId) {
-    if (!sectionId) return null;
+    if (!studentId) return null;
 
-    const exams = await FormalExam.find({
-        section: sectionId, school: schoolId, status: 'FINAL_APPROVED',
-    }).select('title examType startDate publishDate').lean();
-    if (!exams.length) return null;
-
-    const byId    = new Map(exams.map((e) => [String(e._id), e]));
-    const results = await FormalResult.find({
-        student: studentId, exam: { $in: exams.map((e) => e._id) },
-    }).populate('subjects.subject', 'subjectName').lean();
-
+    // By student, not by section: a student promoted on a final's result day
+    // is in next year's section that same day, and must still see the result.
     const now = new Date();
+    const results = await FormalResult.find({ student: studentId, school: schoolId })
+        .populate('exam', 'title examType startDate publishDate status showInPortal showRank school withheld')
+        .populate('subjects.subject', 'subjectName')
+        .lean();
+    // Not a result the school is holding back from this family.
+    const held = (e) => (Array.isArray(e?.withheld) ? e.withheld : []).some((w) => String(w.student) === String(studentId));
     const rows = results
-        .map((r) => ({ r, e: byId.get(String(r.exam)) }))
-        .filter(({ e }) => e && (!e.publishDate || now >= new Date(e.publishDate)))
+        .filter((r) => r.exam && visibleToFamilies(r.exam, now) && !held(r.exam))
+        .map((r) => ({ r, e: r.exam }))
         .sort((a, b) => new Date(a.e.startDate) - new Date(b.e.startDate));
     if (!rows.length) return null;
 
     const trend = rows.map(({ r, e }) => ({
-        examId:     r.exam,
+        examId:     e._id,
         title:      e.title,
         examType:   e.examType,
         date:       e.startDate,
@@ -176,7 +175,7 @@ async function performance(schoolId, sectionId, studentId) {
 
     const last = rows[rows.length - 1];
     const subjects = (last.r.subjects || [])
-        .filter((sub) => !sub.isAbsent && sub.maxMarks > 0)
+        .filter((sub) => !sub.isAbsent && !sub.gradeOnly && sub.maxMarks > 0)
         .map((sub) => ({
             name:          sub.subject?.subjectName || 'Subject',
             marksObtained: sub.marksObtained,
@@ -194,7 +193,7 @@ async function performance(schoolId, sectionId, studentId) {
             title:      last.e.title,
             percentage: Math.round(last.r.percentage || 0),
             grade:      last.r.grade || '',
-            rank:       last.r.rank || 0,
+            rank:       last.e.showRank === false ? null : (last.r.rank || 0),
             resultId:   last.r._id,
         },
     };

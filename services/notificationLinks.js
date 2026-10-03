@@ -171,8 +171,54 @@ const ROUTES = {
         school_admin: { web: '/admin/results',    mobile: '/modules/admin/results' },
     },
     'results.marks': {
-        teacher:      { web: '/teacher/results', mobile: '/modules/results' },
+        teacher:      { web: '/teacher/results?tab=marks', mobile: '/modules/results?tab=marks' },
         school_admin: { web: '/admin/results',   mobile: '/modules/admin/results' },
+    },
+    // Marks every subject has submitted, waiting for the class teacher.
+    'results.validate': {
+        teacher:      { web: '/teacher/results?tab=validation', mobile: '/modules/results?tab=validation' },
+        school_admin: { web: '/admin/results?tab=validation',   mobile: '/modules/admin/results' },
+    },
+    // Class tests: the teacher's own tests, a student's or a child's test marks.
+    'results.tests': {
+        teacher:      { web: '/teacher/results?tab=tests', mobile: '/modules/results?tab=tests' },
+        student:      { web: '/student/results?tab=tests', mobile: '/modules/results?tab=tests' },
+        parent:       { web: '/parent/results?tab=tests',  mobile: '/modules/results?tab=tests' },
+    },
+    // A re-exam set up: the subject teachers enter its marks.
+    'results.reexam': {
+        teacher:      { web: '/teacher/results?tab=reexams', mobile: '/modules/results?tab=reexams' },
+        school_admin: { web: '/admin/results?exam={id}',     mobile: '/modules/admin/results' },
+    },
+    // An exam's timetable set or changed: the reader's own exam schedule.
+    'results.schedule': {
+        student:      { web: '/student/exam-schedule', mobile: '/modules/exam-schedule' },
+        parent:       { web: '/parent/exam-schedule',  mobile: '/modules/exam-schedule' },
+        teacher:      { web: '/teacher/exam-schedule', mobile: '/modules/exam-schedule' },
+        school_admin: { web: '/admin/results?exam={id}', mobile: '/modules/admin/results' },
+    },
+    // A section's report cards released or sent: the family's own report card.
+    'results.reportcard': {
+        student:      { web: '/student/results/report-card', mobile: '/modules/report-card' },
+        parent:       { web: '/parent/results/report-card',  mobile: '/modules/report-card' },
+        teacher:      { web: '/teacher/results/report-cards', mobile: '/modules/report-cards' },
+        school_admin: { web: '/admin/results/report-cards',   mobile: '/modules/admin/results' },
+    },
+    // A family asked for a paper to be checked again: the office's list of requests.
+    'results.recheck': {
+        school_admin: { web: '/admin/results/rechecks', mobile: '/modules/admin/results?view=rechecks' },
+        // The subject teacher is told so they can look at the paper; the office answers.
+        teacher:      { web: '/teacher/results', mobile: '/modules/results' },
+    },
+    // One exam, opened on the office's screen — a step waiting for the office,
+    // or the summary of a promotion the scheduler ran.
+    'results.exam': {
+        school_admin: { web: '/admin/results?exam={id}',         mobile: '/modules/admin/results' },
+        // Only the office's notices use this — "ready to publish", "rejected by
+        // the class teacher", a promotion's summary — and a teacher gets one
+        // only when their designation administers Results. They act on it in
+        // the admin screen, not on their own Results page.
+        teacher:      { web: '/admin/results?exam={id}',         mobile: '/modules/admin/results' },
     },
 
     // ── Timetable ────────────────────────────────────────────────────────────

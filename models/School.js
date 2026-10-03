@@ -64,6 +64,14 @@ const SchoolSchema = new db.Schema({
         type: String,
         default: '',
     },
+    // The school's own clock (an IANA zone, "Asia/Kolkata"). Empty — the
+    // platform's (config/timezone). Results read it for result dates, exam days
+    // and reminders (services/schoolClock); other modules still use the
+    // platform's.
+    timezone: {
+        type: String,
+        default: '',
+    },
     isActive: {
         type: Boolean,
         default: true,

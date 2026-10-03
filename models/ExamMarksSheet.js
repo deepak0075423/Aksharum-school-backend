@@ -5,6 +5,10 @@ const marksEntrySchema = new db.Schema({
     marksObtained: { type: Number, default: null },
     isAbsent:      { type: Boolean, default: false },
     remarks:       { type: String, default: '' },
+    // A paper in parts: { componentKey: marks | null } — marksObtained is their sum.
+    parts:         { type: Object, default: null },
+    // A graded paper (FormalExam subjects[].gradeOnly): the grade given.
+    grade:         { type: String, default: '' },
 }, { _id: false });
 
 const auditEntrySchema = new db.Schema({
@@ -32,6 +36,10 @@ const ExamMarksSheetSchema = new db.Schema({
 
     entries:  { type: [marksEntrySchema], default: [] },
     auditLog: { type: [auditEntrySchema], default: [] },
+    // Bumped by every save (services/resultExams.saveMarks). A screen sends the
+    // version it loaded; a save over a sheet somebody else has changed since is
+    // refused rather than quietly writing their marks back.
+    version:  { type: Number, default: 0 },
 
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },

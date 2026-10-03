@@ -15,6 +15,8 @@ const ClassSubject          = require('../models/ClassSubject');
 const Subject               = require('../models/Subject');
 const School                = require('../models/School');
 const { schoolWorksSaturday } = require('../utils/timetableDays');
+const { accessChanged } = require('../services/accessChanged');
+const { notify } = require('../services/notifyService');
 const pool = require('../db/pool');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
@@ -199,6 +201,12 @@ exports.setActiveAcademicYear = async (req, res) => {
         const year = await AcademicYear.findByIdAndUpdate(
             target._id, { $set: { status: 'active' } }, { new: true }
         );
+        // Which year is active decides who runs a class "this year" — every
+        // teacher's My Section may have just appeared or gone. Tell the open
+        // sessions rather than leave them on last year's answer.
+        User.find({ school: req.schoolId, role: 'teacher', isActive: true }, '_id').lean()
+            .then((rows) => accessChanged(rows, 'academic-year'))
+            .catch(() => {});
         ok(res, year);
     } catch (e) { err(res, e); }
 };
@@ -650,6 +658,7 @@ exports.importYearStructure = async (req, res) => {
         const createdIds = { classes: new Map(), sections: new Map() };   // source id -> target row
         let createdClasses = 0, createdSections = 0, createdLinks = 0, createdAssignments = 0, setClassTeachers = 0;
         let createdSubjects = 0;
+        const givenPosts = [];   // teachers who now run, or teach in, a section in the target year
 
         // Subjects first: a class-subject link and a subject-teacher row both
         // need the target year's own subject row to point at.
@@ -705,8 +714,8 @@ exports.importYearStructure = async (req, res) => {
                     if (includeClassTeachers) {
                         const ct = s.classTeacher && teacherById.get(String(s.classTeacher));
                         const vt = s.substituteTeacher && teacherById.get(String(s.substituteTeacher));
-                        if (ct && ct.isActive !== false) { fields.classTeacher = s.classTeacher; setClassTeachers += 1; }
-                        if (vt && vt.isActive !== false) { fields.substituteTeacher = s.substituteTeacher; setClassTeachers += 1; }
+                        if (ct && ct.isActive !== false) { fields.classTeacher = s.classTeacher; setClassTeachers += 1; givenPosts.push(s.classTeacher); }
+                        if (vt && vt.isActive !== false) { fields.substituteTeacher = s.substituteTeacher; setClassTeachers += 1; givenPosts.push(s.substituteTeacher); }
                     }
                     targetSec = await ClassSection.create(fields);
                     createdSections += 1;
@@ -740,8 +749,14 @@ exports.importYearStructure = async (req, res) => {
                 section: targetSec._id, subject: tgtSubject._id, teacher: row.teacher,
             });
             tgtSSTKey.add(key);
+            givenPosts.push(row.teacher);
             createdAssignments += 1;
         }
+
+        // Importing into the year that is already active gives those teachers
+        // their class at once; into any other it changes nothing until that
+        // year is activated, and the nudge is simply answered "no change".
+        if (givenPosts.length) accessChanged(givenPosts, 'section-post');
 
         ok(res, {
             ...summary,
@@ -1237,11 +1252,18 @@ exports.deleteClass = async (req, res) => {
             });
         }
 
-        const sections = await ClassSection.find({ class: cls._id }).select('_id').lean();
+        const sections = await ClassSection.find({ class: cls._id }).select('_id classTeacher substituteTeacher').lean();
         const sectionIds = sections.map((s) => s._id);
         if (sectionIds.length) {
+            // Everyone who ran one of these sections or took a subject in one:
+            // their My Section has just lost it.
+            const taught = await SectionSubjectTeacher.find({ section: { $in: sectionIds } }).select('teacher').lean();
             await SectionSubjectTeacher.deleteMany({ section: { $in: sectionIds } });
             await ClassSection.deleteMany({ _id: { $in: sectionIds } });
+            accessChanged([
+                ...sections.flatMap((s) => [s.classTeacher, s.substituteTeacher]),
+                ...taught.map((t) => t.teacher),
+            ], 'section-post');
         }
         await ClassSubject.deleteMany({ class: cls._id });
         await Class.findByIdAndDelete(cls._id);
@@ -1992,9 +2014,65 @@ exports.updateSectionTeacher = async (req, res) => {
         // with the new line-up (never creates one)
         syncSectionChatGroup(req.params.sectionId, req.schoolId).catch(() => {});
 
+        // ...and tell the teachers themselves, in words and on their screens.
+        announceSectionPosts(req, current, { ...current, ...update }).catch(() => {});
+
         ok(res, section);
     } catch (e) { err(res, e); }
 };
+
+/**
+ * A section's class teacher or vice class teacher has changed.
+ *
+ * Two things follow for the people who gained or lost the post. Their menu is
+ * different now — My Section is theirs, or is not — and a session of theirs
+ * that is already open is told so at once (services/accessChanged) instead of
+ * being left on the old answer: a teacher who had just been made class teacher
+ * used to be told the page was not theirs until they signed out and back in.
+ * And they are told in words. Being given a class was something a teacher
+ * found out by noticing a new entry in the menu.
+ *
+ * One notice per person: someone moved from vice to class teacher of the same
+ * section hears about the post they now hold, not also the one they left.
+ */
+async function announceSectionPosts(req, before, after) {
+    const id = (v) => (v ? String(v._id || v) : '');
+    const POSTS = [['classTeacher', 'class teacher'], ['substituteTeacher', 'vice class teacher']];
+
+    const gained = new Map();   // teacher → the post they now hold here
+    const lost   = new Map();   // teacher → the post they no longer hold
+    for (const [field, label] of POSTS) {
+        const was = id(before[field]); const now = id(after[field]);
+        if (was === now) continue;
+        if (now && !gained.has(now)) gained.set(now, label);
+        if (was) lost.set(was, label);
+    }
+    const affected = [...new Set([...gained.keys(), ...lost.keys()])];
+    if (!affected.length) return;
+
+    accessChanged(affected, 'section-post');
+
+    const cls   = await Class.findById(after.class, 'className').lean();
+    const where = `${cls?.className || 'Class'} – ${after.sectionName}`;
+    for (const teacher of affected) {
+        const post = gained.get(teacher);
+        notify({
+            school:     req.schoolId,
+            sender:     req.userId,
+            senderRole: req.userRole || 'school_admin',
+            title:      post ? `You are now ${post} of ${where}` : `You are no longer ${lost.get(teacher)} of ${where}`,
+            body:       post === 'class teacher'
+                ? `${where} is your class. Open My Section for its students, attendance, timetable and announcements.`
+                : post
+                    ? `You cover ${where} as vice class teacher. It is listed under My Section.`
+                    : `The school office has changed who runs ${where}.`,
+            recipients: [teacher],
+            // Somebody who just lost their only section has no My Section to
+            // land on, so that notice opens on itself.
+            link:       post ? { type: 'section', entityId: after._id } : null,
+        });
+    }
+}
 exports.updateSectionCapacity = async (req, res) => {
     try {
         // The schema field is maxStudents — writing `capacity` silently did nothing
@@ -2042,8 +2120,11 @@ exports.deleteSection = async (req, res) => {
             });
         }
 
+        const taught = await SectionSubjectTeacher.find({ section: sec._id }).select('teacher').lean();
         await SectionSubjectTeacher.deleteMany({ section: sec._id });
         await ClassSection.findByIdAndDelete(sec._id);
+        // Its class teacher, vice class teacher and subject teachers no longer have it.
+        accessChanged([sec.classTeacher, sec.substituteTeacher, ...taught.map((t) => t.teacher)], 'section-post');
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };

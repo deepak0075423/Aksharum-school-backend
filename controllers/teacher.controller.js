@@ -2,6 +2,7 @@
 const User           = require('../models/User');
 const TeacherProfile = require('../models/TeacherProfile');
 const { ownSections, primarySection } = require('../services/teacherOwnSections');
+const { released } = require('../services/resultExams');
 
 exports.getDashboard = async (req, res) => {
     try {
@@ -33,7 +34,9 @@ exports.getDashboard = async (req, res) => {
                 ? AttendanceCorrection.countDocuments({ section: mySection._id, status: 'Pending' }).catch(() => 0)
                 : 0,
             mySection
-                ? FormalExam.countDocuments({ section: mySection._id, school: req.schoolId, status: { $in: ['SUBMITTED', 'REOPENED'] } }).catch(() => 0)
+                // What the validation queue lists (formalExam.controller): submitted and not
+                // archived. A reopened exam is being corrected, not waiting to be validated.
+                ? FormalExam.countDocuments({ section: mySection._id, school: req.schoolId, status: 'SUBMITTED', archivedAt: null }).catch(() => 0)
                 : 0,
             TimetableEntry.find({ teacher: req.userId }).distinct('timetable').catch(() => []),
             LeaveBalance.find({ teacher: req.userId, school: req.schoolId })
@@ -127,7 +130,8 @@ exports.getDashboard = async (req, res) => {
                 const now = new Date();
                 const latestBySection = new Map();
                 for (const e of exams) {
-                    if (e.publishDate && now < new Date(e.publishDate)) continue;
+                    // The result date is a day on the school's clock (resultExams.released).
+                    if (!released(e, now)) continue;
                     const key  = String(e.section);
                     const seen = latestBySection.get(key);
                     if (!seen || new Date(e.startDate) > new Date(seen.startDate)) latestBySection.set(key, e);

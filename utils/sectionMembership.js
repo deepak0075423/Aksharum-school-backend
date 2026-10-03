@@ -44,16 +44,21 @@ async function syncCounts(sectionIds) {
  * @param {Object?} opts.extra      further profile fields to set (e.g. { rollNumber })
  * @param {Boolean} opts.deferCounts skip the headcount recompute — for batch
  *                                   callers that call syncCounts() once at the end
+ * @param {String?} opts.academicYear only take the student off that year's other
+ *                                   sections. A promotion places a student in next
+ *                                   year's class and leaves last year's roll alone:
+ *                                   that roll is the record of the year — its exams
+ *                                   are worked out from it, even after they move on.
  * @returns {Promise<{ section, class, removedFrom: String[] }>}
  */
-async function setStudentSection({ studentId, sectionId, schoolId, classId = null, extra = null, deferCounts = false }) {
+async function setStudentSection({ studentId, sectionId, schoolId, classId = null, extra = null, deferCounts = false, academicYear = null }) {
     const student = String(studentId);
     const target  = sectionId ? String(sectionId) : null;
 
     // Every section that currently claims this student. Scoped to the school so
     // a shared id can never reach across tenants.
     const holding = await ClassSection.find(
-        { school: schoolId, enrolledStudents: student }, '_id',
+        { school: schoolId, enrolledStudents: student, ...(academicYear ? { academicYear } : {}) }, '_id',
     ).lean();
     const stale = holding.map(s => String(s._id)).filter(id => id !== target);
 

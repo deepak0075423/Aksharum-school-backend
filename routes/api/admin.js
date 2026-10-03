@@ -14,7 +14,7 @@ const notifCtrl      = require('../../controllers/notification.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const aptAdmin       = require('../../controllers/aptitudeAdmin.controller');
 const aptAnalytics   = require('../../controllers/aptitudeAnalytics.controller');
-const formalExamCtrl = require('../../controllers/formalExam.controller');
+const resultAdmin    = require('../../controllers/resultAdmin.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
 const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
@@ -390,18 +390,75 @@ router.get   ('/exams/:id/submissions/:studentId', examGuard, schoolScope, examC
 router.get   ('/exams/:id/analytics',          examGuard, schoolScope, examCtrl.getAnalytics);
 
 // ── Results / Formal Exams ────────────────────────────────────────────────────
-router.get('/results/exams',                          resultGuard, formalExamCtrl.adminGetExams);
-router.post('/results/exams',                         resultGuard, formalExamCtrl.adminCreateExam);
-router.get('/results/exams/:id',                      resultGuard, formalExamCtrl.adminGetExamDetail);
-router.put('/results/exams/:id',                      resultGuard, formalExamCtrl.adminUpdateExam);
-router.delete('/results/exams/:id',                   resultGuard, formalExamCtrl.adminDeleteExam);
-router.get('/results/exams/:id/marks-review',         resultGuard, formalExamCtrl.adminGetMarksReview);
-router.post('/results/exams/:id/approve',             resultGuard, formalExamCtrl.adminApproveExam);
-router.post('/results/exams/:id/reject',              resultGuard, formalExamCtrl.adminRejectExam);
-router.post('/results/exams/:id/reopen',              resultGuard, formalExamCtrl.adminReopenExam);
-router.put('/results/exams/:id/marks/:subjectId',     resultGuard, formalExamCtrl.adminEditMarks);
-router.get('/results/exams/:id/result',               resultGuard, formalExamCtrl.adminGetResult);
-router.get('/results/sections/:sectionId/subjects',   resultGuard, formalExamCtrl.adminGetSectionSubjects);
+// Reads are SQL read models (services/resultBoard); every step an exam takes is
+// decided in services/resultExams, which the teacher's endpoints share. The
+// fixed paths are registered ahead of `/results/exams/:id`.
+router.get   ('/results/overview',                      resultGuard, resultAdmin.getOverview);
+router.get   ('/results/analytics',                     resultGuard, resultAdmin.getAnalytics);
+router.get   ('/results/overall',                       resultGuard, resultAdmin.getOverall);
+router.get   ('/results/settings',                      resultGuard, resultAdmin.getSettings);
+router.put   ('/results/settings',                      resultGuard, resultAdmin.updateSettings);
+router.get   ('/results/report-cards',                  resultGuard, resultAdmin.getReportCards);
+router.get   ('/results/report-cards/pdf',              resultGuard, resultAdmin.getReportCardsPdf);
+router.get   ('/results/schedule',                      resultGuard, resultAdmin.getSchedule);
+// Oct 2026, the second audit: merit list, electives, re-checks, the Results
+// trail, report-card release and sending, and the signature for report cards.
+router.get   ('/results/merit',                         resultGuard, resultAdmin.getMeritList);
+router.get   ('/results/electives',                     resultGuard, resultAdmin.getElectives);
+router.put   ('/results/electives',                     resultGuard, resultAdmin.saveElective);
+router.get   ('/results/rechecks',                      resultGuard, resultAdmin.getRechecks);
+router.put   ('/results/rechecks/:id',                  resultGuard, resultAdmin.resolveRecheck);
+router.get   ('/results/activity',                      resultGuard, resultAdmin.getActivity);
+router.post  ('/results/report-cards/release',          resultGuard, resultAdmin.releaseReportCards);
+router.post  ('/results/report-cards/send',             resultGuard, resultAdmin.sendReportCards);
+router.post  ('/results/settings/signature',            resultGuard, uploadImage.single('file'), resultAdmin.uploadReportSignature);
+router.put   ('/results/report-cards/notes',            resultGuard, resultAdmin.saveReportCardNotes);
+router.get   ('/results/form-meta',                     resultGuard, resultAdmin.getFormMeta);
+router.get   ('/results/form-subjects',                 resultGuard, resultAdmin.getFormSubjects);
+router.get   ('/results/sections/:sectionId/subjects',  resultGuard, resultAdmin.getSectionSubjects);
+router.get   ('/results/exams',                         resultGuard, resultAdmin.getExams);
+router.post  ('/results/exams',                         resultGuard, resultAdmin.createExam);
+router.post  ('/results/exams/bulk',                    resultGuard, resultAdmin.bulk);
+router.get   ('/results/exams/:id',                     resultGuard, resultAdmin.getExamDetail);
+router.put   ('/results/exams/:id',                     resultGuard, resultAdmin.updateExam);
+router.delete('/results/exams/:id',                     resultGuard, resultAdmin.deleteExam);
+router.put   ('/results/exams/:id/options',             resultGuard, resultAdmin.setOptions);
+router.put   ('/results/exams/:id/result-date',         resultGuard, resultAdmin.setResultDate);
+router.get   ('/results/exams/:id/re-exam',             resultGuard, resultAdmin.getReExam);
+router.post  ('/results/marks-import',                  resultGuard, uploadExcel.single('file'), require('../../controllers/resultPortal.controller').readMarksFile);
+// Every class test in the school — read, and approved or sent back where the class teacher cannot.
+const classTestOffice = require('../../controllers/classTest.controller');
+router.get   ('/results/class-tests',                   resultGuard, classTestOffice.adminListClassTests);
+router.get   ('/results/class-tests/:id/sheet',         resultGuard, classTestOffice.adminClassTestSheet);
+router.post  ('/results/class-tests/:id/approve',       resultGuard, classTestOffice.adminApproveClassTest);
+router.post  ('/results/class-tests/:id/reject',        resultGuard, classTestOffice.adminRejectClassTest);
+router.post  ('/results/class-tests/:id/hand-over',     resultGuard, classTestOffice.adminHandOverClassTest);
+router.delete('/results/class-tests/:id',               resultGuard, classTestOffice.adminDeleteClassTest);
+router.put   ('/results/exams/:id/re-exam',             resultGuard, resultAdmin.saveReExam);
+router.post  ('/results/exams/:id/open',                resultGuard, resultAdmin.openMarksEntry);
+router.post  ('/results/exams/:id/draft',               resultGuard, resultAdmin.backToDraft);
+router.post  ('/results/exams/:id/validate',            resultGuard, resultAdmin.validateExam);
+router.post  ('/results/exams/:id/approve',             resultGuard, resultAdmin.approveExam);
+router.post  ('/results/exams/:id/reject',              resultGuard, resultAdmin.rejectExam);
+router.post  ('/results/exams/:id/reopen',              resultGuard, resultAdmin.reopenExam);
+router.post  ('/results/exams/:id/archive',             resultGuard, resultAdmin.archiveExam);
+router.post  ('/results/exams/:id/restore',             resultGuard, resultAdmin.restoreExam);
+router.get   ('/results/exams/:id/marks-review',        resultGuard, resultAdmin.getMarksReview);
+router.get   ('/results/exams/:id/marks/:subjectId',    resultGuard, resultAdmin.getMarks);
+router.get   ('/results/exams/:id/marks/:subjectId/history', resultGuard, resultAdmin.getSheetHistory);
+router.post  ('/results/exams/:id/return-subject',      resultGuard, resultAdmin.returnSubject);
+router.post  ('/results/exams/:id/correct',             resultGuard, resultAdmin.correctMark);
+router.put   ('/results/exams/:id/withheld',            resultGuard, resultAdmin.setWithheld);
+router.get   ('/results/exams/:id/fee-dues',            resultGuard, resultAdmin.getFeeDues);
+router.put   ('/results/exams/:id/promotion-decision',  resultGuard, resultAdmin.setPromotionDecision);
+router.put   ('/results/exams/:id/marks/:subjectId',    resultGuard, resultAdmin.saveMarks);
+router.get   ('/results/exam-day',                      resultGuard, resultAdmin.getExamDay);
+router.post  ('/results/exam-day',                      resultGuard, resultAdmin.planExamDay);
+router.post  ('/results/exam-day/publish',              resultGuard, resultAdmin.publishExamDay);
+router.delete('/results/exam-day',                      resultGuard, resultAdmin.removeExamDay);
+router.get   ('/results/exams/:id/register.xlsx',      resultGuard, resultAdmin.getMarksRegister);
+router.get   ('/results/exams/:id/admit-cards.pdf',    resultGuard, resultAdmin.getAdmitCards);
+router.get   ('/results/exams/:id/result',              resultGuard, resultAdmin.getResult);
 
 // ── Leave ─────────────────────────────────────────────────────────────────────
 // The staff list every leave picker draws from. It is here rather than reusing

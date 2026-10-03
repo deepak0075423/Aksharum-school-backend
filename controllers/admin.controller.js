@@ -630,7 +630,8 @@ exports.getDashboard = async (req, res) => {
             ClassSection.countDocuments({ school, status: 'active' }),
             LeaveApplication.countDocuments({ school, status: 'pending' }).catch(() => 0),
             FeePayment.countDocuments({ school, paymentStatus: 'pending' }).catch(() => 0),
-            FormalExam.countDocuments({ school, status: 'CLASS_APPROVED' }).catch(() => 0),
+            // Validated and waiting for the office to publish. An archived exam is waiting for nobody.
+            FormalExam.countDocuments({ school, status: 'CLASS_APPROVED', archivedAt: null }).catch(() => 0),
             TeacherAttendanceRegularization.countDocuments({ school, status: 'Pending' }).catch(() => 0),
             Notification.find({ school }).sort({ createdAt: -1 }).limit(5)
                 .select('title createdAt senderRole recipientCount').lean().catch(() => []),

@@ -37,7 +37,63 @@ const STEPS = [
         name: 'attendances: drop the one-register-per-day unique index',
         sql:  'DROP INDEX IF EXISTS "ux_attendances_6a938f2e"',
     },
+    {
+        // Report card notes were one per student per year. A school with terms
+        // writes one per term too, so uniqueness moves to (school, year,
+        // student, term) — with a note from before terms (term NULL) folded to
+        // '' — created before the old index is dropped, which already
+        // guarantees the new one holds.
+        name: 'reportcardnotes: unique per student, year and term',
+        sql:  `CREATE UNIQUE INDEX IF NOT EXISTS "ux_reportcardnotes_term"
+                 ON "reportcardnotes" ("school", "academicYear", "student", (COALESCE("term", '')))`,
+    },
+    {
+        name: 'reportcardnotes: drop the one-note-per-year unique index',
+        sql:  'DROP INDEX IF EXISTS "ux_reportcardnotes_ee667e5c"',
+    },
 ];
+
+/**
+ * Data changes that must happen exactly once, not on every boot: each is
+ * claimed in the "datamigrations" ledger first (one row per name), so of two
+ * servers booting together only one runs it; a step that fails gives its
+ * claim back, to be tried again on the next boot.
+ */
+const ONCE = [
+    {
+        // Results stored before Oct 2026 could carry a grade that contradicted
+        // their pass/fail. The first server with the new grading re-grades
+        // them, before any school can change its scale — the step that used to
+        // be "run scripts/fixResultGrades.js --apply after deploying".
+        name: 'results: grades agree with pass and fail (Oct 2026)',
+        run: async () => {
+            const { results, classTests } = await require('../services/gradeBackfill').regrade({ apply: true });
+            return `${results.changed} of ${results.scanned} results, ${classTests.changed} of ${classTests.scanned} class tests re-graded`;
+        },
+    },
+];
+
+async function runOnce() {
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS "datamigrations" ("name" text PRIMARY KEY, "ranAt" timestamptz NOT NULL DEFAULT now(), "result" text)`);
+    } catch (err) {
+        console.warn(`[db] data migrations skipped: ${err.message}`);
+        return;
+    }
+    for (const step of ONCE) {
+        const { rows } = await pool.query(`INSERT INTO "datamigrations" ("name") VALUES ($1) ON CONFLICT ("name") DO NOTHING RETURNING "name"`, [step.name])
+            .catch(() => ({ rows: [] }));
+        if (!rows.length) continue;   // done before, or another server has it
+        try {
+            const result = await step.run();
+            await pool.query(`UPDATE "datamigrations" SET "result" = $2, "ranAt" = now() WHERE "name" = $1`, [step.name, String(result || 'done')]);
+            console.log(`[db] data migration: ${step.name} — ${result || 'done'}`);
+        } catch (err) {
+            await pool.query(`DELETE FROM "datamigrations" WHERE "name" = $1`, [step.name]).catch(() => {});
+            console.warn(`[db] data migration failed, will retry next boot (${step.name}): ${err.message}`);
+        }
+    }
+}
 
 async function runMigrations() {
     for (const step of STEPS) {
@@ -49,6 +105,7 @@ async function runMigrations() {
             console.warn(`[db] migration skipped (${step.name}): ${err.message}`);
         }
     }
+    await runOnce();
 }
 
-module.exports = { runMigrations, STEPS };
+module.exports = { runMigrations, runOnce, STEPS, ONCE };

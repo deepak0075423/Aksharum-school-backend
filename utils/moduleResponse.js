@@ -19,6 +19,21 @@ const { transportRole } = require('../services/transportEnrolment');
 const { staffHasHostel } = require('../services/hostelResident');
 const { onHostelDuty } = require('../middleware/hostelDesk');
 
+/**
+ * One of the "not a module" answers below, on its own feet.
+ *
+ * They are separate questions about separate tables, and they used to share one
+ * Promise.all — so a transport lookup that threw took the whole payload down
+ * with it. The client then had no map at all: every module showed (it fails
+ * open) and My Section, which fails closed, vanished for a teacher who runs a
+ * class. A probe that cannot answer now says "no" for itself, loudly in the
+ * log, and leaves the others alone.
+ */
+const probe = (name, promise, fallback) => Promise.resolve(promise).catch((e) => {
+    console.error(`[modules] ${name} could not be worked out:`, e.message);
+    return fallback;
+});
+
 async function buildModuleResponse(req) {
     const isTeacher = req.userRole === 'teacher';
     const [access, school, mySection, transport, staffHostel, hostelDuty] = await Promise.all([
@@ -26,10 +41,10 @@ async function buildModuleResponse(req) {
         req.schoolId
             ? School.findById(req.schoolId).select('leaveSettings').lean()
             : Promise.resolve(null),
-        isTeacher ? hasMySection(req.schoolId, req.userId) : Promise.resolve(false),
-        transportRole(req.schoolId, req.userId, req.userRole),
-        isTeacher && req.schoolId ? staffHasHostel(req.schoolId, req.userId).catch(() => false) : Promise.resolve(false),
-        isTeacher && req.schoolId ? onHostelDuty(req.schoolId, req.userId).catch(() => false) : Promise.resolve(false),
+        isTeacher ? probe('hasMySection', hasMySection(req.schoolId, req.userId), false) : Promise.resolve(false),
+        probe('transportEnrolled', transportRole(req.schoolId, req.userId, req.userRole), { enrolled: false, crew: false }),
+        isTeacher && req.schoolId ? probe('hostelResident', staffHasHostel(req.schoolId, req.userId), false) : Promise.resolve(false),
+        isTeacher && req.schoolId ? probe('hostelDuty', onHostelDuty(req.schoolId, req.userId), false) : Promise.resolve(false),
     ]);
 
     const ls = school?.leaveSettings ?? {};
@@ -57,10 +72,11 @@ async function buildModuleResponse(req) {
         // just administrative access to their module.
         isLibrarian: moduleAdmin.library,
         isPrincipal: moduleAdmin.feedback,
-        // Not a module: whether this teacher is class teacher or vice class
-        // teacher of a section this year, which is what opens My Section. Sent
-        // here because every client already gates its menus on this payload.
-        // The page's endpoint enforces the same rule (services/teacherOwnSections).
+        // Not a module: whether this teacher has a section this year — as its
+        // class teacher, its vice class teacher, or a subject teacher in it —
+        // which is what opens My Section. Sent here because every client
+        // already gates its menus on this payload. The page's endpoint
+        // enforces the same rule (services/teacherOwnSections).
         hasMySection: mySection,
         // Not a module either: whether this person is enrolled in the transport
         // service (a student or teacher who rides, a parent whose child rides,

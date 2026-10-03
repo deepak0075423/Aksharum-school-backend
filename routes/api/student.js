@@ -10,6 +10,7 @@ const docViewer      = require('../../controllers/documentViewer.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
+const resultPortal   = require('../../controllers/resultPortal.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
@@ -69,8 +70,14 @@ router.post('/documents/:id/submit',  docGuard, uploadDocument.array('files', 5)
 router.get('/holidays', holidayGuard, holidayCtrl.studentGetHolidays);
 
 // Results
+router.get('/results/overview',     resultGuard, resultPortal.studentOverview);
+router.get('/results/schedule',     resultGuard, resultPortal.studentSchedule);
+router.get('/results/admit-card',   resultGuard, resultPortal.studentAdmitCard);
+router.get('/results/report-card',  resultGuard, resultPortal.studentReportCard);
+router.get('/results/report-card/pdf', resultGuard, resultPortal.studentReportCardPdf);
 router.get('/results',              resultGuard, formalExamCtrl.studentGetResults);
 router.get('/results/class-tests',  resultGuard, classTestCtrl.studentGetClassTests);
+router.post('/results/recheck',     resultGuard, resultPortal.studentRecheck);
 router.get('/results/:resultId',    resultGuard, formalExamCtrl.studentGetResultDetail);
 
 module.exports = router;

@@ -209,16 +209,44 @@ async function schoolAdminIds(schoolId) {
     return admins.map(a => a._id);
 }
 
-// Student user ids → { studentIds, parentIds } (parents resolved via StudentProfile)
+/**
+ * These students and every parent of theirs the school knows.
+ *
+ * A parent is linked to a child two ways, and the two drift: the student
+ * record's own `parent` pointer, and the parent account's list of `children`
+ * (services/parentChildren). This used to read the pointer alone, so a second
+ * parent — or one linked from the parent's side, as the admission and parent
+ * forms do — never heard about anything sent to "students and their parents",
+ * in every module that sends one. Both links are read now, and a parent counts
+ * only as an active parent account at the child's own school.
+ */
 async function withParents(studentIds) {
+    const ids = [...new Set((studentIds || []).map(String).filter(Boolean))];
+    if (!ids.length) return [];
+    const pool = require('../db/pool');
     const StudentProfile = require('../models/StudentProfile');
-    const profiles = await StudentProfile.find(
-        { user: { $in: studentIds }, parent: { $ne: null } }, 'parent'
-    ).lean();
-    return [...new Set([
-        ...studentIds.map(String),
-        ...profiles.map(p => p.parent.toString()),
-    ])];
+    const ParentProfile  = require('../models/ParentProfile');
+    const T = (M) => `"${M.tableName}"`;
+    const { rows } = await pool.query(
+        `WITH links AS (
+            SELECT sp."user"::text AS "student", sp."parent"::text AS "parent"
+              FROM ${T(StudentProfile)} sp
+             WHERE sp."user"::text = ANY($1::text[]) AND sp."parent" IS NOT NULL
+            UNION
+            SELECT e.id, pp."user"::text
+              FROM ${T(ParentProfile)} pp
+             CROSS JOIN LATERAL jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(pp."children") = 'array' THEN pp."children" ELSE '[]'::jsonb END) AS e(id)
+             WHERE e.id = ANY($1::text[])
+         )
+         SELECT DISTINCT l."parent"
+           FROM links l
+           JOIN ${T(User)} kid ON kid."_id"::text = l."student"
+           JOIN ${T(User)} p   ON p."_id"::text = l."parent"
+                AND p."role" = 'parent' AND p."isActive" IS NOT FALSE AND p."school" = kid."school"`,
+        [ids],
+    ).catch((e) => { console.error('[notify] parents lookup failed:', e.message); return { rows: [] }; });
+    return [...new Set([...ids, ...rows.map((r) => String(r.parent))])];
 }
 
 module.exports = { notify, schoolAdminIds, withParents };

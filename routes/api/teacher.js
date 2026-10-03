@@ -13,6 +13,7 @@ const aptAdmin       = require('../../controllers/aptitudeAdmin.controller');
 const aptAnalytics   = require('../../controllers/aptitudeAnalytics.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
+const resultPortal   = require('../../controllers/resultPortal.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
 const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
@@ -187,6 +188,28 @@ router.post('/documents/comments/:commentId/like', docGuard, docDetail.toggleLik
 router.get('/holidays',        holidayGuard, holidayCtrl.teacherGetHolidays);
 router.get('/class-holidays',  holidayGuard, holidayCtrl.teacherGetClassHolidays);
 
+// ── Results: the redesigned page's reads (controllers/resultPortal) ─────────
+router.get('/results/board',                                 resultGuard, resultPortal.teacherBoard);
+router.get('/results/schedule',                              resultGuard, resultPortal.teacherSchedule);
+router.get('/results/exams/:examId/register.xlsx',              resultGuard, resultPortal.teacherMarksRegister);
+router.get('/results/exams/:examId/admit-cards.pdf',            resultGuard, resultPortal.teacherAdmitCards);
+router.get('/results/report-cards',                          resultGuard, resultPortal.teacherReportCards);
+router.get('/results/report-cards/pdf',                      resultGuard, resultPortal.teacherReportCardsPdf);
+router.post('/results/marks-import',                         resultGuard, uploadExcel.single('file'), resultPortal.readMarksFile);
+router.get('/results/exams/:id/re-exam',                     resultGuard, resultPortal.teacherReExam);
+router.put('/results/exams/:id/re-exam',                     resultGuard, resultPortal.teacherSaveReExam);
+router.put('/results/report-cards/notes',                    resultGuard, resultPortal.teacherReportCardNotes);
+router.get('/results/test-options',                          resultGuard, resultPortal.teacherTestOptions);
+router.get('/results/sheets/:examId/:subjectId',             resultGuard, resultPortal.teacherSheet);
+router.get('/results/sheets/:examId/:subjectId/history',     resultGuard, resultPortal.teacherSheetHistory);
+router.get('/results/electives',                             resultGuard, resultPortal.teacherElectives);
+router.put('/results/electives',                             resultGuard, resultPortal.teacherSaveElective);
+router.post('/results/report-cards/release',                 resultGuard, resultPortal.teacherReleaseReportCards);
+router.post('/results/report-cards/send',                    resultGuard, resultPortal.teacherSendReportCards);
+router.get('/results/review/:examId',                        resultGuard, resultPortal.teacherReview);
+router.get('/results/exams/:examId/result',                  resultGuard, resultPortal.teacherResults);
+router.get('/results/class-tests/:id/sheet',                 resultGuard, resultPortal.teacherTestSheet);
+
 // ── Results: Formal Exam (marks entry) ───────────────────────────────────────
 router.get('/results/marks-entry',                           resultGuard, formalExamCtrl.teacherGetMarksEntry);
 router.get('/results/marks-entry/:examId/:subjectId',        resultGuard, formalExamCtrl.teacherGetMarksForm);
@@ -204,6 +227,8 @@ router.post('/results/class-tests',                      resultGuard, classTestC
 router.get('/results/class-tests/:id/marks',             resultGuard, classTestCtrl.teacherGetTestMarks);
 router.post('/results/class-tests/:id/marks/save',       resultGuard, classTestCtrl.teacherSaveTestMarks);
 router.post('/results/class-tests/:id/reopen',           resultGuard, classTestCtrl.teacherReopenTest);
+router.put('/results/class-tests/:id',                    resultGuard, classTestCtrl.teacherUpdateClassTest);
+router.delete('/results/class-tests/:id',                 resultGuard, classTestCtrl.teacherDeleteClassTest);
 router.get('/results/class-test-validation',             resultGuard, classTestCtrl.teacherGetClassTestValidation);
 router.get('/results/class-test-validation/:id',         resultGuard, classTestCtrl.teacherGetClassTestValidationDetail);
 router.post('/results/class-test-validation/:id/approve', resultGuard, classTestCtrl.teacherApproveClassTest);
