@@ -162,7 +162,7 @@ exports.update = async (req, res) => {
             // school's currently-enabled modules cannot wipe the levels held for
             // a module that is temporarily disabled.
             update.permissions = svc.sanitizePermissions({
-                ...svc.sanitizePermissions(row.permissions),
+                ...svc.storedPermissions(row),
                 ...req.body.permissions,
             });
         }
@@ -176,7 +176,7 @@ exports.update = async (req, res) => {
             _id: row._id,
             name: update.name ?? row.name,
             description: update.description ?? (row.description || ''),
-            permissions: update.permissions ?? svc.sanitizePermissions(row.permissions),
+            permissions: update.permissions ?? svc.storedPermissions(row),
             isActive: update.isActive ?? (row.isActive !== false),
             teachersRenamed: renamed,
         });
@@ -203,7 +203,7 @@ exports.updateMatrix = async (req, res) => {
             const row = byId.get(String(item._id));
             if (!row) continue;
             const merged = svc.sanitizePermissions({
-                ...svc.sanitizePermissions(row.permissions),
+                ...svc.storedPermissions(row),
                 ...(item.permissions || {}),
             });
             const update = { permissions: merged };

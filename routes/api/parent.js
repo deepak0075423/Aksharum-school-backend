@@ -37,6 +37,12 @@ router.get('/timetable/download', timetableGuard, timetableCtrl.parentDownloadTi
 // Enabled modules for this school
 router.get('/modules', guard, modulesHandler);
 
+// ID cards — my cards, and my children (controllers/idCardPortal)
+const idCardPortal = require('../../controllers/idCardPortal.controller');
+const idCardGuard  = [...guard, requireModule('idCard')];
+router.get('/id-cards',         idCardGuard, idCardPortal.parentCards);
+router.get('/id-cards/:id/pdf', idCardGuard, idCardPortal.parentPdf);
+
 // Attendance
 router.get('/child-attendance', attendanceGuard, attendanceCtrl.getParentChildAttendance);
 router.get('/child-attendance/overview', attendanceGuard, attendanceCtrl.getParentChildAttendanceOverview);

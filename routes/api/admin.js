@@ -594,4 +594,34 @@ router.get('/holidays/export',     holidayGuard, holidayCtrl.adminExportHolidays
 router.get('/holidays/template',   holidayGuard, holidayCtrl.adminGetImportTemplate);
 router.get('/holidays/audit',      holidayGuard, holidayCtrl.adminGetAuditLog);
 
+// ── ID cards ──────────────────────────────────────────────────────────────────
+// The office, or a teacher whose designation administers ID cards. Fixed paths
+// first, so 'cards/…' and 'templates/…' are never read as ids.
+const idCards = require('../../controllers/idCardAdmin.controller');
+const idCardGuard = moduleAdminGuard('idCard');
+router.get   ('/id-cards/overview',               idCardGuard, idCards.overview);
+router.get   ('/id-cards/list',                   idCardGuard, idCards.list);
+router.get   ('/id-cards/activity',               idCardGuard, idCards.activity);
+router.get   ('/id-cards/lookup',                 idCardGuard, idCards.lookup);
+router.post  ('/id-cards/generate/preview',       idCardGuard, idCards.preview);
+router.post  ('/id-cards/generate',               idCardGuard, idCards.generate);
+router.post  ('/id-cards/print',                  idCardGuard, idCards.print);
+router.get   ('/id-cards/templates',              idCardGuard, idCards.templates);
+router.put   ('/id-cards/templates/:kind',        idCardGuard, idCards.saveTemplate);
+router.post  ('/id-cards/templates/:kind/apply',  idCardGuard, idCards.applyTemplate);
+router.get   ('/id-cards/settings',               idCardGuard, idCards.settings);
+router.put   ('/id-cards/settings',               idCardGuard, idCards.saveSettings);
+router.post  ('/id-cards/settings/apply',         idCardGuard, idCards.applySettings);
+router.post  ('/id-cards/settings/:image',        idCardGuard, uploadImage.single('file'), idCards.uploadImage);
+router.delete('/id-cards/settings/:image',        idCardGuard, idCards.removeImage);
+router.get   ('/id-cards/holders/:id',            idCardGuard, idCards.holder);
+router.get   ('/id-cards/cards/:id',              idCardGuard, idCards.card);
+router.get   ('/id-cards/cards/:id/pdf',          idCardGuard, idCards.cardPdf);
+router.post  ('/id-cards/cards/:id/regenerate',   idCardGuard, idCards.regenerate);
+router.post  ('/id-cards/cards/:id/report',       idCardGuard, idCards.report);
+router.post  ('/id-cards/cards/:id/replace',      idCardGuard, idCards.replace);
+router.post  ('/id-cards/cards/:id/block',        idCardGuard, idCards.block);
+router.post  ('/id-cards/cards/:id/activate',     idCardGuard, idCards.activate);
+router.post  ('/id-cards/cards/:id/cancel',       idCardGuard, idCards.cancel);
+
 module.exports = router;

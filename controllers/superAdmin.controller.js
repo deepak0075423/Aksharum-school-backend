@@ -754,10 +754,28 @@ exports.getPermissions = async (req, res) => {
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
+/**
+ * The school's module flags with `changes` laid over them. Only the keys sent
+ * change: `modules` is one stored object, and writing a partial map in place
+ * of it switched off every module the sender did not list — the phone's
+ * Permissions screen listed neither Hostel nor Video Learning, so saving there
+ * turned both off at the school.
+ */
+async function mergedModules(schoolId, changes) {
+    const { schoolModuleFlags, isModuleKey } = require('../config/modules');
+    const school = await School.findById(schoolId).select('modules').lean();
+    if (!school) return null;
+    const next = schoolModuleFlags(school);
+    for (const [k, v] of Object.entries(changes || {})) if (isModuleKey(k)) next[k] = !!v;
+    return next;
+}
+
 exports.updatePermissions = async (req, res) => {
     try {
         const { schoolId, modules } = req.body;
-        const school = await School.findByIdAndUpdate(schoolId, { modules }, { new: true });
+        const next = await mergedModules(schoolId, modules);
+        if (!next) return res.status(404).json({ success: false, message: 'School not found' });
+        const school = await School.findByIdAndUpdate(schoolId, { modules: next }, { new: true });
         await designationSvc.invalidate(schoolId);
         res.json({ success: true, data: school });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
@@ -766,9 +784,10 @@ exports.updatePermissions = async (req, res) => {
 exports.bulkUpdatePermissions = async (req, res) => {
     try {
         const { updates } = req.body;
-        await Promise.all(updates.map(({ schoolId, modules }) =>
-            School.findByIdAndUpdate(schoolId, { modules }),
-        ));
+        await Promise.all(updates.map(async ({ schoolId, modules }) => {
+            const next = await mergedModules(schoolId, modules);
+            if (next) await School.findByIdAndUpdate(schoolId, { modules: next });
+        }));
         await Promise.all(updates.map(({ schoolId }) => designationSvc.invalidate(schoolId)));
         res.json({ success: true, message: 'Permissions updated' });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }

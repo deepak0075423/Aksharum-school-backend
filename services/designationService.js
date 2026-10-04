@@ -53,7 +53,9 @@ const LEGACY_ADMIN_GRANTS = {
 //
 // Named here rather than left to the admin because the fallback fires before
 // anyone has had the chance to configure anything.
-const CREW_MODULES = ['transport', 'attendance', 'leave', 'payroll', 'holiday', 'notification', 'document'];
+// idCard: a driver carries a staff ID card like anyone else, and "My ID Card"
+// is the only thing USER access to it opens.
+const CREW_MODULES = ['transport', 'attendance', 'leave', 'payroll', 'holiday', 'notification', 'document', 'idCard'];
 const RESTRICTED_DEFAULTS = {
     'driver':      CREW_MODULES,
     'conductor':   CREW_MODULES,
@@ -101,10 +103,11 @@ const key  = (name) => norm(name).toLowerCase();
 const emptyPermissions = () => Object.fromEntries(MODULE_KEYS.map((k) => [k, NONE]));
 
 // Normalise anything stored / posted into a complete, valid {key: level} map.
-// Unknown keys are dropped; missing keys default to 'none'; 'admin' on a module
-// with no administrative surface is downgraded to 'user'.
-function sanitizePermissions(raw) {
-    const out = emptyPermissions();
+// Unknown keys are dropped; 'admin' on a module with no administrative surface
+// is downgraded to 'user'; a missing key takes its level from `base` — 'none'
+// unless the caller says otherwise (see storedPermissions).
+function sanitizePermissions(raw, base = emptyPermissions()) {
+    const out = { ...base };
     if (!raw || typeof raw !== 'object') return out;
     for (const [k, v] of Object.entries(raw)) {
         if (!isModuleKey(k)) continue;
@@ -134,6 +137,15 @@ function defaultPermissionsFor(name) {
 // Fallback for a designation with no row: preserve pre-module behaviour.
 const legacyPermissionsFor = (name) => defaultPermissionsFor(name);
 
+// The levels a stored row grants. Every write saves a complete map, so a module
+// the row has no key for joined the platform after the row was last saved —
+// nobody chose 'none' for it. It reads as what a designation of that name is
+// created with today, the same answer as for a designation with no row at all.
+// Read as 'none', every module added later locked out the teachers of every
+// existing designation until an admin re-saved it: Hostel and the Employee
+// Directory were refused that way.
+const storedPermissions = (row) => sanitizePermissions(row?.permissions, defaultPermissionsFor(row?.name));
+
 // AND the school's module flags over a designation's configured levels.
 function gate(permissions, moduleFlags) {
     const out = emptyPermissions();
@@ -158,7 +170,7 @@ async function loadSnapshot(schoolId) {
         byName[key(row.name)] = {
             name: row.name,
             isActive: row.isActive !== false,
-            permissions: sanitizePermissions(row.permissions),
+            permissions: storedPermissions(row),
         };
     }
     return {
@@ -481,7 +493,7 @@ async function listWithPermissions(schoolId) {
     const moduleFlags = schoolModuleFlags(school);
 
     const designations = rows.map((r) => {
-        const permissions = sanitizePermissions(r.permissions);
+        const permissions = storedPermissions(r);
         const held = counts[key(r.name)] || { total: 0, teachers: 0, admins: 0 };
         return {
             _id: r._id,
@@ -529,7 +541,7 @@ async function syncSchoolNames(schoolId) {
 
 module.exports = {
     ADMIN, USER, NONE, LEVELS, RANK, DEFAULT_DESIGNATIONS, CACHE_TTL,
-    sanitizePermissions, defaultPermissionsFor, emptyPermissions, gate,
+    sanitizePermissions, storedPermissions, defaultPermissionsFor, emptyPermissions, gate,
     getSnapshot, invalidate, resolveDesignation, resolveFromSnapshot,
     requestAccess, resolveRequestAccess, meets, isModuleAdmin, moduleAdminIds, teacherDesignation,
     invalidateUser, invalidateUsers,

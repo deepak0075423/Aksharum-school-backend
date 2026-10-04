@@ -349,6 +349,20 @@ const ROUTES = {
         parent:       { web: '/parent/documents',  mobile: '/modules/documents' },
     },
 
+    // ── ID cards ─────────────────────────────────────────────────────────────
+    // A card issued for the reader (or, for a parent, for their child).
+    'idcards.mine': {
+        student:      { web: '/student/id-card',  mobile: '/modules/id-card' },
+        parent:       { web: '/parent/id-cards',  mobile: '/modules/id-card' },
+        teacher:      { web: '/teacher/id-card',  mobile: '/modules/id-card' },
+        school_admin: { web: '/admin/id-cards/dashboard', mobile: '/modules/admin/id-cards' },
+    },
+    // The office's own notices about the module.
+    'idcards.manage': {
+        school_admin: { web: '/admin/id-cards/dashboard', mobile: '/modules/admin/id-cards' },
+        teacher:      { web: '/admin/id-cards/dashboard', mobile: '/modules/admin/id-cards' },
+    },
+
     // ── Class / section ──────────────────────────────────────────────────────
     'section': {
         school_admin: { web: '/admin/sections/{id}', mobile: '/modules/admin/section-detail?id={id}' },
@@ -526,6 +540,7 @@ const MODULE_OF = {
     feedback: 'feedback',
     section: 'academics',
     documents: 'documents',
+    idcards: 'idcards',
 };
 
 const MODULE_LABELS = {
@@ -533,7 +548,7 @@ const MODULE_LABELS = {
     library: 'Library', results: 'Results', timetable: 'Timetable',
     calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
     hostel: 'Hostel', video: 'Videos', feedback: 'Feedback',
-    academics: 'Academics', documents: 'Documents', general: 'General',
+    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', general: 'General',
 };
 
 // Somebody is waiting on the reader, or money is owed. These are the ones that

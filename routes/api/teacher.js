@@ -41,6 +41,12 @@ router.get('/dashboard', guard, teacherCtrl.getDashboard);
 // Enabled modules for this school (used by frontend to show/hide nav items)
 router.get('/modules', guard, modulesHandler);
 
+// ID cards — my cards (controllers/idCardPortal)
+const idCardPortal = require('../../controllers/idCardPortal.controller');
+const idCardGuard  = [...guard, requireModule('idCard')];
+router.get('/id-cards',         idCardGuard, idCardPortal.teacherCards);
+router.get('/id-cards/:id/pdf', idCardGuard, idCardPortal.teacherPdf);
+
 // ── My Section ────────────────────────────────────────────────────────────────
 router.get('/my-section',              guard, sectionCtrl.getMySection);
 router.get('/sections',                guard, sectionCtrl.getMySections);

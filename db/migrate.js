@@ -51,6 +51,16 @@ const STEPS = [
         name: 'reportcardnotes: drop the one-note-per-year unique index',
         sql:  'DROP INDEX IF EXISTS "ux_reportcardnotes_ee667e5c"',
     },
+    {
+        // ID cards: one card in force per holder — per holder and year for a
+        // student. A card that was lost, damaged, replaced or cancelled is
+        // history and does not count, which is why the index is partial: the
+        // replacement is a second row for the same holder and year.
+        name: 'idcards: one live card per holder and year',
+        sql:  `CREATE UNIQUE INDEX IF NOT EXISTS "ux_idcards_live"
+                 ON "idcards" ("holder", "kind", (COALESCE("academicYear"::text, '')))
+              WHERE "status" IN ('active', 'blocked')`,
+    },
 ];
 
 /**

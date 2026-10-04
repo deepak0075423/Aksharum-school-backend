@@ -13,4 +13,10 @@ router.get('/report-card/:code', resultPortal.verifyReportCard);
 // …and its QR as an image, for the card shown on screen.
 router.get('/report-card/:code/qr.svg', resultPortal.reportCardQr);
 
+// An ID card's QR: is this card valid, and whose is it? (controllers/idCardPortal)
+const idCardPortal = require('../../controllers/idCardPortal.controller');
+router.get('/id-card/:code',         idCardPortal.verify);
+router.get('/id-card/:code/qr.svg',  idCardPortal.qrSvg);
+router.get('/id-card/:code/qr.png',  idCardPortal.qrPng);
+
 module.exports = router;

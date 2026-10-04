@@ -29,7 +29,8 @@ const MODULES = [
     { key: 'holiday',      label: 'Holidays',         icon: '🎉', adminCapable: true,  description: 'Holiday calendar' },
     { key: 'notification', label: 'Notifications',    icon: '🔔', adminCapable: true,  description: 'In-app alerts and announcements' },
     { key: 'employeeDirectory', label: 'Employee Directory', icon: '🗂️', adminCapable: true,  description: 'Staff directory assembled from existing employee records' },
-    { key: 'chat',         label: 'Chat',             icon: '💬', adminCapable: false, description: 'Real-time messaging' },
+    { key: 'idCard',       label: 'ID Cards',         icon: '🪪', adminCapable: true,  description: 'Student, teacher, staff and parent ID cards, QR verification and printing' },
+    { key: 'chat',       label: 'Chat',             icon: '💬', adminCapable: false, description: 'Real-time messaging' },
 ];
 
 const MODULE_KEYS = MODULES.map((m) => m.key);
