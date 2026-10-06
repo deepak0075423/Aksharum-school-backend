@@ -99,4 +99,9 @@ const ClassSectionSchema = new db.Schema({
 // Unique section name within a class
 ClassSectionSchema.index({ class: 1, sectionName: 1 }, { unique: true });
 
+// Listed in their class's order, then A–Z, unless a query sorts them itself
+// (utils/listOrder) — so sections of several classes come class by class,
+// and a list spanning several years comes year by year.
+ClassSectionSchema.set('defaultOrder', `(SELECT y."startDate" FROM "academicyears" y WHERE y."_id" = "classsections"."academicYear") NULLS LAST, (SELECT c."classNumber" FROM "classes" c WHERE c."_id" = "classsections"."class") NULLS LAST, ${require('../utils/listOrder').sectionOrderSql()}`);
+
 module.exports = db.model('ClassSection', ClassSectionSchema);

@@ -36,6 +36,7 @@ const persistence = require('../services/timetable/persistence');
 const { solve } = require('../services/timetable/solveRunner');
 const { validate: validateBody } = require('../utils/validators');
 const { newSeed } = require('../services/timetable/rng');
+const { newestYear, previousYear } = require('../utils/listOrder');
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true, data: d });
 const err = (res, e, s = 500) => res.status(s).json({ success: false, message: e.message || e });
@@ -229,7 +230,7 @@ exports.getMeta = async (req, res) => {
     try {
         const year = await resolveYear(req.schoolId, req.query.yearId);
         const [years, classes, sections, subjects, teachers, rooms, school, config] = await Promise.all([
-            AcademicYear.find({ school: req.schoolId }).sort({ createdAt: -1 }).lean(),
+            AcademicYear.find({ school: req.schoolId }).lean(),
             year ? Class.find({ school: req.schoolId, academicYear: year._id }).sort({ classNumber: 1 }).lean() : [],
             year ? ClassSection.find({ school: req.schoolId, academicYear: year._id, status: 'active' }).lean() : [],
             // Per-year subjects: unscoped, this list would repeat every name once per year.
@@ -3428,12 +3429,13 @@ exports.conflictReport = async (req, res) => {
 /** GET — this year's published week beside another year's. */
 exports.yearComparison = async (req, res) => {
     try {
-        const years = await AcademicYear.find({ school: req.schoolId }).sort({ createdAt: -1 }).lean();
+        const years = await AcademicYear.find({ school: req.schoolId }).lean();   // A–Z, for the pickers
         if (!years.length) return err(res, 'No academic year found', 404);
 
         const pick = (id) => years.find((y) => sid(y._id) === String(id));
-        const current = pick(req.query.yearId) || years.find((y) => y.status === 'active') || years[0];
-        const against = pick(req.query.compareTo) || years.find((y) => sid(y._id) !== sid(current._id));
+        const current = pick(req.query.yearId) || years.find((y) => y.status === 'active') || newestYear(years);
+        const against = pick(req.query.compareTo) || previousYear(years, current)
+            || years.find((y) => sid(y._id) !== sid(current._id));
 
         const digest = async (year) => {
             if (!year) return null;

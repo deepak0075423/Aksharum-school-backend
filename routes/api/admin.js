@@ -147,14 +147,12 @@ router.get('/classes-with-sections', guard, async (req, res) => {
             secFilter.academicYear   = activeYear._id;
             secFilter.status         = 'active';
         }
-        // Alphabetical (digit-aware) so dropdowns match the Classes page order
-        const byName = (key) => (a, b) =>
-            String(a[key] || '').localeCompare(String(b[key] || ''), 'en', { numeric: true, sensitivity: 'base' });
-        const classes  = (await Class.find(classFilter).lean()).sort(byName('className'));
+        // Classes in class order, each one's sections A–Z — the models' default
+        // order (utils/listOrder), the same as the Classes page.
+        const classes  = await Class.find(classFilter).lean();
         const sections = await ClassSection.find(secFilter).lean();
         const secMap   = {};
         sections.forEach(s => { const k = s.class.toString(); (secMap[k] = secMap[k] || []).push(s); });
-        Object.values(secMap).forEach(list => list.sort(byName('sectionName')));
         res.json({ success: true, data: classes.map(c => ({ ...c, sections: secMap[c._id.toString()] || [] })) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

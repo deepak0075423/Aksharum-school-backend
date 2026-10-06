@@ -25,12 +25,13 @@ const User = require('../models/User');
 const { isUuid } = require('../db/schema');
 const { RuleError, trail } = require('./resultExams');
 const board = require('./resultBoard');
+const { newestYear } = require('../utils/listOrder');
 
 const fail = (status, message) => { throw new RuleError(status, message); };
 const jarr = (col) => `(CASE WHEN jsonb_typeof(${col}) = 'array' THEN ${col} ELSE '[]'::jsonb END)`;
 
 async function yearsOf(schoolId) {
-    return AcademicYear.find({ school: schoolId }).select('yearName status startDate').sort({ startDate: -1 }).lean();
+    return AcademicYear.find({ school: schoolId }).select('yearName status startDate').lean();   // A–Z, for the picker
 }
 
 /** The sections a caller may set electives for: every one of the year, or a teacher's own. */
@@ -63,7 +64,7 @@ async function subjectsOf(section) {
  */
 async function electivesBoard(schoolId, { academicYear, sectionId, teacherId = null } = {}) {
     const years = await yearsOf(schoolId);
-    const year = years.find((y) => String(y._id) === String(academicYear || '')) || years.find((y) => y.status === 'active') || years[0] || null;
+    const year = years.find((y) => String(y._id) === String(academicYear || '')) || years.find((y) => y.status === 'active') || newestYear(years);
     const base = {
         years: years.map((y) => ({ _id: y._id, yearName: y.yearName, current: y.status === 'active' })),
         year: year ? { _id: year._id, yearName: year.yearName } : null, sections: [], section: null, subjects: [], students: [],

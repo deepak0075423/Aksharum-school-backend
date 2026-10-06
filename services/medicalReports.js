@@ -15,6 +15,7 @@ const settingsSvc = require('./medicalSettings');
 const read = require('./medicalRead');
 const { STUDENT_SELECT, STUDENT_JOIN, withClass, params, localDay, storedDay } = require('./medicalBoard');
 const R = require('./medicalRules');
+const { classOrderSql, sectionOrderSql } = require('../utils/listOrder');
 
 const { todayStr, isUuid, addDays, refuse } = R;
 const run = (sql, list) => pool.query(sql, list).then((r) => r.rows);
@@ -533,7 +534,7 @@ REPORTS.growth = async (S, f) => {
         LEFT JOIN "classsections" cs ON cs."_id" = sp."currentSection"
         LEFT JOIN "classes" c ON c."_id" = COALESCE(cs."class", sp."currentClass")
         LEFT JOIN "medicalprofiles" mp ON mp."student" = u."_id" AND mp."school" = $1
-        WHERE ${where.join(' AND ')} ORDER BY c."className" NULLS LAST, cs."sectionName" NULLS LAST, u."name" LIMIT ${MAX}`, p.list);
+        WHERE ${where.join(' AND ')} ORDER BY ${classOrderSql('c')}, ${sectionOrderSql('cs')}, u."name" LIMIT ${MAX}`, p.list);
     const by = {};
     const out = rows.map((r) => {
         const fresh = r.measuredOn && new Date(r.measuredOn) > new Date(Date.now() - 548 * 86400000);

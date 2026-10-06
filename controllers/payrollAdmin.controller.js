@@ -39,6 +39,7 @@ const SalaryClaim              = require('../models/SalaryClaim');
 const calc = require('../services/payrollCalc');
 const tax  = require('../services/incomeTax');
 const { notify } = require('../services/notifyService');
+const { newestYear } = require('../utils/listOrder');
 
 const MONTHS      = calc.MONTHS;
 const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -127,9 +128,9 @@ async function settingsFor(schoolId) {
 
 /** The academic year a screen is looking at: the one asked for, else the active one. */
 async function resolveYear(schoolId, requested) {
-    const years = await AcademicYear.find({ school: schoolId }).sort({ startDate: -1 }).lean();
+    const years = await AcademicYear.find({ school: schoolId }).lean();   // A–Z, for the picker
     const byId  = (id) => years.find(y => String(y._id) === String(id));
-    const year  = (uuidOr(requested) && byId(requested)) || years.find(y => y.status === 'active') || years[0] || null;
+    const year  = (uuidOr(requested) && byId(requested)) || years.find(y => y.status === 'active') || newestYear(years);
     return { year, years };
 }
 const yearOut = (y) => (y ? { _id: y._id, yearName: y.yearName, status: y.status, startDate: y.startDate, endDate: y.endDate } : null);

@@ -73,7 +73,7 @@ exports.getMeta = async (req, res) => {
         const activeYear = await fb.activeAcademicYear(school);
 
         const [years, classes, sections, subjects, teachers, profiles, templates] = await Promise.all([
-            AcademicYear.find({ school }).select('yearName status startDate').sort({ startDate: -1 }).lean(),
+            AcademicYear.find({ school }).select('yearName status startDate').lean(),
             Class.find({ school, status: 'active' }).select('className classNumber academicYear').sort({ classNumber: 1 }).lean(),
             ClassSection.find({ school, status: 'active' }).select('sectionName class academicYear').lean(),
             // Per-year subjects — narrowed to the active year after the await,

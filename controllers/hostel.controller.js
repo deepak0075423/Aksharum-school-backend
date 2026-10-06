@@ -187,7 +187,7 @@ exports.getMeta = async (req, res) => {
             HostelFloor.find({ school, isActive: true }).select('name floorNumber building hostel status').sort('floorNumber').lean(),
             HostelRoom.find({ school, isActive: true }).select('roomNumber code hostel building floor roomType capacity occupiedBeds status gender occupantType').sort('roomNumber').lean(),
             User.find({ school, role: { $in: ['teacher', 'school_admin'] }, isActive: true }).select('name email role phone').sort('name').lean(),
-            AcademicYear.find({ school }).select('yearName status startDate endDate').sort('-startDate').lean(),
+            AcademicYear.find({ school }).select('yearName status startDate endDate').lean(),
             HostelMess.find({ school, isActive: true }).select('name code hostels mealTimings').sort('name').lean(),
             HostelFeePlan.find({ school, isActive: true }).select('name feeType basis amount frequency hostel appliesTo').sort('name').lean(),
             // The classes a list can be filtered by: the ones students are actually

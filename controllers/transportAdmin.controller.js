@@ -34,6 +34,7 @@ const AcademicYear        = require('../models/AcademicYear');
 
 const { notify, withParents } = require('../services/notifyService');
 const { occupancyByVehicle, syncOccupancy } = require('../services/transportSeats');
+const { byClass, bySection } = require('../utils/listOrder');
 
 // ── replies ──────────────────────────────────────────────────────────────────
 const ok   = (res, data)            => res.json({ success: true, data });
@@ -221,14 +222,15 @@ async function studentIndex(ids = []) {
         User.find({ _id: { $in: uniq } }).select('name email profileImage').lean(),
         StudentProfile.find({ user: { $in: uniq } })
             .select('user admissionNumber rollNumber photoFile currentClass currentSection')
-            .populate({ path: 'currentSection', select: 'sectionName class', populate: { path: 'class', select: 'className' } })
-            .populate({ path: 'currentClass', select: 'className' })
+            .populate({ path: 'currentSection', select: 'sectionName class', populate: { path: 'class', select: 'className classNumber' } })
+            .populate({ path: 'currentClass', select: 'className classNumber' })
             .lean(),
     ]);
     const byProfile = new Map(profiles.map((p) => [String(p.user), p]));
     return new Map(users.map((u) => {
         const p = byProfile.get(String(u._id));
         const className = p?.currentSection?.class?.className || p?.currentClass?.className || '';
+        const classNumber = p?.currentSection?.class?.classNumber ?? p?.currentClass?.classNumber ?? null;
         const sectionName = p?.currentSection?.sectionName || '';
         return [String(u._id), {
             _id: u._id,
@@ -237,6 +239,7 @@ async function studentIndex(ids = []) {
             admissionNumber: p?.admissionNumber || '',
             rollNumber: p?.rollNumber || '',
             className,
+            classNumber,
             sectionName,
             // Schools name their classes either "1" or "Class 1"; prefixing
             // blindly is what produced "Class Class 1A" on every student row.
@@ -1798,7 +1801,9 @@ exports.assignmentBoard = async (req, res) => {
             detail: 'Due to vehicle maintenance', tone: 'warn',
         }));
 
-        const classes = [...new Set([...students.values()].map((s) => s.className).filter(Boolean))].sort();
+        // The class filter, in class order (Class 2 before Class 10, V before X).
+        const classes = [...new Map([...students.values()].filter((s) => s.className)
+            .map((s) => [s.className, s])).values()].sort(byClass).map((s) => s.className);
 
         ok(res, {
             tiles, data: paged, groups, total: decorated.length, page: p, pages: Math.max(1, Math.ceil(decorated.length / lim)),
@@ -3822,7 +3827,7 @@ exports.settingsFull = async (req, res) => {
         const [st, schoolDoc, years, counts] = await Promise.all([
             getSettings(school),
             School.findById(school).select('name address phone email').lean(),
-            AcademicYear.find({ school }).sort('-startDate').select('yearName startDate endDate status').lean(),
+            AcademicYear.find({ school }).select('yearName startDate endDate status').lean(),
             Promise.all([
                 Vehicle.countDocuments({ school, isActive: true }),
                 TransportStaff.countDocuments({ school, isActive: true }),

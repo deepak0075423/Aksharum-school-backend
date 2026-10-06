@@ -38,6 +38,7 @@ const sa               = require('../services/studentAttendance');
 const { officeSectionSubjects } = require('../services/attendanceScope');
 const School           = require('../models/School');
 const Subject          = require('../models/Subject');
+const { newestYear } = require('../utils/listOrder');
 const { capStatus, creditSql, rollupSql } = sa;
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true, data: d });
@@ -60,7 +61,7 @@ function params() {
 // ── Academic years ───────────────────────────────────────────────────────────
 
 const schoolYears = (schoolId) => AcademicYear.find({ school: schoolId })
-    .select('yearName startDate endDate status').sort({ startDate: -1 }).lean();
+    .select('yearName startDate endDate status').lean();   // A–Z, for the picker
 
 /**
  * The year a question is about: the one asked for by id; otherwise the one that
@@ -74,10 +75,10 @@ function pickYear(years, { id, day } = {}) {
     }
     if (day) {
         const holding = years.filter((y) => dateKey(y.startDate) <= day && day <= dateKey(y.endDate));
-        const hit = holding.find((y) => y.status === 'active') || holding[0];
+        const hit = holding.find((y) => y.status === 'active') || newestYear(holding);
         if (hit) return hit;
     }
-    return years.find((y) => y.status === 'active') || years[0] || null;
+    return years.find((y) => y.status === 'active') || newestYear(years);
 }
 
 const yearOut = (y) => (y ? {

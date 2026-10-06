@@ -46,4 +46,8 @@ const ClassSchema = new db.Schema({
 // Unique class number per school per academic year
 ClassSchema.index({ school: 1, academicYear: 1, classNumber: 1 }, { unique: true });
 
+// Listed by class number, then name, unless a query sorts them itself
+// (utils/listOrder). A list spanning several years comes year by year.
+ClassSchema.set('defaultOrder', `(SELECT y."startDate" FROM "academicyears" y WHERE y."_id" = "classes"."academicYear") NULLS LAST, ${require('../utils/listOrder').classOrderSql()}`);
+
 module.exports = db.model('Class', ClassSchema);

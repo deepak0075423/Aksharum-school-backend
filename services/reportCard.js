@@ -56,6 +56,7 @@ const { movesFor } = require('./resultPromotion');
 const overallEngine = require('./resultOverall');
 const schoolClock = require('./schoolClock');
 const { notify } = require('./notifyService');
+const { yearOrderSql, byYear, newestYear } = require('../utils/listOrder');
 
 const t = (M) => `"${M.tableName}"`;
 const T = {
@@ -76,14 +77,14 @@ const verifyUrl = (code) => `${FRONTEND()}/verify/report-card/${code}`;
 async function years(schoolId) {
     const { rows } = await pool.query(
         `SELECT "_id", "yearName", "status", "startDate", "endDate" FROM ${T.years}
-          WHERE "school" = $1::uuid ORDER BY "startDate" DESC NULLS LAST, "yearName" DESC`, [String(schoolId)]);
+          WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]);
     return rows;
 }
 /** The year asked for (one of this school's), else the one the school is in, else the latest. */
 async function yearOf(schoolId, yearId) {
     const list = await years(schoolId);
     return list.find((y) => String(y._id) === String(yearId || ''))
-        || list.find((y) => y.status === 'active') || list[0] || null;
+        || list.find((y) => y.status === 'active') || newestYear(list);
 }
 const yearShape = (y) => (y ? { _id: y._id, yearName: y.yearName, current: y.status === 'active' } : null);
 /** The term asked for, if it is one of the school's; '' — the year's card. */
@@ -395,13 +396,12 @@ async function rollOf(sectionId) {
     return rows.map((r) => String(r._id));
 }
 
-/** The years a teacher holds a class teacher's post in, newest first. */
+/** The years a teacher holds a class teacher's post in, A–Z. */
 async function teacherYears(schoolId, teacherId) {
     const { rows } = await pool.query(`
         SELECT DISTINCT y."_id", y."yearName", y."status", y."startDate", y."endDate" FROM ${T.sections} s JOIN ${T.years} y ON y."_id" = s."academicYear"
-         WHERE s."school" = $1::uuid AND (s."classTeacher" = $2::uuid OR s."substituteTeacher" = $2::uuid)
-         ORDER BY y."startDate" DESC NULLS LAST`, [String(schoolId), String(teacherId)]);
-    return rows;
+         WHERE s."school" = $1::uuid AND (s."classTeacher" = $2::uuid OR s."substituteTeacher" = $2::uuid)`, [String(schoolId), String(teacherId)]);
+    return rows.sort(byYear);
 }
 
 /**
@@ -412,7 +412,7 @@ async function teacherYears(schoolId, teacherId) {
 async function sectionCards(schoolId, { yearId, sectionId, teacherId = null, term = '' } = {}) {
     const list = teacherId ? await teacherYears(schoolId, teacherId) : await years(schoolId);
     const year = list.find((y) => String(y._id) === String(yearId || ''))
-        || list.find((y) => y.status === 'active') || list[0] || null;
+        || list.find((y) => y.status === 'active') || newestYear(list);
     const base = { years: list.map(yearShape), year: yearShape(year), sections: [], section: null, cards: [], frame: null, release: null };
     if (!year) return base;
     const sections = await sectionsOf(schoolId, year._id, teacherId);
@@ -728,9 +728,10 @@ async function familyCard(schoolId, studentId, yearId, term = '') {
         SELECT DISTINCT y."_id", y."yearName", y."status", y."startDate", y."endDate"
           FROM ${T.results} r JOIN ${T.exams} e ON e."_id" = r."exam" JOIN ${T.years} y ON y."_id" = e."academicYear"
          WHERE r."student" = $1::uuid AND e."school" = $2::uuid AND e."status" = 'FINAL_APPROVED'
-           AND e."showInPortal" IS DISTINCT FROM false AND ${overallEngine.releasedSql('e."publishDate"', '$3::text')}
-         ORDER BY y."startDate" DESC NULLS LAST`, [String(studentId), String(schoolId), schoolClock.zoneOf(schoolId)]);
-    const year = seen.find((y) => String(y._id) === String(yearId || '')) || seen[0] || await yearOf(schoolId, null);
+           AND e."showInPortal" IS DISTINCT FROM false AND ${overallEngine.releasedSql('e."publishDate"', '$3::text')}`,
+        [String(studentId), String(schoolId), schoolClock.zoneOf(schoolId)]);
+    seen.sort(byYear);
+    const year = seen.find((y) => String(y._id) === String(yearId || '')) || newestYear(seen) || await yearOf(schoolId, null);
     const out = { years: seen.map(yearShape), year: yearShape(year), frame: null, card: null };
     if (!year) return out;
     const f = await frame(schoolId, year, term);

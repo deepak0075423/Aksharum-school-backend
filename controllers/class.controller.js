@@ -97,7 +97,7 @@ const overlapMessage = (clash) =>
 // Academic Years
 exports.getAcademicYears = async (req, res) => {
     try {
-        const years  = await AcademicYear.find({ school: req.schoolId }).sort({ startDate: -1 }).lean();
+        const years  = await AcademicYear.find({ school: req.schoolId }).lean();   // A–Z
         const counts = await yearCounts(req.schoolId);
         ok(res, years.map((y) => ({ ...y, ...(counts.get(String(y._id)) || EMPTY_YEAR_COUNTS) })));
     } catch (e) { err(res, e); }
@@ -296,10 +296,10 @@ exports.getClasses = async (req, res) => {
             const active = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
             if (active) filter.academicYear = active._id;
         }
-        const classes = (await Class.find(filter)
+        // In class order — by year when it is every year (the model's default order, utils/listOrder)
+        const classes = await Class.find(filter)
             .populate('academicYear', 'yearName status')
-            .lean())
-            .sort(byName('className'));
+            .lean();
         const counts = await classCounts(classes.map(c => c._id));
         ok(res, classes.map(c => ({
             ...c,

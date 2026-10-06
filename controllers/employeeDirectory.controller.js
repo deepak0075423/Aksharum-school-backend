@@ -19,6 +19,7 @@ const svc  = require('../services/employeeDirectoryService');
 const ActivityLog = require('../models/ActivityLog');
 const { RESPONSIBILITY_TYPES } = require('../models/EmployeeResponsibility');
 const { VERIFICATION_SECTIONS, VERIFICATION_STATUSES } = require('../models/EmployeeVerification');
+const { byClass, natural } = require('../utils/listOrder');
 
 const {
     User, TeacherProfile, ClassSection, Class, Subject, SectionSubjectTeacher,
@@ -284,7 +285,7 @@ function buildRow(user, snap) {
         officialPhone: user.phone || '',
         employmentType: p.employmentType || '',
         subjects: subjectNames,
-        classes: [...classKeys.values()],
+        classes: [...classKeys.values()].sort((a, b) => byClass(a, b) || natural(a.label, b.label)),
         classTeacherOf,
         isClassTeacher: classTeacherOf.length > 0,
         responsibilities: snap.responsibilitiesByTeacher.get(uid) || [],

@@ -39,6 +39,7 @@ const places = require('../services/medicalPlaces');
 const safeguarding = require('../services/medicalSafeguarding');
 const stepUp = require('../services/medicalStepUp');
 const retention = require('../services/medicalRetention');
+const { yearOrderSql, classOrderSql, sectionOrderSql } = require('../utils/listOrder');
 
 const { notFound, isUuid } = R;
 const run = (sql, p) => pool.query(sql, p).then((r) => r.rows);
@@ -63,11 +64,11 @@ exports.meta = handle(async (req) => {
     const s = await settingsSvc.get(req.schoolId);
     const today = R.todayStr();
     const [years, classes, sections, beds, items] = await Promise.all([
-        run(`SELECT "_id", "yearName", "startDate", "endDate", "status" FROM "academicyears" WHERE "school" = $1 ORDER BY "startDate" DESC`, [S]),
+        run(`SELECT "_id", "yearName", "startDate", "endDate", "status" FROM "academicyears" WHERE "school" = $1 ORDER BY ${yearOrderSql()}`, [S]),
         run(`SELECT c."_id", c."className", c."classNumber", c."academicYear" FROM "classes" c JOIN "academicyears" y ON y."_id" = c."academicYear"
-              WHERE c."school" = $1 AND y."status" = 'active' ORDER BY c."classNumber" NULLS LAST, c."className"`, [S]),
+              WHERE c."school" = $1 AND y."status" = 'active' ORDER BY ${classOrderSql('c')}`, [S]),
         run(`SELECT cs."_id", cs."sectionName", cs."class" FROM "classsections" cs JOIN "academicyears" y ON y."_id" = cs."academicYear"
-              WHERE cs."school" = $1 AND y."status" = 'active' ORDER BY cs."sectionName"`, [S]),
+              WHERE cs."school" = $1 AND y."status" = 'active' ORDER BY ${sectionOrderSql('cs')}`, [S]),
         run(`SELECT "_id", "label", "kind", "status" FROM "medicalbeds" WHERE "school" = $1 AND "isActive" IS NOT FALSE ORDER BY "sortOrder", "label"`, [S]),
         run(`SELECT i."_id", i."name", i."kind", i."strength", i."unit", i."form", i."category", i."prescriptionOnly", i."minStock",
                     COALESCE((SELECT SUM(b."quantity") FROM "medicalbatches" b WHERE b."item" = i."_id" AND b."status" = 'active'

@@ -52,6 +52,7 @@ const Sched = require('../services/feeSchedule');
 const { notify, withParents } = require('../services/notifyService');
 const { sendSchoolMail, emailHeaderHtml } = require('../utils/schoolMailer');
 const { renderReceipt, defaultTemplate } = require('../services/receiptRenderer');
+const { newestYear, previousYear } = require('../utils/listOrder');
 
 // ── Plumbing ─────────────────────────────────────────────────────────────────
 
@@ -109,18 +110,16 @@ const classTitle = (classNumber, className) => className || (classNumber != null
  */
 async function resolveYear(schoolId, requested) {
     const [years, settings] = await Promise.all([
-        AcademicYear.find({ school: schoolId }).sort({ startDate: -1 }).lean(),
+        AcademicYear.find({ school: schoolId }).lean(),   // A–Z, for the picker
         feesCtl.getOrCreateSettings(schoolId),
     ]);
     const byId = (id) => years.find(y => String(y._id) === String(id));
     const year = (requested && uuidOr(requested) && byId(requested))
         || (settings?.defaultAcademicYear && byId(settings.defaultAcademicYear))
         || years.find(y => y.status === 'active')
-        || years[0] || null;
+        || newestYear(years);
     return { year, years, settings };
 }
-/** The year before `year`, for "vs last year" comparisons. */
-const previousYear = (years, year) => (year ? years.find(y => new Date(y.startDate) < new Date(year.startDate)) || null : null);
 
 const yearOut = (y) => y && ({ _id: y._id, yearName: y.yearName, status: y.status, startDate: y.startDate, endDate: y.endDate });
 

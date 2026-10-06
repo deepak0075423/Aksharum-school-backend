@@ -289,7 +289,7 @@ exports.availableHostels = async (req, res) => {
         // would have to know an academic year id to apply.
         const AcademicYear = require('../models/AcademicYear');
         const academicYears = await AcademicYear.find({ school: req.schoolId, status: { $ne: 'archived' } })
-            .select('yearName status startDate').sort('-startDate').lean();
+            .select('yearName status startDate').lean();
 
         ok(res, {
             hostels: rows.map((h) => ({ ...h, availableBeds: freeMap[String(h._id)] || 0 })),

@@ -58,6 +58,7 @@ function gradeList(scale, found = []) {
 /** The school's exam types, for a filter: every one, switched off or not — old exams have them. */
 const typeOptions = (types) => types.map((t) => ({ value: t.key, label: t.label, kind: t.kind, active: t.active }));
 const promotion = require('./resultPromotion');
+const { yearOrderSql, classOrderSql, sectionOrderSql, naturalSql, newestYear } = require('../utils/listOrder');
 
 const t = (Model) => `"${Model.tableName}"`;
 const T = {
@@ -393,7 +394,7 @@ async function overview(schoolId) {
             SELECT y."_id", y."yearName", y."status",
                    (SELECT count(*)::int FROM ${T.exams} e WHERE e."academicYear" = y."_id" AND e."archivedAt" IS NULL) AS "exams"
               FROM ${T.years} y WHERE y."school" = $1::uuid
-             ORDER BY y."startDate" DESC NULLS LAST, y."yearName" DESC`, [String(schoolId)]),
+             ORDER BY ${yearOrderSql('y')}`, [String(schoolId)]),
         pool.query(`
             SELECT c."classNumber", min(c."className") AS "className"
               FROM ${T.classes} c WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL
@@ -831,7 +832,7 @@ async function formMeta(schoolId) {
     const id = String(schoolId);
     const [{ rows: years }, { rows: sections }] = await Promise.all([
         pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid
-                     ORDER BY "startDate" DESC NULLS LAST, "yearName" DESC`, [id]),
+                     ORDER BY ${yearOrderSql()}`, [id]),
         pool.query(`
             SELECT s."_id", s."sectionName", s."academicYear", s."class" AS "classId", c."className", c."classNumber",
                    ct."name" AS "classTeacherName", ${ROSTER} AS "students"
@@ -839,7 +840,7 @@ async function formMeta(schoolId) {
               JOIN ${T.classes} c ON c."_id" = s."class"
               LEFT JOIN ${T.users} ct ON ct."_id" = s."classTeacher"
              WHERE s."school" = $1::uuid AND COALESCE(s."status", 'active') <> 'archived' AND COALESCE(c."status", 'active') <> 'archived'
-             ORDER BY c."classNumber" NULLS LAST, c."className", s."sectionName"`, [id]),
+             ORDER BY ${classOrderSql('c')}, ${sectionOrderSql('s')}`, [id]),
     ]);
     // Where each class goes up to, for the promotion choice on a final exam.
     const [targets, conf] = await Promise.all([promotion.targetsByClass(schoolId), settings.get(schoolId)]);
@@ -930,13 +931,13 @@ async function subjectsFor(schoolId, sectionIds) {
 async function overall(schoolId, q = {}) {
     const id = String(schoolId);
     const [{ rows: years }, { rows: classList }] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid
-                     ORDER BY "startDate" DESC NULLS LAST, "yearName" DESC`, [id]),
+        pool.query(`SELECT "_id", "yearName", "status", "startDate" FROM ${T.years} WHERE "school" = $1::uuid
+                     ORDER BY ${yearOrderSql()}`, [id]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c
                      WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [id]),
     ]);
     const year = years.find((y) => String(y._id) === String(q.academicYear || ''))
-        || years.find((y) => y.status === 'active') || years[0] || null;
+        || years.find((y) => y.status === 'active') || newestYear(years);
     const filters = {
         years: years.map((y) => ({ _id: y._id, yearName: y.yearName, current: y.status === 'active' })),
         classes: classList.map((c) => ({ classNumber: num(c.classNumber), className: c.className })),
@@ -1086,7 +1087,7 @@ async function analytics(schoolId, q = {}) {
                    count(*) FILTER (WHERE r."isPassed")::int AS "passed", avg(r."percentage") AS "avgPct", max(r."percentage") AS "topPct"
             ${base(p)}
              GROUP BY e."section"
-             ORDER BY max(y."startDate") DESC NULLS LAST, min(c."classNumber") NULLS LAST, min(s."sectionName")`),
+             ORDER BY ${naturalSql('min(y."yearName")')}, min(c."classNumber") NULLS LAST, ${naturalSql('min(s."sectionName")')}`),
         run((p) => `
             SELECT e."_id", e."title", e."examType", e."typeLabel", e."finalApprovedAt", e."publishDate", e."archivedAt",
                    min(c."className") AS "className", min(s."sectionName") AS "sectionName", min(y."yearName") AS "yearName",
@@ -1122,7 +1123,7 @@ async function analytics(schoolId, q = {}) {
     const gradeN = new Map(grades.rows.map((g) => [g.grade, g.n]));
     const bandN = new Map(bands.rows.map((b) => [num(b.band), b.n]));
     const [{ rows: years }, { rows: classes }, conf] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY "startDate" DESC NULLS LAST`, [String(schoolId)]),
+        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c
                      WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [String(schoolId)]),
         settings.get(schoolId),
@@ -1178,11 +1179,11 @@ async function analytics(schoolId, q = {}) {
 async function meritList(schoolId, q = {}) {
     const id = String(schoolId);
     const [{ rows: years }, { rows: classList }] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY "startDate" DESC NULLS LAST, "yearName" DESC`, [id]),
+        pool.query(`SELECT "_id", "yearName", "status", "startDate" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [id]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c
                      WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [id]),
     ]);
-    const year = years.find((y) => String(y._id) === String(q.academicYear || '')) || years.find((y) => y.status === 'active') || years[0] || null;
+    const year = years.find((y) => String(y._id) === String(q.academicYear || '')) || years.find((y) => y.status === 'active') || newestYear(years);
     const classes = classList.map((c) => ({ classNumber: num(c.classNumber), className: c.className }));
     const filters = { years: years.map((y) => ({ _id: y._id, yearName: y.yearName, current: y.status === 'active' })), classes };
     const cn = q.classNumber !== undefined && q.classNumber !== '' && Number.isFinite(Number(q.classNumber)) ? Number(q.classNumber) : (classes[0]?.classNumber ?? null);

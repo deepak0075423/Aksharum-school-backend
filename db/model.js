@@ -146,10 +146,15 @@ function createModel(name, schema) {
         }
     }
 
+    // A model may name the order its rows are listed in when a query asks for
+    // none (schema.set('defaultOrder', <SQL>)) — classes, sections and years
+    // do (utils/listOrder). Without one, Postgres returns them in no order.
+    const defaultOrder = schema.get('defaultOrder') ? ` ORDER BY ${schema.get('defaultOrder')}` : '';
+
     model._rawFind = async function (filter, opts = {}) {
         const params = [];
         const where = whereClause(parsed, filter, params);
-        const order = orderClause(parsed, opts.sort);
+        const order = orderClause(parsed, opts.sort) || defaultOrder;
         const cols = opts.select ? buildSelectColumns(parsed, opts.select) : null;
         const selectList = cols ? cols.map(qi).join(', ') : '*';
         let sql = `SELECT ${selectList} FROM ${T} WHERE ${where}${order}`;

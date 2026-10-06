@@ -24,6 +24,7 @@ const design = require('./idCardDesign');
 const data = require('./idCardData');
 const rules = require('./idCardRules');
 const views = require('./idCardViews');
+const { byYear } = require('../utils/listOrder');
 
 const CARDS = `"${IdCard.tableName}"`;
 const LOGS = `"${IdCardLog.tableName}"`;
@@ -216,7 +217,7 @@ async function list(schoolId, query = {}) {
     return {
         kind,
         year: yearBrief(year),
-        years: kind === 'student' ? [...yc.years].reverse().map(yearBrief) : [],
+        years: kind === 'student' ? [...yc.years].sort(byYear).map(yearBrief) : [],
         canIssue: kind !== 'student' || rules.canIssueFor(year),
         rows: rows.slice((page - 1) * limit, page * limit),
         // Every id on every page — "select all N" in the bulk bar.

@@ -46,6 +46,7 @@ const TimetableEntry        = require('../models/TimetableEntry');
 const NotificationReceipt   = require('../models/NotificationReceipt');
 const InventoryIssue        = require('../models/InventoryIssue');
 const StudentSectionHistory = require('../models/StudentSectionHistory');
+const { byClass, bySection } = require('../utils/listOrder');
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true, data: d });
 const err = (res, e, s = 500) => res.status(s).json({ success: false, message: e.message || e });
@@ -181,9 +182,7 @@ exports.getScope = async (req, res) => {
             academicYear: scope.activeYear
                 ? { _id: scope.activeYear._id, yearName: scope.activeYear.yearName }
                 : null,
-            sections: scope.sections.sort((a, b) =>
-                String(a.className).localeCompare(String(b.className), 'en', { numeric: true })
-                || String(a.sectionName).localeCompare(String(b.sectionName))),
+            sections: scope.sections.sort((a, b) => byClass(a, b) || bySection(a, b)),
             modules,
         });
     } catch (e) { err(res, e); }

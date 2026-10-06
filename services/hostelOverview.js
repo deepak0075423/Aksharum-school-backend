@@ -38,6 +38,7 @@ const HostelAuditLog = require('../models/HostelAuditLog');
 const AcademicYear = require('../models/AcademicYear');
 const User = require('../models/User');
 const { MONTHS, dayRange } = require('./hostelService');
+const { yearOrderSql, newestYear } = require('../utils/listOrder');
 
 const T = (Model) => `"${Model.tableName}"`;
 
@@ -381,7 +382,7 @@ async function recentActivity(schoolId, allowed, limit = 4, { money = true } = {
 async function academicYears(schoolId) {
     const { rows } = await pool.query(
         `SELECT "_id", "yearName", "status", "startDate", "endDate" FROM ${T(AcademicYear)}
-          WHERE "school" = $1 ORDER BY "startDate" DESC NULLS LAST`,
+          WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
         [String(schoolId)],
     );
     const years = rows.map((r) => ({
@@ -391,7 +392,7 @@ async function academicYears(schoolId) {
     const now = new Date();
     const current = years.find((y) => y.status === 'active')
         || years.find((y) => y.startDate && y.endDate && new Date(y.startDate) <= now && now <= new Date(y.endDate))
-        || years[0] || null;
+        || newestYear(years);
     return { years, current };
 }
 

@@ -21,6 +21,7 @@ const TeacherProfile       = require('../models/TeacherProfile');
 const TimetableConfig      = require('../models/TimetableConfig');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const sub                  = require('../services/substituteService');
+const { byClass, bySection } = require('../utils/listOrder');
 
 const ok  = (res, d, s = 200) => res.status(s).json({ success: true, data: d });
 const err = (res, e, s = 500) => res.status(s).json({ success: false, message: e.message || e });
@@ -752,7 +753,7 @@ exports.getWorkloadReport = async (req, res) => {
             SectionSubjectTeacher.find().select('section subject teacher').lean(),
             Subject.find({ school: req.schoolId }).select('subjectName').lean(),
             ClassSection.find({ school: req.schoolId, ...(ctx.year ? { academicYear: ctx.year._id } : {}) })
-                .populate('class', 'className').lean(),
+                .populate('class', 'className classNumber').lean(),
             ctx.year
                 ? TimetableConfig.findOne({ school: req.schoolId, academicYear: ctx.year._id }).lean()
                 : null,
@@ -813,7 +814,8 @@ exports.getWorkloadReport = async (req, res) => {
             const substitutions = subsBy.get(tid) || 0;
             const total = settings.includeSubsInWorkload ? assigned + substitutions : assigned;
             const status = total > overAt ? 'overloaded' : total < underAt ? 'underloaded' : 'balanced';
-            const mine = [...(sectionsOf.get(tid) || [])].map((id) => sectionById.get(id)).filter(Boolean);
+            const mine = [...(sectionsOf.get(tid) || [])].map((id) => sectionById.get(id)).filter(Boolean)
+                .sort((a, b) => byClass(a.class || {}, b.class || {}) || bySection(a, b));
             return {
                 teacher: { _id: t._id, name: t.name },
                 designation: (profile && profile.designation) || 'Teacher',

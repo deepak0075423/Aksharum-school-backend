@@ -35,6 +35,7 @@ const tell = require('./medicalNotify');
 const { patch } = require('../db/patch');
 const growth = require('./medicalGrowth');
 const R = require('./medicalRules');
+const { classOrderSql, sectionOrderSql } = require('../utils/listOrder');
 
 const { refuse, str, num, isUuid, todayStr, dayStr, dayLabel, toDay, addDays } = R;
 const S = (v) => String(v);
@@ -262,7 +263,7 @@ async function students(schoolId, f = {}) {
            LEFT JOIN "classsections" cs ON cs."_id" = sp."currentSection"
            LEFT JOIN "classes" c ON c."_id" = COALESCE(cs."class", sp."currentClass")
           WHERE u."school" = $1 AND u."role" = 'student' AND u."isActive" IS NOT FALSE ${where}
-          ORDER BY c."className" NULLS LAST, cs."sectionName" NULLS LAST, u."name"`, p,
+          ORDER BY ${classOrderSql('c')}, ${sectionOrderSql('cs')}, u."name"`, p,
     )).rows.map((r) => ({ ...r, classLabel: [r.className, r.sectionName].filter(Boolean).join(' – ') }));
 }
 

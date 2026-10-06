@@ -12,6 +12,7 @@ const AcademicYear         = require('../models/AcademicYear');
 const DocumentComment      = require('../models/DocumentComment');
 const User                 = require('../models/User');
 const pool                 = require('../db/pool');
+const { yearOrderSql } = require('../utils/listOrder');
 
 /** Table name, quoted — the raw-SQL reads below take their names from the models. */
 const qt = (Model) => `"${Model.tableName}"`;
@@ -356,7 +357,7 @@ exports.adminGetDocumentOverview = async (req, res) => {
                      ON d."academicYear" = ay."_id" AND COALESCE(d."isArchived", false) = false
                   WHERE ay."school" = $1
                   GROUP BY ay."_id", ay."yearName", ay."status", ay."startDate"
-                  ORDER BY ay."startDate" DESC NULLS LAST`,
+                  ORDER BY ${yearOrderSql('ay')}`,
                 [school],
             ),
             // Documents filed against no year at all — uploaded before the field

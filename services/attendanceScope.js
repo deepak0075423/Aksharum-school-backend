@@ -29,10 +29,13 @@ const Timetable             = require('../models/Timetable');
 const TimetableEntry        = require('../models/TimetableEntry');
 const User                  = require('../models/User');
 const { registrationMode }  = require('./studentAttendance');
+const { byClass, bySection } = require('../utils/listOrder');
 
 const T = (Model) => `"${Model.tableName}"`;
 const ROLE_LABEL = { classTeacher: 'Class Teacher', vice: 'Vice Class Teacher', subject: 'Subject Teacher' };
 const ROLE_RANK  = { classTeacher: 0, vice: 1, subject: 2 };
+/** The section a teacher's screen opens on: the one they are class teacher of, then vice, then any. */
+const ownFirst = (sections = []) => [...sections].sort((a, b) => ROLE_RANK[a.role] - ROLE_RANK[b.role])[0] || null;
 
 const classLabel = (c) => c?.className || (c?.classNumber != null ? `Class ${c.classNumber}` : 'Class');
 
@@ -119,9 +122,9 @@ async function attendanceScope(schoolId, userId, { mode: forced } = {}) {
     })
         // A subject teacher whose subjects have all been removed has nothing to take.
         .filter((s) => mode !== 'subject' || s.subjects.length)
-        .sort((a, b) => (ROLE_RANK[a.role] - ROLE_RANK[b.role])
-            || ((a.classNumber ?? 999) - (b.classNumber ?? 999))
-            || String(a.sectionName).localeCompare(String(b.sectionName)));
+        // Listed in class order (utils/listOrder); the teacher's own section
+        // is the one a screen opens on (`ownFirst`), not the first in the list.
+        .sort((a, b) => byClass(a, b) || bySection(a, b));
 
     return { mode, activeYear, sections };
 }
@@ -207,7 +210,7 @@ async function sectionSubjects(schoolId, activeYear, rows, byId) {
 function pickRegister(scope, sectionId, subjectId, { requireSubject = false } = {}) {
     const section = sectionId
         ? scope.sections.find((s) => s._id === String(sectionId))
-        : scope.sections[0];
+        : ownFirst(scope.sections);
     if (!section) {
         return { section: null, subject: null, error: sectionId ? 'You do not take attendance for that section' : 'No section is assigned to you' };
     }

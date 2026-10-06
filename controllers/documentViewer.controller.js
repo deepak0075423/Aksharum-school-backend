@@ -26,6 +26,7 @@ const AcademicYear       = require('../models/AcademicYear');
 const User               = require('../models/User');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const pool               = require('../db/pool');
+const { yearOrderSql } = require('../utils/listOrder');
 
 const qt = (Model) => `"${Model.tableName}"`;
 const ids = (list) => (list || []).map(String).filter(Boolean);
@@ -183,7 +184,7 @@ async function categoriesOf(schoolId) {
 async function yearsOf(schoolId) {
     const { rows } = await pool.query(
         `SELECT "_id", "yearName", "status" FROM ${qt(AcademicYear)}
-          WHERE "school" = $1 ORDER BY "startDate" DESC NULLS LAST`,
+          WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
         [String(schoolId)],
     );
     return rows.map((r) => ({ _id: r._id, name: r.yearName, status: r.status }));

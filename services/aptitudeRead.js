@@ -19,6 +19,7 @@ const Class            = require('../models/Class');
 const Subject          = require('../models/Subject');
 const StudentProfile   = require('../models/StudentProfile');
 const User             = require('../models/User');
+const { yearOrderSql } = require('../utils/listOrder');
 const {
     getActiveYear, examSectionIds, examWindow,
     SERVER_TZ, startSql, endSql, stageSql, sectionsSql, scoredAttemptsSql,
@@ -494,7 +495,7 @@ async function yearOptions(schoolId, { where = 'true', params = [] } = {}) {
                 (SELECT count(*)::int FROM ex WHERE ex."academicYear" = y."_id" AND ${where}) AS count
            FROM ${T.years} y
           WHERE y."school" = $1
-          ORDER BY y."startDate" DESC`,
+          ORDER BY ${yearOrderSql('y')}`,
         [String(schoolId), SERVER_TZ, ...params],
     );
     return rows.map(r => ({ _id: r._id, name: r.name, current: r.status === 'active', count: r.count }));

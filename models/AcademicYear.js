@@ -38,4 +38,8 @@ const AcademicYearSchema = new db.Schema({
 // Unique: one year name per school
 AcademicYearSchema.index({ school: 1, yearName: 1 }, { unique: true });
 
+// Listed A–Z by name (2024-25, 2025-26 …) unless a query sorts them itself
+// (utils/listOrder).
+AcademicYearSchema.set('defaultOrder', require('../utils/listOrder').yearOrderSql());
+
 module.exports = db.model('AcademicYear', AcademicYearSchema);

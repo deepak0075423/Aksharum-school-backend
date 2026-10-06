@@ -26,6 +26,7 @@ const numbers = require('./medicalNumber');
 const { patch } = require('../db/patch');
 const { newId } = require('../db/schema');
 const R = require('./medicalRules');
+const { classOrderSql, sectionOrderSql } = require('../utils/listOrder');
 
 const { refuse, str, isUuid, todayStr, dayStr, dayLabel, toDay, addDays } = R;
 const S = (v) => String(v);
@@ -421,8 +422,8 @@ async function detail(req, id, f = {}) {
            LEFT JOIN "classsections" cs ON cs."_id" = e."section"
            LEFT JOIN "classes" c ON c."_id" = COALESCE(e."class", cs."class")
           WHERE e."campaign" = $1
-          GROUP BY e."section", c."className", cs."sectionName"
-          ORDER BY c."className" NULLS LAST, cs."sectionName" NULLS LAST`, [S(c._id)]);
+          GROUP BY e."section", c."classNumber", c."className", cs."sectionName"
+          ORDER BY ${classOrderSql('c')}, ${sectionOrderSql('cs')}`, [S(c._id)]);
     const eligible = (x) => (c.consent === 'opt_in' ? x.agreed : x.students - x.declined);
     const per = sections.map((x) => ({ ...x, label: [x.className, x.sectionName].filter(Boolean).join(' – ') || 'No section', eligible: eligible(x), coverage: eligible(x) ? Math.round((x.given / eligible(x)) * 1000) / 10 : null }));
     const total = per.reduce((a, x) => { for (const k of ['students', 'given', 'absent', 'refused', 'excluded', 'waiting', 'declined', 'agreed', 'unanswered', 'eligible']) a[k] = (a[k] || 0) + x[k]; return a; }, {});

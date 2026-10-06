@@ -38,7 +38,7 @@ exports.adminManageTimetable = async (req, res) => {
         const [ttYear, school, allYears] = await Promise.all([
             Timetable.findOne({ section: req.params.sectionId, academicYear: year?._id }).lean(),
             School.findById(req.schoolId).select('leaveSettings').lean(),
-            require('../models/AcademicYear').find({ school: req.schoolId }).sort({ createdAt: -1 }).lean(),
+            require('../models/AcademicYear').find({ school: req.schoolId }).lean(),
         ]);
         // Only fall back to any-year timetable when no yearId was explicitly requested
         const tt = ttYear || (!req.query.yearId ? await Timetable.findOne({ section: req.params.sectionId }).lean() : null);
@@ -490,7 +490,7 @@ exports.teacherViewTimetable = async (req, res) => {
             selectedYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
         }
 
-        const allYears     = await AcademicYear.find({ school: req.schoolId }).sort({ createdAt: -1 }).lean();
+        const allYears     = await AcademicYear.find({ school: req.schoolId }).lean();
         const allTeachers  = await User.find({ school: req.schoolId, role: 'teacher', isActive: true }).select('name').lean();
 
         let entries = [];

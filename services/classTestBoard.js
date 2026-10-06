@@ -18,6 +18,7 @@ const User = require('../models/User');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const { isUuid } = require('../db/schema');
 const { TEST_LABELS } = require('./resultTeacher');
+const { yearOrderSql } = require('../utils/listOrder');
 
 const t = (M) => `"${M.tableName}"`;
 const T = { tests: t(ClassTest), sections: t(ClassSection), classes: t(Class), years: t(AcademicYear), subjects: t(Subject), users: t(User), sst: t(SectionSubjectTeacher) };
@@ -89,7 +90,7 @@ async function list(schoolId, q = {}) {
     const by = Object.fromEntries(counts.map((r) => [r.status, num(r.n)]));
     const sum = (...k) => k.reduce((n, x) => n + (by[x] || 0), 0);
     const [{ rows: years }, { rows: classes }, { rows: subjects }] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY "startDate" DESC NULLS LAST`, [String(schoolId)]),
+        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [String(schoolId)]),
         pool.query(`SELECT DISTINCT ON (lower(sub."subjectName")) sub."_id", sub."subjectName" FROM ${T.tests} ct JOIN ${T.subjects} sub ON sub."_id" = ct."subject"
                      WHERE ct."school" = $1::uuid ORDER BY lower(sub."subjectName"), sub."_id"`, [String(schoolId)]),

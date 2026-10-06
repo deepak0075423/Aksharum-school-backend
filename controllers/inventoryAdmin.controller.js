@@ -2217,7 +2217,7 @@ exports.budgetBoard = async (req, res) => {
                  WHERE "school" = ${mid} AND "status" <> 'cancelled'
                    AND "createdAt" >= date_trunc('month', now()) - INTERVAL '11 months'
                  GROUP BY 1`, mp.list),
-            AcademicYear.find({ school }).sort({ startDate: -1 }).lean(),
+            AcademicYear.find({ school }).lean(),
         ]);
         const yearById = new Map(years.map(y => [String(y._id), y]));
         // `load` only returns active budgets; a closed one still shows on this
@@ -2713,7 +2713,7 @@ exports.formMeta = async (req, res) => {
             masters(school),
             InventoryItem.find({ school, isActive: true })
                 .select('name itemCode unit purchasePrice gst category warehouse reorderLevel image').sort({ name: 1 }).lean(),
-            AcademicYear.find({ school }).sort({ startDate: -1 }).lean(),
+            AcademicYear.find({ school }).lean(),
             InventoryBudget.find({ school, status: 'active' }).select('name code department category').sort({ name: 1 }).lean(),
             User.find({ school, isActive: true, role: { $in: ['school_admin', 'teacher'] } })
                 .select('name role email profileImage').sort({ name: 1 }).limit(500).lean(),
