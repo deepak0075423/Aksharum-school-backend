@@ -20,6 +20,7 @@ const User                = require('../models/User');
 const { publishNotificationCount, publishToUser } = require('../utils/redisPublisher');
 const { sendSchoolMail, emailHeaderHtml, getMailContext } = require('../utils/schoolMailer');
 const notificationLinks   = require('./notificationLinks');
+const { escapeHtml: esc } = require('../utils/textRules');   // what a person typed stays text in the email
 
 async function _pushCount(userId) {
     try {
@@ -108,7 +109,7 @@ function _openButton(url) {
     if (!url) return '';
     return `
         <p style="margin:20px 0 0">
-          <a href="${url}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
+          <a href="${esc(url)}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
              padding:11px 22px;border-radius:8px;font-weight:600;font-size:.9rem">Open in Aksharum</a>
         </p>
         <p style="color:#9ca3af;font-size:.75rem;margin:10px 0 0;word-break:break-all">
@@ -121,11 +122,11 @@ function _emailHtml({ school, recipientName, title, body, openUrl }) {
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school, 'You have a new notification')}
       <div style="background:#f9fafb;padding:24px 28px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb;border-top:none">
-        <p style="margin-top:0">Dear <strong>${recipientName || 'User'}</strong>,</p>
+        <p style="margin-top:0">Dear <strong>${esc(recipientName || 'User')}</strong>,</p>
         <div style="background:#fff;border-left:4px solid #4f46e5;border-radius:0 8px 8px 0;padding:14px 18px;margin-bottom:16px">
-          <h2 style="margin:0 0 4px;font-size:1.05rem;color:#1e293b">${title}</h2>
+          <h2 style="margin:0 0 4px;font-size:1.05rem;color:#1e293b">${esc(title)}</h2>
         </div>
-        <p style="white-space:pre-wrap;line-height:1.6;margin:0">${body}</p>
+        <p style="white-space:pre-wrap;line-height:1.6;margin:0">${esc(body)}</p>
         ${_openButton(openUrl)}
         <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0">
         <p style="color:#9ca3af;font-size:.8rem;margin:0">This is an automated notification — please do not reply.</p>

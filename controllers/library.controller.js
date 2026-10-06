@@ -20,6 +20,7 @@ const Class                          = require('../models/Class');
 const ClassSection                   = require('../models/ClassSection');
 const TeacherProfile     = require('../models/TeacherProfile');
 const { notify }         = require('../services/notifyService');
+const { sheetTextProblem } = require('../middleware/textSafety');
 const {
     MAX_COPIES_PER_ADD, COPY_STATUSES, ACTIVE_ISSUANCE, MAX_LOAN_DAYS,
     fmtLibDate, getOrCreatePolicy, audit, reserveCopyCodes, bumpBookCounts,
@@ -825,6 +826,8 @@ exports.bulkUpload = async (req, res) => {
         const ws   = wb.Sheets[wb.SheetNames[0]];
         const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
         if (!rows.length) return res.status(400).json({ success: false, message: 'File is empty' });
+        const textBad = sheetTextProblem(rows);
+        if (textBad) return res.status(400).json({ success: false, message: textBad });
 
         // `copies` / `rackLocation` are optional; without them the import lands a
         // catalogue entry with nothing to issue, which is rarely what is wanted.

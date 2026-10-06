@@ -5,6 +5,7 @@ const Class        = require('../models/Class');
 const XLSX         = require('xlsx');
 
 const School = require('../models/School');
+const { sheetTextProblem } = require('../middleware/textSafety');
 
 // Legacy slugs kept working alongside the school's own configured list
 const LEGACY_TYPES = ['public', 'school_specific', 'optional', 'exam_break'];
@@ -265,6 +266,8 @@ exports.adminImportHolidays = async (req, res) => {
         const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
 
         if (!rows.length) return res.status(400).json({ success: false, message: 'File is empty' });
+        const textBad = sheetTextProblem(rows);
+        if (textBad) return res.status(400).json({ success: false, message: textBad });
 
         const docs   = [];
         const errors = [];

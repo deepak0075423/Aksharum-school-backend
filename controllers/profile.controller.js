@@ -4,6 +4,8 @@ const TeacherProfile = require('../models/TeacherProfile');
 const StudentProfile = require('../models/StudentProfile');
 const ParentProfile  = require('../models/ParentProfile');
 const { isPhone, normalizePhone } = require('../utils/validators');
+const { nameProblem } = require('../utils/textRules');
+const { fatherOrHusbandLabel } = require('../utils/fatherOrHusband');
 
 exports.getProfile = async (req, res) => {
     try {
@@ -25,6 +27,11 @@ exports.updateProfile = async (req, res) => {
         }
         if (updates.name !== undefined && !String(updates.name).trim())
             return res.status(400).json({ success: false, message: 'Name is required' });
+        if (updates.name !== undefined) {
+            const was = (await User.findById(req.userId).select('name').lean())?.name;
+            const badName = nameProblem(updates.name, 'Name', was);
+            if (badName) return res.status(400).json({ success: false, message: badName });
+        }
         if (updates.phone && !isPhone(updates.phone))
             return res.status(400).json({ success: false, message: 'Phone number must be a valid 10-digit mobile number' });
         if (updates.phone !== undefined) updates.phone = normalizePhone(updates.phone);
@@ -93,6 +100,11 @@ exports.updateMyEmployeeRecord = async (req, res) => {
             const d = new Date(updates.dob);
             if (Number.isNaN(d.getTime())) return res.status(400).json({ success: false, message: 'Invalid date of birth' });
             updates.dob = d;
+        }
+        const current = await TeacherProfile.findOne({ user: req.userId, school: req.schoolId }).select('fatherOrHusbandName emergencyContactName gender').lean();
+        for (const [k, label] of [['fatherOrHusbandName', fatherOrHusbandLabel(updates.gender || current?.gender, 'sentence')], ['emergencyContactName', 'Emergency contact name']]) {
+            const bad = updates[k] !== undefined && nameProblem(updates[k], label, current?.[k]);
+            if (bad) return res.status(400).json({ success: false, message: bad });
         }
         for (const k of ['emergencyContactPhone', 'alternatePhone']) {
             if (updates[k] && !isPhone(updates[k]))

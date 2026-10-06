@@ -52,8 +52,12 @@ const employeeIdUtil = require('../utils/employeeId');
 const { capacityErrorById } = require('../utils/sectionCapacity');
 const { identityClash, changed: idChanged } = require('../utils/identityNumbers');
 const { fatherOrHusbandLabel } = require('../utils/fatherOrHusband');
+const { schoolWithCode } = require('../services/schoolCode');
+const { nameProblem } = require('../utils/textRules');
 const { syncSectionsToSchoolSaturday } = require('../utils/timetableDays');
 const teacherDeps = require('../services/teacherDependencies');
+const { checkText } = require('../middleware/textSafety');
+const { escapeHtml: escHtml } = require('../utils/textRules');   // what a person typed stays text in an email
 
 // Generates a random 10-char one-time password, avoiding visually confusing chars
 const generateOTP = () => {
@@ -69,7 +73,7 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName, schoolId = null) => 
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school, `Welcome to ${schoolName}!`)}
       <div style="background:#f9fafb;padding:28px 32px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none">
-        <p style="margin-top:0">Hi <strong>${name}</strong>,</p>
+        <p style="margin-top:0">Hi <strong>${escHtml(name)}</strong>,</p>
         <p>Your school account has been created. Use the one-time credentials below to log in for the first time:</p>
         <table style="width:100%;border-collapse:collapse;margin:20px 0;background:#fff;border-radius:6px;border:1px solid #e5e7eb">
           <tr style="border-bottom:1px solid #e5e7eb">
@@ -78,7 +82,7 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName, schoolId = null) => 
           </tr>
           <tr style="border-bottom:1px solid #e5e7eb">
             <td style="padding:12px 16px;font-weight:600;color:#6b7280">Email</td>
-            <td style="padding:12px 16px">${email}</td>
+            <td style="padding:12px 16px">${escHtml(email)}</td>
           </tr>
           <tr>
             <td style="padding:12px 16px;font-weight:600;color:#6b7280">One-Time Password</td>
@@ -239,6 +243,8 @@ function validateStudentProfile(profile = {}, { partial = false } = {}) {
     }
     if (profile.dob !== undefined && profile.dob && Number.isNaN(new Date(profile.dob).getTime()))
         return 'Invalid date of birth';
+    const contactName = nameProblem(profile.emergencyContactName, 'Emergency contact name');
+    if (profile.emergencyContactName !== undefined && contactName) return contactName;
     if (profile.emergencyContactPhone !== undefined && String(profile.emergencyContactPhone || '').trim()
         && !isPhone(profile.emergencyContactPhone))
         return 'Emergency contact phone must be a valid 10-digit mobile number';
@@ -437,6 +443,9 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
         const label = key[0].toUpperCase() + key.slice(1);
         if (b.email && !isEmail(b.email)) return { parentId: null, error: `${label}'s email is not a valid email address` };
         if (b.phone && !isPhone(b.phone)) return { parentId: null, error: `${label}'s phone number must be a valid 10-digit mobile number` };
+        const badName = nameProblem(b.name, `${label}'s name`, existingBlocks?.[key]?.name);
+        if (badName) return { parentId: null, error: badName };
+        if (key === 'guardian' && b.relation && !/^[A-Za-z][A-Za-z ]*$/.test(b.relation)) return { parentId: null, error: "Guardian's relation can only have English letters and spaces" };
         if (b.aadhaarNumber && !AADHAAR_RE.test(b.aadhaarNumber)) return { parentId: null, error: `${label}'s Aadhaar number must be 12 digits` };
         if (b.panNumber && !PAN_RE.test(b.panNumber)) return { parentId: null, error: `${label}'s PAN number looks invalid (e.g. ABCDE1234F)` };
     }
@@ -1221,6 +1230,11 @@ exports.updateStudentFull = async (req, res) => {
         // An omitted parentId leaves the link alone; an empty one unlinks.
         const parentId    = req.body.parentId;
         const { name, phone, password, rollNumber, admissionNumber, currentClass, currentSection } = b;
+        if (name !== undefined) {
+            const was = (await User.findOne({ _id: req.params.id, school: req.schoolId }).select('name').lean())?.name;
+            const badName = nameProblem(name, 'Full name', was);
+            if (badName) return res.status(400).json({ success: false, message: badName });
+        }
 
         // Update User fields
         const userUpdate = {};
@@ -1360,6 +1374,8 @@ exports.updateUser = async (req, res) => {
         // the address signs in nowhere else.
         const target = await User.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!target) return res.status(404).json({ success: false, message: 'User not found' });
+        const badName = allowed.name !== undefined && nameProblem(allowed.name, 'Full name', target.name);
+        if (badName) return res.status(400).json({ success: false, message: badName });
         if (password) {
             const credGuard = await identity.guardAccountEdit(target, { password, schoolId: req.schoolId });
             if (credGuard) return res.status(400).json({ success: false, message: credGuard });
@@ -1505,7 +1521,7 @@ const addMembership = (body, role, school) => identity.createMembership(body, { 
  * That is what the Excel importer needs: a spreadsheet cannot carry the Aadhaar,
  * PAN or experience scans, and those are the ONLY rules it is excused from.
  */
-function validateTeacherIntake(b, files = {}, { requireDocuments = true } = {}) {
+function validateTeacherIntake(b, files = {}, { requireDocuments = true, current = {} } = {}) {
     const req = (value, label) => (!String(value ?? '').trim() ? `${label} is required` : null);
     // A sentinel keeps every `if (!file(...))` check below satisfied when the
     // caller has no uploads to offer.
@@ -1522,6 +1538,10 @@ function validateTeacherIntake(b, files = {}, { requireDocuments = true } = {}) 
         || req(b.emergencyContactPhone, 'Emergency contact phone');
     if (e) return e;
     if (!GENDERS.includes(b.gender)) return 'Gender must be Male, Female or Other';
+    e = nameProblem(b.name, 'Full name', current.name)
+        || nameProblem(b.fatherOrHusbandName, fatherOrHusbandLabel(b.gender, 'sentence'), current.fatherOrHusbandName)
+        || nameProblem(b.emergencyContactName, 'Emergency contact name', current.emergencyContactName);
+    if (e) return e;
     if (b.dob && Number.isNaN(new Date(b.dob).getTime())) return 'Invalid date of birth';
     if (!isPhone(b.emergencyContactPhone)) return 'Emergency contact phone must be a valid 10-digit mobile number';
 
@@ -1821,6 +1841,7 @@ exports.updateTeacherFull = async (req, res) => {
         const problem = validateTeacherIntake(
             { ...(existing || {}), ...b },
             { ...fileStubsFor(existing), ...files },
+            { current: { name: user.name, fatherOrHusbandName: existing?.fatherOrHusbandName, emergencyContactName: existing?.emergencyContactName } },
         );
         if (problem) return res.status(400).json({ success: false, message: problem });
 
@@ -1890,6 +1911,8 @@ exports.createStudent = async (req, res) => {
         const newParent = parseMaybeJson(req.body.newParent);
         const parentId  = req.body.parentId || null;
         if (!name?.trim())  return res.status(400).json({ success: false, message: 'Full name is required' });
+        const badName = nameProblem(name, 'Full name');
+        if (badName) return res.status(400).json({ success: false, message: badName });
         if (!email?.trim()) return res.status(400).json({ success: false, message: 'Email is required' });
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, message: 'Invalid email format' });
         if (phone && !isPhone(phone)) return res.status(400).json({ success: false, message: 'Phone number must be a valid 10-digit mobile number' });
@@ -1998,7 +2021,7 @@ exports.createStudent = async (req, res) => {
 exports.createAdmin = async (req, res) => {
     try {
         const err = validate(req.body, {
-            name:  { label: 'Full name', required: true, minLen: 2 },
+            name:  { label: 'Full name', required: true, minLen: 2, type: 'name' },
             email: { label: 'Email', required: true, type: 'email' },
             phone: { label: 'Phone', type: 'phone' },
         });
@@ -2366,6 +2389,8 @@ exports.bulkTeachers = async (req, res) => {
                 failures.push({ row: rowNum, reason, raw: rows[i] });
                 push({ type: 'row_done', row: rowNum, name: name || '?', success: false, reason });
             };
+            const textBad = checkText(rows[i]);
+            if (textBad) { fail(textBad); continue; }
 
             // Dates are dd/mm/yyyy. They are parsed here rather than left to the
             // shared validator, which would hand the string to `new Date` and
@@ -2611,6 +2636,8 @@ exports.bulkStudents = async (req, res) => {
                 failures.push({ row: rowNum, reason, raw: rows[i] });
                 push({ type: 'row_done', row: rowNum, name, success: false, reason });
             };
+            const textBad = checkText(rows[i]);
+            if (textBad) { fail(textBad); continue; }
 
             // ── Account + enrolment: the columns the profile validator does not
             //    own, because they carry their own uniqueness and seat checks.
@@ -2623,6 +2650,8 @@ exports.bulkStudents = async (req, res) => {
             if (missing.length) { fail(`Missing: ${missing.join(', ')}`); continue; }
             if (!isEmail(email)) { fail('Invalid student email'); continue; }
             if (!isPhone(phone)) { fail(`Invalid phone "${phone}" — enter a 10-digit mobile number`); continue; }
+            const badName = nameProblem(name, 'Full Name');
+            if (badName) { fail(badName); continue; }
 
             // Dates are dd/mm/yyyy; `new Date` would read them as mm/dd/yyyy.
             const dates   = {};
@@ -3494,6 +3523,10 @@ exports.updateSchoolSettings = async (req, res) => {
             code:    { label: 'School Code', regex: /^$|^[A-Za-z0-9_-]{2,20}$/, regexMsg: 'School Code must be 2-20 letters, numbers, hyphens or underscores' },
         });
         if (err) return res.status(400).json({ success: false, message: err });
+        // Unique across the platform — another school's name is not this school's to see.
+        if (code && await schoolWithCode(code, req.schoolId)) {
+            return res.status(400).json({ success: false, message: `School code "${String(code).trim()}" is already in use — choose another`, field: 'code' });
+        }
         const update = {};
         if (code    !== undefined) update.code    = (code    || '').trim();
         if (email   !== undefined) update.email   = (email   || '').trim().toLowerCase();
@@ -3818,7 +3851,7 @@ exports.testSmtp = async (req, res) => {
               ${emailHeaderHtml(school, 'SMTP configuration test')}
               <div style="background:#f9fafb;padding:24px 28px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb;border-top:none">
                 <p style="margin-top:0">✅ Your school's SMTP settings are working.</p>
-                <p style="color:#6b7280;font-size:.85rem;margin-bottom:0">All emails for <strong>${school.name}</strong> will now be sent through this mailbox.</p>
+                <p style="color:#6b7280;font-size:.85rem;margin-bottom:0">All emails for <strong>${escHtml(school.name)}</strong> will now be sent through this mailbox.</p>
               </div>
             </div>`,
             rethrow: true,

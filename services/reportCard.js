@@ -57,6 +57,7 @@ const overallEngine = require('./resultOverall');
 const schoolClock = require('./schoolClock');
 const { notify } = require('./notifyService');
 const { yearOrderSql, byYear, newestYear } = require('../utils/listOrder');
+const { escapeHtml: escHtml } = require('../utils/textRules');   // what a person typed stays text in an email
 
 const t = (M) => `"${M.tableName}"`;
 const T = {
@@ -675,9 +676,9 @@ async function sendCards(ctx, { academicYear, sectionId, term = '', studentId = 
                         html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
                                  ${emailHeaderHtml(school, `Report card · ${label}`)}
                                  <div style="background:#f9fafb;padding:24px 28px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
-                                   <p style="margin-top:0">Dear ${p.name || 'Parent'},</p>
-                                   <p>${c.student.name}'s report card for ${label} is attached. You can also read it in the app, under Results → Report Card.</p>
-                                   ${c.verification ? `<p style="color:#6b7280;font-size:13px">Verify it at <a href="${c.verification.url}">${c.verification.url}</a></p>` : ''}
+                                   <p style="margin-top:0">Dear ${escHtml(p.name || 'Parent')},</p>
+                                   <p>${escHtml(c.student.name)}'s report card for ${escHtml(label)} is attached. You can also read it in the app, under Results → Report Card.</p>
+                                   ${c.verification ? `<p style="color:#6b7280;font-size:13px">Verify it at <a href="${escHtml(c.verification.url)}">${escHtml(c.verification.url)}</a></p>` : ''}
                                  </div></div>`,
                         attachments: [{ filename, content: pdf, contentType: 'application/pdf' }],
                     });

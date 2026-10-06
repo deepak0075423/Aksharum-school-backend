@@ -18,8 +18,14 @@ const { sendSchoolMail, emailHeaderHtml, getMailContext, sendSchoolAddedEmail } 
 // header of services/accountIdentity.js.
 const identity = require('../services/accountIdentity');
 const { validate, passwordError, isPhone, normalizePhone } = require('../utils/validators');
+const { natural } = require('../utils/listOrder');
+const { textProblem, nameProblem } = require('../utils/textRules');
+const { STATES_AND_UTS, isPincode } = require('../utils/indiaStates');
+const { schoolWithCode, isCodeClash } = require('../services/schoolCode');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
+const { checkText } = require('../middleware/textSafety');
+const { escapeHtml: escHtml } = require('../utils/textRules');   // what a person typed stays text in an email
 
 const generateOTP = () => {
     const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
@@ -33,7 +39,7 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName = 'Aksharum', schoolI
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school, `Welcome to ${school?.name || schoolName}!`)}
       <div style="background:#f9fafb;padding:28px 32px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none">
-        <p style="margin-top:0">Hi <strong>${name}</strong>,</p>
+        <p style="margin-top:0">Hi <strong>${escHtml(name)}</strong>,</p>
         <p>Your account has been created. Use the one-time credentials below to log in for the first time:</p>
         <table style="width:100%;border-collapse:collapse;margin:20px 0;background:#fff;border-radius:6px;border:1px solid #e5e7eb">
           <tr style="border-bottom:1px solid #e5e7eb">
@@ -42,7 +48,7 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName = 'Aksharum', schoolI
           </tr>
           <tr style="border-bottom:1px solid #e5e7eb">
             <td style="padding:12px 16px;font-weight:600;color:#6b7280">Email</td>
-            <td style="padding:12px 16px">${email}</td>
+            <td style="padding:12px 16px">${escHtml(email)}</td>
           </tr>
           <tr>
             <td style="padding:12px 16px;font-weight:600;color:#6b7280">One-Time Password</td>
@@ -109,10 +115,16 @@ exports.getSchool = async (req, res) => {
 
 const SCHOOL_BOARDS = ['CBSE', 'ICSE', 'State Board', 'IB', 'Cambridge (IGCSE)', 'NIOS', 'Other'];
 // The two choices that do not name a board by themselves — the school has to.
-const NAMED_BOARDS = { 'State Board': 'State Board Name', 'Other': 'Board Name' };
+const NAMED_BOARDS = { 'State Board': 'State Board Name', 'Other': 'Other Board Name' };
+// What each named board may hold: "Other" is a plain name, letters and spaces
+// only; a state board's name may carry its short form, "… (MSBSHSE)".
+const BOARD_NAME_RULE = {
+    'Other':       { ok: /^[A-Za-z ]+$/, msg: 'Other Board Name can only have English letters and spaces' },
+    'State Board': { ok: /^[A-Za-z][A-Za-z .,&'()-]*$/, msg: "State Board Name can only have English letters, spaces and . , & ' ( ) -" },
+};
 
 const _validateSchool = (body) => {
-    const required = { name: 'School Name', code: 'School Code', board: 'School Board', email: 'Email', phone: 'Phone', address: 'Address', city: 'City', state: 'State', country: 'Country' };
+    const required = { name: 'School Name', code: 'School Code', board: 'School Board', email: 'Email', phone: 'Phone', address: 'Address', pincode: 'Pincode', city: 'City', state: 'State', country: 'Country' };
     for (const [field, label] of Object.entries(required)) {
         if (!body[field] || !String(body[field]).trim()) return `${label} is required`;
     }
@@ -122,7 +134,12 @@ const _validateSchool = (body) => {
         const name  = String(body.boardName ?? '').trim();
         if (!name) return `${label} is required when the board is "${body.board}"`;
         if (name.length < 2 || name.length > 100) return `${label} must be 2-100 characters`;
+        if (!BOARD_NAME_RULE[body.board].ok.test(name)) return BOARD_NAME_RULE[body.board].msg;
     }
+    if (!isPincode(body.pincode)) return 'Pincode must be 6 digits';
+    if (!STATES_AND_UTS.includes(String(body.state).trim())) return 'Select a valid Indian state or union territory';
+    const cityProblem = textProblem(String(body.city).trim(), 'City', 'name');
+    if (cityProblem) return cityProblem;
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return 'Valid email is required';
     if (!isPhone(body.phone)) return 'Phone must be a valid 10-digit mobile number';
     if (body.website && !/^https?:\/\/.+\..+/.test(body.website)) return 'Website must be a valid URL starting with http:// or https://';
@@ -145,19 +162,28 @@ const _buildSchoolData = (body, file) => {
     return data;
 };
 
+/** The code is the platform's to give once: refused when another school holds it. */
+const codeClash = async (code, exceptId = null) => {
+    const other = await schoolWithCode(code, exceptId);
+    return other ? `School code "${String(code).trim()}" is already used by ${other.name}` : null;
+};
+
 exports.createSchool = async (req, res) => {
     try {
-        const err = _validateSchool(req.body);
-        if (err) return res.status(400).json({ success: false, message: err });
+        const err = _validateSchool(req.body) || await codeClash(req.body.code);
+        if (err) return res.status(400).json({ success: false, message: err, ...(/^School code\b/i.test(err) ? { field: 'code' } : {}) });
         const school = await School.create(_buildSchoolData(req.body, req.file));
         res.status(201).json({ success: true, data: school });
-    } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+    } catch (err) {
+        if (isCodeClash(err)) return res.status(400).json({ success: false, message: `School code "${String(req.body.code).trim()}" is already in use`, field: 'code' });
+        res.status(400).json({ success: false, message: err.message });
+    }
 };
 
 exports.updateSchool = async (req, res) => {
     try {
-        const err = _validateSchool(req.body);
-        if (err) return res.status(400).json({ success: false, message: err });
+        const err = _validateSchool(req.body) || await codeClash(req.body.code, req.params.id);
+        if (err) return res.status(400).json({ success: false, message: err, ...(/^School code\b/i.test(err) ? { field: 'code' } : {}) });
         const data = _buildSchoolData(req.body, req.file);
         const previous = data.logo !== undefined
             ? (await School.findById(req.params.id).select('logo').lean())?.logo || null
@@ -174,7 +200,10 @@ exports.updateSchool = async (req, res) => {
             if (members.length) await authCache.invalidateMany(members.map((u) => String(u._id)));
         }
         res.json({ success: true, data: school });
-    } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+    } catch (err) {
+        if (isCodeClash(err)) return res.status(400).json({ success: false, message: `School code "${String(req.body.code).trim()}" is already in use`, field: 'code' });
+        res.status(400).json({ success: false, message: err.message });
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -323,7 +352,7 @@ exports.createUser = async (req, res) => {
     try {
         const { name, email, role } = req.body;
         const err = validate(req.body, {
-            name:  { label: 'Name', required: true, minLen: 2 },
+            name:  { label: 'Name', required: true, minLen: 2, type: 'name' },
             email: { label: 'Email', required: true, type: 'email' },
             role:  { label: 'Role', required: true, enum: USER_ROLES },
         });
@@ -358,6 +387,9 @@ exports.updateUser = async (req, res) => {
             role: { label: 'Role', required: true, enum: USER_ROLES },
         });
         if (err) return res.status(400).json({ success: false, message: err });
+        const was = (await User.findById(req.params.id).select('name').lean())?.name;
+        const badName = nameProblem(name, 'Name', was);
+        if (badName) return res.status(400).json({ success: false, message: badName });
         const school = (req.body.school && req.body.school !== '') ? req.body.school : null;
         if (role !== 'super_admin' && !school)
             return res.status(400).json({ success: false, message: 'School is required for this role' });
@@ -465,6 +497,8 @@ const _bulkImport = async (req, res, role) => {
             const name  = String(row.name  || row.Name  || '').trim();
             const email = String(row.email || row.Email || '').trim().toLowerCase();
             if (!name || !email) { errors.push({ email: email || '?', reason: 'name/email missing' }); continue; }
+            const textBad = checkText(row) || nameProblem(name, 'Name');
+            if (textBad) { errors.push({ email, reason: textBad }); continue; }
             try {
                 const otp = generateOTP();
                 const { user, linked, reused, inactive } = await identity.createMembership(
@@ -547,6 +581,13 @@ exports.bulkStudents = async (req, res) => {
 
             push({ type: 'processing', current: i + 1, total: rows.length, name: name || `Row ${rowNum}` });
 
+            const textBad = checkText(row);
+            if (textBad) {
+                errors.push({ row: rowNum, name, reason: textBad });
+                push({ type: 'row_done', row: rowNum, name, success: false, reason: textBad });
+                continue;
+            }
+
             const missing = [];
             if (!name)        missing.push('Full Name');
             if (!email)       missing.push('Email Address');
@@ -577,6 +618,12 @@ exports.bulkStudents = async (req, res) => {
             if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parentEmail)) {
                 errors.push({ row: rowNum, name, reason: 'Invalid parent email' });
                 push({ type: 'row_done', row: rowNum, name, success: false, reason: 'Invalid parent email' });
+                continue;
+            }
+            const badName = nameProblem(name, 'Full Name') || nameProblem(parentName, 'Parent Full Name');
+            if (badName) {
+                errors.push({ row: rowNum, name, reason: badName });
+                push({ type: 'row_done', row: rowNum, name, success: false, reason: badName });
                 continue;
             }
             if (!isPhone(phone) || !isPhone(parentPhone)) {
@@ -757,7 +804,8 @@ const designationSvc = require('../services/designationService');
 
 exports.getPermissions = async (req, res) => {
     try {
-        const schools = await School.find().select('name logo modules designations').lean();
+        const schools = (await School.find().select('name logo modules designations').lean())
+            .sort((a, b) => natural(a.name, b.name));
         res.json({ success: true, data: schools });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };

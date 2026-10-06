@@ -2,6 +2,7 @@
 const nodemailer        = require('nodemailer');
 const globalTransporter = require('../config/mailer');
 const School            = require('../models/School');
+const { escapeHtml: esc } = require('./textRules');   // what a person typed stays text in the email
 
 // Public base URL of THIS backend (serves /uploads). Falls back to localhost dev port.
 const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
@@ -99,9 +100,9 @@ function emailHeaderHtml(school, subtitle = '') {
     const name = school?.name || process.env.APP_NAME || 'School';
     return `
       <div style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 32px;border-radius:12px 12px 0 0;text-align:center">
-        ${logo ? `<img src="${logo}" alt="${name}" style="max-height:64px;max-width:200px;object-fit:contain;background:#fff;border-radius:8px;padding:6px;margin-bottom:10px"/>` : ''}
-        <h1 style="color:#fff;margin:0;font-size:1.35rem">${logo ? '' : '🎓 '}${name}</h1>
-        ${subtitle ? `<p style="margin:6px 0 0;color:rgba(255,255,255,.85);font-size:13px">${subtitle}</p>` : ''}
+        ${logo ? `<img src="${esc(logo)}" alt="${esc(name)}" style="max-height:64px;max-width:200px;object-fit:contain;background:#fff;border-radius:8px;padding:6px;margin-bottom:10px"/>` : ''}
+        <h1 style="color:#fff;margin:0;font-size:1.35rem">${logo ? '' : '🎓 '}${esc(name)}</h1>
+        ${subtitle ? `<p style="margin:6px 0 0;color:rgba(255,255,255,.85);font-size:13px">${esc(subtitle)}</p>` : ''}
       </div>`;
 }
 
@@ -126,9 +127,9 @@ function sendSchoolAddedEmail(to, name, roleLabel, schoolName, schoolId = null) 
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school, `You've been added to ${where}`)}
       <div style="background:#f9fafb;padding:28px 32px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none">
-        <p style="margin-top:0">Hi <strong>${name}</strong>,</p>
-        <p>You have been added to <strong>${where}</strong> as a ${roleLabel}.</p>
-        <p>Nothing changes about how you sign in — keep using <strong>${to}</strong> and your existing
+        <p style="margin-top:0">Hi <strong>${esc(name)}</strong>,</p>
+        <p>You have been added to <strong>${esc(where)}</strong> as a ${roleLabel}.</p>
+        <p>Nothing changes about how you sign in — keep using <strong>${esc(to)}</strong> and your existing
            password. After signing in you will be asked which school you want to open, and you can
            switch between them at any time from your profile.</p>
         <p style="margin:24px 0">

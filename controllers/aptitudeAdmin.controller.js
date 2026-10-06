@@ -24,6 +24,7 @@ const Class            = require('../models/Class');
 const Subject          = require('../models/Subject');
 const StudentProfile   = require('../models/StudentProfile');
 const User             = require('../models/User');
+const { sheetTextProblem } = require('../middleware/textSafety');
 const {
     getActiveYear, examSectionIds, examWindow, examStage,
     SERVER_TZ, startSql, endSql, stageSql, sectionsSql, scoredAttemptsSql,
@@ -560,6 +561,8 @@ exports.importQuestions = async (req, res) => {
         rows = rows.filter(r => Object.values(r).some(v => String(v).trim() !== ''));
         if (!rows.length) return bad(res, 'The sheet has no rows');
         if (rows.length > 500) return bad(res, 'Import at most 500 questions at a time');
+        const textBad = sheetTextProblem(rows);
+        if (textBad) return bad(res, textBad);
 
         const existing = await AptitudeQuestion.find({ exam: exam._id }).select('questionText marks order').lean();
         const norm = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();

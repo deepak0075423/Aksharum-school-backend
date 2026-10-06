@@ -8,6 +8,7 @@ const mailer              = require('../config/mailer');
 const { publishNotificationCount, publishToUser } = require('../utils/redisPublisher');
 const { sendSchoolMail, emailHeaderHtml } = require('../utils/schoolMailer');
 const notificationLinks   = require('../services/notificationLinks');
+const { escapeHtml: esc } = require('../utils/textRules');   // what a person typed stays text in the email
 
 // Recompute and push unread count for one user via the WebSocket Gateway
 async function _pushCount(userId) {
@@ -130,10 +131,10 @@ function dispatchEmails({ recipients, title, body, schoolName, schoolId, school,
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school || { name: schoolName }, title)}
       <div style="background:#f9fafb;padding:24px 28px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none">
-        <p style="white-space:pre-wrap;line-height:1.6;margin:0">${body}</p>
+        <p style="white-space:pre-wrap;line-height:1.6;margin:0">${esc(body)}</p>
         ${openUrl ? `
         <p style="margin:20px 0 0">
-          <a href="${openUrl}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
+          <a href="${esc(openUrl)}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
              padding:11px 22px;border-radius:8px;font-weight:600;font-size:.9rem">Open in Aksharum</a>
         </p>
         <p style="color:#9ca3af;font-size:.75rem;margin:10px 0 0;word-break:break-all">

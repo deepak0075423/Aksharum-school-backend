@@ -62,6 +62,14 @@ const STEPS = [
               WHERE "status" IN ('active', 'blocked')`,
     },
     {
+        // A school code is unique across the platform, whatever its case or
+        // spacing (services/schoolCode checks first; this holds a race). Codes
+        // left blank by older records do not count.
+        name: 'schools: one school per code',
+        sql:  `CREATE UNIQUE INDEX IF NOT EXISTS "ux_schools_code_ci"
+                 ON "schools" (lower(btrim("code"))) WHERE btrim(COALESCE("code", '')) <> ''`,
+    },
+    {
         // Medical Room: one scheduled dose per plan per time slot. The doses of
         // a day are generated both by the sweep and when the administration
         // screen is opened; the index is what makes the two arriving together

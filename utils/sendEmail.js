@@ -1,4 +1,5 @@
 const transporter = require('../config/mailer');
+const { escapeHtml: esc } = require('./textRules');   // what a person typed stays text in the email
 const { sendSchoolMail, emailHeaderHtml, getMailContext } = require('./schoolMailer');
 
 const sendWelcomeEmail = async ({ to, name, email, tempPassword, role, schoolName }) => {
@@ -48,19 +49,19 @@ const sendWelcomeEmail = async ({ to, name, email, tempPassword, role, schoolNam
   </div>
   <div class="body">
     <div class="badge">${roleLabel}</div>
-    <div class="greeting">Hello, <strong style="color:#a5b4fc">${name}</strong>! 👋</div>
+    <div class="greeting">Hello, <strong style="color:#a5b4fc">${esc(name)}</strong>! 👋</div>
     <p style="color:#94a3b8; font-size:14px; margin-bottom:20px;">Your account has been successfully created. Here are your login credentials:</p>
     
     <div class="cred-box">
       <div class="cred-row">
         <span class="cred-label">📧 Email / Username</span>
-        <span class="cred-value">${email}</span>
+        <span class="cred-value">${esc(email)}</span>
       </div>
       <div class="cred-row">
         <span class="cred-label">🔑 Temporary Password</span>
-        <span class="cred-value">${tempPassword}</span>
+        <span class="cred-value">${esc(tempPassword)}</span>
       </div>
-      ${schoolName ? `<div class="cred-row"><span class="cred-label">🏫 School</span><span class="cred-value">${schoolName}</span></div>` : ''}
+      ${schoolName ? `<div class="cred-row"><span class="cred-label">🏫 School</span><span class="cred-value">${esc(schoolName)}</span></div>` : ''}
       <div class="cred-row">
         <span class="cred-label">👤 Role</span>
         <span class="cred-value">${roleLabel}</span>
@@ -134,10 +135,10 @@ const sendOtpEmail = async ({ to, name, otp }) => {
     <p>Password Reset Request</p>
   </div>
   <div class="body">
-    <div class="greeting">Hello, <strong>${name}</strong>! 👋</div>
+    <div class="greeting">Hello, <strong>${esc(name)}</strong>! 👋</div>
     <p style="color:#4b5563; font-size:14px;">We received a request to reset your password. Use the OTP below to verify your identity. This code is valid for <strong>10 minutes</strong>.</p>
     <div class="otp-box">
-      <div class="otp-code">${otp}</div>
+      <div class="otp-code">${esc(otp)}</div>
       <div class="otp-label">One-Time Password (OTP)</div>
     </div>
     <div class="warning">
@@ -178,7 +179,7 @@ const sendAttendanceNotification = async ({ to, parentName, studentName, date, s
     const statusColor = isPresent ? '#10b981' : isLate ? '#f59e0b' : isHalf ? '#4f46e5' : '#ef4444';
     const statusBg = isPresent ? '#d1fae5' : isLate ? '#fef3c7' : isHalf ? '#e0e7ff' : '#fee2e2';
     const statusIcon = isPresent ? '✅' : isLate ? '⏰' : isHalf ? '🌗' : '❌';
-    const where = subjectName ? ` in <strong>${subjectName}</strong>` : '';
+    const where = subjectName ? ` in <strong>${esc(subjectName)}</strong>` : '';
     const message = isPresent
         ? `Your child is marked <strong>present</strong>${where} today.`
         : isLate
@@ -220,7 +221,7 @@ const sendAttendanceNotification = async ({ to, parentName, studentName, date, s
 <div class="wrapper">
   ${emailHeaderHtml(school, schoolName || 'Attendance Notification')}
   <div class="body">
-    <p style="color:#374151; font-size:15px; margin-bottom:20px;">Dear <strong>${parentName}</strong>,</p>
+    <p style="color:#374151; font-size:15px; margin-bottom:20px;">Dear <strong>${esc(parentName)}</strong>,</p>
     <div class="status-box">
       <div class="status-icon">${statusIcon}</div>
       <div class="status-text">${status.toUpperCase()}</div>
@@ -229,7 +230,7 @@ const sendAttendanceNotification = async ({ to, parentName, studentName, date, s
     <div style="border:1px solid #e5e7eb; border-radius:10px; padding:16px; margin-top:16px;">
       <div class="info-row">
         <span class="info-label">🎒 Student</span>
-        <span class="info-value">${studentName}</span>
+        <span class="info-value">${esc(studentName)}</span>
       </div>
       <div class="info-row">
         <span class="info-label">📅 Date</span>
@@ -294,13 +295,13 @@ const sendNotificationEmail = async ({ to, recipientName, title, body, senderRol
   </div>
   <div class="body">
     <p style="color:#374151;font-size:15px;margin-bottom:20px;">
-      Dear <strong>${recipientName}</strong>,
+      Dear <strong>${esc(recipientName)}</strong>,
     </p>
     <div class="title-box">
-      <h2>${title}</h2>
+      <h2>${esc(title)}</h2>
       <div class="from">From: ${roleLabel}</div>
     </div>
-    <div class="message-body">${body}</div>
+    <div class="message-body">${esc(body)}</div>
     <div class="footer">
       This is an automated notification from ${process.env.APP_NAME || 'Aksharum'}.<br/>
       Please do not reply to this email.

@@ -84,6 +84,11 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // get the same check once multer has read them (middleware/upload).
 app.use(require('./middleware/phoneFields').phoneFields);
 
+// Text is English and never markup (no <script>, no tags) in every request —
+// refused with a 400 naming the field. Multipart forms are checked once multer
+// has read them (middleware/upload). See utils/textRules.
+app.use(require('./middleware/textSafety').textSafety);
+
 // Trust the reverse proxy so req.ip / X-Forwarded-For reflect the real client
 // (nginx / load balancer sits in front in production).
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1);
@@ -187,7 +192,7 @@ app.use((req, res) => {
 
 // ── Global Error Handler ──────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
-    if (err.code !== 'INVALID_PHONE') console.error(err);   // a refused phone number is the user's to fix, not a fault
+    if (err.code !== 'INVALID_PHONE' && err.code !== 'INVALID_TEXT') console.error(err);   // a refused field is the user's to fix, not a fault
     const status = err.status || 500;
     res.status(status).json({
         success: false,

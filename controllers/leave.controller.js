@@ -19,6 +19,7 @@ const { commitTransition, recordAdjustments } = require('../services/leaveBalanc
 // Cross-module effects. Each one is gated on the target module's own flag, so a
 // school without Attendance or Timetable sees leave behave exactly as before.
 const leaveIntegrations = require('../services/leaveIntegrations');
+const { sheetTextProblem } = require('../middleware/textSafety');
 // Working-day / weekly-off arithmetic is shared with the Comp Off engine so the
 // two can never disagree about whether a given Saturday is a working day.
 const {
@@ -1997,6 +1998,8 @@ exports.adminBulkAllocateExcel = async (req, res) => {
         const ws   = wb.Sheets[wb.SheetNames[0]];
         const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
         if (!rows.length) return res.status(400).json({ success: false, message: 'File is empty' });
+        const textBad = sheetTextProblem(rows);
+        if (textBad) return res.status(400).json({ success: false, message: textBad });
 
         const ay = req.body.academicYear || await getActiveAcademicYearLabel(req.schoolId);
         if (!ay) return res.status(400).json({ success: false, message: 'No active academic year' });

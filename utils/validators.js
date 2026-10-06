@@ -42,6 +42,7 @@ const isTime     = (v) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v ?? '').trim(
 const TYPE_CHECKS = {
     email:    { check: isEmail,    msg: (l) => `${l} must be a valid email address` },
     phone:    { check: isPhone,    msg: (l) => `${l} must be a valid 10-digit mobile number` },
+    name:     { check: (v) => /^[A-Za-z][A-Za-z .'-]*$/.test(String(v).trim()), msg: (l) => `${l} can only have English letters, spaces and . ' -` },
     url:      { check: isURL,      msg: (l) => `${l} must be a valid URL starting with http:// or https://` },
     pincode:  { check: isPincode,  msg: (l) => `${l} must be 4-10 digits` },
     objectId: { check: isObjectId, msg: (l) => `${l} is not a valid id` },

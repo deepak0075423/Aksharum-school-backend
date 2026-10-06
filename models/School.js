@@ -32,6 +32,12 @@ const SchoolSchema = new db.Schema({
         trim: true,
         default: '',
     },
+    // Six-digit Indian PIN code; the school form fills city and state from it.
+    pincode: {
+        type: String,
+        trim: true,
+        default: '',
+    },
     state: {
         type: String,
         trim: true,

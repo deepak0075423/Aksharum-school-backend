@@ -38,6 +38,8 @@ router.patch('/users/:id/toggle',             guard, ctrl.toggleUserStatus);
 router.post('/users/:id/login-link',          guard, ctrl.generateLoginLink);
 
 // Module Permissions — school-level enablement (the top of the hierarchy)
+// The school form fills city and state from a PIN code, as the teacher form does.
+router.get('/pincode/:pincode',    guard, require('../../controllers/admin.controller').pincodeLookup);
 router.get('/permissions',         guard, ctrl.getPermissions);
 router.put('/permissions',         guard, ctrl.updatePermissions);
 router.put('/permissions/bulk',    guard, ctrl.bulkUpdatePermissions);

@@ -3,6 +3,7 @@ const multer = require('multer');
 const path   = require('path');
 const fs     = require('fs');
 const { checkPhoneFields } = require('./phoneFields');
+const { checkText, textOptionsFor, textExempt } = require('./textSafety');
 
 const ensureDir = (dir) => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -84,10 +85,11 @@ const uploadMedicalDoc = multer({ storage: diskStorage('medical-docs'), fileFilt
 
 /**
  * A multipart form's text fields only exist once multer has read it, so the
- * phone-number rule that server.js applies to every other body
- * (middleware/phoneFields) is applied here, straight after. A refusal goes
- * on as a 400 error — some handlers run these by hand and wait on next() —
- * and takes the files it brought with it.
+ * rules server.js applies to every other body — phone numbers
+ * (middleware/phoneFields), English text without markup (middleware/
+ * textSafety) — are applied here, straight after. A refusal goes on as a 400
+ * error — some handlers run these by hand and wait on next() — and takes the
+ * files it brought with it.
  */
 const withPhoneCheck = (instance) => {
     for (const kind of ['single', 'array', 'fields', 'none', 'any']) {
@@ -96,13 +98,15 @@ const withPhoneCheck = (instance) => {
             const read = make(...args);
             return (req, res, next) => read(req, res, (err) => {
                 if (err) return next(err);
-                const bad = checkPhoneFields(req.body);
+                const phoneBad = checkPhoneFields(req.body);
+                const textBad = phoneBad ? null : (textExempt(req) ? null : checkText(req.body, textOptionsFor(req)));
+                const bad = phoneBad || textBad;
                 if (!bad) return next();
                 const files = [req.file, ...(Array.isArray(req.files) ? req.files : Object.values(req.files || {}).flat())];
                 for (const f of files) if (f?.path) fs.promises.unlink(f.path).catch(() => {});
                 const refusal = new Error(bad);
                 refusal.status = 400;
-                refusal.code = 'INVALID_PHONE';
+                refusal.code = phoneBad ? 'INVALID_PHONE' : 'INVALID_TEXT';
                 return next(refusal);
             });
         };

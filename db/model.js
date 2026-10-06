@@ -402,7 +402,9 @@ function createModel(name, schema) {
         const have = new Set(existing.map((r) => r.column_name));
         for (const [fname, meta] of Object.entries(parsed.fields)) {
             if (!have.has(fname)) {
-                await run(`ALTER TABLE ${T} ADD COLUMN ${qi(fname)} ${pgType(meta)}`);
+                // IF NOT EXISTS: several workers boot at once, and the one that loses the
+                // race to add a new field must not crash on it (config/db exits on error).
+                await run(`ALTER TABLE ${T} ADD COLUMN IF NOT EXISTS ${qi(fname)} ${pgType(meta)}`);
             }
         }
 
