@@ -20,6 +20,13 @@ router.post('/new-password',     ctrl.newPassword);
 router.post('/reset-password',   verifyToken, ctrl.resetPassword);
 router.get('/magic/:token',      ctrl.magicLogin);
 router.get('/me',                verifyToken, ctrl.getMe);
+// A 12-hour token that opens the private upload folders and nothing else
+// (services/privateFiles) — the web app keeps it in a cookie, the phone app
+// adds it to file addresses.
+router.get('/file-token',        verifyToken, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, data: require('../../services/privateFiles').issueToken(req.user) });
+});
 router.post('/refresh',          ctrl.refreshToken);
 
 module.exports = router;

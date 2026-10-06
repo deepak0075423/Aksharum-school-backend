@@ -104,6 +104,9 @@ const ParentProfileSchema = new db.Schema({
         type: Date,
         default: Date.now,
     },
+    // The language the school's Medical Room writes to this parent in: '' (the school's choice), 'en' or 'hi'
+    // (services/medicalLang).
+    medicalLanguage: { type: String, default: '' },
 });
 
 module.exports = db.model('ParentProfile', ParentProfileSchema);

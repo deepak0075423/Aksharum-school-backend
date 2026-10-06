@@ -71,4 +71,14 @@ const uploadHostelDoc = multer({ storage: diskStorage('hostel-docs'), fileFilter
 // Evidence for an attendance correction — a medical certificate, a note from home.
 const uploadAttendanceDoc = multer({ storage: diskStorage('attendance-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024, files: 3 } });
 
-module.exports = { uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
+// Medical Room files — prescriptions, certificates, reports, injury photos.
+// Saved under uploads/medical-docs, which server.js does NOT serve: they are
+// read through /api/medical/files (controllers/medicalFiles) after an access
+// check. No SVG: a drawing can carry script, and these open in the browser.
+const medicalFilter = (req, file, cb) => {
+    const ok = /\.(pdf|jpg|jpeg|png|webp|doc|docx)$/i.test(file.originalname);
+    cb(ok ? null : new Error('Upload a PDF, a photo (JPG, PNG, WebP) or a Word document'), ok);
+};
+const uploadMedicalDoc = multer({ storage: diskStorage('medical-docs'), fileFilter: medicalFilter, limits: { fileSize: 10 * 1024 * 1024 } });
+
+module.exports = { uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

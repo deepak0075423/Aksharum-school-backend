@@ -363,6 +363,107 @@ const ROUTES = {
         teacher:      { web: '/admin/id-cards/dashboard', mobile: '/modules/admin/id-cards' },
     },
 
+    // ── Medical Room ─────────────────────────────────────────────────────────
+    // The room's own notices go to whoever runs it: the school admin, or a
+    // teacher whose designation grants Medical admin (a nurse) — which is why
+    // the teacher rows of the staff types point into /admin.
+    'medical.desk': {
+        school_admin: { web: '/admin/medical/requests', mobile: '/modules/admin/medical?tab=requests' },
+        teacher:      { web: '/admin/medical/requests', mobile: '/modules/admin/medical?tab=requests' },
+    },
+    'medical.room': {
+        school_admin: { web: '/admin/medical/room', mobile: '/modules/admin/medical?tab=room' },
+        teacher:      { web: '/admin/medical/room', mobile: '/modules/admin/medical?tab=room' },
+    },
+    // Today's medicine round: doses due now, doses not recorded, a plan the family authorised.
+    'medical.round': {
+        school_admin: { web: '/admin/medical/medicines/administration', mobile: '/modules/admin/medical?tab=round' },
+        teacher:      { web: '/admin/medical/medicines/administration', mobile: '/modules/admin/medical?tab=round' },
+    },
+    'medical.visit': {
+        school_admin: { web: '/admin/medical/visits', mobile: '/modules/admin/medical?tab=room' },
+        teacher:      { web: '/admin/medical/visits', mobile: '/modules/admin/medical?tab=room' },
+    },
+    'medical.incident': {
+        school_admin: { web: '/admin/medical/incidents', mobile: '/modules/admin/medical?tab=incidents' },
+        teacher:      { web: '/admin/medical/incidents', mobile: '/modules/admin/medical?tab=incidents' },
+    },
+    'medical.stock': {
+        school_admin: { web: '/admin/medical/medicines/inventory', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/medicines/inventory', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    // A first-aid supply's stock lives on the Inventory screen, not Medicines.
+    'medical.supplies': {
+        school_admin: { web: '/admin/medical/inventory?view=supplies', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/inventory?view=supplies', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    'medical.equipment': {
+        school_admin: { web: '/admin/medical/equipment', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/equipment', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    'medical.documents': {
+        school_admin: { web: '/admin/medical/documents', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/documents', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    'medical.followups': {
+        school_admin: { web: '/admin/medical/visits?tab=follow_up', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/visits?tab=follow_up', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    'medical.vaccinations': {
+        school_admin: { web: '/admin/medical/vaccinations', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/vaccinations', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    'medical.changes': {
+        school_admin: { web: '/admin/medical/health/updates', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/health/updates', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    // A teacher's own request, or a student of theirs in the room.
+    'medical.mine': {
+        teacher:      { web: '/teacher/medical', mobile: '/modules/medical' },
+        school_admin: { web: '/admin/medical/requests', mobile: '/modules/admin/medical?tab=requests' },
+    },
+    // Who opened which medical records (the school admins).
+    'medical.access': {
+        school_admin: { web: '/admin/medical/access-review', mobile: '/modules/admin/medical' },
+    },
+    // A safeguarding concern: the log (leads) or one's own concerns.
+    'medical.safeguarding': {
+        teacher:      { web: '/teacher/medical?tab=safeguarding', mobile: '/modules/medical?tab=safeguarding' },
+        school_admin: { web: '/admin/medical/safeguarding', mobile: '/modules/admin/medical' },
+    },
+    // Specialist referrals waiting for the family, or for the room to read what came back.
+    'medical.referrals': {
+        school_admin: { web: '/admin/medical/checkups/referrals', mobile: '/modules/admin/medical?tab=alerts' },
+        teacher:      { web: '/admin/medical/checkups/referrals', mobile: '/modules/admin/medical?tab=alerts' },
+    },
+    // Health campaigns (a deworming day, a vaccination drive).
+    'medical.campaigns': {
+        school_admin: { web: '/admin/medical/programmes/campaigns', mobile: '/modules/admin/medical?tab=campaigns' },
+        teacher:      { web: '/admin/medical/programmes/campaigns', mobile: '/modules/admin/medical?tab=campaigns' },
+    },
+    // The outbreak watch, and families' reports of a child off sick.
+    'medical.outbreaks': {
+        school_admin: { web: '/admin/medical/programmes/outbreaks', mobile: '/modules/admin/medical?tab=outbreaks' },
+        teacher:      { web: '/admin/medical/programmes/outbreaks', mobile: '/modules/admin/medical?tab=outbreaks' },
+    },
+    // One student's medical record (a new student's health details to check).
+    'medical.student': {
+        school_admin: { web: '/admin/medical/students/{id}', mobile: '/modules/admin/medical?tab=lookup&focus={id}' },
+        teacher:      { web: '/admin/medical/students/{id}', mobile: '/modules/admin/medical?tab=lookup&focus={id}' },
+    },
+    // A family says their child is off sick.
+    'medical.illness': {
+        school_admin: { web: '/admin/medical/programmes/off-sick', mobile: '/modules/admin/medical?tab=illness' },
+        teacher:      { web: '/admin/medical/programmes/off-sick', mobile: '/modules/admin/medical?tab=illness' },
+    },
+    // A child's record: the parent's page (on that child), the student's own.
+    'medical.child': {
+        parent:       { web: '/parent/medical', mobile: '/modules/medical' },
+        student:      { web: '/student/medical', mobile: '/modules/medical' },
+        teacher:      { web: '/teacher/medical', mobile: '/modules/medical' },
+        school_admin: { web: '/admin/medical/dashboard', mobile: '/modules/admin/medical' },
+    },
+
     // ── Class / section ──────────────────────────────────────────────────────
     'section': {
         school_admin: { web: '/admin/sections/{id}', mobile: '/modules/admin/section-detail?id={id}' },
@@ -389,10 +490,18 @@ function fill(template, values) {
 }
 
 /** Adds `key=value` to a path that may or may not already carry a query. */
+/**
+ * Set `key` on a path's query — replacing a value the route already carries.
+ * Appending made `?tab=alerts&tab=low`, which a reader sees as two tabs (the
+ * phone took the pair as one unknown tab and opened the wrong screen).
+ */
 function withParam(path, key, value) {
     if (!value) return path;
     const [base, hash = ''] = String(path).split('#');
-    const joined = `${base}${base.includes('?') ? '&' : '?'}${key}=${encodeURIComponent(value)}`;
+    const [pathname, query = ''] = base.split('?');
+    const kept = query.split('&').filter((pair) => pair && decodeURIComponent(pair.split('=')[0]) !== key);
+    kept.push(`${key}=${encodeURIComponent(value)}`);
+    const joined = `${pathname}?${kept.join('&')}`;
     return hash ? `${joined}#${hash}` : joined;
 }
 
@@ -541,6 +650,7 @@ const MODULE_OF = {
     section: 'academics',
     documents: 'documents',
     idcards: 'idcards',
+    medical: 'medical',
 };
 
 const MODULE_LABELS = {
@@ -548,7 +658,7 @@ const MODULE_LABELS = {
     library: 'Library', results: 'Results', timetable: 'Timetable',
     calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
     hostel: 'Hostel', video: 'Videos', feedback: 'Feedback',
-    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', general: 'General',
+    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', general: 'General',
 };
 
 // Somebody is waiting on the reader, or money is owed. These are the ones that
@@ -561,6 +671,7 @@ const HIGH_TYPES = [
     'fees.mine', 'library.myfines', 'library.manage.fines', 'library.fines',
     'substitutions',
     'documents.item',
+    'medical.desk', 'medical.changes', 'medical.round',
 ];
 
 // Nothing is being asked and nothing has changed for the reader personally —

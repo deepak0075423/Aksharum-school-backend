@@ -6,6 +6,11 @@ const { verifyToken, requirePasswordReset } = require('../../middleware/auth');
 
 const guard = [verifyToken, requirePasswordReset];
 
+// OS push notifications: the Web Push key, and this device in or out (services/pushService).
+router.get('/push/config',               guard, ctrl.pushConfig);
+router.post('/push/devices',             guard, ctrl.pushRegister);
+router.post('/push/devices/remove',      guard, ctrl.pushUnregister);
+
 router.get('/inbox',                     guard, ctrl.getInboxApi);
 router.get('/all',                       guard, ctrl.getAllNotifications);
 router.get('/unread-count',              guard, ctrl.getUnreadCount);

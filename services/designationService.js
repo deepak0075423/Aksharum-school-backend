@@ -39,6 +39,18 @@ const LEGACY_ADMIN_GRANTS = {
     'vice principal':   ['feedback'],
     'headmaster':       ['feedback'],
     'headmistress':     ['feedback'],
+    // Not legacy: the Medical Room arrived after the matrix (Oct 2026), and a
+    // school's nurse is the person it is for. Granting it by name means an
+    // existing "Nurse" row — whose stored map has no `medical` key yet, so it
+    // reads as this default (storedPermissions) — runs the room the day the
+    // module is switched on, instead of waiting for someone to find the matrix.
+    'nurse':            ['medical'],
+    'school nurse':     ['medical'],
+    'staff nurse':      ['medical'],
+    'medical officer':  ['medical'],
+    'school doctor':    ['medical'],
+    'doctor':           ['medical'],
+    'health officer':   ['medical'],
 };
 
 // The other half of the story. A designation with no row falls back to
@@ -91,6 +103,13 @@ const DEFAULT_DESCRIPTIONS = {
     'crew member':      'Assists the driver and conductor on the route',
     'helper':           'Assists the driver and conductor on the route',
     'attendant':        'Assists the driver and conductor on the route',
+    'nurse':            'Runs the medical room: visits, first aid, medicines and health records',
+    'school nurse':     'Runs the medical room: visits, first aid, medicines and health records',
+    'staff nurse':      'Runs the medical room: visits, first aid, medicines and health records',
+    'medical officer':  'Oversees student health, the medical room and its records',
+    'school doctor':    'Oversees student health, the medical room and its records',
+    'doctor':           'Oversees student health, the medical room and its records',
+    'health officer':   'Oversees student health, the medical room and its records',
 };
 
 const defaultDescriptionFor = (name) => DEFAULT_DESCRIPTIONS[key(name)] || '';

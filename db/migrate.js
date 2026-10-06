@@ -61,6 +61,31 @@ const STEPS = [
                  ON "idcards" ("holder", "kind", (COALESCE("academicYear"::text, '')))
               WHERE "status" IN ('active', 'blocked')`,
     },
+    {
+        // Medical Room: one scheduled dose per plan per time slot. The doses of
+        // a day are generated both by the sweep and when the administration
+        // screen is opened; the index is what makes the two arriving together
+        // harmless (INSERT … ON CONFLICT DO NOTHING).
+        name: 'medicationdoses: one dose per plan and slot',
+        sql:  `CREATE UNIQUE INDEX IF NOT EXISTS "ux_medicationdoses_slot"
+                 ON "medicationdoses" ("plan", "scheduledFor")
+              WHERE "plan" IS NOT NULL AND "scheduledFor" IS NOT NULL`,
+    },
+    {
+        // Medical Room: a student is in the room on one visit at a time, and
+        // has one request open at a time. Checked by the service first; the
+        // index is what makes two nurses pressing "Arrived" together safe.
+        name: 'medicalvisits: one open visit per student',
+        sql:  `CREATE UNIQUE INDEX IF NOT EXISTS "ux_medicalvisits_open"
+                 ON "medicalvisits" ("school", "student")
+              WHERE "status" IN ('in_room', 'observation', 'emergency') AND "archivedAt" IS NULL`,
+    },
+    {
+        name: 'medicalrequests: one open request per student',
+        sql:  `CREATE UNIQUE INDEX IF NOT EXISTS "ux_medicalrequests_open"
+                 ON "medicalrequests" ("school", "student")
+              WHERE "status" IN ('requested', 'accepted', 'arrived', 'treatment')`,
+    },
 ];
 
 /**

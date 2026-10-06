@@ -65,7 +65,9 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   // X-Requested-With: sent by the Google sign-in call, which refuses a request
   // without it (see auth.controller googleLogin) — cross-origin in production.
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  // X-Medical-Step-Up: the Medical Room's "confirm it is you" token
+  // (services/medicalStepUp.js) — without it every staff request fails its preflight.
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Medical-Step-Up'],
 }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
@@ -108,10 +110,42 @@ for (const p of ['/api/auth/login', '/api/auth/forgot-password', '/api/auth/veri
 app.post('/api/auth/google', authLimiter);
 
 // ── Static Files (uploads) ────────────────────────────────────────────────────
-// Hostel paperwork — ID proofs, medical notes, a child's complaint photo — is
-// not handed to whoever has the address. It is read through /api/hostel/files
-// (with a login) or a short-lived signed link; see controllers/hostelFiles.
-app.use('/uploads/hostel-docs', (req, res) => res.status(403).json({ success: false, message: 'Hostel files are opened from the hostel screens' }));
+// Two folders are never handed to whoever has the address:
+//   hostel-docs   ID proofs, medical notes, a child's complaint photo — read
+//                 through /api/hostel/files (controllers/hostelFiles)
+//   medical-docs  prescriptions, certificates, injury photos — read through
+//                 /api/medical/files after an access check (controllers/medicalFiles)
+// The check is on the path express.static will actually serve — decoded and
+// normalised — not on the address as typed: a prefix match on the raw URL let
+// /uploads/medical%2Ddocs/…, /uploads//medical-docs/… and /uploads/x/../medical-docs/…
+// straight through to the file.
+//
+// Five more folders are served only to a signed-in reader their owner's rules
+// allow — admission papers, staff papers, leave and attendance attachments and
+// the Documents module's files (services/privateFiles). A profile photo in
+// them stays public: avatars are drawn everywhere.
+const PRIVATE_UPLOADS = {
+    'hostel-docs': 'Hostel files are opened from the hostel screens',
+    'medical-docs': 'Medical files are opened from the Medical Room screens',
+};
+const privateFiles = require('./services/privateFiles');
+app.use('/uploads', async (req, res, next) => {
+    let p;
+    try { p = decodeURIComponent(req.path); } catch { return res.status(400).json({ success: false, message: 'Bad file address' }); }
+    const parts = path.posix.normalize(`/${p.replace(/\\/g, '/')}`).split('/').filter(Boolean);
+    const first = (parts[0] || '').toLowerCase();
+    const refused = PRIVATE_UPLOADS[first];
+    if (refused) return res.status(403).json({ success: false, message: refused });
+    if (privateFiles.FOLDERS.includes(first)) {
+        try {
+            if (await privateFiles.serve(req, res, first, parts.slice(1).join('/'))) return undefined;
+        } catch (e) {
+            console.error('[uploads] private file check failed:', e.message);
+            return res.status(500).json({ success: false, message: 'The file could not be opened' });
+        }
+    }
+    return next();
+});
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ── API Routes ────────────────────────────────────────────────────────────────
@@ -127,6 +161,7 @@ app.use('/api/library',       require('./routes/api/library'));
 app.use('/api/inventory',     require('./routes/api/inventory'));
 app.use('/api/transport',     require('./routes/api/transport'));
 app.use('/api/hostel',        require('./routes/api/hostel'));
+app.use('/api/medical',       require('./routes/api/medical'));
 app.use('/api/video',         require('./routes/api/video'));
 app.use('/api/feedback',      require('./routes/api/feedback'));
 app.use('/api/analytics',     require('./routes/api/analytics'));
@@ -509,6 +544,40 @@ if (isPrimaryWorker) {
         };
         setTimeout(tick, 45 * 1000);           // once shortly after boot
         setInterval(tick, 10 * 60 * 1000);     // then every 10 minutes
+    }());
+
+    // ── Medical Room watchman ─────────────────────────────────────────────────
+    // Today's scheduled doses, missed doses, low stock, expiring and expired
+    // batches, maintenance and document expiry, vaccination reminders and the
+    // staff's daily digest (services/medicalSweep). Every alert is claimed in
+    // medicalalerts before anyone is told and every reminder is stamped on its
+    // row first, so a restart mid-sweep, or two ticks, tell nobody twice.
+    (function scheduleMedicalSweep() {
+        const medical = require('./services/medicalSweep');
+        const tick = async () => {
+            try {
+                const r = await medical.sweepAll();
+                if (r.missed) console.log(`[Medical] sweep: ${r.missed} dose(s) marked missed across ${r.schools} school(s)`);
+            } catch (err) { console.error('[Medical] sweep error:', err.message); }
+        };
+        setTimeout(tick, 75 * 1000);           // once shortly after boot
+        setInterval(tick, 15 * 60 * 1000);     // then every 15 minutes
+    }());
+
+    // ── Medical Room: urgent news nobody has answered, and what is due now ────
+    // Every minute: a notice to a family (emergency, sent home, referral,
+    // serious incident) unanswered for the school's urgentEscalateMinutes
+    // moves to the next contact — the parents reminded in the app, and the
+    // staff told whom to ring (services/medicalUrgent); and the doses due now
+    // and the rechecks fallen due are said, live (services/medicalReminders).
+    // Each is claimed before anyone is told.
+    (function scheduleMedicalUrgent() {
+        const urgent = require('./services/medicalUrgent');
+        const reminders = require('./services/medicalReminders');
+        setInterval(async () => {
+            try { await urgent.tick(); } catch (err) { console.error('[Medical] urgent tick error:', err.message); }
+            try { await reminders.tick(); } catch (err) { console.error('[Medical] reminders tick error:', err.message); }
+        }, 60 * 1000);
     }());
 
     // ── Video scheduled-publish worker ────────────────────────────────────────

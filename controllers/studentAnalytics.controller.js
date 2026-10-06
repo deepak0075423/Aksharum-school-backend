@@ -166,6 +166,8 @@ async function getModules(schoolId) {
         timetable:    !!m.timetable,
         inventory:    !!m.inventory,
         notification: !!m.notification,
+        // Only ever drawn for medical staff (services/medicalAnalytics) — the flag alone shows nothing.
+        medical:      !!m.medical,
     };
 }
 
@@ -1446,6 +1448,11 @@ exports.getStudentAnalytics = async (req, res) => {
         if (modules.timetable)    run('timetable',     timetableBlock);
         if (modules.inventory)    run('inventory',     inventoryBlock);
         if (modules.notification) run('notifications', notificationsBlock);
+        // The Medical Room's counts — for medical staff only (services/medicalAnalytics).
+        const medicalAnalytics = require('../services/medicalAnalytics');
+        if (modules.medical && await medicalAnalytics.isStaff(req)) {
+            jobs.push(medicalAnalytics.blockFor(req, user._id, scope.activeYear).then((v) => { blocks.medical = v; }));
+        }
 
         await Promise.all(jobs);
 

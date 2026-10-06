@@ -1916,6 +1916,11 @@ exports.createStudent = async (req, res) => {
         }
         const profileErr = validateStudentProfile(profile) || validateStudentDocs(profile, uploads);
         if (profileErr) return res.status(400).json({ success: false, message: profileErr });
+        // Health details from the admission form (allergies, conditions, the doctor) are checked
+        // now and written into the Medical Room's record once the student exists.
+        const intake = require('../services/medicalIntake');
+        let health = null;
+        try { health = intake.check(req.body.health); } catch (e) { return res.status(400).json({ success: false, message: e.message }); }
         // A section that is already at capacity does not take another student.
         if (profile.currentSection) {
             const full = await capacityErrorById(profile.currentSection);
@@ -1973,7 +1978,12 @@ exports.createStudent = async (req, res) => {
             );
         }
         sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
-        jsonOk(res, user, 201);
+        let healthSaved = null;
+        if (health) {
+            try { healthSaved = await intake.fromAdmission(req, user._id, health); }
+            catch (e) { console.error('[admission] health intake failed:', e.message); healthSaved = { failed: [e.message] }; }
+        }
+        jsonOk(res, healthSaved ? { ...(user.toObject?.() ?? user), healthSaved } : user, 201);
     } catch (err) { jsonErr(res, err, 400); }
 };
 

@@ -30,6 +30,7 @@ const MODULES = [
     { key: 'notification', label: 'Notifications',    icon: '🔔', adminCapable: true,  description: 'In-app alerts and announcements' },
     { key: 'employeeDirectory', label: 'Employee Directory', icon: '🗂️', adminCapable: true,  description: 'Staff directory assembled from existing employee records' },
     { key: 'idCard',       label: 'ID Cards',         icon: '🪪', adminCapable: true,  description: 'Student, teacher, staff and parent ID cards, QR verification and printing' },
+    { key: 'medical',      label: 'Medical Room',     icon: '🩺', adminCapable: true,  description: 'Medical room visits, incidents, student health records, medicines and first aid' },
     { key: 'chat',       label: 'Chat',             icon: '💬', adminCapable: false, description: 'Real-time messaging' },
 ];
 

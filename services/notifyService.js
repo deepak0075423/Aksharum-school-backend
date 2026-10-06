@@ -6,6 +6,10 @@
  *   • Persists a Notification + one NotificationReceipt per recipient
  *   • Pushes `notification:new` + updated unread count to each recipient's
  *     sockets via the WebSocket Gateway (Redis chat.deliver channel)
+ *   • Shows it as the device's own notification — the phone's tray, the
+ *     browser's desktop notification — even with the app closed
+ *     (services/pushService). deliver() does both, for every notification in
+ *     the app: this file's and the admin's broadcast (notification.controller)
  *   • Optionally emails recipients through the school's own SMTP
  *
  * notify() is fire-and-forget: it never throws and runs after the response.
@@ -28,20 +32,73 @@ async function _pushCount(userId) {
     } catch {}
 }
 
+/** Unread counts for many readers in one grouped query: Map(userId → n). */
+async function _unreadCounts(userIds) {
+    const out = new Map();
+    if (!userIds.length) return out;
+    const rows = await NotificationReceipt.aggregate([
+        { $match: { recipient: { $in: userIds }, isRead: false, isCleared: false } },
+        { $group: { _id: '$recipient', n: { $sum: 1 } } },
+    ]);
+    const countByUser = new Map(rows.map((r) => [String(r._id), r.n]));
+    for (const uid of userIds) out.set(String(uid), countByUser.get(String(uid)) || 0);
+    return out;
+}
+
 // Batched variant for fan-outs: one grouped count query for ALL recipients
 // instead of one countDocuments per user.
 async function _pushCounts(userIds) {
     try {
         if (!userIds.length) return;
-        const rows = await NotificationReceipt.aggregate([
-            { $match: { recipient: { $in: userIds }, isRead: false, isCleared: false } },
-            { $group: { _id: '$recipient', n: { $sum: 1 } } },
-        ]);
-        const countByUser = new Map(rows.map((r) => [String(r._id), r.n]));
-        for (const uid of userIds) {
-            publishNotificationCount(uid, countByUser.get(String(uid)) || 0).catch(() => {});
-        }
+        for (const [uid, n] of await _unreadCounts(userIds)) publishNotificationCount(uid, n).catch(() => {});
     } catch {}
+}
+
+/**
+ * Hand a stored notification to its readers — every notification in the app
+ * comes through here: notify() below, and the admin's broadcast
+ * (notification.controller).
+ *
+ *   1. live, over the websocket: `notification:new` carrying this reader's own
+ *      destination — the same notification opens elsewhere for a teacher and
+ *      a parent — then their unread count;
+ *   2. as the device's own notification: the phone's tray and lock screen, the
+ *      browser's desktop notification, even with the app closed — with the
+ *      unread count as the app's badge (services/pushService).
+ *
+ * recipients: [{ _id, role }]; receiptOf: Map(userId → receiptId);
+ * link: the stored link (notificationLinks.normalize) or null.
+ */
+async function deliver(notification, recipients, receiptOf, link = null) {
+    // How loud it is: `urgent` only when the sender said so (priority 'high') —
+    // the screens keep such a notice up until it is seen, and the phone vibrates.
+    const loudness = notificationLinks.priorityOf(notification);
+    const urgent   = notification.priority === 'high';
+    const items = [];
+    for (const u of recipients) {
+        const uid = String(u._id);
+        const receiptId = receiptOf.get(uid) || null;
+        const target = notificationLinks.resolve(link, u.role, receiptId);
+        publishToUser(uid, 'notification:new', {
+            _id:        notification._id,
+            receiptId,
+            title:      notification.title,
+            body:       notification.body,
+            senderRole: notification.senderRole,
+            createdAt:  notification.createdAt,
+            link:       target,
+            priority:   loudness,
+            urgent,
+        });
+        items.push({ user: uid, title: notification.title, body: notification.body, receiptId, link: target, urgent, kind: 'notification' });
+    }
+    let counts = new Map();
+    try {
+        counts = await _unreadCounts(items.map((x) => x.user));
+        for (const [uid, n] of counts) publishNotificationCount(uid, n).catch(() => {});
+    } catch {}
+    for (const x of items) if (counts.has(x.user)) x.badge = counts.get(x.user);
+    require('./pushService').send(items).catch(() => {});
 }
 
 // The button points at /n/:receiptId rather than the resolved page: the same
@@ -152,20 +209,8 @@ async function _notify({ school, sender, senderRole, title, body, recipients = [
     const users  = await User.find({ _id: { $in: ids } }, 'name email role').lean();
     const roleOf = new Map(users.map(u => [String(u._id), u.role]));
 
-    const stored = notificationLinks.normalize(link);
-    for (const uid of ids) {
-        const receiptId = receiptOf.get(String(uid)) || null;
-        publishToUser(uid, 'notification:new', {
-            _id:        notification._id,
-            receiptId,
-            title:      notification.title,
-            body:       notification.body,
-            senderRole: notification.senderRole,
-            createdAt:  notification.createdAt,
-            link:       notificationLinks.resolve(stored, roleOf.get(String(uid)), receiptId),
-        });
-    }
-    _pushCounts(ids);
+    // Live over the websocket, and as each reader's device notification.
+    await deliver(notification, ids.map((uid) => ({ _id: uid, role: roleOf.get(String(uid)) })), receiptOf, notificationLinks.normalize(link));
 
     if (email) {
         try {
@@ -249,4 +294,4 @@ async function withParents(studentIds) {
     return [...new Set([...ids, ...rows.map((r) => String(r.parent))])];
 }
 
-module.exports = { notify, schoolAdminIds, withParents };
+module.exports = { notify, deliver, schoolAdminIds, withParents };

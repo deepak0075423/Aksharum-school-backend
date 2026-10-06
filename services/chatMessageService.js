@@ -149,8 +149,30 @@ async function send(actor, chatId, input = {}) {
     // tabs. `tempId` is the name the older clients match optimistic rows on.
     broker.publishToRoom(chatId, 'chat:message', { ...message, tempId: clientId }).catch(() => {});
     writeReceipts(created._id, chatId, actor.userId, actor.schoolId).catch(() => {});
+    // …and as each member's device notification, for a phone or a browser that is not looking.
+    pushMessage(created, chat, actor).catch((e) => console.error('[chat] push failed:', e.message));
 
     return { message: isSchoolAdmin(actor) ? await readModel.messageById(created._id, true) : message, duplicate: false };
+}
+
+/**
+ * A new message as each member's own device notification — the phone's tray,
+ * the browser's desktop notification, with the app closed (services/pushService).
+ * Not to the sender, nor to a member who muted the conversation; tapping it
+ * opens the conversation. The live copy already went to every open socket.
+ */
+async function pushMessage(created, chat, actor) {
+    const now = Date.now();
+    const members = await ChatMember.find({ chat: chat._id, user: { $ne: actor.userId }, isActive: true }).select('user isMuted muteUntil').lean();
+    const to = members
+        .filter((m) => !(m.isMuted && (!m.muteUntil || new Date(m.muteUntil).getTime() > now)))
+        .map((m) => String(m.user));
+    if (!to.length) return;
+    const who = actor.name || 'New message';
+    const title = chat.type === 'direct' ? who : `${who} · ${chat.name || 'Group'}`;
+    const text = String(created.content || '').trim();
+    const body = text || (created.type === 'image' ? 'Photo' : 'Attachment');
+    await require('./pushService').send(to.map((user) => ({ user, title, body, kind: 'chat', chatId: String(chat._id) })));
 }
 
 async function writeReceipts(messageId, chatId, senderId, schoolId) {

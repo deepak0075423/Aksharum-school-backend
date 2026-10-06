@@ -4989,6 +4989,8 @@ exports.createIncident = async (req, res) => {
                 email: true,
             });
             if (medical) await HostelIncident.findByIdAndUpdate(row._id, { $set: { parentNotifiedAt: new Date() } });
+            // A resident unwell in the hostel: the Medical Room hears of it, and sees them in the morning.
+            if (medical) await require('../services/medicalHostel').fromHostelIncident(req, row).catch((e) => console.error('[hostel] → medical room:', e.message));
         }
         ok(res, row);
     } catch (e) { fail(res, e); }

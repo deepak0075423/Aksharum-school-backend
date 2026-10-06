@@ -273,20 +273,12 @@ exports.send = async (req, res) => {
                     .find({ notification: notification._id }, '_id recipient').lean();
                 rows.forEach(r => receiptOf.set(String(r.recipient), String(r._id)));
             }
-            // Fire-and-forget: real-time event + updated count via the WebSocket Gateway
-            recipients.forEach(u => {
-                const receiptId = receiptOf.get(String(u._id)) || null;
-                publishToUser(u._id, 'notification:new', {
-                    _id:        notification._id,
-                    receiptId,
-                    title:      notification.title,
-                    body:       notification.body,
-                    senderRole: notification.senderRole,
-                    createdAt:  notification.createdAt,
-                    link:       notificationLinks.resolve(null, u.role, receiptId),
-                });
-            });
-            _pushCounts(recipients.map(u => u._id));
+            // Live over the WebSocket Gateway (the event + each reader's unread
+            // count) and as each reader's device notification — the phone's
+            // tray, the browser's desktop notification — the same way as every
+            // other notification in the app (notifyService.deliver).
+            require('../services/notifyService').deliver(notification, recipients, receiptOf, null)
+                .catch(e => console.error('[notify] broadcast delivery failed:', e.message));
             // Emails go out below and need the same per-reader ids
             req._notifReceiptOf = receiptOf;
         }
@@ -902,3 +894,19 @@ exports.resolveReceipt = async (req, res) => {
         });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
+
+// ── OS push notifications: this device shows the signed-in person's notifications ──
+// (services/pushService). The web asks for the key to subscribe with; the phone
+// app and the browser register their device after sign-in and remove it on sign-out.
+const pushService = require('../services/pushService');
+const pushAnswer = (fn) => async (req, res) => {
+    try { res.json({ success: true, data: await fn(req) }); }
+    catch (err) {
+        const status = err instanceof pushService.PushError ? err.status : 500;
+        if (status === 500) console.error('[push] request failed:', err.message);
+        res.status(status).json({ success: false, message: status === 500 ? 'Push notifications could not be set up' : err.message });
+    }
+};
+exports.pushConfig     = pushAnswer(() => pushService.config());
+exports.pushRegister   = pushAnswer(async (req) => { const d = await pushService.register(req, req.body || {}); return { registered: !!d, kind: d?.kind || null }; });
+exports.pushUnregister = pushAnswer((req) => pushService.unregister(req, req.body || {}));
