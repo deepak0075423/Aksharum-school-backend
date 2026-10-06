@@ -3,6 +3,7 @@ const User           = require('../models/User');
 const TeacherProfile = require('../models/TeacherProfile');
 const StudentProfile = require('../models/StudentProfile');
 const ParentProfile  = require('../models/ParentProfile');
+const { isPhone, normalizePhone } = require('../utils/validators');
 
 exports.getProfile = async (req, res) => {
     try {
@@ -24,8 +25,9 @@ exports.updateProfile = async (req, res) => {
         }
         if (updates.name !== undefined && !String(updates.name).trim())
             return res.status(400).json({ success: false, message: 'Name is required' });
-        if (updates.phone && !/^[+\d\s\-]{7,15}$/.test(updates.phone))
-            return res.status(400).json({ success: false, message: 'Invalid phone number' });
+        if (updates.phone && !isPhone(updates.phone))
+            return res.status(400).json({ success: false, message: 'Phone number must be a valid 10-digit mobile number' });
+        if (updates.phone !== undefined) updates.phone = normalizePhone(updates.phone);
         // A new photo replaces any emoji avatar, so the two can never disagree.
         if (req.file) {
             updates.profileImage = `/uploads/profiles/${req.file.filename}`;
@@ -74,7 +76,6 @@ exports.updateMyEmployeeRecord = async (req, res) => {
             return res.status(403).json({ success: false, message: 'No employee record on this account' });
         }
         const TeacherProfile = require('../models/TeacherProfile');
-        const { isPhone } = require('../utils/validators');
         const { STATES_AND_UTS, isPincode } = require('../utils/indiaStates');
 
         const b = req.body || {};
@@ -95,7 +96,8 @@ exports.updateMyEmployeeRecord = async (req, res) => {
         }
         for (const k of ['emergencyContactPhone', 'alternatePhone']) {
             if (updates[k] && !isPhone(updates[k]))
-                return res.status(400).json({ success: false, message: `${k === 'alternatePhone' ? 'Secondary phone' : 'Emergency contact phone'} is not valid` });
+                return res.status(400).json({ success: false, message: `${k === 'alternatePhone' ? 'Secondary phone' : 'Emergency contact phone'} must be a valid 10-digit mobile number` });
+            if (updates[k] !== undefined) updates[k] = normalizePhone(updates[k]);
         }
         for (const [k, label] of [['currentPincode', 'Current'], ['permanentPincode', 'Permanent']]) {
             if (updates[k] && !isPincode(updates[k]))

@@ -15,8 +15,24 @@
 //   });
 //   if (err) return res.status(400).json({ success: false, message: err });
 
+// Phone numbers are Indian mobile numbers — the platform is India-only: ten
+// digits, the first 6–9, stored without +91 or a leading 0. normalizePhone()
+// drops the formatting a person, an older app or an imported sheet may send
+// ("+91 98765 43210", "098765-43210", the number 9876543210), so the number
+// itself is what is checked and stored. Anything else in it (a letter, an
+// extension) is left alone for isPhone to refuse — never silently cut down.
+const PHONE_LENGTH = 10;
+const normalizePhone = (v) => {
+    const s = String(v ?? '').trim();
+    if (!/^[\d\s\-().+]+$/.test(s) || s.split('+').length > 2) return s;
+    const d = s.replace(/\D/g, '');
+    if (d.length === 12 && d.startsWith('91')) return d.slice(2);
+    if (d.length === 11 && d.startsWith('0')) return d.slice(1);
+    return d;
+};
+
 const isEmail    = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v ?? '').trim());
-const isPhone    = (v) => /^\d{7,15}$/.test(String(v ?? '').replace(/[\s\-+()]/g, ''));
+const isPhone    = (v) => /^[6-9]\d{9}$/.test(normalizePhone(v));
 const isURL      = (v) => /^https?:\/\/.+\..+/.test(String(v ?? '').trim());
 const isPincode  = (v) => /^\d{4,10}$/.test(String(v ?? '').trim());
 const isObjectId = (v) => /^[0-9a-fA-F]{24}$/.test(String(v ?? ''));
@@ -25,7 +41,7 @@ const isTime     = (v) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v ?? '').trim(
 
 const TYPE_CHECKS = {
     email:    { check: isEmail,    msg: (l) => `${l} must be a valid email address` },
-    phone:    { check: isPhone,    msg: (l) => `${l} must be a valid phone number (7-15 digits)` },
+    phone:    { check: isPhone,    msg: (l) => `${l} must be a valid 10-digit mobile number` },
     url:      { check: isURL,      msg: (l) => `${l} must be a valid URL starting with http:// or https://` },
     pincode:  { check: isPincode,  msg: (l) => `${l} must be 4-10 digits` },
     objectId: { check: isObjectId, msg: (l) => `${l} is not a valid id` },
@@ -77,4 +93,10 @@ const passwordError = (pw) => {
     return null;
 };
 
-module.exports = { validate, passwordError, isEmail, isPhone, isURL, isPincode, isObjectId, isDate, isTime };
+/** The message for one phone field, or null when it is fine (or empty and optional). */
+const phoneError = (v, label = 'Mobile number', { required = false } = {}) => {
+    if (!String(v ?? '').trim()) return required ? `${label} is required` : null;
+    return isPhone(v) ? null : `${label} must be a valid 10-digit mobile number`;
+};
+
+module.exports = { validate, passwordError, isEmail, isPhone, normalizePhone, phoneError, PHONE_LENGTH, isURL, isPincode, isObjectId, isDate, isTime };

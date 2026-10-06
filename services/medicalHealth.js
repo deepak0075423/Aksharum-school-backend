@@ -30,7 +30,7 @@ const ntk = () => require('./medicalNeedToKnow');
 const CARD_KINDS = ['allergy', 'condition', 'rescue_med', 'care_plan'];
 const access = require('./medicalAccess');
 const settingsSvc = require('./medicalSettings');
-const { isPhone } = require('../utils/validators');
+const { isPhone, normalizePhone } = require('../utils/validators');
 const R = require('./medicalRules');
 
 const { refuse, notFound, str, num, bool, oneOf, isUuid, toDay, dayStr, dayLabel, todayStr } = R;
@@ -40,8 +40,8 @@ const UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'medical-docs');
 
 function phone(v, label) {
     const p = str(v, 30);
-    if (p && !isPhone(p)) refuse(`${label} is not a valid phone number`);
-    return p;
+    if (p && !isPhone(p)) refuse(`${label} must be a valid 10-digit mobile number`);
+    return normalizePhone(p);
 }
 
 /* ── Profile ──────────────────────────────────────────────────────────────── */

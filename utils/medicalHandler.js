@@ -18,6 +18,8 @@ const handle = (fn) => async (req, res) => {
             const { status, code, message, name, stack, ...extra } = e;
             return res.status(status).json({ success: false, code, message, ...extra });
         }
+        // A phone number refused as the upload was read (middleware/upload).
+        if (e?.code === 'INVALID_PHONE') return res.status(400).json({ success: false, code: e.code, message: e.message });
         if (e?.name === 'MulterError' || /Upload a PDF|Unsupported file type/.test(e?.message || '')) {
             return res.status(400).json({ success: false, code: 'MEDICAL_UPLOAD', message: e.code === 'LIMIT_FILE_SIZE' ? 'The file is larger than 10 MB' : e.message });
         }

@@ -75,14 +75,14 @@ const WAREHOUSES = [
 ];
 
 const VENDORS = [
-    ['S.K. Stationery', 'Stationery', 'Suresh Kumar', '+91 98765 43210', 'skstationery@gmail.com', '12 Park Street', 'Kolkata', 'West Bengal', '700016', '19ABCDE1234F1Z5', 'ABCDE1234F', '30 Days', false, 'Stationery & Office Supplies'],
-    ['ABC Educational Supplies', 'Books', 'Anita Sharma', '+91 98760 12345', 'sales@abcedu.in', '5 College Row', 'Kolkata', 'West Bengal', '700073', '19BBCDE1234F1Z5', 'BBCDE1234F', '45 Days', false, 'Books & Learning Material'],
-    ['Lab Care Pvt Ltd', 'Lab Equipment', 'Dr. Mehta', '+91 98712 34567', 'care@labcare.co.in', '88 Industrial Area', 'Delhi', 'Delhi', '110020', '07CBCDE1234F1Z5', 'CBCDE1234F', '30 Days', false, 'Laboratory Equipment & Chemicals'],
-    ['TechEdu Solutions', 'IT Equipment', 'Rohit Verma', '+91 98123 45678', 'hello@techedu.in', '22 Residency Road', 'Bangalore', 'Karnataka', '560025', '29DBCDE1234F1Z5', 'DBCDE1234F', 'Advance', true, 'Classroom Technology'],
-    ['Classroom Store', 'Furniture', 'Neha Kapoor', '+91 98765 67890', 'orders@classroomstore.in', '7 Gariahat Road', 'Kolkata', 'West Bengal', '700019', '19EBCDE1234F1Z5', 'EBCDE1234F', '30 Days', false, 'School Furniture'],
-    ['Om Paper Mart', 'Stationery', 'Manoj Yadav', '+91 98987 65432', 'ompaper@gmail.com', '41 Burrabazar', 'Kolkata', 'West Bengal', '700007', '19FBCDE1234F1Z5', 'FBCDE1234F', '15 Days', false, 'Paper & Printing'],
-    ['Metro Electronics', 'Audio Visual', 'Kavita Singh', '+91 98734 56789', 'metro@electronics.in', '9 Lamington Road', 'Mumbai', 'Maharashtra', '400007', '27GBCDE1234F1Z5', 'GBCDE1234F', '30 Days', false, 'Audio Visual Systems'],
-    ['Global Labs', 'Lab Equipment', 'Arjun Das', '+91 98222 33444', 'contact@globallabs.in', '14 Anna Salai', 'Chennai', 'Tamil Nadu', '600002', '33HBCDE1234F1Z5', 'HBCDE1234F', '45 Days', true, 'Scientific Instruments'],
+    ['S.K. Stationery', 'Stationery', 'Suresh Kumar', '9876543210', 'skstationery@gmail.com', '12 Park Street', 'Kolkata', 'West Bengal', '700016', '19ABCDE1234F1Z5', 'ABCDE1234F', '30 Days', false, 'Stationery & Office Supplies'],
+    ['ABC Educational Supplies', 'Books', 'Anita Sharma', '9876012345', 'sales@abcedu.in', '5 College Row', 'Kolkata', 'West Bengal', '700073', '19BBCDE1234F1Z5', 'BBCDE1234F', '45 Days', false, 'Books & Learning Material'],
+    ['Lab Care Pvt Ltd', 'Lab Equipment', 'Dr. Mehta', '9871234567', 'care@labcare.co.in', '88 Industrial Area', 'Delhi', 'Delhi', '110020', '07CBCDE1234F1Z5', 'CBCDE1234F', '30 Days', false, 'Laboratory Equipment & Chemicals'],
+    ['TechEdu Solutions', 'IT Equipment', 'Rohit Verma', '9812345678', 'hello@techedu.in', '22 Residency Road', 'Bangalore', 'Karnataka', '560025', '29DBCDE1234F1Z5', 'DBCDE1234F', 'Advance', true, 'Classroom Technology'],
+    ['Classroom Store', 'Furniture', 'Neha Kapoor', '9876567890', 'orders@classroomstore.in', '7 Gariahat Road', 'Kolkata', 'West Bengal', '700019', '19EBCDE1234F1Z5', 'EBCDE1234F', '30 Days', false, 'School Furniture'],
+    ['Om Paper Mart', 'Stationery', 'Manoj Yadav', '9898765432', 'ompaper@gmail.com', '41 Burrabazar', 'Kolkata', 'West Bengal', '700007', '19FBCDE1234F1Z5', 'FBCDE1234F', '15 Days', false, 'Paper & Printing'],
+    ['Metro Electronics', 'Audio Visual', 'Kavita Singh', '9873456789', 'metro@electronics.in', '9 Lamington Road', 'Mumbai', 'Maharashtra', '400007', '27GBCDE1234F1Z5', 'GBCDE1234F', '30 Days', false, 'Audio Visual Systems'],
+    ['Global Labs', 'Lab Equipment', 'Arjun Das', '9822233444', 'contact@globallabs.in', '14 Anna Salai', 'Chennai', 'Tamil Nadu', '600002', '33HBCDE1234F1Z5', 'HBCDE1234F', '45 Days', true, 'Scientific Instruments'],
 ];
 
 const DEPARTMENTS = ['Science', 'Administration', 'Primary', 'IT Department', 'Sports', 'Library', 'Transport', 'Mathematics'];

@@ -93,7 +93,7 @@ async function main() {
     await M('TransportSettings').findOneAndUpdate({ school: S }, {
         $set: {
             schoolLatitude: PLACES.school.latitude, schoolLongitude: PLACES.school.longitude,
-            contactEmail: 'transport@aksharum.edu.in', contactPhone: '+91 98765 43210',
+            contactEmail: 'transport@aksharum.edu.in', contactPhone: '9876543210',
             officeAddress: '123 School Road, Kolkata, West Bengal - 700029',
             mapProvider: 'osm', delayThresholdMin: 10, maxStudentsPerBus: 52,
         },
@@ -152,7 +152,7 @@ async function main() {
             gender: 'male', dob: new Date(1985 + i, (i * 2) % 12, 12 + i),
             joiningDate: new Date(2021, i % 12, 5),
             currentAddress: 'Kalighat, Kolkata', currentCity: 'Kolkata',
-            emergencyContactName: 'Family contact', emergencyContactPhone: `98765 1234${i}`,
+            emergencyContactName: 'Family contact', emergencyContactPhone: `987651234${i}`,
         });
         crew.push(await M('TransportStaff').create({
             school: S, user: user._id, staffType, employeeId: `TRP${String(i + 1).padStart(3, '0')}`,
@@ -161,7 +161,7 @@ async function main() {
             medicalCertExpiry: day(i === 7 ? -10 : 180 + i * 30),
             experienceYears, status: i === 2 ? 'on_leave' : 'active',
             policeVerification: { status: 'verified', date: new Date(2024, 3, 2) },
-            emergencyContact: { name: 'Family contact', phone: `98765 1234${i}`, relation: 'Spouse' },
+            emergencyContact: { name: 'Family contact', phone: `987651234${i}`, relation: 'Spouse' },
             locationSharing: i < 3,
             leaves: i === 2 ? [{ fromDate: day(-1), toDate: day(2), leaveType: 'sick', reason: 'Fever', status: 'approved' }] : [],
         }));

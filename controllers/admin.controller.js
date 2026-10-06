@@ -42,7 +42,7 @@ const mailer         = require('../config/mailer');
 const { sendSchoolMail, emailHeaderHtml, getMailContext, sendSchoolAddedEmail, invalidate: invalidateMailer } = require('../utils/schoolMailer');
 const { notify } = require('../services/notifyService');
 const { setStudentSection } = require('../utils/sectionMembership');
-const { validate, isEmail, isPhone, isURL } = require('../utils/validators');
+const { validate, isEmail, isPhone, isURL, normalizePhone } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
 const { STATES_AND_UTS, isPincode, stateFromPincode } = require('../utils/indiaStates');
@@ -240,7 +240,7 @@ function validateStudentProfile(profile = {}, { partial = false } = {}) {
         return 'Invalid date of birth';
     if (profile.emergencyContactPhone !== undefined && String(profile.emergencyContactPhone || '').trim()
         && !isPhone(profile.emergencyContactPhone))
-        return 'Emergency contact phone is not valid';
+        return 'Emergency contact phone must be a valid 10-digit mobile number';
     if (profile.aadhaarNumber !== undefined && String(profile.aadhaarNumber || '').trim()
         && !AADHAAR_RE.test(String(profile.aadhaarNumber).replace(/\s/g, '')))
         return 'Aadhaar number must be 12 digits';
@@ -276,7 +276,7 @@ function validateStudentProfile(profile = {}, { partial = false } = {}) {
         if (profile.previousSchoolState && !STATES_AND_UTS.includes(String(profile.previousSchoolState).trim()))
             return 'Select a valid previous school state or union territory';
         if (profile.previousSchoolContact && !isPhone(profile.previousSchoolContact))
-            return 'Previous school contact number is not valid';
+            return 'Previous school contact number must be a valid 10-digit mobile number';
         for (const [key, label] of [['previousSchoolLeavingDate', 'leaving date'], ['tcDate', 'TC date']]) {
             if (profile[key] && Number.isNaN(new Date(profile[key]).getTime())) return `Invalid previous school ${label}`;
         }
@@ -313,6 +313,10 @@ function buildStudentProfile(profile = {}, uploads = {}) {
 
     out.nationality  = str(profile.nationality) || 'Indian';
     out.country      = str(profile.country) || 'India';
+    // Phone numbers are kept as their ten digits, however they were typed.
+    for (const key of ['emergencyContactPhone', 'previousSchoolContact']) {
+        if (profile[key] !== undefined) out[key] = normalizePhone(profile[key]);
+    }
     if (profile.aadhaarNumber !== undefined) out.aadhaarNumber = str(profile.aadhaarNumber).replace(/\s/g, '');
 
     // "Same as current" copies the whole block, not just the street line
@@ -373,7 +377,7 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
         acc[key] = {
             name:          str(b.name),
             email:         str(b.email).toLowerCase(),
-            phone:         str(b.phone),
+            phone:         normalizePhone(b.phone),
             occupation:    str(b.occupation),
             organization:  str(b.organization),
             designation:   str(b.designation),
@@ -403,7 +407,7 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
             ...blocks.guardian,
             name:  str(newParent.name),
             email: str(newParent.email).toLowerCase(),
-            phone: str(newParent.phone),
+            phone: normalizePhone(newParent.phone),
         };
     }
 
@@ -431,7 +435,7 @@ async function resolveNewParent(newParent, { schoolId, schoolName, uploads = {},
     for (const [key, b] of Object.entries(blocks)) {
         const label = key[0].toUpperCase() + key.slice(1);
         if (b.email && !isEmail(b.email)) return { parentId: null, error: `${label}'s email is not a valid email address` };
-        if (b.phone && !isPhone(b.phone)) return { parentId: null, error: `${label}'s phone number is not valid` };
+        if (b.phone && !isPhone(b.phone)) return { parentId: null, error: `${label}'s phone number must be a valid 10-digit mobile number` };
         if (b.aadhaarNumber && !AADHAAR_RE.test(b.aadhaarNumber)) return { parentId: null, error: `${label}'s Aadhaar number must be 12 digits` };
         if (b.panNumber && !PAN_RE.test(b.panNumber)) return { parentId: null, error: `${label}'s PAN number looks invalid (e.g. ABCDE1234F)` };
     }
@@ -1220,12 +1224,12 @@ exports.updateStudentFull = async (req, res) => {
         // Update User fields
         const userUpdate = {};
         if (name  !== undefined) userUpdate.name  = name;
-        if (phone !== undefined) userUpdate.phone = phone;
+        if (phone !== undefined) userUpdate.phone = normalizePhone(phone);
         // Only a freshly uploaded photo replaces the avatar — an edit that
         // leaves the photo alone must not clobber one the student set themselves
         if (uploads.photo) userUpdate.profileImage = `/uploads/student-docs/${uploads.photo}`;
-        if (phone && !/^[+\d\s\-]{7,15}$/.test(phone))
-            return res.status(400).json({ success: false, message: 'Invalid phone number' });
+        if (phone && !isPhone(phone))
+            return res.status(400).json({ success: false, message: 'Phone number must be a valid 10-digit mobile number' });
         const rollValue = rollNumber !== undefined ? String(rollNumber).trim() : undefined;
         if (rollValue) {
             const sectionId = currentSection !== undefined
@@ -1348,8 +1352,9 @@ exports.updateUser = async (req, res) => {
         const { password, role, school, email, designation, ...allowed } = req.body;
         if (password && password.length < 6)
             return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
-        if (allowed.phone && !/^[+\d\s\-]{7,15}$/.test(allowed.phone))
-            return res.status(400).json({ success: false, message: 'Invalid phone number' });
+        if (allowed.phone && !isPhone(allowed.phone))
+            return res.status(400).json({ success: false, message: 'Phone number must be a valid 10-digit mobile number' });
+        if (allowed.phone !== undefined) allowed.phone = normalizePhone(allowed.phone);
         // Read before the write: the password is only this office's to set while
         // the address signs in nowhere else.
         const target = await User.findOne({ _id: req.params.id, school: req.schoolId }).lean();
@@ -1515,14 +1520,14 @@ function validateTeacherIntake(b, files = {}, { requireDocuments = true } = {}) 
         || req(b.emergencyContactPhone, 'Emergency contact phone');
     if (e) return e;
     if (b.dob && Number.isNaN(new Date(b.dob).getTime())) return 'Invalid date of birth';
-    if (!isPhone(b.emergencyContactPhone)) return 'Emergency contact phone is not valid';
+    if (!isPhone(b.emergencyContactPhone)) return 'Emergency contact phone must be a valid 10-digit mobile number';
 
     // 2. Contact
     e = req(b.phone, 'Mobile number')
         || req(b.email, 'Email address');
     if (e) return e;
-    if (!isPhone(b.phone)) return 'Mobile number is not valid';
-    if (b.alternatePhone && !isPhone(b.alternatePhone)) return 'Secondary phone number is not valid';
+    if (!isPhone(b.phone)) return 'Mobile number must be a valid 10-digit mobile number';
+    if (b.alternatePhone && !isPhone(b.alternatePhone)) return 'Secondary phone number must be a valid 10-digit mobile number';
     if (!isEmail(b.email)) return 'Email address is not valid';
 
     // Addresses use the same street / PIN / city / state shape as student intake
@@ -1603,9 +1608,9 @@ function buildTeacherProfile(b, files = {}) {
         bloodGroup:   b.bloodGroup || '',
         fatherOrHusbandName:   String(b.fatherOrHusbandName || '').trim(),
         emergencyContactName:  String(b.emergencyContactName || '').trim(),
-        emergencyContactPhone: String(b.emergencyContactPhone || '').trim(),
+        emergencyContactPhone: normalizePhone(b.emergencyContactPhone),
 
-        alternatePhone:   String(b.alternatePhone || '').trim(),
+        alternatePhone:   normalizePhone(b.alternatePhone),
         currentAddress:   String(b.currentAddress || '').trim(),
         currentCity:      String(b.currentCity    || '').trim(),
         currentState:     String(b.currentState   || '').trim(),
@@ -1834,7 +1839,7 @@ exports.updateTeacherFull = async (req, res) => {
 
         const userUpdate = {};
         if (b.name  !== undefined) userUpdate.name  = String(b.name).trim();
-        if (b.phone !== undefined) userUpdate.phone = String(b.phone).trim();
+        if (b.phone !== undefined) userUpdate.phone = normalizePhone(b.phone);
         if (b.email !== undefined) userUpdate.email = String(b.email).toLowerCase().trim();
         if (b.password && String(b.password).length < 6)
             return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
@@ -1884,7 +1889,7 @@ exports.createStudent = async (req, res) => {
         if (!name?.trim())  return res.status(400).json({ success: false, message: 'Full name is required' });
         if (!email?.trim()) return res.status(400).json({ success: false, message: 'Email is required' });
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, message: 'Invalid email format' });
-        if (phone && !/^[+\d\s\-]{7,15}$/.test(phone)) return res.status(400).json({ success: false, message: 'Invalid phone number' });
+        if (phone && !isPhone(phone)) return res.status(400).json({ success: false, message: 'Phone number must be a valid 10-digit mobile number' });
         // Class is required; the section can be assigned later. A section on its
         // own is still accepted (mobile + bulk import) — the class is derived.
         let classId = profile.currentClass || null;
@@ -2380,10 +2385,10 @@ exports.bulkTeachers = async (req, res) => {
                     bloodGroup: normalizeBloodGroup(cell('blood group', 'bloodgroup')),
                     fatherOrHusbandName:   cell("father's / husband's name", 'father / husband name', "father's name", 'father name'),
                     emergencyContactName:  cell('emergency contact name'),
-                    emergencyContactPhone: cell('emergency contact phone'),
+                    emergencyContactPhone: normalizePhone(cell('emergency contact phone')),
 
-                    phone:          cell('phone number', 'mobile number', 'phone'),
-                    alternatePhone: cell('alternate phone', 'secondary phone'),
+                    phone:          normalizePhone(cell('phone number', 'mobile number', 'phone')),
+                    alternatePhone: normalizePhone(cell('alternate phone', 'secondary phone')),
                     currentAddress: cell('current address', 'address'),
                     currentCity:    cell('current city', 'city'),
                     currentState:   matchOption(cell('current state', 'state'), STATES_AND_UTS),
@@ -2573,7 +2578,7 @@ exports.bulkStudents = async (req, res) => {
 
             const name        = cell('full name', 'name');
             const email       = cell('email address', 'email').toLowerCase();
-            const phone       = cell('phone number', 'mobile number', 'phone');
+            const phone       = normalizePhone(cell('phone number', 'mobile number', 'phone'));
             const className   = cell('class');
             const sectionName = cell('section');
             const admNo       = cell('admission number', 'admissionnumber');
@@ -2597,7 +2602,7 @@ exports.bulkStudents = async (req, res) => {
             if (!sectionName) missing.push('Section');
             if (missing.length) { fail(`Missing: ${missing.join(', ')}`); continue; }
             if (!isEmail(email)) { fail('Invalid student email'); continue; }
-            if (!isPhone(phone)) { fail(`Invalid phone "${phone}"`); continue; }
+            if (!isPhone(phone)) { fail(`Invalid phone "${phone}" — enter a 10-digit mobile number`); continue; }
 
             // Dates are dd/mm/yyyy; `new Date` would read them as mm/dd/yyyy.
             const dates   = {};
@@ -2626,7 +2631,7 @@ exports.bulkStudents = async (req, res) => {
                     religion:    cell('religion'),
                     nationality: cell('nationality') || 'Indian',
                     emergencyContactName:     cell('emergency contact name'),
-                    emergencyContactPhone:    cell('emergency contact phone'),
+                    emergencyContactPhone:    normalizePhone(cell('emergency contact phone')),
                     emergencyContactRelation: cell('emergency contact relation', 'emergency contact relation to the student'),
 
                     address: cell('address', 'current address'),
@@ -2655,7 +2660,7 @@ exports.bulkStudents = async (req, res) => {
                     previousClass:         cell('previous class'),
                     previousAcademicYear:  cell('previous academic year'),
                     previousSchoolLeavingDate: dates.previousSchoolLeavingDate,
-                    previousSchoolContact: cell('previous school contact'),
+                    previousSchoolContact: normalizePhone(cell('previous school contact')),
                     tcNumber:              cell('tc number'),
                     tcDate:                dates.tcDate,
                 }),
@@ -2675,7 +2680,7 @@ exports.bulkStudents = async (req, res) => {
             const parentBlock = (role) => suppliedOnly({
                 name:          cell(`${role} name`, `${role} full name`),
                 email:         cell(`${role} email`).toLowerCase(),
-                phone:         cell(`${role} phone`, `${role} phone number`),
+                phone:         normalizePhone(cell(`${role} phone`, `${role} phone number`)),
                 occupation:    cell(`${role} occupation`),
                 organization:  cell(`${role} organization`),
                 designation:   cell(`${role} designation`),
@@ -2700,7 +2705,7 @@ exports.bulkStudents = async (req, res) => {
                 if (!legacyName || !legacyEmail) { fail('Parent / guardian details are required'); continue; }
                 newParent.name  = legacyName;
                 newParent.email = legacyEmail;
-                newParent.phone = cell('parent phone number', 'parent phone');
+                newParent.phone = normalizePhone(cell('parent phone number', 'parent phone'));
             }
 
             const clasDoc = classMap[className.toLowerCase()];

@@ -79,6 +79,11 @@ app.use('/api', (_req, res, next) => {
 });
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Phone numbers are 10-digit Indian mobile numbers wherever a request carries
+// one: normalised to their ten digits, or refused with a 400. Multipart forms
+// get the same check once multer has read them (middleware/upload).
+app.use(require('./middleware/phoneFields').phoneFields);
+
 // Trust the reverse proxy so req.ip / X-Forwarded-For reflect the real client
 // (nginx / load balancer sits in front in production).
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1);
@@ -182,7 +187,7 @@ app.use((req, res) => {
 
 // ── Global Error Handler ──────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
-    console.error(err);
+    if (err.code !== 'INVALID_PHONE') console.error(err);   // a refused phone number is the user's to fix, not a fault
     const status = err.status || 500;
     res.status(status).json({
         success: false,

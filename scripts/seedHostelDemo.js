@@ -220,7 +220,7 @@ async function main() {
         const [name, role, gender, shift, start, end] = STAFF[i];
         const u = await M('User').create({
             school: S, name, email: `${name.toLowerCase().replace(/[^a-z]+/g, '.')}.staff@${DOMAIN}`, password,
-            role: 'teacher', isActive: true, isFirstLogin: false, phone: `+91 98${String(76543210 + i * 1111).slice(0, 8)}`,
+            role: 'teacher', isActive: true, isFirstLogin: false, phone: `98${String(76543210 + i * 1111).slice(0, 8)}`,
         });
         await M('TeacherProfile').create({
             user: u._id, school: S, employeeId: `HST${String(i + 1).padStart(3, '0')}`, department: 'Hostel',
@@ -265,7 +265,7 @@ async function main() {
     for (const h of LAYOUT) {
         const hostel = await M('Hostel').create({
             school: S, name: h.name, code: h.code, hostelType: h.type, gender: h.gender, city: 'Kolkata',
-            contactNumber: '+91 98765 43210', capacity: 60, warden: h.warden.id, status: 'active',
+            contactNumber: '9876543210', capacity: 60, warden: h.warden.id, status: 'active',
             entryTime: '06:00', exitTime: '21:00', curfewTime: '22:00', facilities: ['wifi', 'laundry', 'study hall'],
             createdBy: A,
         });
@@ -410,7 +410,7 @@ async function main() {
             status, appliedAt, appliedBy: A, reviewedBy: ['applied', 'pending_approval'].includes(status) ? null : A,
             reviewedAt: ['applied', 'pending_approval'].includes(status) ? null : at(-(48 - i * 3), 15),
             waitlistPosition: status === 'waitlisted' ? (i % 2) + 1 : 0, allocation: r.allocation?._id || null,
-            guardianName: 'Parent', guardianPhone: '+91 90000 00000', reason: 'Distance from home',
+            guardianName: 'Parent', guardianPhone: '9000000000', reason: 'Distance from home',
             decisionRemark: status === 'rejected' ? 'Incomplete medical form' : '', createdBy: A,
         });
     }
@@ -455,7 +455,7 @@ async function main() {
             school: S, hostel: r.spot.hostel._id, student: r.st.id, allocation: r.allocation._id, academicYear: Y,
             leaveNumber: `HLV-2609-${String(i + 1).padStart(4, '0')}`, leaveType: type, fromDate: from, toDate: to, totalDays: len,
             reason: pick(['Family function', 'Weekend at home', 'Doctor visit', 'Festival', 'Sibling wedding'], i),
-            destination: 'Home', guardianName: 'Parent', guardianPhone: '+91 90000 00000', status,
+            destination: 'Home', guardianName: 'Parent', guardianPhone: '9000000000', status,
             parentApprovalRequired: false,
             wardenApprovedBy: ['approved', 'active', 'returned'].includes(status) ? A : null,
             wardenApprovedAt: ['approved', 'active', 'returned'].includes(status) ? at(start - 1, 16) : null,
@@ -521,7 +521,7 @@ async function main() {
         const inAt = at(d, 9 + (i % 7), 10 + (i % 4) * 10);
         const v = await M('HostelVisitor').create({
             school: S, hostel: r.spot.hostel._id, student: r.st.id, passNumber: `GP${String(i + 1).padStart(3, '0')}`,
-            visitorName: vn, mobile: `+91 9${String(8765432100 + i * 1234567).slice(0, 9)}`, relationship: rel,
+            visitorName: vn, mobile: `9${String(8765432100 + i * 1234567).slice(0, 9)}`, relationship: rel,
             purpose: pick(['Personal meet', 'Fee discussion', 'Inspection', 'Parcel delivery', 'Maintenance work'], i),
             scheduledAt: inAt, entryTime: ['checked_in', 'checked_out'].includes(status) ? inAt : null,
             exitTime: status === 'checked_out' ? new Date(inAt.getTime() + (45 + (i % 5) * 20) * 60e3) : null,

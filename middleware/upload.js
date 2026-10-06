@@ -2,6 +2,7 @@
 const multer = require('multer');
 const path   = require('path');
 const fs     = require('fs');
+const { checkPhoneFields } = require('./phoneFields');
 
 const ensureDir = (dir) => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -80,5 +81,35 @@ const medicalFilter = (req, file, cb) => {
     cb(ok ? null : new Error('Upload a PDF, a photo (JPG, PNG, WebP) or a Word document'), ok);
 };
 const uploadMedicalDoc = multer({ storage: diskStorage('medical-docs'), fileFilter: medicalFilter, limits: { fileSize: 10 * 1024 * 1024 } });
+
+/**
+ * A multipart form's text fields only exist once multer has read it, so the
+ * phone-number rule that server.js applies to every other body
+ * (middleware/phoneFields) is applied here, straight after. A refusal goes
+ * on as a 400 error — some handlers run these by hand and wait on next() —
+ * and takes the files it brought with it.
+ */
+const withPhoneCheck = (instance) => {
+    for (const kind of ['single', 'array', 'fields', 'none', 'any']) {
+        const make = instance[kind].bind(instance);
+        instance[kind] = (...args) => {
+            const read = make(...args);
+            return (req, res, next) => read(req, res, (err) => {
+                if (err) return next(err);
+                const bad = checkPhoneFields(req.body);
+                if (!bad) return next();
+                const files = [req.file, ...(Array.isArray(req.files) ? req.files : Object.values(req.files || {}).flat())];
+                for (const f of files) if (f?.path) fs.promises.unlink(f.path).catch(() => {});
+                const refusal = new Error(bad);
+                refusal.status = 400;
+                refusal.code = 'INVALID_PHONE';
+                return next(refusal);
+            });
+        };
+    }
+    return instance;
+};
+[uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo,
+    uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc].forEach(withPhoneCheck);
 
 module.exports = { uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

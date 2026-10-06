@@ -21,7 +21,7 @@ const R = require('./medicalRules');
 
 const { refuse, str, oneOf } = R;
 const MAX = 12;
-const PHONE = /^[+\d\s-]{7,15}$/;
+const { isPhone, normalizePhone } = require('../utils/validators');
 
 /** The form's health part, cleaned — or null when nothing was filled in. */
 function check(raw) {
@@ -51,8 +51,8 @@ function check(raw) {
             medication: str(c?.medication, 400), emergencyInstructions: str(c?.emergencyInstructions, 400),
         });
     }
-    const doctor = { name: str(h.doctor?.name, 120), phone: str(h.doctor?.phone, 20) };
-    if (doctor.phone && !PHONE.test(doctor.phone)) refuse('The family doctor\'s phone number is not valid');
+    const doctor = { name: str(h.doctor?.name, 120), phone: normalizePhone(str(h.doctor?.phone, 20)) };
+    if (doctor.phone && !isPhone(doctor.phone)) refuse('The family doctor\'s phone number must be a valid 10-digit mobile number');
     const out = { allergies, conditions, medicines: str(h.medicines, 600), doctor, dietary: str(h.dietary, 600), notes: str(h.notes, 1200) };
     const any = allergies.length || conditions.length || out.medicines || doctor.name || doctor.phone || out.dietary || out.notes;
     return any ? out : null;

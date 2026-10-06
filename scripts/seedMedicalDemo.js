@@ -86,7 +86,7 @@ async function main() {
     const password = await bcrypt.hash(PASSWORD, 10);
 
     const school = await M('School').create({
-        name: NAME, code: 'APM', email: `office@${DOMAIN}`, phone: '+91 20 2543 1100', address: '12, MG Road, Kothrud', city: 'Pune', state: 'Maharashtra',
+        name: NAME, code: 'APM', email: `office@${DOMAIN}`, phone: '9822543110', address: '12, MG Road, Kothrud', city: 'Pune', state: 'Maharashtra',
         board: 'CBSE', isActive: true, modules: { medical: true, notification: true, attendance: true, holiday: true, document: true },
     });
     const S = String(school._id);
@@ -101,13 +101,13 @@ async function main() {
     };
     const person = (role, name, extra = {}) => M('User').create({ school: S, role, name, password, isActive: true, isFirstLogin: false, email: emailOf(name), ...extra });
 
-    const admin = await person('school_admin', 'Office Admin', { email: `admin@${DOMAIN}`, phone: '+91 98200 10001' });
+    const admin = await person('school_admin', 'Office Admin', { email: `admin@${DOMAIN}`, phone: '9820010001' });
     used.add(`admin@${DOMAIN}`);
-    const nurse = await person('teacher', 'Mary Joseph', { phone: '+91 98200 10012' });
+    const nurse = await person('teacher', 'Mary Joseph', { phone: '9820010012' });
     await M('TeacherProfile').create({ user: nurse._id, school: S, designation: 'Nurse', department: 'Medical Room', staffType: 'non_teaching', employeeId: 'EMP3012', gender: 'Female' });
     const teachers = {};
     for (const [n, g] of [['Priya Sharma', 'Female'], ['Rakesh Iyer', 'Male'], ['Neha Kapoor', 'Female'], ['Sanjay Deshmukh', 'Male'], ['Farah Khan', 'Female'], ['Vivek Menon', 'Male']]) {
-        teachers[n] = await person('teacher', n, { phone: `+91 98500 1${String(Object.keys(teachers).length).padStart(4, '0')}` });
+        teachers[n] = await person('teacher', n, { phone: `985001${String(Object.keys(teachers).length).padStart(4, '0')}` });
         await M('TeacherProfile').create({ user: teachers[n]._id, school: S, designation: 'Teacher', staffType: 'teaching', gender: g });
     }
     await M('Designation').create({ school: S, name: 'Nurse', permissions: { medical: 'admin', attendance: 'user', leave: 'user', payroll: 'user', holiday: 'user', notification: 'user', document: 'user' }, isActive: true, description: 'Runs the medical room: visits, first aid, medicines and health records' }).catch(() => {});
@@ -141,13 +141,13 @@ async function main() {
         secs[sec].students.push(u._id);
         const surname = name.split(' ')[1];
         let parent = null;
-        if (surname === 'Sharma') parent = parents.Sharma || (parents.Sharma = await person('parent', 'Rahul Sharma', { phone: '+91 98220 41234' }));
-        else if (['Vihaan Rao', 'Diya Iyer', 'Kabir Nair', 'Ira Menon'].includes(name)) parent = await person('parent', `${pick(['Rajesh', 'Amit', 'Sunil', 'Vikas'])} ${surname}`, { phone: `+91 97${String(10000000 + adm * 7919).slice(-8)}` });
+        if (surname === 'Sharma') parent = parents.Sharma || (parents.Sharma = await person('parent', 'Rahul Sharma', { phone: '9822041234' }));
+        else if (['Vihaan Rao', 'Diya Iyer', 'Kabir Nair', 'Ira Menon'].includes(name)) parent = await person('parent', `${pick(['Rajesh', 'Amit', 'Sunil', 'Vikas'])} ${surname}`, { phone: `97${String(10000000 + adm * 7919).slice(-8)}` });
         await M('StudentProfile').create({
             user: u._id, school: S, currentClass: secs[sec].cls._id, currentSection: secs[sec].doc._id, admissionNumber: `APM${String(2016 + (adm % 8))}${String(adm).padStart(3, '0')}`,
             rollNumber: String(secs[sec].students.length), bloodGroup: blood, dob: new Date(Date.UTC(2026 - Number(sec.replace(/\D/g, '')) - 6, adm % 12, 3 + (adm % 25))),
             gender: g === 'f' ? 'Female' : 'Male', parent: parent?._id || null,
-            emergencyContactName: name === 'Aarav Sharma' ? 'Raj Malhotra' : '', emergencyContactPhone: name === 'Aarav Sharma' ? '+91 98220 77881' : '', emergencyContactRelation: name === 'Aarav Sharma' ? 'Uncle' : '',
+            emergencyContactName: name === 'Aarav Sharma' ? 'Raj Malhotra' : '', emergencyContactPhone: name === 'Aarav Sharma' ? '9822077881' : '', emergencyContactRelation: name === 'Aarav Sharma' ? 'Uncle' : '',
         });
         if (parent) {
             const pp = await M('ParentProfile').findOne({ user: parent._id }).lean();
@@ -155,7 +155,7 @@ async function main() {
             else {
                 await M('ParentProfile').create({
                     user: parent._id, school: S, relationship: 'Father', children: [u._id],
-                    father: { name: parent.name, phone: parent.phone }, mother: { name: surname === 'Sharma' ? 'Sunita Sharma' : `Pooja ${surname}`, phone: `+91 98111 ${String(40000 + adm * 37).slice(-5)}` },
+                    father: { name: parent.name, phone: parent.phone }, mother: { name: surname === 'Sharma' ? 'Sunita Sharma' : `Pooja ${surname}`, phone: `98111${String(40000 + adm * 37).slice(-5)}` },
                 });
             }
         }
@@ -173,7 +173,7 @@ async function main() {
     const equip = require('../services/medicalEquipment');
     const id = (n) => String(S2[n]._id);
 
-    await settings.save(S, { roomName: 'Medical Room', roomLocation: 'Ground floor, next to the main office', roomPhone: '+91 20 2543 1199 (ext. 12)', roomHours: '7:45 AM – 3:30 PM' }, ctx.userId);
+    await settings.save(S, { roomName: 'Medical Room', roomLocation: 'Ground floor, next to the main office', roomPhone: '9822543119', roomHours: '7:45 AM – 3:30 PM' }, ctx.userId);
     const beds = {};
     for (const [label, kind] of [['Bed 1', 'bed'], ['Bed 2', 'bed'], ['Rest area A', 'rest_area'], ['Isolation', 'isolation']]) beds[label] = await cases.saveBed(ctx, null, { label, kind });
 
@@ -232,8 +232,8 @@ async function main() {
     const prof = (n, body) => health.saveProfile(ctx, id(n), body);
     await prof('Aarav Sharma', { heightCm: 152, weightKg: 44, dietaryRestrictions: 'No peanuts or tree nuts in any form', instructions: 'Carries an inhaler in his school bag. If he is wheezing, let him use it and send him to the Medical Room.',
         emergencyMedication: { required: true, name: 'Adrenaline auto-injector 0.3 mg', location: 'School bag (front pocket); spare in the Medical Room red box', instructions: 'Inject into the outer thigh at the first sign of anaphylaxis, then call an ambulance.' },
-        doctor: { name: 'Dr. Anil Kulkarni', phone: '+91 98230 11122', clinic: 'Kothrud Children’s Clinic' }, hospital: { name: 'Deenanath Mangeshkar Hospital', phone: '+91 20 4015 1000', address: 'Erandwane, Pune' },
-        alternateContact: { name: 'Sunita Sharma', phone: '+91 98111 40037', relation: 'Mother' }, privateNotes: 'Anaphylaxis at age 6 (hospitalised). Review the action plan each June.', reviewed: true });
+        doctor: { name: 'Dr. Anil Kulkarni', phone: '9823011122', clinic: 'Kothrud Children’s Clinic' }, hospital: { name: 'Deenanath Mangeshkar Hospital', phone: '9840151000', address: 'Erandwane, Pune' },
+        alternateContact: { name: 'Sunita Sharma', phone: '9811140037', relation: 'Mother' }, privateNotes: 'Anaphylaxis at age 6 (hospitalised). Review the action plan each June.', reviewed: true });
     await health.addHealthRecord(ctx, 'allergy', id('Aarav Sharma'), { allergen: 'Peanuts', category: 'food', severity: 'life_threatening', reaction: 'Lip and throat swelling, wheezing, hives', emergencyInstructions: 'Use the adrenaline auto-injector immediately, call an ambulance, then the parents', medication: 'Adrenaline auto-injector 0.3 mg', doctor: 'Dr. Anil Kulkarni' });
     await health.addHealthRecord(ctx, 'condition', id('Aarav Sharma'), { type: 'asthma', condition: 'Asthma', severity: 'moderate', chronic: true, diagnosedOn: '2018-07-10', treatment: 'Reliever inhaler as needed; preventer at home', medication: 'Salbutamol inhaler 100 mcg', emergencyInstructions: 'Sit him up, 4 puffs of the reliever; if no better in 10 minutes call an ambulance' });
     await health.addHealthRecord(ctx, 'allergy', id('Diya Iyer'), { allergen: 'Penicillin', category: 'medicine', severity: 'severe', reaction: 'Widespread rash and swelling', emergencyInstructions: 'Never give penicillin-group antibiotics. Antihistamine for a rash; ambulance if breathing is affected.' });
@@ -343,7 +343,7 @@ async function main() {
 
     /* Parents' updates waiting for the room. */
     await health.submitChange(pctx, id('Ananya Sharma'), { kind: 'allergy', action: 'add', payload: { allergen: 'Shellfish', category: 'food', severity: 'moderate', reaction: 'Hives around the mouth' }, note: 'Found out at a wedding last month' });
-    await health.submitChange(pctx, id('Aarav Sharma'), { kind: 'contact', payload: { slot: 'alternate', name: 'Raj Malhotra', phone: '+91 98220 77881', relation: 'Uncle (lives nearby)' }, note: 'Please call him if we cannot be reached' });
+    await health.submitChange(pctx, id('Aarav Sharma'), { kind: 'contact', payload: { slot: 'alternate', name: 'Raj Malhotra', phone: '9822077881', relation: 'Uncle (lives nearby)' }, note: 'Please call him if we cannot be reached' });
 
     console.log(`done.\n  logins (password ${PASSWORD}): admin@${DOMAIN}, mary.joseph@${DOMAIN} (nurse), priya.sharma@${DOMAIN} (class teacher VIII-B), aarav.sharma@${DOMAIN} (student), rahul.sharma@${DOMAIN} (parent)`);
 }

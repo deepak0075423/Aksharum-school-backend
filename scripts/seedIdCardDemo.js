@@ -214,7 +214,7 @@ async function main() {
     const logo = writeImage('idcard-demo', 'crest', CREST, 200, 200, true);
     const signature = writeImage('idcard-demo', 'signature', SIGNATURE, 360, 120, true);
     const school = await M('School').create({
-        name: NAME, code: 'APS', email: `office@${DOMAIN}`, phone: '+91 20 2543 1100', address: '12, MG Road, Kothrud',
+        name: NAME, code: 'APS', email: `office@${DOMAIN}`, phone: '9822543110', address: '12, MG Road, Kothrud',
         city: 'Pune', state: 'Maharashtra', board: 'CBSE', website: 'www.aksharum.edu.in', logo, isActive: true,
         modules: { idCard: true, attendance: true, notification: true, holiday: true, document: true, result: true, employeeDirectory: true },
     });
@@ -238,13 +238,13 @@ async function main() {
         school: S, role, name, password, isActive: true, isFirstLogin: false, email: emailOf(name), ...extra,
     });
 
-    const admin = await person('school_admin', 'Office Admin', { email: `admin@${DOMAIN}`, phone: '+91 98200 10001', profileImage: photoFor({ gender: 'm', attire: 'shirt', shirt: '#3f4f6b', hair: 'short' }) });
+    const admin = await person('school_admin', 'Office Admin', { email: `admin@${DOMAIN}`, phone: '9820010001', profileImage: photoFor({ gender: 'm', attire: 'shirt', shirt: '#3f4f6b', hair: 'short' }) });
     const ctx = { schoolId: S, userId: String(admin._id), userRole: 'school_admin' };
 
     /* Settings: what every card says about the school. */
     await design.saveSettings(S, {
         displayName: 'Aksharum Public School', tagline: 'Affiliated to CBSE · Affiliation No. 1130256',
-        address: '12, MG Road, Kothrud, Pune, Maharashtra 411038', phone: '+91 20 2543 1100', email: 'office@aksharum.edu.in',
+        address: '12, MG Road, Kothrud, Pune, Maharashtra 411038', phone: '9822543110', email: 'office@aksharum.edu.in',
         website: 'www.aksharum.edu.in', signatoryName: 'Dr. Meera Kulkarni', signatoryTitle: 'Principal',
     }, ctx.userId);
     await design.setImage(S, 'signature', signature, ctx.userId);
@@ -271,10 +271,10 @@ async function main() {
     ];
     const staff = {};
     for (const [i, [name, g, designation, department, staffType, employeeId, look]] of STAFF.entries()) {
-        const u = await person('teacher', name, { phone: `+91 98500 ${String(11000 + i * 37).slice(-5)}`, profileImage: photoFor({ gender: g, age: 'adult', ...look }) });
+        const u = await person('teacher', name, { phone: `98500${String(11000 + i * 37).slice(-5)}`, profileImage: photoFor({ gender: g, age: 'adult', ...look }) });
         await M('TeacherProfile').create({
             user: u._id, school: S, employeeId, designation, department, staffType, gender: g === 'f' ? 'Female' : 'Male',
-            bloodGroup: BLOOD[i % BLOOD.length], joiningDate: day(2012 + (i % 9), 6, 1 + i), emergencyContactPhone: `+91 99220 ${String(30000 + i * 41).slice(-5)}`,
+            bloodGroup: BLOOD[i % BLOOD.length], joiningDate: day(2012 + (i % 9), 6, 1 + i), emergencyContactPhone: `99220${String(30000 + i * 41).slice(-5)}`,
             subjects: staffType === 'teaching' ? [department] : [],
         });
         staff[name] = u;
@@ -336,11 +336,11 @@ async function main() {
         const surname = st.name.split(' ').slice(-1)[0];
         let parent;
         if (st.name.endsWith('Sharma')) {
-            parent = parents.Sharma || (parents.Sharma = await person('parent', 'Rahul Sharma', { phone: '+91 98220 41234', profileImage: photoFor({ gender: 'm', age: 'adult', attire: 'shirt', shirt: '#334e68', glasses: true, hair: 'short' }) }));
+            parent = parents.Sharma || (parents.Sharma = await person('parent', 'Rahul Sharma', { phone: '9822041234', profileImage: photoFor({ gender: 'm', age: 'adult', attire: 'shirt', shirt: '#334e68', glasses: true, hair: 'short' }) }));
         } else if (i % 4 !== 1) {
             const g = i % 3 ? 'm' : 'f';
             const pname = `${g === 'm' ? pick(['Rajesh', 'Amit', 'Sunil', 'Vikas', 'Manoj', 'Prakash']) : pick(['Pooja', 'Sneha', 'Kavita', 'Anjali', 'Rekha', 'Shalini'])} ${surname}`;
-            parent = await person('parent', pname, { phone: `+91 97${String(10000000 + i * 7919).slice(-8)}`, profileImage: i % 6 === 0 ? '' : photoFor({ gender: g, age: 'adult', ...PARENT_LOOKS[i % PARENT_LOOKS.length] }) });
+            parent = await person('parent', pname, { phone: `97${String(10000000 + i * 7919).slice(-8)}`, profileImage: i % 6 === 0 ? '' : photoFor({ gender: g, age: 'adult', ...PARENT_LOOKS[i % PARENT_LOOKS.length] }) });
             parent.relationship = g === 'm' ? 'Father' : 'Mother';
         }
         const photoFile = photo ? path.basename(photo) : '';

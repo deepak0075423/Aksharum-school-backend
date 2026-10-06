@@ -17,7 +17,7 @@ const { sendSchoolMail, emailHeaderHtml, getMailContext, sendSchoolAddedEmail } 
 // One address is one person, who may hold posts at several schools — see the
 // header of services/accountIdentity.js.
 const identity = require('../services/accountIdentity');
-const { validate, passwordError } = require('../utils/validators');
+const { validate, passwordError, isPhone, normalizePhone } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
 
@@ -124,7 +124,7 @@ const _validateSchool = (body) => {
         if (name.length < 2 || name.length > 100) return `${label} must be 2-100 characters`;
     }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return 'Valid email is required';
-    if (!/^\d{7,15}$/.test(body.phone.replace(/[\s\-+()]/g, ''))) return 'Valid phone number is required';
+    if (!isPhone(body.phone)) return 'Phone must be a valid 10-digit mobile number';
     if (body.website && !/^https?:\/\/.+\..+/.test(body.website)) return 'Website must be a valid URL starting with http:// or https://';
     if (String(body.name).trim().length < 3) return 'School Name must be at least 3 characters';
     if (!/^[A-Za-z0-9_-]{2,20}$/.test(String(body.code).trim())) return 'School Code must be 2-20 letters, numbers, hyphens or underscores';
@@ -532,7 +532,7 @@ exports.bulkStudents = async (req, res) => {
 
             const name        = r['full name']          || r['name']        || '';
             const email       = (r['email address']     || r['email']       || '').toLowerCase();
-            const phone       = r['phone number']        || r['phone']       || '';
+            const phone       = normalizePhone(r['phone number'] || r['phone'] || '');
             const admNo       = r['admission number']    || r['admissionnumber'] || '';
             const dobRaw      = r['date of birth']       || r['dob']         || '';
             const gender      = r['gender']              || '';
@@ -543,7 +543,7 @@ exports.bulkStudents = async (req, res) => {
             const address     = r['address']             || '';
             const parentName  = r['parent full name']    || r['parent name'] || '';
             const parentEmail = (r['parent email']       || '').toLowerCase();
-            const parentPhone = r['parent phone number'] || r['parent phone'] || '';
+            const parentPhone = normalizePhone(r['parent phone number'] || r['parent phone'] || '');
 
             push({ type: 'processing', current: i + 1, total: rows.length, name: name || `Row ${rowNum}` });
 
@@ -577,6 +577,14 @@ exports.bulkStudents = async (req, res) => {
             if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parentEmail)) {
                 errors.push({ row: rowNum, name, reason: 'Invalid parent email' });
                 push({ type: 'row_done', row: rowNum, name, success: false, reason: 'Invalid parent email' });
+                continue;
+            }
+            if (!isPhone(phone) || !isPhone(parentPhone)) {
+                const reason = !isPhone(phone)
+                    ? `Invalid phone "${phone}" — enter a 10-digit mobile number`
+                    : `Invalid parent phone "${parentPhone}" — enter a 10-digit mobile number`;
+                errors.push({ row: rowNum, name, reason });
+                push({ type: 'row_done', row: rowNum, name, success: false, reason });
                 continue;
             }
 

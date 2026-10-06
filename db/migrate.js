@@ -106,6 +106,17 @@ const ONCE = [
             return `${results.changed} of ${results.scanned} results, ${classTests.changed} of ${classTests.scanned} class tests re-graded`;
         },
     },
+    {
+        // Phone numbers were stored as typed ("+91 98765 43210"); every phone
+        // field now holds a 10-digit mobile number. Only formatting and the
+        // country code go — a number that would not become a valid mobile is
+        // left as it is (scripts/normalizePhones.js lists those).
+        name: 'phones: stored as 10-digit mobile numbers (Oct 2026)',
+        run: async () => {
+            const r = await require('../services/phoneBackfill').normalizeStoredPhones({ apply: true });
+            return `${r.changed} of ${r.scanned} phone numbers rewritten as ten digits, ${r.leftAlone} left as they are${r.skipped ? `, ${r.skipped} saved meanwhile` : ''}`;
+        },
+    },
 ];
 
 async function runOnce() {
