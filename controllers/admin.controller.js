@@ -51,6 +51,7 @@ const admissionNo = require('../utils/admissionNumber');
 const employeeIdUtil = require('../utils/employeeId');
 const { capacityErrorById } = require('../utils/sectionCapacity');
 const { identityClash, changed: idChanged } = require('../utils/identityNumbers');
+const { fatherOrHusbandLabel } = require('../utils/fatherOrHusband');
 const { syncSectionsToSchoolSaturday } = require('../utils/timetableDays');
 const teacherDeps = require('../services/teacherDependencies');
 
@@ -1515,10 +1516,12 @@ function validateTeacherIntake(b, files = {}, { requireDocuments = true } = {}) 
         || req(b.dob, 'Date of birth')
         || req(b.gender, 'Gender')
         || req(b.bloodGroup, 'Blood group')
-        || req(b.fatherOrHusbandName, "Father's / husband's name")
+        // A man gives his father's name; a woman her father's or her husband's.
+        || req(b.fatherOrHusbandName, fatherOrHusbandLabel(b.gender, 'sentence'))
         || req(b.emergencyContactName, 'Emergency contact name')
         || req(b.emergencyContactPhone, 'Emergency contact phone');
     if (e) return e;
+    if (!GENDERS.includes(b.gender)) return 'Gender must be Male, Female or Other';
     if (b.dob && Number.isNaN(new Date(b.dob).getTime())) return 'Invalid date of birth';
     if (!isPhone(b.emergencyContactPhone)) return 'Emergency contact phone must be a valid 10-digit mobile number';
 
@@ -2374,6 +2377,23 @@ exports.bulkTeachers = async (req, res) => {
             if (dobRaw  && !dob)     { fail('Invalid Date of Birth (use dd/mm/yyyy)'); continue; }
             if (joinRaw && !joining) { fail('Invalid Date of Joining (use dd/mm/yyyy)'); continue; }
 
+            // A man gives his father's name; a woman her father's OR her
+            // husband's — one name either way, as on the add-teacher form. A
+            // sheet from the template before Oct 2026 has the one combined
+            // column instead, read for any gender. With no valid gender the
+            // shared validator below says so first.
+            const gender      = matchOption(cell('gender'), GENDERS);
+            const fatherName  = cell("father's name", 'father name');
+            const husbandName = cell("husband's name", 'husband name');
+            if (GENDERS.includes(gender)) {
+                if (gender === 'Male' && husbandName) { fail("Husband's Name is only for a female teacher — give a male teacher's Father's Name"); continue; }
+                if (fatherName && husbandName && fatherName.toLowerCase() !== husbandName.toLowerCase()) {
+                    fail("Give either the Father's Name or the Husband's Name, not both"); continue;
+                }
+            }
+            const fatherOrHusbandName = (gender === 'Male' ? fatherName : husbandName || fatherName)
+                || cell("father's / husband's name", 'father / husband name');
+
             const employeeId = cell('employee id', 'employeeid');
             // The row, shaped exactly like the seven-step wizard's POST body.
             const b = {
@@ -2381,9 +2401,9 @@ exports.bulkTeachers = async (req, res) => {
                     name,
                     email,
                     dob,
-                    gender:     matchOption(cell('gender'), GENDERS),
+                    gender,
                     bloodGroup: normalizeBloodGroup(cell('blood group', 'bloodgroup')),
-                    fatherOrHusbandName:   cell("father's / husband's name", 'father / husband name', "father's name", 'father name'),
+                    fatherOrHusbandName,
                     emergencyContactName:  cell('emergency contact name'),
                     emergencyContactPhone: normalizePhone(cell('emergency contact phone')),
 
@@ -3069,7 +3089,7 @@ exports.downloadStudentTemplate = async (req, res) => {
 // The seven steps of the add-teacher wizard, flattened into columns.
 const TEACHER_TEMPLATE_HEADERS = [
     // 1. Personal
-    'Full Name', 'Date of Birth', 'Gender', 'Blood Group', "Father's / Husband's Name",
+    'Full Name', 'Date of Birth', 'Gender', 'Blood Group', "Father's Name", "Husband's Name",
     'Emergency Contact Name', 'Emergency Contact Phone',
     // 2. Contact
     'Phone Number', 'Alternate Phone', 'Email Address',
@@ -3105,7 +3125,7 @@ exports.downloadTeacherTemplate = async (req, res) => {
 
         const sample = sampleFor(headers, {
             'Full Name': 'Anita Sharma', 'Date of Birth': '12/04/1990', Gender: 'Female', 'Blood Group': 'B+',
-            "Father's / Husband's Name": 'Ramesh Sharma',
+            "Husband's Name": 'Ramesh Sharma',
             'Emergency Contact Name': 'Ramesh Sharma', 'Emergency Contact Phone': '9876543200',
 
             'Phone Number': '9876543210', 'Email Address': 'anita.sharma@example.com',
@@ -3142,6 +3162,11 @@ exports.downloadTeacherTemplate = async (req, res) => {
         referenceSheet(wb, [
             ['Designations (this school) — a row with any other value is rejected', designations],
             ['Gender', GENDERS],
+            ["Father's Name / Husband's Name", [
+                "Male — the Father's Name; leave Husband's Name blank",
+                "Female — the Father's Name or the Husband's Name, one of the two",
+                "Other — the Father's Name or the Husband's Name, one of the two",
+            ]],
             ['Blood Group', BLOOD_GROUPS],
             ['Qualification', [
                 ...QUALIFICATIONS,
@@ -3160,7 +3185,8 @@ exports.downloadTeacherTemplate = async (req, res) => {
             ['Leave blank to auto-generate', ['Employee ID']],
             ['Required in every row', [
                 'Full Name', 'Date of Birth', 'Gender', 'Blood Group',
-                "Father's / Husband's Name", 'Emergency Contact Name', 'Emergency Contact Phone',
+                "Father's Name (a female teacher may give the Husband's Name instead)",
+                'Emergency Contact Name', 'Emergency Contact Phone',
                 'Phone Number', 'Email Address',
                 'Current Address', 'Current City', 'Current State', 'Current Pincode',
                 'Aadhaar Number', 'PAN Number', 'Qualification', 'Employment Type',

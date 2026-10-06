@@ -39,6 +39,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const User                  = require('../models/User');
+const { fatherOrHusbandLabel } = require('../utils/fatherOrHusband');
 const TeacherProfile        = require('../models/TeacherProfile');
 const ClassSection          = require('../models/ClassSection');
 const Class                 = require('../models/Class');
@@ -217,7 +218,8 @@ function computeCompletion(user, profile) {
         const source = f.on === 'user' ? user : p;
         const value  = source?.[f.key];
         const ok = value instanceof Date ? !Number.isNaN(value.getTime()) : !!trim(value);
-        if (ok) filled += 1; else missing.push({ key: f.key, label: f.label, isDocument: !!f.doc });
+        const label = f.key === 'fatherOrHusbandName' ? fatherOrHusbandLabel(p.gender, 'sentence') : f.label;
+        if (ok) filled += 1; else missing.push({ key: f.key, label, isDocument: !!f.doc });
     }
     return {
         percent: pct(filled, required.length),
