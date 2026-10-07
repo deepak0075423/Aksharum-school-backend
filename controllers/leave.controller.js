@@ -20,6 +20,7 @@ const { commitTransition, recordAdjustments } = require('../services/leaveBalanc
 // school without Attendance or Timetable sees leave behave exactly as before.
 const leaveIntegrations = require('../services/leaveIntegrations');
 const { sheetTextProblem } = require('../middleware/textSafety');
+const { textProblem } = require('../utils/textRules');
 // Working-day / weekly-off arithmetic is shared with the Comp Off engine so the
 // two can never disagree about whether a given Saturday is a working day.
 const {
@@ -260,14 +261,58 @@ exports.adminGetLeaveTypes = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * A leave type's name and description take no symbols (utils/textRules:
+ * `words`, `sentence`), the same rule the web form types by. With `existing`,
+ * only a value that changes is judged — a type saved before the rule can
+ * still be switched on or off without first being renamed.
+ */
+/**
+ * The type already wearing `code` at this school — active or not, because the
+ * code is how every report, balance sheet and import names a type. `selfId`
+ * is the type being edited. Codes are stored in capitals (the model and both
+ * handlers upper-case them), so the comparison is exact.
+ */
+async function codeTakenBy(schoolId, code, selfId = null) {
+    return LeaveType.findOne({ school: schoolId, code, ...(selfId ? { _id: { $ne: selfId } } : {}) })
+        .select('name isActive').lean();
+}
+const codeTaken = (code, t, adding = false) => `Code ${code} is already used by ${t.name}`
+    + (t.isActive === false
+        ? (adding ? ' (inactive — switch it back on rather than adding it again)' : ' (inactive)')
+        : '');
+
+function leaveTypeTextProblem({ name, description }, existing = null) {
+    const changed = (v, was) => v !== undefined && String(v ?? '').trim() !== String(was ?? '').trim();
+    if (name !== undefined && (!existing || changed(name, existing.name))) {
+        const bad = textProblem(String(name).trim(), 'Leave type name', 'words');
+        if (bad) return { field: 'name', message: bad };
+    }
+    if (description !== undefined && (!existing || changed(description, existing.description))) {
+        const bad = textProblem(String(description ?? '').trim(), 'Description', 'sentence');
+        if (bad) return { field: 'description', message: bad };
+    }
+    return null;
+}
+
+/** A refusal that names the form field it is about, so the form can mark that box. */
+const fieldError = (res, field, message) => res.status(400).json({ success: false, field, message });
+
 exports.adminCreateLeaveType = async (req, res) => {
     try {
         const { name, code, description, category, annualAllocation, monthlyAccrual, carryForward, encashable,
                 maxEncashableDays, maxConsecutiveDays, requiresDocument, documentRequiredAfterDays, isActive } = req.body;
-        if (!name?.trim()) return res.status(400).json({ success: false, message: 'Name is required' });
-        if (!code?.trim()) return res.status(400).json({ success: false, message: 'Code is required' });
+        if (!name?.trim()) return fieldError(res, 'name', 'Name is required');
+        if (!code?.trim()) return fieldError(res, 'code', 'Code is required');
+        const badText = leaveTypeTextProblem({ name, description });
+        if (badText) return fieldError(res, badText.field, badText.message);
 
         const normalizedCode = code.trim().toUpperCase();
+        // A code belongs to one type. This used to be an upsert on the code, so
+        // "adding" a type under a code already in use silently rewrote that
+        // type's name, allocation and description instead of saying so.
+        const taken = await codeTakenBy(req.schoolId, normalizedCode);
+        if (taken) return fieldError(res, 'code', codeTaken(normalizedCode, taken, true));
         const resolvedCategory = category === 'compoff' || normalizedCode === 'COMPOFF' ? 'compoff' : 'general';
 
         // Only one comp off type can be live at a time — the engine resolves
@@ -277,7 +322,7 @@ exports.adminCreateLeaveType = async (req, res) => {
                 school: req.schoolId, category: 'compoff', isActive: true,
                 code: { $ne: normalizedCode },
             }).lean();
-            if (clash) return res.status(400).json({ success: false, message: `An active Comp Off leave type already exists (${clash.code}). Deactivate it first.` });
+            if (clash) return fieldError(res, 'category', `An active Comp Off leave type already exists (${clash.code}). Deactivate it first.`);
         }
 
         const payload = {
@@ -302,14 +347,13 @@ exports.adminCreateLeaveType = async (req, res) => {
         if (requiresDocument          !== undefined) payload.requiresDocument          = !!requiresDocument;
         if (documentRequiredAfterDays !== undefined) payload.documentRequiredAfterDays = Number(documentRequiredAfterDays) || 0;
 
-        // Upsert: create new or update existing type with the same code
-        const lt = await LeaveType.findOneAndUpdate(
-            { school: req.schoolId, code: normalizedCode },
-            { $set: payload, $setOnInsert: { school: req.schoolId, code: normalizedCode, createdBy: req.userId } },
-            { upsert: true, new: true }
-        );
-        res.status(201).json({ success: true, data: lt });
+        const lt = await LeaveType.create({
+            ...payload, school: req.schoolId, code: normalizedCode, createdBy: req.userId,
+        });
+        res.status(201).json({ success: true, data: lt.toObject ? lt.toObject() : lt });
     } catch (e) {
+        // Two saves of the same code racing past the check meet the unique index.
+        if (e.code === 11000) return res.status(400).json({ success: false, field: 'code', message: 'That code is already used by another leave type' });
         res.status(500).json({ success: false, message: e.message });
     }
 };
@@ -321,6 +365,9 @@ exports.adminUpdateLeaveType = async (req, res) => {
 
         const existing = await LeaveType.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!existing) return res.status(404).json({ success: false, message: 'Leave type not found' });
+        if (name !== undefined && !String(name).trim()) return fieldError(res, 'name', 'Name is required');
+        const badText = leaveTypeTextProblem({ name, description }, existing);
+        if (badText) return fieldError(res, badText.field, badText.message);
         const nextCategory = category !== undefined
             ? (category === 'compoff' ? 'compoff' : 'general')
             : (existing.category || 'general');
@@ -329,13 +376,21 @@ exports.adminUpdateLeaveType = async (req, res) => {
             const clash = await LeaveType.findOne({
                 school: req.schoolId, category: 'compoff', isActive: true, _id: { $ne: req.params.id },
             }).lean();
-            if (clash) return res.status(400).json({ success: false, message: `An active Comp Off leave type already exists (${clash.code}). Deactivate it first.` });
+            if (clash) return fieldError(res, 'category', `An active Comp Off leave type already exists (${clash.code}). Deactivate it first.`);
         }
 
         const update = {};
+        if (code !== undefined) {
+            const nextCode = String(code ?? '').trim().toUpperCase();
+            if (!nextCode) return fieldError(res, 'code', 'Code is required');
+            if (nextCode !== existing.code) {
+                const taken = await codeTakenBy(req.schoolId, nextCode, existing._id);
+                if (taken) return fieldError(res, 'code', codeTaken(nextCode, taken));
+            }
+            update.code = nextCode;
+        }
         if (category                 !== undefined) update.category                 = nextCategory;
         if (name                     !== undefined) update.name                     = name.trim();
-        if (code                     !== undefined) update.code                     = code.trim().toUpperCase();
         if (description              !== undefined) update.description              = (description || '').trim();
         // Comp off days are earned, never allocated — keep the annual figure at 0
         if (annualAllocation         !== undefined) update.annualAllocation         = nextCategory === 'compoff' ? 0 : Number(annualAllocation);
@@ -356,7 +411,7 @@ exports.adminUpdateLeaveType = async (req, res) => {
         if (!lt) return res.status(404).json({ success: false, message: 'Leave type not found' });
         res.json({ success: true, data: lt });
     } catch (e) {
-        if (e.code === 11000) return res.status(400).json({ success: false, message: 'Leave type code already exists' });
+        if (e.code === 11000) return res.status(400).json({ success: false, field: 'code', message: 'That code is already used by another leave type' });
         res.status(500).json({ success: false, message: e.message });
     }
 };
@@ -687,7 +742,7 @@ exports.adminGetLeaveOverview = async (req, res) => {
             // Who is out right now. Half days say which half, because a morning
             // absence and an afternoon one need different cover.
             pool.query(
-                `SELECT la."_id", la."teacher", la."toDate", la."leaveMode", la."halfDaySession",
+                `SELECT la."_id", la."teacher", la."fromDate", la."toDate", la."leaveMode", la."halfDaySession",
                         u."name", tp."employeeId",
                         lt."name" AS "typeName", lt."code" AS "typeCode"
                    FROM ${qt(LeaveApplication)} la
@@ -765,9 +820,11 @@ exports.adminGetLeaveOverview = async (req, res) => {
                 // Distinct people, not applications — a morning half day and an
                 // afternoon one is one teacher out of school, not two.
                 onLeaveToday: new Set(outToday.rows.map((r) => String(r.teacher))).size,
+                // `teacher` so the "On Leave Today" list can fold a morning and
+                // an afternoon half day into the one person the tile counted.
                 out: outToday.rows.map((r) => ({
-                    _id: String(r._id), name: r.name, employeeId: r.employeeId || '',
-                    leaveType: r.typeName, code: r.typeCode, toDate: r.toDate,
+                    _id: String(r._id), teacher: String(r.teacher), name: r.name, employeeId: r.employeeId || '',
+                    leaveType: r.typeName, code: r.typeCode, fromDate: r.fromDate, toDate: r.toDate,
                     leaveMode: r.leaveMode, halfDaySession: r.halfDaySession,
                 })),
                 upcoming: soon.rows.map((r) => ({
@@ -801,14 +858,32 @@ const REQUEST_SORTS = {
     longest: { totalDays: -1 },
 };
 
+/**
+ * The teachers of one department, as ids — department lives on TeacherProfile,
+ * not on the application. The same resolution the Reports tab counts with, so
+ * a report's figure and the request list it opens hold the same applications.
+ */
+const NO_ONE = '00000000-0000-0000-0000-000000000000';
+async function narrowToDepartment(filter, schoolId, department) {
+    if (!department) return;
+    const profiles = await TeacherProfile.find({ school: schoolId, department }).select('user').lean();
+    const ids = profiles.map((pr) => String(pr.user));
+    // A teacher already asked for must also be in the department; an empty
+    // department matches nothing, never everything.
+    filter.teacher = filter.teacher
+        ? (ids.includes(String(filter.teacher)) ? filter.teacher : NO_ONE)
+        : { $in: ids.length ? ids : [NO_ONE] };
+}
+
 exports.adminGetRequests = async (req, res) => {
     try {
         const { status, teacherId, leaveType, fromDate, toDate, page = 1, limit = 20, focus,
-                q, sort: sortKey, mode } = req.query;
+                q, sort: sortKey, mode, department } = req.query;
         const filter = { school: req.schoolId };
         if (status)    filter.status    = status;
         if (teacherId) filter.teacher   = teacherId;
         if (leaveType) filter.leaveType = leaveType;
+        await narrowToDepartment(filter, req.schoolId, department);
         if (mode === 'half_day' || mode === 'full_day') filter.leaveMode = mode;
         if (fromDate || toDate) {
             filter.fromDate = {};
@@ -2300,11 +2375,12 @@ exports.adminGetReports = async (req, res) => {
 
 exports.adminExportRequests = async (req, res) => {
     try {
-        const { status, teacherId, leaveType, fromDate, toDate } = req.query;
+        const { status, teacherId, leaveType, fromDate, toDate, department } = req.query;
         const filter = { school: req.schoolId };
         if (status)    filter.status    = status;
         if (teacherId) filter.teacher   = teacherId;
         if (leaveType) filter.leaveType = leaveType;
+        await narrowToDepartment(filter, req.schoolId, department);
         if (fromDate || toDate) {
             filter.fromDate = {};
             if (fromDate) filter.fromDate.$gte = new Date(fromDate);

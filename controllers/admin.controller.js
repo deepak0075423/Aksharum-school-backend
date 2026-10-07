@@ -593,7 +593,7 @@ async function attendanceTrend(schoolId, days = 7) {
 }
 
 /** New teachers / students / parents / sections since the 1st of this month. */
-async function monthGrowth(schoolId) {
+async function monthGrowth(schoolId, yearId = null) {
     const since = new Date();
     since.setHours(0, 0, 0, 0);
     since.setDate(1);
@@ -606,11 +606,13 @@ async function monthGrowth(schoolId) {
               GROUP BY "role"`,
             [String(schoolId), since],
         ),
+        // In the working year, like the section count it sits under.
         pool.query(
             `SELECT count(*)::int AS "n"
                FROM ${qt(ClassSection)}
-              WHERE "school" = $1 AND "createdAt" >= $2`,
-            [String(schoolId), since],
+              WHERE "school" = $1 AND "createdAt" >= $2
+                AND ($3::uuid IS NULL OR "academicYear" = $3::uuid)`,
+            [String(schoolId), since, yearId ? String(yearId) : null],
         ),
     ]);
 
@@ -635,13 +637,21 @@ exports.getDashboard = async (req, res) => {
         const TeacherAttendanceRegularization = require('../models/TeacherAttendanceRegularization');
         const Notification     = require('../models/Notification');
 
+        const academicYear = await AcademicYear.findOne({ school, status: 'active' })
+            .select('yearName startDate endDate status').lean().catch(() => null);
+        // Sections are counted in the year the school is working in — the one
+        // the Classes screen behind this tile shows. A year that has ended
+        // keeps its sections "active" on their own rows, and counting those
+        // made the tile larger than any screen it led to.
+        const yearScope = academicYear ? { academicYear: academicYear._id } : {};
+
         const [teachers, students, parents, sections,
                pendingLeaves, pendingPayments, examsToPublish, pendingRegularizations,
-               recentNotifications, academicYear, trend, growth] = await Promise.all([
+               recentNotifications, trend, growth] = await Promise.all([
             User.countDocuments({ school, role: 'teacher' }),
             User.countDocuments({ school, role: 'student' }),
             User.countDocuments({ school, role: 'parent' }),
-            ClassSection.countDocuments({ school, status: 'active' }),
+            ClassSection.countDocuments({ school, status: 'active', ...yearScope }),
             LeaveApplication.countDocuments({ school, status: 'pending' }).catch(() => 0),
             FeePayment.countDocuments({ school, paymentStatus: 'pending' }).catch(() => 0),
             // Validated and waiting for the office to publish. An archived exam is waiting for nobody.
@@ -649,14 +659,12 @@ exports.getDashboard = async (req, res) => {
             TeacherAttendanceRegularization.countDocuments({ school, status: 'Pending' }).catch(() => 0),
             Notification.find({ school }).sort({ createdAt: -1 }).limit(5)
                 .select('title createdAt senderRole recipientCount').lean().catch(() => []),
-            AcademicYear.findOne({ school, status: 'active' })
-                .select('yearName startDate endDate status').lean().catch(() => null),
             // Each of these is a nicety on the dashboard, never a reason for it
             // to fail to load — a broken one degrades to "no data" in the UI.
             // 30 days so the dashboard's range filter (week / fortnight / month)
             // slices what it already has instead of asking again.
             attendanceTrend(school, 30).catch(() => []),
-            monthGrowth(school).catch(() => null),
+            monthGrowth(school, academicYear?._id).catch(() => null),
         ]);
 
         const today = trend[trend.length - 1] || null;

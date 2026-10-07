@@ -395,7 +395,7 @@ exports.importYearStructure = async (req, res) => {
                 .select('subjectName subjectCode type description').lean(),
         ]);
         const tgtSubjects = await Subject.find({ school: req.schoolId, academicYear: target._id })
-            .select('subjectName').lean();
+            .select('subjectName subjectCode').lean();
         // Matched on name, case-insensitively: the same subject typed into both
         // years by hand must not become two rows.
         const tgtSubjectByName = new Map(tgtSubjects.map((x) => [x.subjectName.trim().toLowerCase(), x]));
@@ -485,6 +485,28 @@ exports.importYearStructure = async (req, res) => {
                     + ` Tick ${names.length > 1 ? 'them' : 'it'} too, or set`
                     + ` ${names.length > 1 ? 'them' : 'it'} up in ${target.yearName} first.`,
             });
+        }
+
+        // A code is unique within a school's year. A subject copied in under a
+        // code the year already gives a differently named subject would be
+        // refused by the database halfway through the write, so it is caught
+        // here, where the preview can say so before anything is written.
+        if (inc.subjects) {
+            const upper = (v) => String(v || '').trim().toUpperCase();
+            const tgtByCode = new Map(tgtSubjects.filter((x) => upper(x.subjectCode))
+                .map((x) => [upper(x.subjectCode), x]));
+            const clashes = subjects
+                .filter((s) => !tgtSubjectByName.has(s.subjectName.trim().toLowerCase()))
+                .filter((s) => tgtByCode.has(upper(s.subjectCode)))
+                .map((s) => `${s.subjectName} (${upper(s.subjectCode)} is ${tgtByCode.get(upper(s.subjectCode)).subjectName})`);
+            if (clashes.length) {
+                blocked.push({
+                    part: 'subjectCodes',
+                    needs: [],
+                    message: `${target.yearName} already uses the code${clashes.length === 1 ? '' : 's'} of `
+                        + `${clashes.join(', ')}. Give one of each pair a different code first.`,
+                });
+            }
         }
 
 

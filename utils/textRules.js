@@ -16,6 +16,8 @@
  *            . ' - ( ) and digits ("North 24 Parganas" is a district the PIN
  *            lookup fills in; the screens do not let anyone type digits there)
  *   title    the name of a thing: English letters, digits, spaces and . , - & ' ( ) / + : # %
+ *   words    a label with no symbols (a leave type's name): letters, digits, spaces
+ *   sentence a line of description with no symbols: letters, digits, spaces and . , ' - ( ) /
  *   code     an ID: English letters, digits and - / _ .
  *   upper    capital letters and digits
  *   digits   digits only;  decimal  a number with one decimal point
@@ -35,6 +37,8 @@ const KINDS = {
     letters: { ok: /^[A-Za-z][A-Za-z ]*$/,            msg: (l) => `${l} can only have English letters and spaces` },
     place:   { ok: /^[A-Za-z][A-Za-z0-9 .'()-]*$/,    msg: (l) => `${l} can only have English letters, spaces and . ' - ( )` },
     title:   { ok: /^[A-Za-z0-9 .,&'()/+:#%-]+$/,     msg: (l) => `${l} can only have English letters, numbers, spaces and . , - & ' ( ) / + : # %` },
+    words:   { ok: /^[A-Za-z][A-Za-z0-9 ]*$/,         msg: (l) => `${l} must start with a letter and can only have English letters, numbers and spaces` },
+    sentence: { ok: /^[A-Za-z0-9][A-Za-z0-9 .,'()/-]*$/, msg: (l) => `${l} must start with a letter or a number and can only have English letters, numbers, spaces and . , ' - ( ) /` },
     code:    { ok: /^[A-Za-z0-9/._-]+$/,              msg: (l) => `${l} can only have English letters, numbers and - / _ .` },
     upper:   { ok: /^[A-Z0-9]+$/, upper: true,        msg: (l) => `${l} can only have capital letters and numbers` },
     digits:  { ok: /^[0-9]+$/,                        msg: (l) => `${l} can only have numbers` },

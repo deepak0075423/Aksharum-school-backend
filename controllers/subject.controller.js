@@ -9,6 +9,7 @@ const TeacherProfile        = require('../models/TeacherProfile');
 const User                  = require('../models/User');
 const { syncSectionChatGroup } = require('../services/sectionChatService');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
+const { textProblem } = require('../utils/textRules');
 const { accessChanged } = require('../services/accessChanged');
 
 /**
@@ -286,10 +287,45 @@ exports.getSubject = async (req, res) => {
         });
     } catch (e) { err(res, e); }
 };
+/** A code as stored: trimmed and in capitals, so "math" and "MATH" are one code. */
+const normalCode = (v) => String(v ?? '').trim().toUpperCase();
+
+/** The code a request sends, under either name the callers use; undefined when it sends none. */
+const sentCode = (body) => (body.subjectCode !== undefined ? body.subjectCode : body.code);
+
+/**
+ * Why `code` cannot be this subject's, or null.
+ *
+ * Required, an ID's characters, and not already worn by another subject in
+ * the same school's year. Each school keeps its own catalogue, and so does
+ * each year of it — the year's subjects are copied forward with their codes,
+ * so last year's MATH, or another school's, is not a clash. Compared without
+ * regard to case, which is how a code is read. `selfId` is the subject being
+ * edited.
+ */
+async function codeProblem(code, { schoolId, yearId, selfId }) {
+    if (!code) return 'Subject code is required';
+    if (code.length > 20) return 'Subject code can be at most 20 characters';
+    const bad = textProblem(code, 'Subject code', 'code');
+    if (bad) return bad;
+    const rx = `^${code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`;
+    const clash = await Subject.findOne({
+        school: schoolId,
+        academicYear: yearId || null,
+        subjectCode: { $regex: rx, $options: 'i' },
+        ...(selfId ? { _id: { $ne: selfId } } : {}),
+    }).select('subjectName').lean();
+    return clash ? `Subject code ${code} is already used by ${clash.subjectName} in this academic year` : null;
+}
+
+// Two saves racing past codeProblem meet the unique index instead.
+const isDuplicate = (e) => e?.code === 11000 || e?.code === '23505';
+
 exports.createSubject = async (req, res) => {
     try {
-        const { name, subjectName, code, subjectCode, type, description, teachers } = req.body;
+        const { name, subjectName, type, description, teachers } = req.body;
         if (!(subjectName || name)?.trim()) return err(res, 'Subject name is required', 400);
+        const code = normalCode(sentCode(req.body));
         // A subject is created INTO a year — the one the screen is showing, or
         // the active one when the caller does not say.
         let yearId = req.body.academicYear;
@@ -302,12 +338,14 @@ exports.createSubject = async (req, res) => {
             yearId = active._id;
         }
         if (type && !['theory', 'practical', 'elective'].includes(type)) return err(res, 'Subject type must be theory, practical or elective', 400);
+        const badCode = await codeProblem(code, { schoolId: req.schoolId, yearId });
+        if (badCode) return err(res, badCode, 400);
         // A deactivated teacher cannot be listed against a subject.
         const inactive = await inactiveTeacherError(teachers, req.schoolId);
         if (inactive) return err(res, inactive, 400);
         const s = await Subject.create({
             subjectName: subjectName || name,
-            subjectCode: subjectCode || code || null,
+            subjectCode: code,
             type:        type || 'theory',
             description: description || '',
             teachers:    Array.isArray(teachers) ? teachers : [],
@@ -316,14 +354,30 @@ exports.createSubject = async (req, res) => {
         });
         const populated = await s.populate('teachers', 'name email');
         ok(res, await attachTeacherDetail(populated.toObject?.() ?? populated), 201);
-    } catch (e) { err(res, e, 400); }
+    } catch (e) {
+        if (isDuplicate(e)) return err(res, 'Subject code is already used by another subject in this academic year', 400);
+        err(res, e, 400);
+    }
 };
 exports.updateSubject = async (req, res) => {
     try {
-        const { name, subjectName, code, subjectCode, type, description, teachers } = req.body;
+        const { name, subjectName, type, description, teachers } = req.body;
         const update = {};
         if (subjectName || name)           update.subjectName = subjectName || name;
-        if (subjectCode || code)           update.subjectCode = subjectCode || code;
+        // A save that carries a code is judged like a new one — required, and
+        // free in the subject's own year. One that does not (a caller changing
+        // only the teacher pool) leaves the code alone.
+        if (sentCode(req.body) !== undefined) {
+            const current = await Subject.findOne({ _id: req.params.id, school: req.schoolId })
+                .select('academicYear').lean();
+            if (!current) return err(res, 'Subject not found', 404);
+            const code = normalCode(sentCode(req.body));
+            const badCode = await codeProblem(code, {
+                schoolId: req.schoolId, yearId: current.academicYear, selfId: current._id,
+            });
+            if (badCode) return err(res, badCode, 400);
+            update.subjectCode = code;
+        }
         if (type)                          update.type        = type;
         if (description !== undefined)     update.description = description;
         if (Array.isArray(teachers))       update.teachers    = teachers;
@@ -335,7 +389,10 @@ exports.updateSubject = async (req, res) => {
             .populate('teachers', 'name email');
         if (!s) return err(res, 'Subject not found', 404);
         ok(res, await attachTeacherDetail(s.toObject?.() ?? s));
-    } catch (e) { err(res, e, 400); }
+    } catch (e) {
+        if (isDuplicate(e)) return err(res, 'Subject code is already used by another subject in this academic year', 400);
+        err(res, e, 400);
+    }
 };
 exports.deleteSubject = async (req, res) => {
     try {
