@@ -103,6 +103,8 @@ router.get('/teachers/template',            guard, adminCtrl.downloadTeacherTemp
 // The list as it stands on screen, as a spreadsheet — same filters, no paging.
 // Declared above '/teachers/:id' so 'export' is not read as an id.
 router.get('/teachers/export',              guard, adminCtrl.exportTeachers);
+// Each subject the "Subjects Covered" tile counts, with who covers it.
+router.get('/teachers/subjects',            guard, adminCtrl.getTeacherSubjects);
 router.delete('/teachers/:id',              guard, adminCtrl.deleteUser);
 router.get('/teachers/:id',                 guard, adminCtrl.getTeacherDetail);
 // What still points at a teacher, so Delete / Deactivate can show it first.
@@ -132,6 +134,10 @@ router.get('/admins',                       guard, adminCtrl.getAdmins);
 router.get('/admins/export',                guard, adminCtrl.exportAdmins);
 router.post('/admins',                      guard, adminCtrl.createAdmin);
 router.delete('/admins/:id',                guard, adminCtrl.deleteUser);
+
+// Parents — created through a student's admission; listed here
+router.get('/parents',                      guard, adminCtrl.getParents);
+router.get('/parents/export',               guard, adminCtrl.exportParents);
 
 // All classes with sections in one call (for student form dropdowns) — active academic year only
 router.get('/classes-with-sections', guard, async (req, res) => {

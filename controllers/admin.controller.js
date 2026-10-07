@@ -712,8 +712,10 @@ async function yearStart(schoolId) {
  * The four figures every list page leads with. School-wide on purpose — they
  * describe the school, not the filter currently applied, so switching a filter
  * does not make the summary jump around.
+ *
+ * `start` is the year's first day when the caller already has it.
  */
-async function accountStats(schoolId, role) {
+async function accountStats(schoolId, role, start) {
     const { rows } = await pool.query(
         `SELECT count(*)::int                                        AS "total",
                 count(*) FILTER (WHERE "isActive" IS NOT FALSE)::int AS "active",
@@ -721,9 +723,19 @@ async function accountStats(schoolId, role) {
                 count(*) FILTER (WHERE "createdAt" >= $2)::int       AS "recent"
            FROM ${qt(User)}
           WHERE "school" = $1 AND "role" = $3`,
-        [String(schoolId), await yearStart(schoolId), role],
+        [String(schoolId), start || await yearStart(schoolId), role],
     );
     return rows[0] || { total: 0, active: 0, inactive: 0, recent: 0 };
+}
+
+/**
+ * `?added=year` keeps the accounts created since this academic year began —
+ * what the "new this year" tile counts, from the same date, so the tile and the
+ * list it opens always agree. Null when the list is not asked to narrow.
+ */
+async function addedSince(req, start) {
+    if (req.query.added !== 'year') return null;
+    return start || yearStart(req.schoolId);
 }
 
 /** Paging that can't be talked into scanning the whole school. */
@@ -806,28 +818,48 @@ const STUDENT_ORDER = {
     class:    `COALESCE(csc."className", ocl."className") ASC NULLS LAST, cs."sectionName" ASC NULLS LAST, u."name" ASC`,
 };
 
-/** Everything the students list is asked to narrow itself by, in one place. */
-function studentFilters(req) {
+/**
+ * Everything the students list is asked to narrow itself by, in one place.
+ * `since` is addedSince()'s answer.
+ */
+function studentFilters(req, since) {
     const c = conditions([String(req.schoolId)]);
     c.where.push(`u."school" = $1`, `u."role" = 'student'`);
 
-    const { search = '', status = 'all', gender = '', classId = '', sectionId = '' } = req.query;
+    const { search = '', status = 'all', gender = '', classId = '', sectionId = '',
+            academicYear = '' } = req.query;
     if (search.trim()) {
         c.add(`(u."name" ILIKE ? OR u."email" ILIKE ? OR sp."rollNumber" ILIKE ? OR sp."admissionNumber" ILIKE ?)`,
             ...Array(4).fill(`%${search.trim()}%`));
     }
     const st = statusClause(status);
     if (st) c.where.push(st);
+    if (since)                  c.add(`u."createdAt" >= ?`, since);
     if (gender)                 c.add(`sp."gender" = ?`, gender);
     if (isUuid(sectionId))      c.add(`sp."currentSection" = ?::uuid`, sectionId);
     else if (isUuid(classId))   c.add(`COALESCE(cs."class", sp."currentClass") = ?::uuid`, classId);
+    // Sat in a section of that year's classes — read off the section rosters,
+    // which is what the Classes screen's "Total Students" adds up. For a year
+    // that has ended the rosters are the only record: everyone's profile has
+    // moved on to this year's section. Uncorrelated, so it is hashed once.
+    if (isUuid(academicYear)) {
+        c.add(`u."_id"::text IN (
+                   SELECT e.id
+                     FROM ${qt(ClassSection)} ys
+                     JOIN ${qt(Class)} yc ON yc."_id" = ys."class"
+                    CROSS JOIN LATERAL jsonb_array_elements_text(
+                          CASE WHEN jsonb_typeof(ys."enrolledStudents") = 'array'
+                               THEN ys."enrolledStudents" ELSE '[]'::jsonb END) AS e(id)
+                    WHERE yc."school" = $1 AND yc."academicYear" = ?::uuid)`, academicYear);
+    }
     return c;
 }
 
 exports.getStudents = async (req, res) => {
     try {
         const { page, limit, offset } = paging(req.query);
-        const c     = studentFilters(req);
+        const start = await yearStart(req.schoolId);
+        const c     = studentFilters(req, await addedSince(req, start));
         const order = STUDENT_ORDER[req.query.sort] || STUDENT_ORDER.name;
 
         const [rows, count, stats] = await Promise.all([
@@ -837,7 +869,7 @@ exports.getStudents = async (req, res) => {
                 c.values,
             ),
             pool.query(`SELECT count(*)::int AS "n" ${STUDENT_FROM} ${c.sql()}`, c.values),
-            accountStats(req.schoolId, 'student'),
+            accountStats(req.schoolId, 'student', start),
         ]);
 
         const total = count.rows[0]?.n || 0;
@@ -948,19 +980,50 @@ function teacherFilters(req) {
     if (department)  c.add(`tp."department" = ?`, department);
     if (gender)      c.add(`tp."gender" = ?`, gender);
     if (staffType)   c.add(`${STAFF_TYPE} = ?`, staffType);
-    // Either source counts: `@>` on a jsonb array is "contains this element",
-    // and the EXISTS covers a teacher assigned the subject on a section but
-    // whose intake form never listed it.
-    if (subject) {
-        c.add(`(tp."subjects" @> ?::jsonb OR EXISTS (
-                    SELECT 1 FROM ${qt(SectionSubjectTeacher)} sst
-                      JOIN ${qt(Subject)} sub ON sub."_id" = sst."subject"
-                     WHERE sst."teacher" = u."_id" AND sub."school" = u."school"
-                       AND sub."subjectName" = ?))`,
-            JSON.stringify([subject]), subject);
+    // Either source counts — the intake form's list, or a section the teacher
+    // is assigned the subject on — compared trimmed, exactly as SUBJECT_PAIRS
+    // reads them, so a subject's count in the coverage list is what this finds.
+    const subj = typeof subject === 'string' ? subject.trim() : '';
+    if (subj) {
+        c.add(`(EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+                            CASE WHEN jsonb_typeof(tp."subjects") = 'array' THEN tp."subjects" ELSE '[]'::jsonb END
+                        ) AS ps(v) WHERE trim(ps.v) = ?)
+                OR EXISTS (SELECT 1 FROM ${qt(SectionSubjectTeacher)} sst
+                             JOIN ${qt(Subject)} sub ON sub."_id" = sst."subject"
+                            WHERE sst."teacher" = u."_id" AND sub."school" = u."school"
+                              AND trim(sub."subjectName") = ?))`,
+            subj, subj);
     }
     return c;
 }
+
+/**
+ * Every (teacher, subject) pair in the school, from both sources the subject
+ * filter reads: the intake form's list and the section assignments.
+ *
+ * Read from the teachers outward, the way the list itself is, so a profile or
+ * an assignment left behind by a deleted account cannot make a subject look
+ * covered while its filter finds nobody. The "Subjects Covered" tile, the
+ * subject dropdown and the coverage list are all built from this.
+ */
+const SUBJECT_PAIRS = `
+    SELECT DISTINCT u."_id", u."name", u."isActive", p."subject"
+      FROM ${qt(User)} u
+      LEFT JOIN ${qt(TeacherProfile)} tp ON tp."user" = u."_id"
+     CROSS JOIN LATERAL (
+           SELECT trim(ps.v) AS "subject"
+             FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof(tp."subjects") = 'array' THEN tp."subjects" ELSE '[]'::jsonb END
+                  ) AS ps(v)
+            UNION
+           SELECT trim(sub."subjectName")
+             FROM ${qt(SectionSubjectTeacher)} sst
+             JOIN ${qt(Subject)} sub ON sub."_id" = sst."subject"
+            WHERE sst."teacher" = u."_id" AND sub."school" = u."school"
+         ) p
+     WHERE u."school" = $1 AND u."role" = 'teacher' AND p."subject" <> ''`;
+
+const byName = (a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' });
 
 /**
  * The values the filter dropdowns offer — taken from what teachers actually
@@ -974,30 +1037,36 @@ async function teacherOptions(schoolId) {
                FROM ${qt(TeacherProfile)} WHERE "school" = $1`,
             [String(schoolId)],
         ),
-        pool.query(
-            `SELECT DISTINCT trim(s.value) AS "subject"
-               FROM ${qt(TeacherProfile)} tp
-               CROSS JOIN LATERAL jsonb_array_elements_text(
-                   CASE WHEN jsonb_typeof(tp."subjects") = 'array' THEN tp."subjects" ELSE '[]'::jsonb END
-               ) AS s(value)
-              WHERE tp."school" = $1 AND trim(s.value) <> ''
-              UNION
-             SELECT DISTINCT trim(sub."subjectName")
-               FROM ${qt(Subject)} sub
-              WHERE sub."school" = $1 AND trim(sub."subjectName") <> ''
-                AND EXISTS (SELECT 1 FROM ${qt(SectionSubjectTeacher)} sst
-                             WHERE sst."subject" = sub."_id")`,
-            [String(schoolId)],
-        ),
+        pool.query(`SELECT DISTINCT "subject" FROM (${SUBJECT_PAIRS}) x`, [String(schoolId)]),
     ]);
-    const uniq = (list) => [...new Set(list.filter(Boolean))]
-        .sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+    const uniq = (list) => [...new Set(list.filter(Boolean))].sort(byName);
     return {
         designations: uniq(text.rows.map((r) => r.designation)),
         departments:  uniq(text.rows.map((r) => r.department)),
         subjects:     uniq(subjects.rows.map((r) => r.subject)),
     };
 }
+
+/**
+ * What the "Subjects Covered" tile counts, opened up: each subject and the
+ * teachers covering it, inactive ones included (the list shows them too).
+ */
+exports.getTeacherSubjects = async (req, res) => {
+    try {
+        const { rows } = await pool.query(SUBJECT_PAIRS, [String(req.schoolId)]);
+        const bySubject = new Map();
+        for (const r of rows) {
+            if (!bySubject.has(r.subject)) bySubject.set(r.subject, []);
+            bySubject.get(r.subject).push({ _id: r._id, name: r.name, isActive: r.isActive !== false });
+        }
+        jsonOk(res, [...bySubject.entries()]
+            .sort(([a], [b]) => byName(a, b))
+            .map(([subject, teachers]) => ({
+                subject,
+                teachers: teachers.sort((a, b) => byName(a.name || '', b.name || '')),
+            })));
+    } catch (err) { jsonErr(res, err); }
+};
 
 exports.getTeachers = async (req, res) => {
     try {
@@ -1046,7 +1115,7 @@ const ADMIN_ORDER = {
     active: 'u."lastSeenAt" DESC NULLS LAST, u."name" ASC',
 };
 
-function adminFilters(req) {
+function adminFilters(req, since) {
     const c = conditions([String(req.schoolId)]);
     c.where.push(`u."school" = $1`, `u."role" = 'school_admin'`);
 
@@ -1057,13 +1126,15 @@ function adminFilters(req) {
     }
     const st = statusClause(status);
     if (st) c.where.push(st);
+    if (since) c.add(`u."createdAt" >= ?`, since);
     return c;
 }
 
 exports.getAdmins = async (req, res) => {
     try {
         const { page, limit, offset } = paging(req.query);
-        const c     = adminFilters(req);
+        const start = await yearStart(req.schoolId);
+        const c     = adminFilters(req, await addedSince(req, start));
         const order = ADMIN_ORDER[req.query.sort] || ADMIN_ORDER.name;
 
         const [rows, count, stats] = await Promise.all([
@@ -1073,7 +1144,147 @@ exports.getAdmins = async (req, res) => {
                 c.values,
             ),
             pool.query(`SELECT count(*)::int AS "n" ${ADMIN_FROM} ${c.sql()}`, c.values),
-            accountStats(req.schoolId, 'school_admin'),
+            accountStats(req.schoolId, 'school_admin', start),
+        ]);
+
+        const total = count.rows[0]?.n || 0;
+        res.json({
+            success: true,
+            data: {
+                data: rows.rows, total, page, pages: Math.ceil(total / limit) || 1,
+                stats: {
+                    total: stats.total, active: stats.active,
+                    inactive: stats.inactive, newThisYear: stats.recent,
+                },
+            },
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
+// ── Parents ──────────────────────────────────────────────────────────────────
+
+/**
+ * Every parent → child link in the school, read from both sides the way
+ * services/parentChildren.childrenOf() reads them: the parent's own `children`
+ * list and each student profile naming its parent. Kept only where the child
+ * is a student of this school, so a stale id on either side shows nobody.
+ *
+ * A CTE because the children column and two of the filters all read it.
+ */
+const PARENT_LINKS = `links AS (
+    SELECT DISTINCT l."parent", k."_id" AS "child"
+      FROM (
+            SELECT sp2."parent" AS "parent", sp2."user"::text AS "child"
+              FROM ${qt(StudentProfile)} sp2
+             WHERE sp2."school" = $1 AND sp2."parent" IS NOT NULL
+             UNION
+            SELECT pp2."user", c.id
+              FROM ${qt(ParentProfile)} pp2
+             CROSS JOIN LATERAL jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(pp2."children") = 'array' THEN pp2."children" ELSE '[]'::jsonb END
+                 ) AS c(id)
+           ) l
+      JOIN ${qt(User)} k ON k."_id"::text = l."child" AND k."school" = $1 AND k."role" = 'student'
+)`;
+
+const PARENT_FROM = `
+       FROM ${qt(User)}           u
+  LEFT JOIN ${qt(ParentProfile)}  pp ON pp."user" = u."_id"`;
+
+// The family block holds Aadhaar and PAN numbers and their scans; the list
+// needs who each person is and how to reach them, and nothing else leaves.
+const familyMember = (key, extra = '') => {
+    const col = `pp."${key}"`;
+    return `jsonb_build_object('name', ${col}->>'name', 'phone', ${col}->>'phone',
+                               'email', ${col}->>'email', 'occupation', ${col}->>'occupation'${extra})`;
+};
+
+const PARENT_COLUMNS = `
+        u."_id", u."name", u."email", u."profileImage", u."isActive", u."createdAt",
+        u."lastSeenAt", u."isFirstLogin", pp."relationship",
+        COALESCE(NULLIF(u."phone", ''), NULLIF(pp."father"->>'phone', ''), NULLIF(pp."mother"->>'phone', ''),
+                 NULLIF(pp."guardian"->>'phone', ''), NULLIF(pp."emergencyContact", '')) AS "phone",
+        NULLIF(pp."emergencyContact", '') AS "emergencyContact",
+        CASE WHEN pp."_id" IS NULL THEN NULL ELSE jsonb_build_object(
+            'father',   ${familyMember('father')},
+            'mother',   ${familyMember('mother')},
+            'guardian', ${familyMember('guardian', `, 'relation', pp."guardian"->>'relation'`)}
+        ) END AS "family",
+        (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    '_id', k."_id", 'name', k."name", 'isActive', k."isActive" IS NOT FALSE,
+                    'className',   COALESCE(kc."className", ko."className"),
+                    'sectionName', ks."sectionName"
+                ) ORDER BY k."name"), '[]'::jsonb)
+           FROM links l
+           JOIN ${qt(User)}               k   ON k."_id"   = l."child"
+           LEFT JOIN ${qt(StudentProfile)} ksp ON ksp."user" = k."_id"
+           LEFT JOIN ${qt(ClassSection)}   ks  ON ks."_id"  = ksp."currentSection"
+           LEFT JOIN ${qt(Class)}          kc  ON kc."_id"  = ks."class"
+           LEFT JOIN ${qt(Class)}          ko  ON ko."_id"  = ksp."currentClass"
+          WHERE l."parent" = u."_id") AS "children"`;
+
+const PARENT_ORDER = {
+    name:   'u."name" ASC',
+    name_z: 'u."name" DESC',
+    newest: 'u."createdAt" DESC, u."name" ASC',
+    oldest: 'u."createdAt" ASC, u."name" ASC',
+    active: 'u."lastSeenAt" DESC NULLS LAST, u."name" ASC',
+};
+
+/**
+ * Search covers the children's names too — "whose parent is Aarav's" is the
+ * question an office most often asks of this list. Every link-reading clause
+ * is uncorrelated, so each is worked out once per request, not once per row.
+ */
+function parentFilters(req, since) {
+    const c = conditions([String(req.schoolId)]);
+    c.where.push(`u."school" = $1`, `u."role" = 'parent'`);
+
+    const { search = '', status = 'all', classId = '', sectionId = '' } = req.query;
+    if (search.trim()) {
+        // The phone shown can come off the family record, so that is searched too.
+        c.add(`(u."name" ILIKE ? OR u."email" ILIKE ? OR u."phone" ILIKE ?
+                OR pp."father"->>'phone' ILIKE ? OR pp."mother"->>'phone' ILIKE ?
+                OR pp."guardian"->>'phone' ILIKE ?
+                OR u."_id" IN (SELECT l."parent" FROM links l
+                                 JOIN ${qt(User)} k ON k."_id" = l."child"
+                                WHERE k."name" ILIKE ?))`,
+            ...Array(7).fill(`%${search.trim()}%`));
+    }
+    const st = statusClause(status);
+    if (st) c.where.push(st);
+    if (since) c.add(`u."createdAt" >= ?`, since);
+    // A child's class, as the students list reads it: through the section, or
+    // off the profile while the child waits to be placed in one.
+    if (isUuid(sectionId) || isUuid(classId)) {
+        const sectionWanted = isUuid(sectionId);
+        c.add(`u."_id" IN (SELECT l."parent" FROM links l
+                             JOIN ${qt(StudentProfile)} ksp ON ksp."user" = l."child"
+                             LEFT JOIN ${qt(ClassSection)} ks ON ks."_id" = ksp."currentSection"
+                            WHERE ${sectionWanted
+                                ? 'ksp."currentSection" = ?::uuid'
+                                : 'COALESCE(ks."class", ksp."currentClass") = ?::uuid'})`,
+            sectionWanted ? sectionId : classId);
+    }
+    return c;
+}
+
+exports.getParents = async (req, res) => {
+    try {
+        const { page, limit, offset } = paging(req.query);
+        const start = await yearStart(req.schoolId);
+        const c     = parentFilters(req, await addedSince(req, start));
+        const order = PARENT_ORDER[req.query.sort] || PARENT_ORDER.name;
+
+        const [rows, count, stats] = await Promise.all([
+            pool.query(
+                `WITH ${PARENT_LINKS}
+                 SELECT ${PARENT_COLUMNS} ${PARENT_FROM} ${c.sql()}
+                  ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`,
+                c.values,
+            ),
+            pool.query(`WITH ${PARENT_LINKS} SELECT count(*)::int AS "n" ${PARENT_FROM} ${c.sql()}`, c.values),
+            accountStats(req.schoolId, 'parent', start),
         ]);
 
         const total = count.rows[0]?.n || 0;
@@ -1123,7 +1334,7 @@ const asList    = (v) => (Array.isArray(v) ? v.join(', ') : (v || ''));
 
 exports.exportStudents = async (req, res) => {
     try {
-        const c     = studentFilters(req);
+        const c     = studentFilters(req, await addedSince(req));
         const order = STUDENT_ORDER[req.query.sort] || STUDENT_ORDER.name;
         const { rows } = await pool.query(
             `SELECT ${STUDENT_COLUMNS} ${STUDENT_FROM} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
@@ -1174,7 +1385,7 @@ exports.exportTeachers = async (req, res) => {
 
 exports.exportAdmins = async (req, res) => {
     try {
-        const c     = adminFilters(req);
+        const c     = adminFilters(req, await addedSince(req));
         const order = ADMIN_ORDER[req.query.sort] || ADMIN_ORDER.name;
         const { rows } = await pool.query(
             `SELECT ${ADMIN_COLUMNS} ${ADMIN_FROM} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
@@ -1190,6 +1401,33 @@ exports.exportAdmins = async (req, res) => {
                 sheetDate(a.createdAt), sheetDate(a.lastSeenAt),
             ]),
             widths: [24, 30, 15, 14, 10, 14, 14],
+            textColumns: [2],
+        });
+    } catch (err) { jsonErr(res, err); }
+};
+
+exports.exportParents = async (req, res) => {
+    try {
+        const c     = parentFilters(req, await addedSince(req));
+        const order = PARENT_ORDER[req.query.sort] || PARENT_ORDER.name;
+        const { rows } = await pool.query(
+            `WITH ${PARENT_LINKS}
+             SELECT ${PARENT_COLUMNS} ${PARENT_FROM} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
+            c.values,
+        );
+        const childLine = (k) => [k.name, [k.className, k.sectionName].filter(Boolean).join(' ')]
+            .filter(Boolean).join(' — ');
+        sendSheet(res, {
+            filename: 'parents.xlsx',
+            sheet: 'Parents',
+            headers: ['Name', 'Email', 'Phone', 'Relationship', 'Children', 'Status', 'Added On', 'Last Active'],
+            rows: rows.map((p) => [
+                p.name, p.email, p.phone || '', p.relationship || '',
+                (p.children || []).map(childLine).join('; '),
+                p.isActive === false ? 'Inactive' : 'Active',
+                sheetDate(p.createdAt), sheetDate(p.lastSeenAt),
+            ]),
+            widths: [24, 30, 15, 13, 40, 10, 14, 14],
             textColumns: [2],
         });
     } catch (err) { jsonErr(res, err); }
