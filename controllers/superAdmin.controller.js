@@ -138,7 +138,7 @@ const _validateSchool = (body) => {
     }
     if (!isPincode(body.pincode)) return 'Pincode must be 6 digits';
     if (!STATES_AND_UTS.includes(String(body.state).trim())) return 'Select a valid Indian state or union territory';
-    const cityProblem = textProblem(String(body.city).trim(), 'City', 'name');
+    const cityProblem = textProblem(String(body.city).trim(), 'City', 'place');
     if (cityProblem) return cityProblem;
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return 'Valid email is required';
     if (!isPhone(body.phone)) return 'Phone must be a valid 10-digit mobile number';
