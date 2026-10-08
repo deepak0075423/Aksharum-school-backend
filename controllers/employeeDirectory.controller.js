@@ -281,6 +281,11 @@ function buildRow(user, snap) {
         isActive: !!user.isActive,
         joiningDate: p.joiningDate || null,
         joiningYear: yearOf(p.joiningDate),
+        // Joined on or after the working year began: what the overview's
+        // newThisYear and the Reports page's "New joiners" count, and what
+        // ?joined=year filters to, so the figure and its list agree.
+        joinedThisYear: !!(isDate(p.joiningDate) && isDate(snap.activeYear?.startDate)
+            && new Date(p.joiningDate) >= new Date(snap.activeYear.startDate)),
         officialEmail: user.email,
         officialPhone: user.phone || '',
         employmentType: p.employmentType || '',
@@ -375,6 +380,7 @@ function matches(row, q) {
     if (q.accountStatus === 'active'   && row.isActive === false) return false;
     if (q.accountStatus === 'inactive' && row.isActive !== false) return false;
     if (q.joiningYear  && String(row.joiningYear || '') !== String(q.joiningYear)) return false;
+    if (q.joined === 'year' && !row.joinedThisYear) return false;
     if (q.reportingManager && row.reportingManagerId !== String(q.reportingManager)) return false;
     if (q.subject) {
         const want = low(q.subject);
@@ -510,10 +516,7 @@ exports.getDashboard = async (req, res) => {
         // Anyone who joined on or after the active year began. The overview
         // reports the school's own year rather than a rolling three months —
         // "new this year" is the number an admin is actually asked for.
-        const yearStart = isDate(snap.activeYear?.startDate) ? new Date(snap.activeYear.startDate) : null;
-        const joinedThisYear = yearStart
-            ? rows.filter((r) => isDate(r.joiningDate) && new Date(r.joiningDate) >= yearStart)
-            : [];
+        const joinedThisYear = rows.filter((r) => r.joinedThisYear);
         // Headcount before this year began, and the growth since. Derived from
         // joining dates only, so it counts arrivals and cannot see departures —
         // the client says "new this year", never "turnover".
@@ -589,11 +592,10 @@ exports.getDashboard = async (req, res) => {
 // would be answering a different question each time it was read. Active and
 // inactive are the ACCOUNT state here, so the two sum to the total and each
 // tile maps onto the accountStatus filter it sets.
+// eslint-disable-next-line no-unused-vars
 function headcounts(rows, activeYear) {
-    const yearStart = isDate(activeYear?.startDate) ? new Date(activeYear.startDate) : null;
-    const newThisYear = yearStart
-        ? rows.filter((r) => isDate(r.joiningDate) && new Date(r.joiningDate) >= yearStart).length
-        : 0;
+    // The row's own flag (buildRow) — one rule for this, the overview and ?joined=year.
+    const newThisYear = rows.filter((r) => r.joinedThisYear).length;
     const carriedOver = rows.length - newThisYear;
     return {
         employees:   rows.length,
