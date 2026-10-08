@@ -22,6 +22,14 @@ const FeedbackCampaignSchema = new db.Schema({
         ref: 'AcademicYear',
         default: null,
     },
+    // The template the questionnaire was copied from, when it was — what the
+    // Templates screen's "Times Reused" counts. Null for a campaign built from
+    // hand-picked questions, and for every campaign made before this existed.
+    template: {
+        type: db.Types.UUID,
+        ref: 'FeedbackTemplate',
+        default: null,
+    },
     // Free-form term label ('Term 1', 'Semester 2') — the ERP has no Term entity,
     // so it is stored as text and used as a trend axis (spec §15).
     term: {

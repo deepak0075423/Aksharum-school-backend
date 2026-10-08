@@ -425,8 +425,19 @@ exports.deleteQuestion = async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 exports.getTemplates = async (req, res) => {
     try {
-        const rows = await FeedbackTemplate.find({ school: req.schoolId }).sort({ isDefault: -1, name: 1 }).lean();
-        ok(res, rows.map((t) => ({ ...t, questionCount: (t.questions || []).length })));
+        const [rows, used] = await Promise.all([
+            FeedbackTemplate.find({ school: req.schoolId }).sort({ isDefault: -1, name: 1 }).lean(),
+            // Campaigns built from each template — archived ones too, they
+            // still ran it. Only counted since campaigns began recording it.
+            pool.query(
+                `SELECT "template", count(*)::int AS "n" FROM "feedbackcampaigns"
+                  WHERE "school" = $1 AND "template" IS NOT NULL GROUP BY "template"`,
+                [String(req.schoolId)],
+            ).then((r) => new Map(r.rows.map((x) => [sid(x.template), x.n]))).catch(() => new Map()),
+        ]);
+        ok(res, rows.map((t) => ({
+            ...t, questionCount: (t.questions || []).length, timesUsed: used.get(sid(t._id)) || 0,
+        })));
     } catch (e) { fail(res, e); }
 };
 
@@ -761,16 +772,18 @@ exports.createCampaign = async (req, res) => {
             isRequired: q.isRequired === undefined ? undefined : bool(q.isRequired, true),
         })).filter((q) => q.question);
 
+        let fromTemplate = null;   // only when the questions really came from it
         if (!questionSpecs.length && req.body.template) {
             const tpl = await FeedbackTemplate.findOne({ _id: str(req.body.template, 40), school: req.schoolId }).lean();
             if (!tpl) return bad(res, 'Template not found.');
             questionSpecs = (tpl.questions || []).map((q, i) => ({ question: sid(q.question), displayOrder: i, isRequired: q.isRequired !== false }));
             if (!body.instructions && tpl.instructions) body.instructions = tpl.instructions;
+            fromTemplate = tpl._id;
         }
         if (!questionSpecs.length) return bad(res, 'A campaign needs at least one question. Pick a template or choose questions.');
 
         const campaign = await FeedbackCampaign.create({
-            school: req.schoolId, ...body, status: 'draft', createdBy: req.userId,
+            school: req.schoolId, ...body, template: fromTemplate, status: 'draft', createdBy: req.userId,
         });
         const written = await fb.snapshotQuestions(campaign, questionSpecs);
         if (!written) {
@@ -860,6 +873,9 @@ exports.duplicateCampaign = async (req, res) => {
             ...targets,
             allowResubmission: c.allowResubmission,
             reminderEnabled: c.reminderEnabled, reminderIntervalDays: c.reminderIntervalDays,
+            // The copy asks the same questionnaire, so it is another use of the
+            // same template.
+            template: c.template || null,
             status: 'draft', createdBy: req.userId,
         });
         await fb.snapshotQuestions(copy, questions.map((q, i) => ({ question: q.question, displayOrder: i, isRequired: q.isRequired })));
@@ -1542,6 +1558,9 @@ async function buildReport(req) {
             const r = assignments.filter((a) => sid(a.campaign) === sid(c._id));
             const agg = fb.aggregate(r, 0);
             return {
+                // On screen only (exports flatten through the columns): lets a
+                // trend tile open the campaign a point stands for.
+                campaignId: sid(c._id),
                 campaign: c.name, term: c.term || '',
                 period: c.startDate ? new Date(c.startDate).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }) : '',
                 responses: agg.responses,
