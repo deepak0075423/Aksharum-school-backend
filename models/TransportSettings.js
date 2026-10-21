@@ -87,10 +87,9 @@ const TransportSettingsSchema = new db.Schema({
     notifyOnIncident: { type: Boolean, default: true },
     notifyOnMaintenanceDue: { type: Boolean, default: true },
     notifyOnInvoice: { type: Boolean, default: true },
+    // The platform sends no SMS or WhatsApp: in-app (push) and email only.
     channels: {
-        sms: { type: Boolean, default: false },
         email: { type: Boolean, default: true },
-        whatsapp: { type: Boolean, default: false },
         push: { type: Boolean, default: true },
     },
 

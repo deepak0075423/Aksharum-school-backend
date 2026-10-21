@@ -471,6 +471,29 @@ const ROUTES = {
         student:      { web: '/student/my-class',    mobile: '/modules/my-class' },
         parent:       { web: '/parent/child-class',  mobile: '/modules/child-class' },
     },
+
+    // ── Admissions (services/admission) ──────────────────────────────────────
+    // Sent only to admission administrators — a teacher receiving one holds
+    // admin on the module, so the /admin screens are theirs — except stage
+    // digests, which also reach the staff assigned to a stage: those land on
+    // the teacher's own admission duties.
+    'admission.applications': {
+        school_admin: { web: '/admin/admissions/applications', mobile: '/(tabs)/notifications' },
+        teacher:      { web: '/teacher/admissions',            mobile: '/(tabs)/notifications' },
+    },
+    'admission.selection': {
+        school_admin: { web: '/admin/admissions/selection', mobile: '/(tabs)/notifications' },
+        teacher:      { web: '/admin/admissions/selection', mobile: '/(tabs)/notifications' },
+    },
+    // A family's privacy request to answer (services/admission/privacy.js).
+    'admission.privacy': {
+        school_admin: { web: '/admin/admissions/privacy', mobile: '/(tabs)/notifications' },
+        teacher:      { web: '/admin/admissions/privacy', mobile: '/(tabs)/notifications' },
+    },
+    'admission.enquiries': {
+        school_admin: { web: '/admin/admissions/enquiries', mobile: '/(tabs)/notifications' },
+        teacher:      { web: '/admin/admissions/enquiries', mobile: '/(tabs)/notifications' },
+    },
 };
 
 // Where a role's plain notification list lives. This is the universal fallback:
@@ -481,6 +504,8 @@ const INBOX = {
     teacher:      { web: '/teacher/notifications',     mobile: '/(tabs)/notifications' },
     student:      { web: '/student/notifications',     mobile: '/(tabs)/notifications' },
     parent:       { web: '/parent/notifications',      mobile: '/(tabs)/notifications' },
+    // An admission applicant's updates live on their school's portal (/applicant finds it).
+    guest:        { web: '/applicant',                 mobile: '/(tabs)/notifications' },
 };
 
 /** `/admin/sections/{id}` + { id } → `/admin/sections/abc`. */
@@ -651,6 +676,7 @@ const MODULE_OF = {
     documents: 'documents',
     idcards: 'idcards',
     medical: 'medical',
+    admission: 'admission',
 };
 
 const MODULE_LABELS = {
@@ -658,7 +684,7 @@ const MODULE_LABELS = {
     library: 'Library', results: 'Results', timetable: 'Timetable',
     calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
     hostel: 'Hostel', video: 'Videos', feedback: 'Feedback',
-    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', general: 'General',
+    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', admission: 'Admissions', general: 'General',
 };
 
 // Somebody is waiting on the reader, or money is owed. These are the ones that

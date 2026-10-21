@@ -186,6 +186,11 @@ const SchoolSchema = new db.Schema({
             type: Boolean,
             default: false,
         },
+        // The admission portal and everything behind it (models/Admission*).
+        admission: {
+            type: Boolean,
+            default: false,
+        },
     },
     leaveSettings: {
         saturdayWorking:  { type: Boolean, default: true },
@@ -230,6 +235,8 @@ const SchoolSchema = new db.Schema({
             fees:    { type: Boolean, default: false },
             library: { type: Boolean, default: false },
             hostel:  { type: Boolean, default: false },
+            // Application and admission fees paid from the admission portal.
+            admission: { type: Boolean, default: false },
         },
     },
     createdAt: {

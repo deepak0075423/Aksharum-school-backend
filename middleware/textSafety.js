@@ -61,7 +61,8 @@ function checkText(node, { english = true } = {}, key = null, depth = 0) {
 }
 
 const optionsFor = (req) => ({ english: !/^\/api\/chat(\/|$)/.test(req.originalUrl || '') });
-const exempt = (req) => /^\/internal(\/|$)/.test(req.originalUrl || '');
+// Internal calls, and signed machine-to-machine webhooks (a mail provider's bounce report quotes the server verbatim).
+const exempt = (req) => /^\/internal(\/|$)|^\/api\/admission\/webhooks\//.test(req.originalUrl || '');
 
 function textSafety(req, res, next) {
     if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS' || exempt(req)) return next();

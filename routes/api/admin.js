@@ -70,6 +70,13 @@ router.get('/payment-gateway', guard, adminCtrl.getPaymentGateway);
 router.put('/payment-gateway', guard, adminCtrl.updatePaymentGateway);
 
 // Receipt designs, per module and payment mode
+// Privacy & cookies: the school's cookie policy and the answers to its banner.
+const cookieCtrl = require('../../controllers/cookiePolicy.controller');
+router.get('/cookie-policy',           guard, cookieCtrl.get);
+router.put('/cookie-policy',           guard, cookieCtrl.save);
+router.post('/cookie-policy/reset',    guard, cookieCtrl.reset);
+router.get('/cookie-policy/consents',  guard, cookieCtrl.consents);
+
 router.get('/receipt-templates',         guard, adminCtrl.getReceiptTemplates);
 router.put('/receipt-templates',         guard, adminCtrl.updateReceiptTemplate);
 router.get('/receipt-templates/preview', guard, adminCtrl.previewReceiptTemplate);

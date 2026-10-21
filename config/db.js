@@ -3,6 +3,9 @@ const path = require('path');
 const orm = require('../db/orm');
 const { runMigrations } = require('../db/migrate');
 
+// True once every table, index and migration is in place — /health/ready.
+let ready = false;
+
 const connectDB = async () => {
     try {
         await orm.connect();
@@ -15,11 +18,14 @@ const connectDB = async () => {
         // syncAll only ever adds; anything that has to be dropped or rebuilt is
         // named in db/migrate.js and applied here, after the tables exist.
         await runMigrations();
+        ready = true;
         console.log('PostgreSQL connected, schema synced');
     } catch (err) {
         console.error('PostgreSQL connection error:', err.message);
         process.exit(1);
     }
 };
+
+connectDB.isReady = () => ready;
 
 module.exports = connectDB;

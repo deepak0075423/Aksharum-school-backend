@@ -57,6 +57,13 @@ async function loadSessionUser(userId) {
     return user;
 }
 
+// An applicant who registered on a school's admission portal (role `guest`) is
+// not a member of the school yet. Their session opens the applicant API and the
+// session endpoints every signed-in person needs — and nothing else. Deny by
+// default: a route added later is out of an applicant's reach whether or not
+// its author remembered a role guard.
+const GUEST_ALLOWED = /^\/api\/(auth\/(me|logout|accounts|switch|reset-password)|admission\/portal)(\/|\?|$)/;
+
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.startsWith('Bearer ') && authHeader.slice(7);
@@ -92,6 +99,13 @@ const verifyToken = async (req, res, next) => {
                 message: user.role === 'school_admin'
                     ? `${user.school.name || 'Your school'} has been deactivated. Please contact support.`
                     : `${user.school.name || 'Your school'} is currently inactive. Please contact your school administrator.`,
+            });
+        }
+        if (user.role === 'guest' && !GUEST_ALLOWED.test(req.originalUrl || '')) {
+            return res.status(403).json({
+                success: false,
+                code: 'GUEST_ACCESS_DENIED',
+                message: 'Applicant accounts can only use the admission portal',
             });
         }
         req.user    = user;

@@ -65,7 +65,9 @@ async function getMailContext(schoolId) {
 // Never throws unless `rethrow` is set — most emails are fire-and-forget.
 // `attachments` is nodemailer's own shape: [{ filename, content, contentType }].
 // Used by payroll to send the payslip itself rather than only a link to it.
-async function sendSchoolMail(schoolId, { to, subject, html, fromName, attachments, rethrow = false }) {
+// `replyTo` and `text` (a plain-text twin of the HTML) are optional — the
+// admission module sets both (services/admission/mailer.js).
+async function sendSchoolMail(schoolId, { to, subject, html, text, fromName, replyTo, attachments, rethrow = false }) {
     try {
         const ctx = await getMailContext(schoolId);
         const info = await ctx.transporter.sendMail({
@@ -73,6 +75,8 @@ async function sendSchoolMail(schoolId, { to, subject, html, fromName, attachmen
             to,
             subject,
             html,
+            ...(text ? { text } : {}),
+            ...(replyTo ? { replyTo } : {}),
             ...(attachments && attachments.length ? { attachments } : {}),
         });
         console.log(`[mail] sent to ${to} — ${info.messageId}`);

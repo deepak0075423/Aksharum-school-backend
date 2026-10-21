@@ -108,6 +108,11 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName, schoolId = null) => 
     }).catch(err => console.error(`[email] welcome failed for ${to}:`, err.message));
 };
 
+// Reused by the admission conversion (services/admission/conversion.js), so a
+// student or parent account opened from an application gets the same email.
+exports._sendWelcomeEmail = sendWelcomeEmail;
+exports._generateOTP = generateOTP;
+
 const jsonOk  = (res, data, status = 200) => res.status(status).json({ success: true,  data });
 const jsonErr = (res, err, status = 500)  => res.status(status).json({ success: false, message: err.message || err });
 
@@ -165,7 +170,7 @@ const STUDENT_PROFILE_KEYS = [
     'address', 'city', 'state', 'pincode', 'country',
     'permanentAddress', 'permanentCity', 'permanentState', 'permanentPincode', 'permanentCountry',
     'sameAsCurrent', 'aadhaarNumber', 'isTransferStudent', 'previousSchoolCountry',
-    'previousSchoolStateBoardName',
+    'previousSchoolStateBoardName', 'penNumber', 'apaarId', 'previousSchoolUdise',
     ...REQUIRED_TRANSFER_FIELDS.map(([key]) => key),
 ];
 
@@ -253,6 +258,15 @@ function validateStudentProfile(profile = {}, { partial = false } = {}) {
         return 'Aadhaar number must be 12 digits';
     if (profile.pincode !== undefined && String(profile.pincode || '').trim() && !isPincode(profile.pincode))
         return 'Current PIN code must be 6 digits';
+    // National student IDs — optional, but a wrong one is worse than none.
+    for (const [key, re, msg] of [
+        ['penNumber', /^\d{11}$/, 'PEN (Permanent Education Number) must be 11 digits'],
+        ['apaarId', /^\d{12}$/, 'APAAR ID must be 12 digits'],
+        ['previousSchoolUdise', /^\d{11}$/, "The previous school's UDISE+ code must be 11 digits"],
+    ]) {
+        const v = String(profile[key] ?? '').replace(/\s/g, '');
+        if (profile[key] !== undefined && v && !re.test(v)) return msg;
+    }
     if (profile.state !== undefined && String(profile.state || '').trim() && !STATES_AND_UTS.includes(String(profile.state).trim()))
         return 'Select a valid current state or union territory';
 
@@ -325,6 +339,9 @@ function buildStudentProfile(profile = {}, uploads = {}) {
         if (profile[key] !== undefined) out[key] = normalizePhone(profile[key]);
     }
     if (profile.aadhaarNumber !== undefined) out.aadhaarNumber = str(profile.aadhaarNumber).replace(/\s/g, '');
+    for (const key of ['penNumber', 'apaarId', 'previousSchoolUdise']) {
+        if (profile[key] !== undefined) out[key] = str(profile[key]).replace(/\s/g, '');
+    }
 
     // "Same as current" copies the whole block, not just the street line
     out.sameAsCurrent = isTrue(profile.sameAsCurrent);
@@ -3536,59 +3553,16 @@ exports.checkEmail = async (req, res) => {
 // so an admin can pick the right parent and link them to as many children as
 // they have — one parent account is shared across all their students.
 // ── PIN code → country / state / city ─────────────────────────────────────────
-// Proxied through the API (not called from the browser) so the response can be
-// cached and a CORS-less public API stays server-side. When India Post is
-// unreachable the PIN prefix still yields the state, so the form is never stuck.
-const PIN_CACHE = new Map();          // pincode -> resolved payload
-const PIN_CACHE_MAX = 2000;
-
+// Answered by services/pincodes.js: the PIN directory loaded into the database,
+// else India Post's public lookup (server-side: cached, and no CORS), else the
+// state the PIN's digits belong to — so the form is never stuck.
 exports.pincodeLookup = async (req, res) => {
     const pincode = String(req.params.pincode || '').trim();
     if (!isPincode(pincode))
         return res.status(400).json({ success: false, message: 'PIN code must be 6 digits' });
-
-    if (PIN_CACHE.has(pincode)) return jsonOk(res, PIN_CACHE.get(pincode));
-
-    const fallback = {
-        pincode,
-        country: 'India',
-        state:   stateFromPincode(pincode),
-        city:    '',
-        district: '',
-        areas:   [],
-        source:  'offline',
-    };
-
-    let result = fallback;
-    try {
-        const r = await fetch(`https://api.postalpincode.in/pincode/${pincode}`, {
-            signal: AbortSignal.timeout(4000),
-        });
-        if (r.ok) {
-            const body = await r.json();
-            const entry = Array.isArray(body) ? body[0] : null;
-            const offices = entry?.Status === 'Success' ? (entry.PostOffice || []) : [];
-            if (offices.length) {
-                const first = offices[0];
-                const state = STATES_AND_UTS.includes(first.State) ? first.State : stateFromPincode(pincode);
-                result = {
-                    pincode,
-                    country:  first.Country || 'India',
-                    state,
-                    city:     first.District || first.Division || '',
-                    district: first.District || '',
-                    areas:    [...new Set(offices.map(o => o.Name).filter(Boolean))],
-                    source:   'india-post',
-                };
-            }
-        }
-    } catch { /* offline / timeout — fall through to the prefix-derived state */ }
-
-    if (!result.state && !result.city)
+    const result = await require('../services/pincodes').lookup(pincode);
+    if (!result || (!result.state && !result.city))
         return res.status(404).json({ success: false, message: `No location found for PIN code ${pincode}` });
-
-    if (PIN_CACHE.size >= PIN_CACHE_MAX) PIN_CACHE.clear();
-    PIN_CACHE.set(pincode, result);
     jsonOk(res, result);
 };
 

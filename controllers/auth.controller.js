@@ -6,6 +6,7 @@ const User    = require('../models/User');
 const { isEmail, passwordError } = require('../utils/validators');
 const identity  = require('../services/accountIdentity');
 const { sendOtpEmail } = require('../utils/sendEmail');
+const { publicSchool, publicUser } = require('../utils/publicShapes');
 
 // role + schoolId ride along so the WebSocket Gateway can route sockets without
 // a round trip to the API on every handshake (it falls back to /internal/user-context
@@ -119,15 +120,26 @@ async function answerSignIn(res, openedRows) {
  * every client already reads.
  */
 async function sendSessionFor(res, row) {
-    const user = await User.findById(row._id).populate('school');
-    if (!user || !user.isActive) {
+    const session = await sessionPayload(row);
+    if (!session) {
         return res.status(401).json({ success: false, message: 'User not found or inactive' });
     }
+    return res.json({ success: true, ...session });
+}
+
+/**
+ * The session for one membership row — tokens plus the user shape every client
+ * reads — or null when the account is gone or switched off. Shared with the
+ * admission portal's own sign-in (services/admission/guestAuth.js), so an
+ * applicant's session is issued exactly the way everyone else's is.
+ */
+async function sessionPayload(row) {
+    const user = await User.findById(row._id).populate('school');
+    if (!user || !user.isActive) return null;
     // The other seats this same password opens, so the app can offer the
     // switcher without a second round trip.
     const accounts = await identity.switchTargets(row);
-    return res.json({
-        success: true,
+    return {
         token:        signToken(user),
         refreshToken: signRefresh(user._id),
         user: {
@@ -137,12 +149,13 @@ async function sendSessionFor(res, row) {
             email:        user.email,
             role:         user.role,
             isFirstLogin: user.isFirstLogin,
-            school:       user.school,
+            school:       publicSchool(user.school),
             profileImage: user.profileImage,
             accounts,
         },
-    });
+    };
 }
+exports.sessionPayload = sessionPayload;
 
 /**
  * POST /auth/select — finish a sign-in that stopped to ask which seat.
@@ -307,7 +320,8 @@ exports.getMe = async (req, res) => {
     // req.user comes straight from `SELECT u.*`, so the password hash is on it.
     // It has no business leaving the server — strip it here rather than hope
     // every caller remembers to.
-    const { password, otp, otpExpiry, loginToken, resetToken, ...user } = req.user;
+    // The school's stored credentials (SMTP password, gateway secrets) go too.
+    const user = publicUser(req.user);
     // The seats this session can move between, so the app can draw the switcher
     // on a plain page load and not only right after sign-in.
     const accounts = await identity.switchTargets(req.user);

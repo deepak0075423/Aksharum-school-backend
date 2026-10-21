@@ -6,6 +6,8 @@ const { verifyToken } = require('../../middleware/auth');
 const { uploadProfile } = require('../../middleware/upload');
 
 router.get('/',       verifyToken, ctrl.getProfile);
+// The signed-in person's school's cookie policy (School Settings → Privacy & cookies).
+router.get('/cookie-policy', verifyToken, require('../../controllers/cookiePolicy.controller').mine);
 router.put('/update', verifyToken, uploadProfile.single('profileImage'), ctrl.updateProfile);
 
 // The employee half of "my profile". Staff only, and limited to the fields an

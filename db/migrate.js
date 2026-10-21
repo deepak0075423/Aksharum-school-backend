@@ -94,7 +94,83 @@ const STEPS = [
                  ON "medicalrequests" ("school", "student")
               WHERE "status" IN ('requested', 'accepted', 'arrived', 'treatment')`,
     },
+    ...admissionSteps(),
 ];
+
+/**
+ * The admission module (Oct 2026): what its tables need beyond syncAll().
+ *
+ *   - a portal address belongs to one school, whatever its case;
+ *   - one live offer per application, one exam sitting open at a time, one
+ *     current wording per email, one current file per document type — the
+ *     services check first, and these hold the race;
+ *   - foreign keys between the module's OWN tables. The rest of the app keeps
+ *     Mongo's no-foreign-key semantics, and references out to schools, users
+ *     and classes follow it; inside the module, a document, an exam sitting or
+ *     a list line without its application is never meaningful, so those go
+ *     with it (CASCADE), and a round or payment that something still points
+ *     at cannot be deleted (RESTRICT).
+ *
+ * Each foreign key is added only when missing, so every boot of every instance
+ * may run this; two instances racing on the same key lose one harmlessly (the
+ * runner logs and moves on). scripts/admissionRollback.js removes all of it.
+ */
+function admissionSteps() {
+    const indexes = [
+        ['admissionsettings: one portal per address',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_admissionsettings_slug"
+               ON "admissionsettings" (lower(btrim("slug"))) WHERE btrim(COALESCE("slug", '')) <> ''`],
+        ['admissionoffers: one live offer per application',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_admissionoffers_live"
+               ON "admissionoffers" ("application") WHERE "status" IN ('issued', 'accepted', 'confirmed')`],
+        ['admissionattempts: one sitting open per exam and application',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_admissionattempts_open"
+               ON "admissionattempts" ("exam", "application") WHERE "status" = 'in_progress'`],
+        ['admissionemailtemplates: one current wording per event',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_admissionemailtemplates_current"
+               ON "admissionemailtemplates" ("school", "event") WHERE "isCurrent"`],
+        ['admissiondocuments: one current file per document type',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_admissiondocuments_current"
+               ON "admissiondocuments" ("application", "docKey") WHERE "current" AND "docKey" <> ''`],
+    ];
+    // [constraint, child table, column, parent table, on delete]
+    const keys = [
+        ['fk_admformversions_form',      'admissionformversions', 'form',        'admissionforms',        'CASCADE'],
+        ['fk_admapplications_round',     'admissionapplications', 'round',       'admissionrounds',       'RESTRICT'],
+        ['fk_admapplications_version',   'admissionapplications', 'formVersion', 'admissionformversions', 'RESTRICT'],
+        ['fk_admdocuments_application',  'admissiondocuments',    'application', 'admissionapplications', 'CASCADE'],
+        ['fk_admdocuments_type',         'admissiondocuments',    'docType',     'admissiondocumenttypes', 'SET NULL'],
+        ['fk_admevents_application',     'admissionevents',       'application', 'admissionapplications', 'CASCADE'],
+        ['fk_admexams_round',            'admissionexams',        'round',       'admissionrounds',       'RESTRICT'],
+        ['fk_admquestions_exam',         'admissionquestions',    'exam',        'admissionexams',        'CASCADE'],
+        ['fk_admcandidates_exam',        'admissioncandidates',   'exam',        'admissionexams',        'CASCADE'],
+        ['fk_admcandidates_application', 'admissioncandidates',   'application', 'admissionapplications', 'CASCADE'],
+        ['fk_admattempts_exam',          'admissionattempts',     'exam',        'admissionexams',        'CASCADE'],
+        ['fk_admattempts_application',   'admissionattempts',     'application', 'admissionapplications', 'CASCADE'],
+        ['fk_admresults_exam',           'admissionresults',      'exam',        'admissionexams',        'CASCADE'],
+        ['fk_admresults_application',    'admissionresults',      'application', 'admissionapplications', 'CASCADE'],
+        ['fk_admlists_round',            'admissionlists',        'round',       'admissionrounds',       'RESTRICT'],
+        ['fk_admlistentries_list',       'admissionlistentries',  'list',        'admissionlists',        'CASCADE'],
+        ['fk_admlistentries_application','admissionlistentries',  'application', 'admissionapplications', 'CASCADE'],
+        ['fk_admoffers_application',     'admissionoffers',       'application', 'admissionapplications', 'CASCADE'],
+        ['fk_admoffers_list',            'admissionoffers',       'list',        'admissionlists',        'SET NULL'],
+        ['fk_admlistentries_offer',      'admissionlistentries',  'offer',       'admissionoffers',       'SET NULL'],
+        ['fk_admpayments_application',   'admissionpayments',     'application', 'admissionapplications', 'RESTRICT'],
+        ['fk_admemaillogs_application',  'admissionemaillogs',    'application', 'admissionapplications', 'SET NULL'],
+    ];
+    return [
+        ...indexes.map(([name, sql]) => ({ name, sql })),
+        ...keys.map(([con, child, col, parent, onDelete]) => ({
+            name: `${child}.${col} → ${parent} (${onDelete})`,
+            sql: `DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${con}') THEN
+                        ALTER TABLE "${child}" ADD CONSTRAINT "${con}"
+                            FOREIGN KEY ("${col}") REFERENCES "${parent}"("_id") ON DELETE ${onDelete};
+                    END IF;
+                  END $$`,
+        })),
+    ];
+}
 
 /**
  * Data changes that must happen exactly once, not on every boot: each is

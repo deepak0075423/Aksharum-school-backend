@@ -9,9 +9,12 @@
 // normal traffic of a whole school sitting behind one NAT'd office IP.
 const { getCacheRedis } = require('../config/cacheRedis');
 
+// The caller's address as the nearest trusted proxy saw it. req.ip already
+// applies `trust proxy` (server.js, one hop: nginx) — it is the address nginx
+// APPENDED to X-Forwarded-For. The header's FIRST entry is whatever the caller
+// typed themselves, so keying on it let every request claim a fresh bucket
+// and walk straight past the sign-in limits.
 function clientIp(req) {
-    const xff = req.headers['x-forwarded-for'];
-    if (xff) return String(xff).split(',')[0].trim();
     return req.ip || req.socket?.remoteAddress || 'anon';
 }
 

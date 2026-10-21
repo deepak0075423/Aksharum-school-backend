@@ -70,7 +70,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Medical-Step-Up'],
 }));
 app.use(morgan('dev'));
-app.use(express.json({ limit: '10mb' }));
+// Signed webhooks are checked against the exact bytes that arrived.
+app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { if (/^\/api\/admission\/webhooks\//.test(req.originalUrl || '')) req.rawBody = Buffer.from(buf); } }));
 
 // No-cache for all /api routes — prevents stale responses after schema changes
 app.use('/api', (_req, res, next) => {
@@ -120,11 +121,13 @@ for (const p of ['/api/auth/login', '/api/auth/forgot-password', '/api/auth/veri
 app.post('/api/auth/google', authLimiter);
 
 // ── Static Files (uploads) ────────────────────────────────────────────────────
-// Two folders are never handed to whoever has the address:
-//   hostel-docs   ID proofs, medical notes, a child's complaint photo — read
-//                 through /api/hostel/files (controllers/hostelFiles)
-//   medical-docs  prescriptions, certificates, injury photos — read through
-//                 /api/medical/files after an access check (controllers/medicalFiles)
+// Three folders are never handed to whoever has the address:
+//   hostel-docs     ID proofs, medical notes, a child's complaint photo — read
+//                   through /api/hostel/files (controllers/hostelFiles)
+//   medical-docs    prescriptions, certificates, injury photos — read through
+//                   /api/medical/files after an access check (controllers/medicalFiles)
+//   admission-docs  applicants' certificates and photos — read through the
+//                   admission API after an ownership check (services/admission/documents)
 // The check is on the path express.static will actually serve — decoded and
 // normalised — not on the address as typed: a prefix match on the raw URL let
 // /uploads/medical%2Ddocs/…, /uploads//medical-docs/… and /uploads/x/../medical-docs/…
@@ -137,6 +140,7 @@ app.post('/api/auth/google', authLimiter);
 const PRIVATE_UPLOADS = {
     'hostel-docs': 'Hostel files are opened from the hostel screens',
     'medical-docs': 'Medical files are opened from the Medical Room screens',
+    'admission-docs': 'Admission documents are opened from the admission screens',
 };
 const privateFiles = require('./services/privateFiles');
 app.use('/uploads', async (req, res, next) => {
@@ -180,10 +184,16 @@ app.use('/api/chat',          require('./routes/api/chat'));
 app.use('/api/notifications', require('./routes/api/notifications'));
 app.use('/api/profile',       require('./routes/api/profile'));
 app.use('/api/public',        require('./routes/api/public'));
+// Admission portals (public, applicant, office and staff) — routes/api/admission.js
+app.use('/api/admission',     require('./routes/api/admission'));
 app.use('/internal',          require('./routes/api/internal'));
 
 // ── Health Check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
+// Ready = the schema sync and migrations have finished (the server listens before they do).
+app.get('/health/ready', (req, res) => (connectDB.isReady()
+    ? res.json({ status: 'ready', timestamp: new Date() })
+    : res.status(503).json({ status: 'starting' })));
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
@@ -589,6 +599,14 @@ if (isPrimaryWorker) {
             try { await reminders.tick(); } catch (err) { console.error('[Medical] reminders tick error:', err.message); }
         }, 60 * 1000);
     }());
+
+    // ── Admissions clock ──────────────────────────────────────────────────────
+    // Online exam attempts whose time is up are submitted, lists and results
+    // booked for later are published, unanswered offers lapse (and the waiting
+    // list moves up), and exam / fee reminders go out. Each step claims its
+    // row first (services/admission/sweep.js), so a restart or a second
+    // instance never acts twice.
+    require('./services/admission/sweep').start();
 
     // ── Video scheduled-publish worker ────────────────────────────────────────
     // Flips master videos from 'scheduled' → 'published' once scheduledAt passes.

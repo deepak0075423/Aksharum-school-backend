@@ -75,17 +75,20 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName = 'Aksharum', schoolI
 
 exports.getDashboard = async (req, res) => {
     try {
-        const [schoolCount, userCount, admins, teachers, students, parents, recentSchools] = await Promise.all([
+        // Admission applicants (guest) are counted on their own: they are
+        // members of the public applying, not the schools' users.
+        const [schoolCount, userCount, admins, teachers, students, parents, applicants, recentSchools] = await Promise.all([
             School.countDocuments(),
-            User.countDocuments(),
+            User.countDocuments({ role: { $ne: 'guest' } }),
             User.countDocuments({ role: 'school_admin' }),
             User.countDocuments({ role: 'teacher' }),
             User.countDocuments({ role: 'student' }),
             User.countDocuments({ role: 'parent' }),
+            User.countDocuments({ role: 'guest' }),
             School.find().sort({ createdAt: -1 }).limit(5).select('name code logo isActive createdAt').lean(),
         ]);
         res.json({ success: true, data: {
-            schoolCount, userCount,
+            schoolCount, userCount, applicants,
             roles: { admins, teachers, students, parents },
             recentSchools,
         }});
@@ -221,6 +224,7 @@ const ROLE_LABEL = {
     student:      'Student',
     parent:       'Parent',
     super_admin:  'Super Admin',
+    guest:        'Admission applicant',
 };
 
 async function schoolMembers(schoolId) {
@@ -324,7 +328,9 @@ exports.getUsers = async (req, res) => {
         const { page = 1, limit = 20, search = '', role = '', school = '', status = '', sortBy = 'createdAt', sortDir = '-1' } = req.query;
         const filter = {};
         if (search) filter.$or = [{ name: new RegExp(search, 'i') }, { email: new RegExp(search, 'i') }];
+        // Applicant accounts appear only when asked for by role.
         if (role)   filter.role   = role;
+        else        filter.role   = { $ne: 'guest' };
         if (school) filter.school = school;
         if (status === 'active')   filter.isActive = true;
         if (status === 'inactive') filter.isActive = false;

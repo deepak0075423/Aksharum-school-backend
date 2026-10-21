@@ -6,10 +6,12 @@ const ParentProfile  = require('../models/ParentProfile');
 const { isPhone, normalizePhone } = require('../utils/validators');
 const { nameProblem } = require('../utils/textRules');
 const { fatherOrHusbandLabel } = require('../utils/fatherOrHusband');
+const { publicUser } = require('../utils/publicShapes');
 
 exports.getProfile = async (req, res) => {
     try {
-        const user = await User.findById(req.userId).populate('school').lean();
+        // Never the password hash or the school's stored credentials (utils/publicShapes).
+        const user = publicUser(await User.findById(req.userId).populate('school').lean());
         let profile = null;
         if (user.role === 'teacher')  profile = await TeacherProfile.findOne({ user: req.userId }).lean();
         if (user.role === 'student')  profile = await StudentProfile.findOne({ user: req.userId }).lean();

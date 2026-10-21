@@ -393,7 +393,17 @@ function createModel(name, schema) {
         for (const [fname, meta] of Object.entries(parsed.fields)) {
             colDefs.push(`${qi(fname)} ${pgType(meta)}`);
         }
-        await run(`CREATE TABLE IF NOT EXISTS ${T} (${colDefs.join(', ')})`);
+        try {
+            await run(`CREATE TABLE IF NOT EXISTS ${T} (${colDefs.join(', ')})`);
+        } catch (e) {
+            // Two workers creating a brand-new table at the same moment: IF NOT
+            // EXISTS does not cover the race, and the loser is told the table
+            // (42P07) or its row type (a duplicate key on pg_type — which run()
+            // reports as 11000) already exists. Either way it is there now —
+            // carry on (config/db exits on any error).
+            const raced = e.code === '42P07' || ([11000, '23505'].includes(e.code) && /pg_type_typname_nsp_index/.test(`${e.constraint || ''} ${e.message}`));
+            if (!raced) throw e;
+        }
 
         const { rows: existing } = await run(
             `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`,

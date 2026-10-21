@@ -218,6 +218,15 @@ const sampleReceipt = (module) => (module === 'hostel'
                 { label: 'Mess — Oct 2026 (HF-2610-0032)', amount: 3200 }],
         total: 9700,
     }
+    : module === 'admission'
+    ? {
+        module: 'admission', number: 'ADR202600042', date: new Date(),
+        paidBy: 'Priya Sharma', paidByDetailLabel: 'For', paidByDetail: 'Aarav Sharma — Class 5 (application APP202600118)',
+        title: 'Admission fee', paymentMode: 'online',
+        reference: 'pay_PkQ2xR7mNc1Abc',
+        lines: [{ label: 'Admission fee', amount: 15000 }],
+        total: 15000,
+    }
     : module === 'library'
     ? {
         module: 'library', number: 'LIB-REC-000042', date: new Date(),

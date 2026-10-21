@@ -322,6 +322,11 @@ async function resolveRequestAccess(req) {
         const { permissions, source } = resolveFromSnapshot(snapshot, designation);
         return { role, moduleFlags, permissions, designation, source };
     }
+    // An admission applicant is not a member of the school: no module at all.
+    // (middleware/auth already keeps a guest session off every module's routes.)
+    if (role === 'guest') {
+        return { role, moduleFlags, permissions: Object.fromEntries(MODULE_KEYS.map((k) => [k, NONE])), designation: '', source: role };
+    }
     const level = role === 'school_admin' ? ADMIN : USER;
     return {
         role,

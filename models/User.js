@@ -24,9 +24,13 @@ const UserSchema = new db.Schema({
         type: String,
         required: true,
     },
+    // `guest` is an applicant who registered on a school's admission portal
+    // (services/admission). A guest session reaches the admission portal API
+    // and nothing else — middleware/auth refuses it everywhere else — until the
+    // school confirms the admission and creates the student and parent posts.
     role: {
         type: String,
-        enum: ['super_admin', 'school_admin', 'teacher', 'student', 'parent'],
+        enum: ['super_admin', 'school_admin', 'teacher', 'student', 'parent', 'guest'],
         required: true,
     },
     school: {

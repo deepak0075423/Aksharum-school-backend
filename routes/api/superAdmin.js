@@ -53,6 +53,31 @@ router.get('/notifications',       guard, notifCtrl.getList);
 router.post('/notifications/send', guard, notifCtrl.send);
 
 // Holiday Audit
+// How this server sees a request's address — to check TRUST_PROXY_HOPS in
+// production. Rate limits key on req.ip: with too few hops every visitor shares
+// the proxy's address; with too many, X-Forwarded-For can be forged again.
+// Admission groups — schools that families see on one page, /g/<slug> (controllers/admissionGroup).
+const admissionGroups = require('../../controllers/admissionGroup.controller');
+router.get('/admission-groups', guard, admissionGroups.list);
+router.post('/admission-groups', guard, admissionGroups.create);
+router.put('/admission-groups/:id', guard, admissionGroups.update);
+router.delete('/admission-groups/:id', guard, admissionGroups.remove);
+
+router.get('/diagnostics/request', guard, (req, res) => {
+    const hops = req.app.get('trust proxy');
+    const xff = String(req.get('x-forwarded-for') || '');
+    const chain = xff ? xff.split(',').map((x) => x.trim()).filter(Boolean) : [];
+    res.set('Cache-Control', 'no-store').json({
+        success: true,
+        data: {
+            ip: req.ip, ips: req.ips, socketAddress: req.socket?.remoteAddress || '', forwardedFor: chain, trustProxy: hops,
+            advice: !chain.length
+                ? 'No X-Forwarded-For header arrived: either nothing sits in front of this server, or the proxy does not set it.'
+                : `The proxy chain has ${chain.length} address(es). TRUST_PROXY_HOPS should equal the number of proxies you run in front of the API (nginx alone = 1; a CDN or load balancer in front of nginx adds one each). "ip" above must be your own public address.`,
+        },
+    });
+});
+
 router.get('/holidays/audit',        guard, holidayCtrl.superAdminAuditLog);
 router.get('/holidays/audit/export', guard, holidayCtrl.superAdminExportAuditCSV);
 

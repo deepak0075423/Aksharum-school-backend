@@ -19,4 +19,7 @@ router.get('/id-card/:code',         idCardPortal.verify);
 router.get('/id-card/:code/qr.svg',  idCardPortal.qrSvg);
 router.get('/id-card/:code/qr.png',  idCardPortal.qrPng);
 
+// The platform's own cookie policy — what the sign-in page links to before a school is known.
+router.get('/cookie-policy', require('../../controllers/cookiePolicy.controller').platform);
+
 module.exports = router;

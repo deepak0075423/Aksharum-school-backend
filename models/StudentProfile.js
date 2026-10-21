@@ -120,6 +120,13 @@ const StudentProfileSchema = new db.Schema({
     disabilityCertificateFile: { type: String, default: '' },
     medicalCertificateFile:    { type: String, default: '' },
 
+    // ── National student IDs (Oct 2026) ─────────────────────────────────────
+    // PEN: the 11-digit Permanent Education Number UDISE+ gives every student.
+    // APAAR: the 12-digit Automated Permanent Academic Account Registry ID.
+    // Both optional; both follow the student from school to school.
+    penNumber:                 { type: String, default: '', trim: true },
+    apaarId:                   { type: String, default: '', trim: true },
+
     // ── Previous school ─────────────────────────────────────────────────────
     // Only filled in for a transfer admission; `isTransferStudent` gates the
     // whole block in the intake form and in validation.
@@ -141,6 +148,8 @@ const StudentProfileSchema = new db.Schema({
     previousAcademicYear:      { type: String, default: '', trim: true },
     previousSchoolLeavingDate: { type: Date,   default: null },
     previousSchoolContact:     { type: String, default: '', trim: true },
+    // The previous school's UDISE+ code (11 digits) — on its TC, for UDISE+ returns.
+    previousSchoolUdise:       { type: String, default: '', trim: true },
     tcNumber:                  { type: String, default: '', trim: true },
     tcDate:                    { type: Date,   default: null },
     tcFile:                    { type: String, default: '' },

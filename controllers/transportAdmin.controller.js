@@ -3907,6 +3907,14 @@ exports.updateSettingsFull = async (req, res) => {
             patch.attendanceMethods = [...new Set(patch.attendanceMethods)].filter((m) => allowed.includes(m));
             if (!patch.attendanceMethods.length) return bad(res, 'Keep at least one way of taking attendance');
         }
+        if (patch.channels !== undefined) {
+            // Only the channels the platform has: in-app and email (no SMS or WhatsApp).
+            // A switch left out keeps its stored value.
+            const given = patch.channels && typeof patch.channels === 'object' ? patch.channels : {};
+            const current = (await TransportSettings.findOne({ school: req.schoolId }).lean())?.channels || {};
+            patch.channels = {};
+            for (const k of ['push', 'email']) patch.channels[k] = typeof given[k] === 'boolean' ? given[k] : current[k] !== false;
+        }
         if (patch.earlyArrivalBufferMin != null && patch.delayThresholdMin != null
             && +patch.earlyArrivalBufferMin > +patch.delayThresholdMin) {
             return bad(res, 'The early-arrival buffer cannot be larger than the late threshold');

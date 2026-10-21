@@ -62,7 +62,8 @@ async function canMessage(senderId, senderRole, receiverId, receiverRole, school
  */
 async function getAllowedContacts(userId, userRole, schoolId) {
     if (userRole === 'super_admin' || userRole === 'school_admin') {
-        return User.find({ school: schoolId, _id: { $ne: userId }, isActive: true })
+        // Admission applicants (guest) are not members of the school and are never chat contacts.
+        return User.find({ school: schoolId, _id: { $ne: userId }, isActive: true, role: { $ne: 'guest' } })
             .select('name role email profileImage').lean();
     }
     switch (userRole) {

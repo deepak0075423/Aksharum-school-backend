@@ -262,6 +262,11 @@ SMTP_PASS=your_16_char_app_password
 EMAIL_FROM=School Management <your_gmail@gmail.com>
 ```
 
+The admission module's optional providers — a private document bucket, virus
+scanning, the "not a robot" check, DigiLocker — and its
+background jobs, health card and data-protection runbook are described in
+[`docs/admission-operations.md`](docs/admission-operations.md).
+
 ### Generating a Gmail App Password
 
 1. Go to your Google Account → **Security**

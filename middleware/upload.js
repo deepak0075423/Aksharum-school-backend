@@ -83,6 +83,18 @@ const medicalFilter = (req, file, cb) => {
 };
 const uploadMedicalDoc = multer({ storage: diskStorage('medical-docs'), fileFilter: medicalFilter, limits: { fileSize: 10 * 1024 * 1024 } });
 
+// Admission papers uploaded from the public admission portal — birth
+// certificates, report cards, photos. Saved under uploads/admission-docs,
+// which server.js does NOT serve: they are streamed by the admission API after
+// an ownership check, and their content is checked against the type they claim
+// (services/admission/documents.js). The per-document-type size and format
+// limits are applied there too; this is the ceiling.
+const admissionFilter = (req, file, cb) => {
+    const ok = /\.(pdf|jpg|jpeg|png|webp)$/i.test(file.originalname);
+    cb(ok ? null : Object.assign(new Error('Upload a PDF or a photo (JPG, PNG, WebP)'), { status: 400 }), ok);
+};
+const uploadAdmissionDoc = multer({ storage: diskStorage('admission-docs'), fileFilter: admissionFilter, limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
+
 /**
  * A multipart form's text fields only exist once multer has read it, so the
  * rules server.js applies to every other body — phone numbers
@@ -114,6 +126,6 @@ const withPhoneCheck = (instance) => {
     return instance;
 };
 [uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo,
-    uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc].forEach(withPhoneCheck);
+    uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc, uploadAdmissionDoc].forEach(withPhoneCheck);
 
-module.exports = { uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
+module.exports = { uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

@@ -14,9 +14,9 @@ const crypto = require('crypto');
 const School = require('../models/School');
 
 /** Modules that may be granted use of the gateway. */
-const GATEWAY_MODULES = ['fees', 'library', 'hostel'];
+const GATEWAY_MODULES = ['fees', 'library', 'hostel', 'admission'];
 /** How each module's payments are named in a message a payer may read. */
-const MODULE_WORDS = { fees: 'fees', library: 'library fines', hostel: 'hostel fees' };
+const MODULE_WORDS = { fees: 'fees', library: 'library fines', hostel: 'hostel fees', admission: 'admission fees' };
 
 /**
  * Resolves the gateway for one module.

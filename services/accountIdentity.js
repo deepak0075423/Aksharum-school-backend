@@ -51,7 +51,9 @@ const MEMBERSHIPS_SQL = `
                 WHEN 'school_admin' THEN 1
                 WHEN 'teacher'      THEN 2
                 WHEN 'parent'       THEN 3
-                ELSE 4
+                WHEN 'student'      THEN 4
+                WHEN 'guest'        THEN 5
+                ELSE 6
               END,
               s."name" NULLS FIRST, u."_id"`;
 
@@ -188,6 +190,7 @@ const ROLE_LABEL = {
     teacher:      'teacher',
     student:      'student',
     parent:       'parent',
+    guest:        'admission applicant',
 };
 
 // Roles a person may hold in more than one place, or alongside each other. A

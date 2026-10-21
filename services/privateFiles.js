@@ -101,7 +101,10 @@ async function loadViewer(uid) {
            FROM "users" u LEFT JOIN "schools" s ON s."_id" = u."school" WHERE u."_id"::text = $1 LIMIT 1`,
         [uid],
     );
-    const v = u && u.isActive !== false && (u.role === 'super_admin' || u.schoolActive !== false)
+    // An admission applicant (guest) belongs to no school yet: the "anyone signed
+    // in at the school" rules below must not count them in. Their own admission
+    // papers are served by the admission API, which checks ownership itself.
+    const v = u && u.isActive !== false && u.role !== 'guest' && (u.role === 'super_admin' || u.schoolActive !== false)
         ? { uid: u.uid, role: u.role, sid: u.sid } : null;
     viewerCache.set(uid, { v, until: Date.now() + 60 * 1000 });
     return v;
