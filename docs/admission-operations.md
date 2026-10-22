@@ -125,9 +125,26 @@ the portal; the module sends no text messages or WhatsApp.
   safe to repeat. A forecast from the school's last three years of offers says
   how many more offers each class needs. Admissions → *Enrolment*.
 - **Installable portal and phone app.** Each school's portal installs on a
-  phone's home screen with its own name, colours and icon. In the Aksharum
-  phone app, applicants follow their applications: the next step, an offer to
-  accept or decline, exams, documents, fees and the timeline.
+  phone's home screen with its own name, colours and icon. The Aksharum phone
+  app carries the module too:
+  - *Families* answer offers (and withdraw their other branches' applications
+    on accepting), upload documents from the phone's files or camera, fetch
+    them from DigiLocker, choose or change exam and interview times, book
+    campus visits, appeal, pay (the gateway's own checkout, opened in the
+    phone's browser), and use *Your data*. A changed privacy notice is agreed
+    to first. Filling in a new application form and sitting an online exam
+    stay on the portal.
+  - *The office* (school admin, or a teacher who administers the module) has
+    the dashboard and health, applications (status, documents, offers, fees,
+    refunds, payment links, quota, legal hold, branches, enrolment),
+    documents, exams (candidates, times, extra time, marks, publishing),
+    selection lists (the lottery draw and its check), visits, appeals,
+    enquiries, enrolment and the forecast, payments, RTE seats, branches,
+    privacy and the main settings. Setting up forms, emails, rounds and exam
+    questions stays on the web.
+  - *Teachers* see their admission duties; the *super admin* manages groups
+    of schools; a school admin edits the cookie policy (School settings →
+    Privacy & cookies).
 
 ---
 
@@ -199,6 +216,7 @@ Needs the platform to be a registered DigiLocker partner (MeriPehchaan).
 |---|---|
 | `DIGILOCKER_CLIENT_ID`, `DIGILOCKER_CLIENT_SECRET`, `DIGILOCKER_REDIRECT_URI` | Turns on "Fetch from DigiLocker". The redirect URI registered with DigiLocker must be the API's `/api/admission/digilocker/callback`. |
 | `DIGILOCKER_BASE_URL` | Default `https://digilocker.meripehchaan.gov.in/public/oauth2`. |
+| `APP_SCHEME` | The phone app's link scheme (its `app.json` "scheme"), default `aksharum`. A DigiLocker connection started in the app returns to `aksharum://…`; one started on the portal returns to the portal. |
 
 A connection lasts thirty minutes; its access token is kept encrypted and
 deleted when it ends. Fetched documents go through the upload's own checks

@@ -411,6 +411,6 @@ async function gatewayInfo(schoolId) {
 }
 
 module.exports = {
-    KINDS, LABEL, OFFLINE_MODES, REFUND_MODES, balance, feeStatus, refreshStatus, createOrder, verifyOnline, reconcile, recordOffline, voidPayment,
+    KINDS, LABEL, OFFLINE_MODES, REFUND_MODES, balance, feeStatus, refreshStatus, payableKind, createOrder, verifyOnline, reconcile, recordOffline, voidPayment,
     applyWaiver, removeWaiver, summary, gatewayInfo, refund, scheduleOf, planFor,
 };

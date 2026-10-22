@@ -112,6 +112,7 @@ router.post('/portal/applications/:id/appeals', guest, appeal.file);
 router.post('/portal/applications/:id/appeals/:appealId/withdraw', guest, appeal.withdraw);
 router.get('/portal/applications/:id/documents/:docId/file', guest, portal.documentFile);
 router.post('/portal/applications/:id/pay', guest, portal.payOrder);
+router.post('/portal/applications/:id/pay-link', guest, accountLimiter, portal.payLink);
 router.post('/portal/applications/:id/pay/verify', guest, portal.payVerify);
 router.post('/portal/applications/:id/payments/:paymentId/reconcile', guest, portal.payReconcile);
 router.get('/portal/applications/:id/payments/:paymentId/receipt', guest, portal.receipt);

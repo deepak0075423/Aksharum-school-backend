@@ -143,4 +143,23 @@ describe('admission — instalments, refunds and payment links', () => {
         const mail = (await H.q(`SELECT "body" FROM "admissionemaillogs" WHERE "application" = $1 AND "event" = 'payment_link'`, [a4._id]))[0];
         assert.ok(mail && mail.body.includes(`/pay/${token}`), 'the link was emailed');
     });
+
+    it('gives a signed-in family an hour-long link to pay its own fee in a browser (the phone app has no checkout)', async () => {
+        const g5 = await H.registerGuest(s, portal.slug);
+        const a5 = await H.submittedApplication(s, g5, round, { answers: { studentName: 'Rohan Iyer', studentDob: '2021-07-17' } });
+        await H.verifyAllDocs(s, a5._id);
+        const early = await H.api('POST', `/admission/portal/applications/${a5._id}/pay-link`, { token: g5.token, body: { kind: 'admission_fee' } });
+        assert.equal(early.status, 409, 'not before a seat is offered');
+        await H.api('POST', `/admission/admin/applications/${a5._id}/offer`, { token: s.adminToken, body: {} });
+        const mk = await H.api('POST', `/admission/portal/applications/${a5._id}/pay-link`, { token: g5.token, body: { kind: 'admission_fee' } });
+        assert.equal(mk.status, 201, JSON.stringify(mk.body));
+        assert.ok(new Date(mk.body.data.expiresAt).getTime() - Date.now() <= 3600e3 + 5000, 'an hour, not a week');
+        const token = mk.body.data.url.split('/pay/')[1];
+        assert.equal((await H.api('GET', `/admission/public/portals/${portal.slug}/pay/${token}`)).body.data.studentFirstName, 'Rohan');
+        const stranger = await H.registerGuest(s, portal.slug);
+        assert.equal((await H.api('POST', `/admission/portal/applications/${a5._id}/pay-link`, { token: stranger.token, body: { kind: 'admission_fee' } })).status, 404, 'only for its own application');
+        await H.q(`UPDATE "schools" SET "paymentGateway" = $2::jsonb WHERE "_id" = $1`, [s.id, JSON.stringify({ enabled: false, provider: 'none', modules: {} })]);
+        const off = await H.api('POST', `/admission/portal/applications/${a5._id}/pay-link`, { token: g5.token, body: { kind: 'admission_fee' } });
+        assert.equal(off.body.code, 'GATEWAY_UNAVAILABLE', 'no link to a checkout that cannot work');
+    });
 });

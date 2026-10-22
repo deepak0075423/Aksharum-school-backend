@@ -47,6 +47,8 @@ function familyView(app) {
 const portalSummary = (portal) => ({
     slug: portal.slug, schoolName: portal.school.name, title: portal.settings.portal.title, theme: portal.settings.portal.theme,
     status: portal.settings.portal.status, help: portal.settings.portal.help, contact: portal.settings.portal.contact,
+    // Whether families book campus visits here (the phone app shows the way in only then).
+    visits: !!portal.settings.visits?.enabled,
     // The portal's own web address — what the phone app opens for an applicant.
     url: `${String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '')}/${portal.slug}`,
 });
@@ -246,6 +248,26 @@ exports.documentFile = handler(async (req, res) => {
 exports.payOrder = handler(async (req, res) => {
     const app = await access.ownApplication(req, req.params.id);
     res.json({ success: true, data: await payments.createOrder(req, app, req.body?.kind, { part: req.body?.part === 'instalment' ? 'instalment' : 'all' }) });
+}, TAG);
+
+/**
+ * A link to pay this family's own fee in a browser (Oct 2026) — the phone app
+ * has no card checkout of its own, so it opens the portal's pay page with this.
+ * Same rules as paying here (payments.payableKind, something due, the gateway
+ * on); the link lasts an hour and pays only this fee of this application.
+ */
+exports.payLink = handler(async (req, res) => {
+    const app = await access.ownApplication(req, req.params.id);
+    const kind = req.body?.kind;
+    payments.payableKind(app, kind);
+    const b = await payments.balance(app, kind);
+    if (b.due <= 0) refuse('Nothing is due', 409, { code: 'NOTHING_DUE' });
+    const resolved = await require('../services/paymentGateway').resolveGateway(app.school, 'admission');
+    if (!resolved.ok) refuse('Online payment is not set up at this school — please pay at the school office', 409, { code: 'GATEWAY_UNAVAILABLE' });
+    const settings = req.portal?.settings || await require('../services/admission/settings').getSettings(app.school);
+    const { token, expiresAt } = require('../services/admission/payLink').make(app, kind, 1 / 24);
+    const url = `${String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '')}/${settings.slug}/pay/${token}`;
+    res.status(201).json({ success: true, data: { url, expiresAt, due: b.due } });
 }, TAG);
 
 exports.payVerify = handler(async (req, res) => {

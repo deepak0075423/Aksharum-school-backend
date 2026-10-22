@@ -75,8 +75,11 @@ function isoDob(v) {
 
 // ── Connecting ───────────────────────────────────────────────────────────────
 
+/** The phone app's link scheme (Nexora-Hives app.json "scheme"); letters, digits, + - . only. */
+const appScheme = () => (/^[a-z][a-z0-9+.-]{1,30}$/i.test(String(process.env.APP_SCHEME || '')) ? String(process.env.APP_SCHEME) : 'aksharum');
+
 /** Start: a state and a PKCE pair for this application; the address to send the family to. */
-async function start(req, app) {
+async function start(req, app, { client = 'web' } = {}) {
     const c = config();
     if (!(await available(app.school))) refuse('DigiLocker is not available on this portal', 409, { code: 'DIGILOCKER_OFF' });
     const state = crypto.randomBytes(24).toString('base64url');
@@ -85,7 +88,7 @@ async function start(req, app) {
     await pool.query(`UPDATE "admissiondigilockersessions" SET "status" = 'ended', "token" = '', "updatedAt" = now() WHERE "application" = $1 AND "status" IN ('started', 'connected')`, [String(app._id)]);
     const { sql, params } = buildInsert(AdmissionDigilockerSession, {
         school: app.school, application: app._id, applicant: req.userId, state, codeVerifier: verifier, status: 'started',
-        expiresAt: new Date(Date.now() + SESSION_MINUTES * 60000),
+        client: client === 'app' ? 'app' : 'web', expiresAt: new Date(Date.now() + SESSION_MINUTES * 60000),
     });
     await pool.query(sql, params);
     const q = new URLSearchParams({ response_type: 'code', client_id: c.clientId, redirect_uri: c.redirectUri, state, code_challenge: challenge, code_challenge_method: 'S256' });
@@ -112,6 +115,8 @@ async function callback({ code, state, error }) {
     const { rows: [s] } = await pool.query(`SELECT * FROM "admissiondigilockersessions" WHERE "state" = $1`, [String(state || '')]);
     const back = async (ok) => {
         if (!s) return `${String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '')}/`;
+        // Started in the phone app: back into it. The scheme is the server's own, never the request's.
+        if (s.client === 'app') return `${appScheme()}://modules/applicant-application?id=${s.application}&digilocker=${ok ? 'connected' : 'failed'}`;
         const st = await settingsSvc.getSettings(s.school);
         return `${String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '')}/${st.slug}/applications/${s.application}?digilocker=${ok ? 'connected' : 'failed'}`;
     };

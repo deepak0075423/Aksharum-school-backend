@@ -121,4 +121,13 @@ describe('admission — documents from DigiLocker', () => {
         assert.equal(v.status, 'failed');
         assert.deepEqual(v.files, []);
     });
+
+    it('sends a connection started in the phone app back into the app — never to an address the request names', async () => {
+        const r = await H.api('POST', `/admission/portal/applications/${app._id}/digilocker/start`, { token: g.token, body: { client: 'app', returnTo: 'https://evil.test/' } });
+        const st = new URL(r.body.data.url).searchParams.get('state');
+        const back = await callback({ code: 'good-code', state: st });
+        assert.equal(back.headers.get('location'), `aksharum://modules/applicant-application?id=${app._id}&digilocker=connected`);
+        const v = (await H.api('GET', `/admission/portal/applications/${app._id}/digilocker`, { token: g.token })).body.data;
+        assert.equal(v.status, 'connected');
+    });
 });
