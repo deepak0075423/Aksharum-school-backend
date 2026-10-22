@@ -7,6 +7,7 @@ const { isPhone, normalizePhone } = require('../utils/validators');
 const { nameProblem } = require('../utils/textRules');
 const { fatherOrHusbandLabel } = require('../utils/fatherOrHusband');
 const { publicUser } = require('../utils/publicShapes');
+const authCache = require('../utils/authCache');
 
 exports.getProfile = async (req, res) => {
     try {
@@ -45,7 +46,12 @@ exports.updateProfile = async (req, res) => {
             updates.profileImage = '';
         }
         const user = await User.findByIdAndUpdate(req.userId, updates, { new: true });
-        res.json({ success: true, data: user });
+        // Every signed-in request — /auth/me included — reads the account from
+        // a 30-second cache. Left alone, the page re-read the OLD photo and
+        // phone straight after "Profile updated", as if the save had failed.
+        await authCache.invalidate(req.userId);
+        // Never the password hash or the school's stored credentials (utils/publicShapes).
+        res.json({ success: true, data: publicUser(user) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
