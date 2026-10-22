@@ -12,6 +12,7 @@
  * Tokens: {INITIALS} {CODE} {YYYY} {YY} {MM} {DD} {CLASS} {CLASSNO}
  *         {####} (padded to the number of #) or {SEQ} (unpadded) — exactly one.
  */
+const classLevels = require('../../utils/classLevels');
 const pool = require('../../db/pool');
 const AdmissionCounter = require('../../models/AdmissionCounter');
 
@@ -40,7 +41,13 @@ function parts(template, { school = null, year = null, classDoc = null, on = new
     const y = year || on.getFullYear();
     const className = String(classDoc?.className || '');
     const classSlug = className.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-    const classNo = (className.match(/\d+/) || [])[0] || (classDoc?.classNumber != null ? String(classDoc.classNumber) : classSlug);
+    // A pre-primary class's number is 0 or below (utils/classLevels) — no use in
+    // an application number, and "KG1"'s digit would read as Class 1 — so it
+    // goes by its short name: NUR, LKG, KG1, PG.
+    const n = Number(classDoc?.classNumber);
+    const classNo = classDoc && Number.isInteger(n) && n < 1 && classLevels.levelOf(n)
+        ? classLevels.shortOf(classDoc).replace(/[^A-Za-z0-9]/g, '').toUpperCase()
+        : (className.match(/\d+/) || [])[0] || (classDoc?.classNumber != null ? String(classDoc.classNumber) : classSlug);
     const fill = (s) => s
         .replace(/\{INITIALS\}/g, initialsOf(school?.name))
         .replace(/\{CODE\}/g, String(school?.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''))

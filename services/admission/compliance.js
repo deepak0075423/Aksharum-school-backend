@@ -21,7 +21,8 @@ const { refuse } = require('./util');
 
 // Pre-primary classes are named, not numbered: a class without digits gets
 // whatever number is free (controllers/class.controller), so names decide.
-const PRE_PRIMARY = /\b(nursery|pre[\s-]?(nursery|primary|school|kg)|play[\s-]?(group|school)|kindergarten|kg|lkg|ukg|jr\.?\s?kg|sr\.?\s?kg|bal[\s-]?vatika)\b/i;
+// KG1 / KG2 are how some schools name LKG / UKG (utils/classLevels) — `\bkg\b` alone misses them.
+const PRE_PRIMARY = /\b(nursery|pre[\s-]?(nursery|primary|school|kg)|play[\s-]?(group|school)|kindergarten|kg|kg[\s-]?[12]|lkg|ukg|jr\.?\s?kg|sr\.?\s?kg|bal[\s-]?vatika)\b/i;
 
 const DEFAULT_RTE = { enabled: true, classNumbers: [1, 2, 3, 4, 5, 6, 7, 8], prePrimary: false, exemptReason: '', exemptNote: '' };
 

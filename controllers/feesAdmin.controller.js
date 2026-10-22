@@ -17,6 +17,7 @@
  *   due      = every debit − every credit (negative = paid in advance)
  * "Total fees" on a row is charged − waived, so total = paid + due.
  */
+const classLevels = require('../utils/classLevels');
 const pool          = require('../db/pool');
 const { isUuid }    = require('../db/schema');
 const TZ            = require('../config/timezone');
@@ -96,11 +97,19 @@ const GROUP_MODES = { online: ['online', 'upi', 'bank_transfer'], cash: ['cash']
 const groupSql = (col) => `CASE WHEN ${col} IN ('online','upi','bank_transfer') THEN 'online'
                                 WHEN ${col} = 'cash' THEN 'cash' WHEN ${col} = 'card' THEN 'card' ELSE 'other' END`;
 
-/** "10A" for Class 10 section A; the class name alone when there is no number. */
+/**
+ * "10A" for Class 10 section A, "LKG A" for a pre-primary class (utils/
+ * classLevels — its number is 0 or below, which is no label); the class name
+ * alone when there is no number.
+ */
 function classLabel(classNumber, className, sectionName) {
-    const base = classNumber != null && classNumber !== '' ? String(Number(classNumber)) : String(className || '').replace(/^class\s*/i, '');
+    const n = Number(classNumber);
+    const numbered = classNumber != null && classNumber !== '' && Number.isInteger(n) && n >= 1;
+    const base = numbered ? String(n)
+        : classLevels.levelOf(classNumber) ? classLevels.shortOf({ classNumber, className })
+        : String(className || '').replace(/^class\s*/i, '');
     if (!sectionName) return base || '—';
-    return `${base}${String(sectionName).length <= 2 ? '' : ' '}${sectionName}`;
+    return `${base}${numbered && String(sectionName).length <= 2 ? '' : ' '}${sectionName}`;
 }
 const classTitle = (classNumber, className) => className || (classNumber != null ? `Class ${Number(classNumber)}` : '—');
 

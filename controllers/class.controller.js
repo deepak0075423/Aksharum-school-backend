@@ -5,6 +5,7 @@ const ClassSection   = require('../models/ClassSection');
 const StudentProfile = require('../models/StudentProfile');
 const User           = require('../models/User');
 const { isDate }     = require('../utils/validators');
+const classLevels    = require('../utils/classLevels');
 const { inactiveTeacherError } = require('../utils/activeTeacher');
 const { syncSectionChatGroup, sectionGroups } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
@@ -794,25 +795,33 @@ exports.importYearStructure = async (req, res) => {
 exports.createClass = async (req, res) => {
     try {
         const { name, className, classNumber, level, academicYear } = req.body;
-        if (!(className || name)?.trim()) return err(res, 'Class name is required', 400);
+        const typed  = String(className || name || '').trim();
         const rawNum = classNumber ?? level;
-        if (rawNum !== undefined && rawNum !== null && rawNum !== '' && (Number.isNaN(Number(rawNum)) || Number(rawNum) < 0))
-            return err(res, 'Class number must be a non-negative number', 400);
+
+        // One of the standard classes (utils/classLevels): its number, and the
+        // name the school picked for it ("LKG" or "KG1"). An older app sends
+        // only a typed name — matched to its class, so "lkg" or "Class V" still
+        // lands in its place, in the standard spelling.
+        let pick;
+        if (rawNum !== undefined && rawNum !== null && rawNum !== '') {
+            const lvl = classLevels.levelOf(rawNum);
+            if (!lvl) return err(res, `Pick a class from the list — ${classLevels.SUMMARY}.`, 400);
+            const chosen = typed ? lvl.names.find((n) => n.toLowerCase() === typed.toLowerCase()) : lvl.names[0];
+            if (!chosen) return err(res, `${lvl.label} is named ${lvl.names.map((n) => `"${n}"`).join(' or ')}.`, 400);
+            pick = { number: lvl.number, name: chosen };
+        } else {
+            if (!typed) return err(res, 'Class name is required', 400);
+            pick = classLevels.levelForName(typed);
+            if (!pick) return err(res, `Pick a class from the list — ${classLevels.SUMMARY}.`, 400);
+        }
+        const label = pick.name;
+        const num   = pick.number;
+
         let yearId = academicYear;
         if (!yearId) {
             const active = await AcademicYear.findOne({ school: req.schoolId, status: 'active' });
             if (!active) return err(res, { message: 'No active academic year. Please set one first.' }, 400);
             yearId = active._id;
-        }
-
-        const label = (className || name).trim();
-        // classNumber is part of a unique index (school + year + number). Blank
-        // grades used to all collapse onto 0 and collide — derive it from the
-        // class name instead, and fall back to the next free number.
-        let num = (rawNum === undefined || rawNum === null || rawNum === '') ? null : Number(rawNum);
-        if (num === null) {
-            const digits = label.match(/\d+/);
-            num = digits ? Number(digits[0]) : null;
         }
 
         const yearDoc  = await AcademicYear.findById(yearId).lean();
@@ -822,14 +831,9 @@ exports.createClass = async (req, res) => {
         const dupName = siblings.find(c => c.className.trim().toLowerCase() === label.toLowerCase());
         if (dupName) return err(res, { message: `Class "${label}" already exists${yearLabel}.` }, 400);
 
-        if (num === null) {
-            const used = new Set(siblings.map(c => Number(c.classNumber)));
-            num = 0;
-            while (used.has(num)) num++;
-        } else {
-            const dupNum = siblings.find(c => Number(c.classNumber) === num);
-            if (dupNum) return err(res, { message: `Grade / level ${num} is already used by class "${dupNum.className}"${yearLabel}. Pick a different grade.` }, 400);
-        }
+        // One class per standard class in a year — the number is unique.
+        const dupNum = siblings.find(c => Number(c.classNumber) === num);
+        if (dupNum) return err(res, { message: `${classLevels.levelOf(num).label} is already added${yearLabel}, as "${dupNum.className}".` }, 400);
 
         const cls = await Class.create({
             className: label,
@@ -847,7 +851,11 @@ exports.createClass = async (req, res) => {
 //  Bulk class + section creation.
 //
 //  Setting a school up one class and one section at a time is 12 forms and then
-//  48 more. This takes a grade range and a section count and builds the lot.
+//  48 more. This takes a range of the standard classes (utils/classLevels —
+//  Playgroup / Pre-Nursery up to Class 12) and a section count and builds the
+//  lot. The pre-primary years that go by two names are named as the school
+//  chose (`names`: { "-3": "Pre-Nursery", "-1": "KG1", "0": "KG2" }), else
+//  their first name.
 //
 //  It is ADDITIVE, never destructive: a class already in the year is left where
 //  it is and only its MISSING sections are added, so a half-finished setup can
@@ -860,27 +868,31 @@ exports.createClass = async (req, res) => {
 
 // A-Z. Past 26 a school is not naming sections by letter any more.
 const SECTION_LETTERS = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i));
-// Guard rails against a typo'd range turning into thousands of rows.
-const MAX_CLASSES_PER_RUN = 30;
-const MAX_GRADE = 20;
-
 exports.bulkCreateClasses = async (req, res) => {
     try {
-        const { fromClass, toClass, sectionsPerClass, capacity, preview } = req.body;
+        const { fromClass, toClass, sectionsPerClass, capacity, preview, names = {} } = req.body;
 
-        const from = Number(fromClass);
-        const to   = Number(toClass);
+        const fromLvl = classLevels.levelOf(fromClass);
+        const toLvl   = classLevels.levelOf(toClass);
         const secs = Number(sectionsPerClass);
         const cap  = capacity === undefined || capacity === null || capacity === '' ? 40 : Number(capacity);
 
-        if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0)
-            return err(res, 'Give a whole-number class range, for example 1 to 12', 400);
+        if (!fromLvl || !toLvl)
+            return err(res, `Pick the first and last class from the list — ${classLevels.SUMMARY}.`, 400);
+        const from = fromLvl.number;
+        const to   = toLvl.number;
         if (from > to)
             return err(res, 'The first class cannot be higher than the last', 400);
-        if (to > MAX_GRADE)
-            return err(res, `Classes go up to ${MAX_GRADE} here. Create anything above that one at a time.`, 400);
-        if (to - from + 1 > MAX_CLASSES_PER_RUN)
-            return err(res, `That range is ${to - from + 1} classes — ${MAX_CLASSES_PER_RUN} is the most in one go.`, 400);
+        // The name each class in the range gets: the one the school chose for a
+        // two-name year, checked against that year's names.
+        const nameFor = new Map();
+        for (let n = from; n <= to; n += 1) {
+            const lvl = classLevels.levelOf(n);
+            const asked = names && typeof names === 'object' ? String(names[n] ?? '').trim() : '';
+            const chosen = asked ? lvl.names.find((x) => x.toLowerCase() === asked.toLowerCase()) : lvl.names[0];
+            if (!chosen) return err(res, `${lvl.label} is named ${lvl.names.map((x) => `"${x}"`).join(' or ')}.`, 400);
+            nameFor.set(n, chosen);
+        }
         if (!Number.isInteger(secs) || secs < 0 || secs > SECTION_LETTERS.length)
             return err(res, `Sections per class must be between 0 and ${SECTION_LETTERS.length}`, 400);
         if (!Number.isFinite(cap) || cap < 1)
@@ -917,7 +929,7 @@ exports.bulkCreateClasses = async (req, res) => {
         const wanted = SECTION_LETTERS.slice(0, secs);
         const plan = [];      // what this run would do, class by class
         for (let n = from; n <= to; n += 1) {
-            const label = `Class ${n}`;
+            const label = nameFor.get(n);
             const existing = byNumber.get(n);
             // A class of the same NAME on a different grade number is somebody
             // else's row — skipped rather than silently folded into this range.
