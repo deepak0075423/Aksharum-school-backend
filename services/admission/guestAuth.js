@@ -28,6 +28,7 @@ const pool = require('../../db/pool');
 const User = require('../../models/User');
 const AdmissionApplicant = require('../../models/AdmissionApplicant');
 const identity = require('../accountIdentity');
+const lockout = require('../loginLockout');
 const authCache = require('../../utils/authCache');
 const { isEmail, isPhone, normalizePhone, passwordError } = require('../../utils/validators');
 const { nameProblem } = require('../../utils/textRules');
@@ -221,9 +222,10 @@ async function login(portal, body) {
     const email = str(body.email, 200).toLowerCase();
     const password = String(body.password ?? '');
     if (!isEmail(email) || !password) refuse('Enter your email and password', 400);
-    const rows = await identity.membershipsByEmail(email);
-    const opened = rows.length ? await identity.openedBy(rows, password) : [];
-    if (!opened.length) refuse('Invalid email or password', 401, { code: 'INVALID_CREDENTIALS' });
+    // The same count as the main sign-in page: it is the address's one password
+    // either way, so five wrong guesses here lock it there too (services/loginLockout).
+    const { opened, refusal } = await lockout.checkPassword(email, password);
+    if (refusal) refuse(refusal.body.message, refusal.status, refusal.body);
     const here = guestRowHere(opened, portal.school._id);
     if (!here) {
         refuse(`This email has no applicant account with ${portal.school.name} yet. Create one to apply — you can keep the same password.`, 403, { code: 'NO_APPLICANT_ACCOUNT' });

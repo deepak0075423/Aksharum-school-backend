@@ -5,6 +5,7 @@ const crypto  = require('crypto');
 const User    = require('../models/User');
 const { isEmail, passwordError } = require('../utils/validators');
 const identity  = require('../services/accountIdentity');
+const lockout   = require('../services/loginLockout');
 const { sendOtpEmail } = require('../utils/sendEmail');
 const { publicSchool, publicUser } = require('../utils/publicShapes');
 
@@ -59,11 +60,10 @@ exports.login = async (req, res) => {
         // An address is a person, not a seat: it may open a teaching post at one
         // school and a parent's account at another. Everything the password
         // opens is collected, and the person says which one they are here as.
-        const rows = await identity.membershipsByEmail(email);
-        const opened = rows.length ? await identity.openedBy(rows, password) : [];
-        if (!opened.length) {
-            return res.status(401).json({ success: false, message: 'Invalid credentials' });
-        }
+        // Five wrong passwords lock the address for a day; each refusal says
+        // how many tries are left (services/loginLockout).
+        const { opened, refusal } = await lockout.checkPassword(email, password);
+        if (refusal) return lockout.sendRefusal(res, refusal);
         // Checked after the password so a wrong password never reveals whether
         // the account exists or which school it belongs to.
         return answerSignIn(res, opened);

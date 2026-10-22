@@ -29,6 +29,9 @@ function sendError(res, err, tag = 'admission') {
             ...(err.field ? { field: err.field } : {}),
             ...(err.code && typeof err.code === 'string' ? { code: err.code } : {}),
             ...(err.errors ? { errors: err.errors } : {}),
+            // A refused sign-in: how many tries are left, and when a lock lifts (services/loginLockout).
+            ...(err.attempts ? { attempts: err.attempts } : {}),
+            ...(err.lockedUntil ? { lockedUntil: err.lockedUntil, retryAfter: err.retryAfter } : {}),
         });
     }
     if (err && (err.code === 11000 || err.code === '23505')) {

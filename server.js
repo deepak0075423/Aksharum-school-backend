@@ -600,6 +600,19 @@ if (isPrimaryWorker) {
         }, 60 * 1000);
     }());
 
+    // ── Sign-in lockouts ──────────────────────────────────────────────────────
+    // Wrong-password counts are kept for every address typed at sign-in,
+    // registered or not (services/loginLockout). Once a lock has run out and
+    // the last failure is a day old, the row says nothing — clear those out.
+    (function scheduleLoginAttemptPrune() {
+        const lockout = require('./services/loginLockout');
+        const tick = async () => {
+            try { await lockout.prune(); } catch (err) { console.error('[Auth] lockout prune error:', err.message); }
+        };
+        setTimeout(tick, 90 * 1000);           // once shortly after boot
+        setInterval(tick, 6 * 60 * 60 * 1000); // then every 6 hours
+    }());
+
     // ── Admissions clock ──────────────────────────────────────────────────────
     // Online exam attempts whose time is up are submitted, lists and results
     // booked for later are published, unanswered offers lapse (and the waiting
