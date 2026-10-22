@@ -290,7 +290,11 @@ async function scopedProfiles(req, scope, { paginate = false } = {}) {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
 
     const filter = { school: req.schoolId };
-    if (gender) filter.gender = gender;
+    // Stored the way the profile form writes it ('Male' / 'Female' / 'Other'),
+    // but both apps ask for 'male' / 'female' / 'other' — an exact match found
+    // nobody. Matched ignoring case and stray spaces, as imported rows vary too.
+    const g = String(gender || '').trim();
+    if (g) filter.gender = { $regex: `^\\s*${escapeRx(g)}\\s*$`, $options: 'i' };
 
     // Section narrowing — always intersected with the caller's scope.
     let allowed = scope.sectionIds;
