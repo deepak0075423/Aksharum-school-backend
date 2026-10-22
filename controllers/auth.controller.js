@@ -6,6 +6,7 @@ const User    = require('../models/User');
 const { isEmail, passwordError } = require('../utils/validators');
 const identity  = require('../services/accountIdentity');
 const lockout   = require('../services/loginLockout');
+const resetCodes = require('../services/resetCodeLimit');
 const { sendOtpEmail } = require('../utils/sendEmail');
 const { publicSchool, publicUser } = require('../utils/publicShapes');
 
@@ -386,28 +387,71 @@ exports.resetPassword = async (req, res) => {
 //  User schema, so nothing was ever stored and step two could not match.
 // ─────────────────────────────────────────────────────────────────────────────
 
+const OTP_MINUTES = 10;   // what the email tells the person (utils/sendEmail)
+
 exports.forgotPassword = async (req, res) => {
     try {
         const { email } = req.body;
         if (!isEmail(email)) return res.status(400).json({ success: false, message: 'A valid email address is required' });
-        // The same answer either way: whether an address has an account here is
-        // not something a stranger gets to find out.
-        const generic = { success: true, message: 'If that email exists, an OTP was sent' };
+        // A code goes only to an address an account uses, and the person is told
+        // plainly when none does — the school's call (Oct 2026); it used to give
+        // the same "if that email exists" answer either way. Sign-in still never
+        // says which half of a sign-in was wrong.
         const rows = await identity.membershipsByEmail(email);
-        const live = identity.partition(rows).open;
-        if (!live.length) return res.json(generic);
-
-        const otp     = Math.floor(100000 + Math.random() * 900000).toString();
-        const expires = new Date(Date.now() + 10 * 60 * 1000);
-        await identity.setCredentials(email, { extra: { otp, otpExpiry: expires } });
-        // Best effort: a mail failure must not tell the caller whether the
-        // address exists, so it is logged and the same answer goes back.
-        try {
-            await sendOtpEmail({ to: live[0].email, name: live[0].name, otp });
-        } catch (mailErr) {
-            console.error('[auth] reset OTP email failed:', mailErr.message);
+        if (!rows.length) {
+            return res.status(404).json({ success: false, code: 'ACCOUNT_NOT_FOUND', message: 'No account found with this email address.' });
         }
-        res.json(generic);
+        // An account that cannot sign in has no use for a new password — say why.
+        // (Not SCHOOL_INACTIVE: the web app ends the session on that code.)
+        const { open, blocked } = identity.partition(rows);
+        if (!open.length) {
+            return res.status(403).json({ success: false, code: 'ACCOUNT_UNAVAILABLE', message: blocked[0]?.reason || 'Account disabled' });
+        }
+        // 60 seconds between codes; three in a row, then a day's wait (services/resetCodeLimit).
+        const slot = await resetCodes.claim(email);
+        if (!slot.ok) {
+            const { status, body } = resetCodes.refusal(slot);
+            res.setHeader('Retry-After', String(body.retryAfter));
+            return res.status(status).json({ success: false, ...body });
+        }
+
+        const otp     = String(crypto.randomInt(100000, 1000000));
+        const expires = new Date(Date.now() + OTP_MINUTES * 60 * 1000);
+        await identity.setCredentials(email, { extra: { otp, otpExpiry: expires } });
+        try {
+            // From the person's own school's mail server when one of theirs has
+            // "Use our school's own mail server" on (utils/schoolMailer sendPersonMail).
+            await sendOtpEmail({ to: open[0].email, name: open[0].name, otp, schoolIds: open.map((r) => r.school) });
+        } catch (mailErr) {
+            // The mail server refusing our own login is not a passing hiccup:
+            // nothing will go out, for anyone, until SMTP_USER / SMTP_PASS are
+            // fixed (Gmail wants an App Password, and revokes it when the
+            // account's password changes). Say so, rather than "try again".
+            const refusedLogin = mailErr.code === 'EAUTH' || mailErr.code === 'ENOAUTH';
+            console.error('[auth] reset OTP email failed:', mailErr.message,
+                refusedLogin ? '— the mail server rejected SMTP_USER / SMTP_PASS in .env' : '');
+            // Nobody received this code: a code they may already hold keeps
+            // working, and this send is not counted against them.
+            await identity.setCredentials(email, { extra: { otp: rows[0].otp ?? null, otpExpiry: rows[0].otpExpiry ?? null } });
+            await resetCodes.release(slot);
+            return res.status(502).json({
+                success: false,
+                code:    refusedLogin ? 'EMAIL_UNAVAILABLE' : 'OTP_NOT_SENT',
+                message: refusedLogin
+                    ? 'We could not send the code because the email service is not working right now. Please contact your school office.'
+                    : 'The code could not be emailed just now. Please try again in a minute.',
+            });
+        }
+        res.json({
+            success:          true,
+            message:          `A 6-digit code has been sent to ${open[0].email}.`,
+            expiresInMinutes: OTP_MINUTES,
+            resendIn:         slot.resendIn,
+            sendsLeft:        slot.sendsLeft,
+            maxSends:         slot.maxSends,
+            // That was the last of the three: when the next may be asked for.
+            ...(slot.availableAt ? { availableAt: new Date(slot.availableAt).toISOString() } : {}),
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -452,6 +496,8 @@ exports.newPassword = async (req, res) => {
             isFirstLogin: false,
             extra: { resetToken: null, resetTokenExpiry: null },
         });
+        // Done — the address has its three codes again for next time.
+        await resetCodes.clear(row.email);
         res.json({ success: true, message: 'Password reset successfully' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });

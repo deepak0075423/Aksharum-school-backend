@@ -1,6 +1,6 @@
 const transporter = require('../config/mailer');
 const { escapeHtml: esc } = require('./textRules');   // what a person typed stays text in the email
-const { sendSchoolMail, emailHeaderHtml, getMailContext } = require('./schoolMailer');
+const { sendSchoolMail, sendPersonMail, emailHeaderHtml, getMailContext } = require('./schoolMailer');
 
 const sendWelcomeEmail = async ({ to, name, email, tempPassword, role, schoolName }) => {
   const loginUrl = `${process.env.APP_URL}/auth/login`;
@@ -105,7 +105,22 @@ const sendWelcomeEmail = async ({ to, name, email, tempPassword, role, schoolNam
   }
 };
 
-const sendOtpEmail = async ({ to, name, otp }) => {
+/* ─────────────────────────────────────────────
+   PASSWORD RESET CODE — to a person, not a school
+   The address may belong to several schools, so the sender is chosen by
+   sendPersonMail: the school's own mail server when one of theirs has it on
+   (one at random when several do), the platform's otherwise. The email wears
+   the name and logo of whoever sends it. `schoolIds` are the schools of the
+   person's live accounts.
+─────────────────────────────────────────────── */
+const otpEmail = ({ name, otp, school }) => {
+  const brand = school?.name || process.env.APP_NAME;
+  const header = school
+    ? emailHeaderHtml(school, 'Password Reset Request')
+    : `<div class="header">
+    <h1>🎓 ${esc(brand)}</h1>
+    <p>Password Reset Request</p>
+  </div>`;
   const html = `
 <!DOCTYPE html>
 <html lang="en">
@@ -130,10 +145,7 @@ const sendOtpEmail = async ({ to, name, otp }) => {
 </head>
 <body>
 <div class="wrapper">
-  <div class="header">
-    <h1>🎓 ${process.env.APP_NAME}</h1>
-    <p>Password Reset Request</p>
-  </div>
+  ${header}
   <div class="body">
     <div class="greeting">Hello, <strong>${esc(name)}</strong>! 👋</div>
     <p style="color:#4b5563; font-size:14px;">We received a request to reset your password. Use the OTP below to verify your identity. This code is valid for <strong>10 minutes</strong>.</p>
@@ -148,20 +160,19 @@ const sendOtpEmail = async ({ to, name, otp }) => {
     <p style="color:#6b7280; font-size:13px;">For security, never share this OTP with anyone. Our team will never ask for it.</p>
   </div>
   <div class="footer">
-    <p>© ${new Date().getFullYear()} ${process.env.APP_NAME} — Automated security email.</p>
+    <p>© ${new Date().getFullYear()} ${esc(brand)} — Automated security email.</p>
   </div>
 </div>
 </body>
 </html>
     `;
+  return { subject: `${otp} is your ${brand} password reset OTP`, html };
+};
+
+const sendOtpEmail = async ({ to, name, otp, schoolIds = [] }) => {
   try {
-    await transporter.sendMail({
-      from: process.env.EMAIL_FROM,
-      to,
-      subject: `${otp} is your ${process.env.APP_NAME} password reset OTP`,
-      html,
-    });
-    console.log(`📧 OTP email sent to ${to}`);
+    const { schoolId } = await sendPersonMail(schoolIds, to, (school) => otpEmail({ name, otp, school }));
+    console.log(`📧 OTP email sent to ${to}${schoolId ? ` from school ${schoolId}'s own mail server` : ''}`);
   } catch (err) {
     console.error(`❌ OTP email failed for ${to}:`, err.message);
     throw err; // OTP emails are fatal — surface the error

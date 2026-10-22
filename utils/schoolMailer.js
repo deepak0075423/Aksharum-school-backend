@@ -24,6 +24,9 @@ function _buildTransporter(smtp) {
     });
 }
 
+// "Use our school's own mail server" is on, and there is enough to log in with.
+const hasOwnServer = (smtp) => !!(smtp?.enabled && smtp.host && smtp.user && smtp.pass);
+
 // Resolve mail context for a school. Returns:
 //   { transporter, fromEmail, school } — school is a lean doc with branding fields.
 // Falls back to the platform transporter when the school has no usable SMTP config.
@@ -37,7 +40,7 @@ async function getMailContext(schoolId) {
     }
 
     const smtp = school?.smtp;
-    if (smtp?.enabled && smtp.host && smtp.user && smtp.pass) {
+    if (hasOwnServer(smtp)) {
         const key    = _configKey(smtp);
         const cached = _cache.get(schoolId.toString());
         let transporter = cached?.key === key ? cached.transporter : null;
@@ -86,6 +89,53 @@ async function sendSchoolMail(schoolId, { to, subject, html, text, fromName, rep
         if (rethrow) throw e;
         return null;
     }
+}
+
+/**
+ * Mail for a PERSON rather than for one school. A password-reset code goes to
+ * an address, and one address can belong to several schools (services/
+ * accountIdentity), so whose mail server sends it is a choice:
+ *
+ *   - one of their schools has "Use our school's own mail server" on → that one;
+ *   - several have → one of those, at random;
+ *   - none has → the platform's (.env).
+ *
+ * The rest stand by in order — the other schools' own servers (shuffled), then
+ * the platform's — so one school's broken mailbox does not leave the person
+ * without their mail. `build(school)` returns { subject, html } for the school
+ * whose server is sending (null for the platform), so the email carries the
+ * sender's own name and logo.
+ *
+ * Resolves to { info, schoolId } — schoolId null when the platform sent it —
+ * and throws the last failure when every server refused.
+ */
+async function sendPersonMail(schoolIds, to, build) {
+    const ids = [...new Set((schoolIds || []).filter(Boolean).map(String))];
+    const schools = ids.length
+        ? await School.find({ _id: { $in: ids } }).select('_id smtp').lean()
+        : [];
+    const own = schools.filter((s) => hasOwnServer(s.smtp)).map((s) => String(s._id));
+    for (let i = own.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [own[i], own[j]] = [own[j], own[i]];
+    }
+    let lastErr = null;
+    for (const schoolId of [...own, null]) {
+        try {
+            const ctx = await getMailContext(schoolId);
+            const { subject, html } = build(schoolId ? ctx.school : null);
+            const from = schoolId
+                ? `"${ctx.fromName}" <${ctx.fromEmail}>`
+                : (process.env.EMAIL_FROM || `"${ctx.fromName}" <${ctx.fromEmail}>`);
+            const info = await ctx.transporter.sendMail({ from, to, subject, html });
+            console.log(`[mail] sent to ${to} through ${schoolId ? `school ${schoolId}'s own mail server` : 'the platform mail server'} — ${info.messageId}`);
+            return { info, schoolId };
+        } catch (e) {
+            lastErr = e;
+            console.error(`[mail] ${schoolId ? `school ${schoolId}'s own mail server` : 'the platform mail server'} failed for ${to}:`, e.message);
+        }
+    }
+    throw lastErr;
 }
 
 // Absolute URL of the school's uploaded logo (empty string when none).
@@ -158,4 +208,4 @@ function invalidate(schoolId) {
     if (schoolId) _cache.delete(schoolId.toString());
 }
 
-module.exports = { getMailContext, sendSchoolMail, schoolLogoUrl, emailHeaderHtml, sendSchoolAddedEmail, invalidate };
+module.exports = { getMailContext, sendSchoolMail, sendPersonMail, schoolLogoUrl, emailHeaderHtml, sendSchoolAddedEmail, invalidate };

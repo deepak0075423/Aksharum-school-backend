@@ -181,4 +181,5 @@ module.exports = {
     sendRefusal,
     prune,
     stampOf,
+    waitText,
 };
