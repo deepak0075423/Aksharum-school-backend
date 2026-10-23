@@ -50,6 +50,9 @@ async function attachTeacherDetail(docs, key = 'teachers') {
 // having to be smuggled into the array.
 const ok  = (res, d, s=200, meta=null) => res.status(s).json({ success: true, data: d, ...(meta || {}) });
 const err = (res, e, s=500) => res.status(s).json({ success: false, message: e.message||e });
+// A refusal about one field of the form says which, so the form can show it
+// beside that field — a message at the top of a long dialog is easy to miss.
+const fieldErr = (res, field, message, s = 400) => res.status(s).json({ success: false, message, field });
 
 /**
  * One year's subjects.
@@ -324,7 +327,7 @@ const isDuplicate = (e) => e?.code === 11000 || e?.code === '23505';
 exports.createSubject = async (req, res) => {
     try {
         const { name, subjectName, type, description, teachers } = req.body;
-        if (!(subjectName || name)?.trim()) return err(res, 'Subject name is required', 400);
+        if (!(subjectName || name)?.trim()) return fieldErr(res, 'name', 'Subject name is required');
         const code = normalCode(sentCode(req.body));
         // A subject is created INTO a year — the one the screen is showing, or
         // the active one when the caller does not say.
@@ -337,12 +340,12 @@ exports.createSubject = async (req, res) => {
             if (!active) return err(res, 'No active academic year. Please set one first.', 400);
             yearId = active._id;
         }
-        if (type && !['theory', 'practical', 'elective'].includes(type)) return err(res, 'Subject type must be theory, practical or elective', 400);
+        if (type && !['theory', 'practical', 'elective'].includes(type)) return fieldErr(res, 'type', 'Subject type must be theory, practical or elective');
         const badCode = await codeProblem(code, { schoolId: req.schoolId, yearId });
-        if (badCode) return err(res, badCode, 400);
+        if (badCode) return fieldErr(res, 'code', badCode);
         // A deactivated teacher cannot be listed against a subject.
         const inactive = await inactiveTeacherError(teachers, req.schoolId);
-        if (inactive) return err(res, inactive, 400);
+        if (inactive) return fieldErr(res, 'teachers', inactive);
         const s = await Subject.create({
             subjectName: subjectName || name,
             subjectCode: code,
@@ -355,7 +358,7 @@ exports.createSubject = async (req, res) => {
         const populated = await s.populate('teachers', 'name email');
         ok(res, await attachTeacherDetail(populated.toObject?.() ?? populated), 201);
     } catch (e) {
-        if (isDuplicate(e)) return err(res, 'Subject code is already used by another subject in this academic year', 400);
+        if (isDuplicate(e)) return fieldErr(res, 'code', 'Subject code is already used by another subject in this academic year');
         err(res, e, 400);
     }
 };
@@ -375,7 +378,7 @@ exports.updateSubject = async (req, res) => {
             const badCode = await codeProblem(code, {
                 schoolId: req.schoolId, yearId: current.academicYear, selfId: current._id,
             });
-            if (badCode) return err(res, badCode, 400);
+            if (badCode) return fieldErr(res, 'code', badCode);
             update.subjectCode = code;
         }
         if (type)                          update.type        = type;
@@ -383,14 +386,14 @@ exports.updateSubject = async (req, res) => {
         if (Array.isArray(teachers))       update.teachers    = teachers;
         if (update.teachers) {
             const inactive = await inactiveTeacherError(update.teachers, req.schoolId);
-            if (inactive) return err(res, inactive, 400);
+            if (inactive) return fieldErr(res, 'teachers', inactive);
         }
         const s = await Subject.findOneAndUpdate({ _id: req.params.id, school: req.schoolId }, update, { new: true })
             .populate('teachers', 'name email');
         if (!s) return err(res, 'Subject not found', 404);
         ok(res, await attachTeacherDetail(s.toObject?.() ?? s));
     } catch (e) {
-        if (isDuplicate(e)) return err(res, 'Subject code is already used by another subject in this academic year', 400);
+        if (isDuplicate(e)) return fieldErr(res, 'code', 'Subject code is already used by another subject in this academic year');
         err(res, e, 400);
     }
 };

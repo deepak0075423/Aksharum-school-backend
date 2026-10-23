@@ -95,9 +95,15 @@ async function resolveScope(req) {
         };
     }
 
+    // This year's sections only, like the admin's above (and Teacher My
+    // Section): a class teacher's post or a subject link from a past year is
+    // history — it used to put last year's Class 5 beside this year's in the
+    // filters, and its students in the roster. Switched-off sections stay out.
+    const thisYear = activeYear ? { academicYear: activeYear._id, status: 'active' } : {};
     const [own, links] = await Promise.all([
         ClassSection.find({
             school,
+            ...thisYear,
             $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
         }).select('_id classTeacher substituteTeacher').lean(),
         SectionSubjectTeacher.find({ teacher: req.userId })
@@ -126,9 +132,9 @@ async function resolveScope(req) {
 
     const ids = Object.keys(roles);
     // Re-read through the school filter: a stale subject link must never widen
-    // the scope past the teacher's own school.
+    // the scope past the teacher's own school — nor past this year.
     const sections = ids.length
-        ? await ClassSection.find({ _id: { $in: ids }, school }).populate('class', 'className classNumber').lean()
+        ? await ClassSection.find({ _id: { $in: ids }, school, ...thisYear }).populate('class', 'className classNumber').lean()
         : [];
 
     return {
@@ -324,12 +330,11 @@ async function scopedProfiles(req, scope, { paginate = false } = {}) {
                 school: req.schoolId, role: 'student',
                 $or: [{ name: { $regex: rx, $options: 'i' } }, { email: { $regex: rx, $options: 'i' } }],
             }).select('_id').lean(),
+            // By admission number only — roll numbers are not searched (taken
+            // out at the school's request, Oct 2026).
             StudentProfile.find({
                 school: req.schoolId,
-                $or: [
-                    { admissionNumber: { $regex: rx, $options: 'i' } },
-                    { rollNumber:      { $regex: rx, $options: 'i' } },
-                ],
+                admissionNumber: { $regex: rx, $options: 'i' },
             }).select('user').lean(),
         ]);
         const ids = new Set([...users.map((u) => String(u._id)), ...profs.map((p) => String(p.user))]);

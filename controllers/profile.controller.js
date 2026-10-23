@@ -104,7 +104,12 @@ exports.updateMyEmployeeRecord = async (req, res) => {
 
         if (updates.gender && !['Male', 'Female', 'Other'].includes(updates.gender))
             return res.status(400).json({ success: false, message: 'Gender must be Male, Female or Other' });
-        if (updates.dob) {
+        // A blank date of birth is "not recorded" — it used to go to the
+        // database as '' and come back as a raw "invalid input syntax for type
+        // timestamp" error, failing the whole save for anyone without one.
+        if (updates.dob === '' || updates.dob === null) {
+            updates.dob = null;
+        } else if (updates.dob !== undefined) {
             const d = new Date(updates.dob);
             if (Number.isNaN(d.getTime())) return res.status(400).json({ success: false, message: 'Invalid date of birth' });
             updates.dob = d;
