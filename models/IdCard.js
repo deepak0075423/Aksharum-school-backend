@@ -66,8 +66,17 @@ const IdCardSchema = new db.Schema({
     // Set when the card's details were brought up to date in place — allowed
     // only while the office has never printed it (services/idCardService).
     refreshedAt:  { type: Date, default: null },
-    // The office's print queue: when it was last sent to print / downloaded
-    // by the office, and how many times.
+    // Two different facts, kept apart on purpose.
+    //
+    // releasedAt — a PDF of this card has left the system (prepared for the
+    // printer, or downloaded by the office). From then on a copy of it may
+    // exist on paper, so its details are no longer rewritten in place: a
+    // change is a reissue with a new number.
+    //
+    // printedAt / printCount — the office SAID the card was printed. Nothing
+    // sets these on its own: a PDF handed to the browser's print window may
+    // be saved as a file and never reach a printer, and the office is asked.
+    releasedAt:   { type: Date, default: null },
     printedAt:    { type: Date, default: null },
     printCount:   { type: Number, default: 0 },
     // QR scans, at the gate or anywhere.

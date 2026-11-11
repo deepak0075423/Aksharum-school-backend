@@ -125,7 +125,10 @@ exports.print = handle(async (req, res) => {
     const cards = await cardsById(req.schoolId, b.cardIds);
     if (!cards.length) return res.status(400).json({ success: false, message: 'Choose the cards to print' });
     const yc = await rules.yearContext(req.schoolId);
-    await service.markPrinted(ctxOf(req), cards.filter((c) => rules.effectiveStatus(c, yc) === 'active' || rules.effectiveStatus(c, yc) === 'generated').map((c) => c._id), 'printed');
+    // Handing the PDF over is not printing it: the browser's print window can
+    // save it as a file, or be cancelled. The cards are only marked printed
+    // when the office says they were (markPrinted, below).
+    await service.markReleased(ctxOf(req), cards.filter((c) => rules.effectiveStatus(c, yc) === 'active' || rules.effectiveStatus(c, yc) === 'generated').map((c) => c._id), b.purpose === 'download' ? 'downloaded' : 'print_ready');
     renderIdCards(res, {
         cards: cards.map((c) => ({ ...c, effective: rules.effectiveStatus(c, yc) })),
         layout: LAYOUTS.includes(b.layout) ? b.layout : 'sheet',
@@ -135,13 +138,26 @@ exports.print = handle(async (req, res) => {
     });
 });
 
+/**
+ * POST /admin/id-cards/mark-printed { cardIds }
+ * The office confirms these cards came out of the printer.
+ */
+exports.markPrinted = handle(async (req, res) => {
+    const cards = await cardsById(req.schoolId, (req.body || {}).cardIds);
+    if (!cards.length) return res.status(400).json({ success: false, message: 'Choose the cards that were printed' });
+    const yc = await rules.yearContext(req.schoolId);
+    const live = cards.filter((c) => ['active', 'generated', 'blocked'].includes(rules.effectiveStatus(c, yc)));
+    const marked = await service.markPrinted(ctxOf(req), live.map((c) => c._id), 'printed');
+    return res.json({ success: true, data: { marked } });
+});
+
 /** GET /admin/id-cards/cards/:id/pdf?layout=card|sheet — one card, saved by the office. */
 exports.cardPdf = handle(async (req, res) => {
     const [card] = await cardsById(req.schoolId, [req.params.id]);
     if (!card) return res.status(404).json({ success: false, message: 'Card not found' });
     const yc = await rules.yearContext(req.schoolId);
     const effective = rules.effectiveStatus(card, yc);
-    if (effective === 'active' || effective === 'generated') await service.markPrinted(ctxOf(req), [card._id], 'downloaded');
+    if (effective === 'active' || effective === 'generated') await service.markReleased(ctxOf(req), [card._id], 'downloaded');
     renderIdCards(res, {
         cards: [{ ...card, effective }],
         layout: LAYOUTS.includes(req.query.layout) ? req.query.layout : 'card',

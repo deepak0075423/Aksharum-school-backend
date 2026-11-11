@@ -121,6 +121,7 @@ async function rowsFor(schoolId, kind, yc, year) {
                 _id: String(card._id), number: card.number, status, stored: card.status,
                 statusLabel: rules.STATUS_LABEL[status], statusReason: card.statusReason || '',
                 issuedAt: card.issuedAt, printedAt: card.printedAt || null, printCount: Number(card.printCount) || 0,
+                releasedAt: card.releasedAt || null,
                 reissueNo: Number(card.reissueNo) || 0, replacedBy: card.replacedBy ? String(card.replacedBy) : null,
                 yearName: card.snapshot?.yearName || '',
             } : null,
@@ -356,7 +357,7 @@ async function overview(schoolId) {
 }
 
 const ACTION_LABEL = {
-    issued: 'Issued', reissued: 'Reissued', refreshed: 'Details updated', printed: 'Printed', downloaded: 'Downloaded',
+    issued: 'Issued', reissued: 'Reissued', refreshed: 'Details updated', printed: 'Marked as printed', print_ready: 'Sent to print', downloaded: 'Downloaded',
     blocked: 'Blocked', activated: 'Activated', cancelled: 'Cancelled', lost: 'Reported lost', damaged: 'Reported damaged',
     replaced: 'Replaced', verified: 'Verified at the desk', scanned: 'QR scanned', design_applied: 'Design applied to cards in use',
     template_saved: 'Template saved', settings_saved: 'Settings saved',
@@ -386,7 +387,7 @@ function abilities(card, yc, holderActive) {
         && (card.kind !== 'student' || yc.byId.get(String(card.academicYear))?.phase !== 'past');
     return {
         regenerate: actionable,
-        refreshInPlace: actionable && !card.printedAt,
+        refreshInPlace: actionable && !card.printedAt && !card.releasedAt,
         report: actionable,
         replace: lostOpen && holderActive,
         block: actionable && card.status === 'active',

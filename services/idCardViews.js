@@ -69,6 +69,7 @@ async function cardView(card, yc, { qr = true } = {}) {
         validUntil: card.validUntil || null,
         refreshedAt: card.refreshedAt || null,
         printedAt: card.printedAt || null,
+        releasedAt: card.releasedAt || null,
         printCount: Number(card.printCount) || 0,
         verifiedAt: card.verifiedAt || null,
         verifyCount: Number(card.verifyCount) || 0,

@@ -405,14 +405,14 @@ async function regenerate(ctx, cardId, { note = '' } = {}) {
     }
     const year = card.kind === 'student' ? yc.byId.get(String(card.academicYear)) : null;
 
-    if (!card.printedAt) {
+    if (!card.printedAt && !card.releasedAt) {
         const ident = await design.identityOf(ctx.schoolId);
         const look = design.composeDesign(card.kind, await design.templateOf(ctx.schoolId, card.kind), ident);
         const snap = data.snapshotOf(card.kind, row, { year, parentId: card.snapshot?.holderCode });
         const changes = data.diff(card.kind, card.snapshot, snap, design.cardDesign(card.kind, card.design));
         const oldPhoto = card.snapshot?.photo || '';
         const photo = await data.copyPhoto(ctx.schoolId, `${card._id}-${Date.now().toString(36)}`, row.photoSource);
-        const done = await patch(IdCard, card._id, { snapshot: { ...snap, photo }, design: look, refreshedAt: new Date() }, { where: { status: card.status, printedAt: null } });
+        const done = await patch(IdCard, card._id, { snapshot: { ...snap, photo }, design: look, refreshedAt: new Date() }, { where: { status: card.status, printedAt: null, releasedAt: null } });
         if (!done) { await data.dropPhoto(photo); fail(409, 'The card changed while this was being done — open it again'); }
         if (oldPhoto && oldPhoto !== photo) await data.dropPhoto(oldPhoto);
         await log(ctx, card, 'refreshed', note, { changes });
@@ -506,14 +506,32 @@ async function cancel(ctx, cardId, { reason = '' } = {}) {
 }
 
 /**
- * The office printed (or downloaded) these cards. A printed card is no longer
- * refreshed in place — see regenerate.
+ * A PDF of these cards has been handed over — to the print window
+ * (`print_ready`) or as a download. That is all the system can know: it is
+ * NOT a printed card yet. A released card is no longer refreshed in place
+ * (see regenerate), because a paper copy of it may now exist.
+ */
+async function markReleased(ctx, cardIds, action = 'downloaded') {
+    const list = [...new Set((cardIds || []).map(String))];
+    if (!list.length) return 0;
+    const { rows } = await pool.query(`
+        UPDATE ${CARDS} SET "releasedAt" = now()
+         WHERE "school" = $1::uuid AND "_id" = ANY($2::uuid[])
+        RETURNING "_id", "holder", "kind"`, [String(ctx.schoolId), list]);
+    await writeLogs((sql, params) => pool.query(sql, params), rows.map((c) => logRow(ctx, c, action)));
+    return rows.length;
+}
+
+/**
+ * The office confirmed these cards were printed — answered after the print
+ * window closes, or marked by hand for cards printed from a downloaded file.
  */
 async function markPrinted(ctx, cardIds, action = 'printed') {
     const list = [...new Set((cardIds || []).map(String))];
     if (!list.length) return 0;
     const { rows } = await pool.query(`
-        UPDATE ${CARDS} SET "printedAt" = now(), "printCount" = COALESCE("printCount", 0) + 1
+        UPDATE ${CARDS} SET "printedAt" = now(), "printCount" = COALESCE("printCount", 0) + 1,
+                            "releasedAt" = COALESCE("releasedAt", now())
          WHERE "school" = $1::uuid AND "_id" = ANY($2::uuid[])
         RETURNING "_id", "holder", "kind"`, [String(ctx.schoolId), list]);
     await writeLogs((sql, params) => pool.query(sql, params), rows.map((c) => logRow(ctx, c, action)));
@@ -558,5 +576,5 @@ async function liveCount(schoolId, kind) {
 
 module.exports = {
     RuleError, newCode, preview, issue, regenerate, report, replace, block, activate, cancel,
-    markPrinted, noteDownload, applyDesign, liveCount, log, loadCard, holderRow,
+    markPrinted, markReleased, noteDownload, applyDesign, liveCount, log, loadCard, holderRow,
 };

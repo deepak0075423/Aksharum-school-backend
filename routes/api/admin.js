@@ -618,6 +618,7 @@ router.get   ('/id-cards/lookup',                 idCardGuard, idCards.lookup);
 router.post  ('/id-cards/generate/preview',       idCardGuard, idCards.preview);
 router.post  ('/id-cards/generate',               idCardGuard, idCards.generate);
 router.post  ('/id-cards/print',                  idCardGuard, idCards.print);
+router.post  ('/id-cards/mark-printed',           idCardGuard, idCards.markPrinted);
 router.get   ('/id-cards/templates',              idCardGuard, idCards.templates);
 router.put   ('/id-cards/templates/:kind',        idCardGuard, idCards.saveTemplate);
 router.post  ('/id-cards/templates/:kind/apply',  idCardGuard, idCards.applyTemplate);
