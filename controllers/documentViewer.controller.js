@@ -18,6 +18,7 @@
 const Document           = require('../models/Document');
 const AssignmentSubmission = require('../models/AssignmentSubmission');
 const DocumentCategory   = require('../models/DocumentCategory');
+const DocumentRead       = require('../models/DocumentRead');
 const StudentProfile     = require('../models/StudentProfile');
 const ParentProfile      = require('../models/ParentProfile');
 const ClassSection       = require('../models/ClassSection');
@@ -79,7 +80,11 @@ async function reachOf(studentUserId, schoolId) {
 
 // ── Reading the shelf ────────────────────────────────────────────────────────
 
-const SELECT = (extra = '') => `
+/**
+ * `reader` is the placeholder holding whoever is asking (`$4::uuid`), so each
+ * row can say whether that person has opened it yet.
+ */
+const SELECT = (extra = '', reader = null) => `
   SELECT d."_id", d."title", d."description", d."category", d."docType", d."subject",
          d."targetType", d."targetClasses", d."targetSections", d."targetUsers",
          d."isAssignment", d."assignmentType", d."dueDate", d."allowSubmission",
@@ -87,9 +92,11 @@ const SELECT = (extra = '') => `
          u."_id" AS "uploaderId", u."name" AS "uploaderName",
          u."role" AS "uploaderRole", u."profileImage" AS "uploaderPhoto",
          ay."yearName" AS "academicYearName",
-         cls.labels AS "classLabels", sec.labels AS "sectionLabels"${extra}
+         cls.labels AS "classLabels", sec.labels AS "sectionLabels",
+         ${reader ? 'rd."readAt"' : 'NULL::timestamptz'} AS "readAt"${extra}
     FROM ${qt(Document)} d
     LEFT JOIN ${qt(User)} u          ON u."_id"  = d."uploadedBy"
+    ${reader ? `LEFT JOIN ${qt(DocumentRead)} rd ON rd."document" = d."_id" AND rd."user" = ${reader}` : ''}
     LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = d."academicYear"
     LEFT JOIN LATERAL (
       SELECT array_agg(x.label ORDER BY x.ord) AS labels FROM (
@@ -139,6 +146,8 @@ function shapeDoc(r) {
         files,
         fileCount: files.length,
         fileSize: files.reduce((n, f) => n + (Number(f.fileSize) || 0), 0),
+        // Opened by whoever is asking. Their own upload is never "unread".
+        isRead: !!r.readAt,
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
         academicYear: r.academicYear,
@@ -212,11 +221,11 @@ exports.studentGetDocuments = async (req, res) => {
             reachOf(req.userId, school), yearsOf(school), categoriesOf(school),
         ]);
 
-        const params = [school, reach.classes, reach.sections];
+        const params = [school, reach.classes, reach.sections, String(req.userId)];
         const year   = yearClause(req, years, params);
 
         const { rows } = await pool.query(
-            `${SELECT()}
+            `${SELECT('', '$4::uuid')}
               WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
                 AND ( d."targetType" = 'whole_school'
                    OR (d."targetType" = 'class'          AND d."targetClasses"  ?| $2::text[])
@@ -269,6 +278,7 @@ function countsOf(docs, pick = (d) => d) {
         missed:      docs.filter((d) => state(d) === 'missed').length,
         submitted:   docs.filter((d) => ['submitted', 'late', 'marked'].includes(state(d))).length,
         marked:      docs.filter((d) => state(d) === 'marked').length,
+        unread:      docs.filter((d) => !d.isRead).length,
     };
 }
 
@@ -332,11 +342,11 @@ exports.parentGetDocuments = async (req, res) => {
         const allClasses  = [...new Set(reaches.flatMap((r) => r.classes))];
         const allSections = [...new Set(reaches.flatMap((r) => r.sections))];
 
-        const params = [school, allClasses, allSections];
+        const params = [school, allClasses, allSections, String(req.userId)];
         const year   = yearClause(req, years, params);
 
         const { rows } = await pool.query(
-            `${SELECT()}
+            `${SELECT('', '$4::uuid')}
               WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
                 AND ( d."targetType" = 'whole_school'
                    OR (d."targetType" = 'class'          AND d."targetClasses"  ?| $2::text[])
@@ -486,7 +496,7 @@ exports.teacherGetDocuments = async (req, res) => {
         const { rows } = await pool.query(
             `${SELECT(`,
          COALESCE(sub."n", 0)::int   AS "submissionCount",
-         COALESCE(sub."marked", 0)::int AS "markedCount"`)}
+         COALESCE(sub."marked", 0)::int AS "markedCount"`, '$2::uuid')}
              LEFT JOIN LATERAL (
                SELECT count(*)::int AS "n",
                       count(*) FILTER (WHERE a."marks" IS NOT NULL)::int AS "marked"
@@ -508,6 +518,7 @@ exports.teacherGetDocuments = async (req, res) => {
         const data = rows.map((r) => ({
             ...shapeDoc(r),
             mine: String(r.uploaderId) === me,
+            isRead: !!r.readAt || String(r.uploaderId) === me,
             submissionCount: r.submissionCount || 0,
             markedCount: r.markedCount || 0,
         }));
@@ -521,6 +532,7 @@ exports.teacherGetDocuments = async (req, res) => {
                 ...countsOf(data),
                 mine: mine.length,
                 shared: data.length - mine.length,
+                unread: data.filter((d) => !d.isRead).length,
                 // Work waiting on this teacher: their own assignments with
                 // something handed in that nobody has marked.
                 toMark: mine.reduce((n, d) => n + Math.max(0, d.submissionCount - d.markedCount), 0),
@@ -530,4 +542,61 @@ exports.teacherGetDocuments = async (req, res) => {
             year: req.query.year || null,
         });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+// ── Read marks ───────────────────────────────────────────────────────────────
+
+/**
+ * "I have opened these."
+ *
+ * One call for one document or for the whole shelf — the list posts the ids it
+ * is showing. Written as a single INSERT … WHERE NOT EXISTS so opening the same
+ * notice twice, or from two tabs at once, leaves one row. Ids from another
+ * school are dropped by the join rather than refused: there is nothing to tell
+ * the caller about a document they cannot see.
+ */
+exports.markRead = async (req, res) => {
+    try {
+        const wanted = ids(req.params.id ? [req.params.id] : req.body?.ids)
+            .filter((id) => /^[0-9a-f-]{36}$/i.test(id))
+            .slice(0, 2000);
+        if (!wanted.length) return res.json({ success: true, marked: 0 });
+
+        const { rowCount } = await pool.query(
+            `INSERT INTO ${qt(DocumentRead)} ("_id", "document", "user", "school", "readAt", "createdAt", "updatedAt")
+             SELECT gen_random_uuid(), d."_id", $2::uuid, d."school", now(), now(), now()
+               FROM ${qt(Document)} d
+              WHERE d."_id" = ANY($1::uuid[]) AND d."school" = $3
+                AND NOT EXISTS (
+                  SELECT 1 FROM ${qt(DocumentRead)} r
+                   WHERE r."document" = d."_id" AND r."user" = $2::uuid)
+             ON CONFLICT DO NOTHING`,
+            [wanted, String(req.userId), String(req.schoolId)],
+        );
+        res.json({ success: true, marked: rowCount });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+// ── A student reading the discussion ─────────────────────────────────────────
+
+/**
+ * Route middleware: the document must be one this student can see.
+ *
+ * The same reach the list is built from, so a document that is on a student's
+ * shelf can always be opened and one that is not never can — whatever id is
+ * put in the address.
+ */
+exports.studentDocumentAccess = async (req, res, next) => {
+    try {
+        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!doc || doc.isArchived) return res.status(404).json({ success: false, message: 'Document not found' });
+
+        if (doc.targetType === 'whole_school') return next();
+        const reach = await reachOf(req.userId, req.schoolId);
+        const hit = (list, mine) => ids(list).some((x) => mine.includes(x));
+        if (doc.targetType === 'class'          && hit(doc.targetClasses,  reach.classes))  return next();
+        if (doc.targetType === 'class_sections' && hit(doc.targetSections, reach.sections)) return next();
+
+        return res.status(403).json({ success: false, message: 'This document was not shared with you' });
+    } catch (e) { return res.status(500).json({ success: false, message: e.message }); }
 };

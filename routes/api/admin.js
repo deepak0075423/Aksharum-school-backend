@@ -567,6 +567,7 @@ router.get('/documents/audit',                        docGuard, docCtrl.adminGet
 // Before '/documents/:id' — Express matches in order, and 'overview' would
 // otherwise be read as a document id and 404.
 router.get('/documents/overview',                     docGuard, docCtrl.adminGetDocumentOverview);
+router.get('/documents/teachers',                     docGuard, docCtrl.adminDocumentTeachers);
 router.post('/documents/bulk-archive',                docGuard, docCtrl.adminBulkArchive);
 router.delete('/documents/bulk-delete',               docGuard, docCtrl.adminBulkDelete);
 router.get('/documents/:id',                          docGuard, docCtrl.adminGetDocument);

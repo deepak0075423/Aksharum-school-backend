@@ -204,7 +204,7 @@ exports.teacherDocumentAccess = (mode = 'read') => async (req, res, next) => {
 
 /** The header strip: what this document is, in one object both tabs read. */
 async function header(doc, req) {
-    const [uploader, sections, classes, year] = await Promise.all([
+    const [uploader, sections, classes, year, people] = await Promise.all([
         doc.uploadedBy ? User.findById(doc.uploadedBy).select('name role profileImage').lean() : null,
         (doc.targetSections || []).length
             ? pool.query(
@@ -225,12 +225,19 @@ async function header(doc, req) {
             ? pool.query(`SELECT "yearName" FROM "academicyears" WHERE "_id" = $1`, [String(doc.academicYear)])
                 .then((r) => r.rows[0]?.yearName || null)
             : null,
+        doc.targetType === 'specific_teachers' && (doc.targetUsers || []).length
+            ? pool.query(
+                `SELECT "name" AS label FROM ${qt(User)} WHERE "_id" = ANY($1::uuid[]) ORDER BY lower("name")`,
+                [(doc.targetUsers || []).map(String)],
+            ).then((r) => r.rows.map((x) => x.label))
+            : [],
     ]);
 
     const where = doc.targetType === 'whole_school' ? ['Whole School']
         : doc.targetType === 'all_teachers'         ? ['All Teachers']
         : doc.targetType === 'class_sections'       ? sections
         : doc.targetType === 'class'                ? classes
+        : doc.targetType === 'specific_teachers'    ? people
         : [];
 
     const due  = doc.dueDate ? new Date(doc.dueDate) : null;
@@ -745,6 +752,9 @@ exports.duplicate = async (req, res) => {
 
 // ── Tab 4: comments ──────────────────────────────────────────────────────────
 
+/** Staff read every comment; a student or parent only the ones marked for all. */
+const isStaff = (req) => ['school_admin', 'teacher'].includes(req.userRole);
+
 const buildFiles = (files) => (files || []).map((f) => ({
     originalName: f.originalname,
     storedName:   f.filename,
@@ -769,6 +779,10 @@ exports.listComments = async (req, res) => {
         const dir = req.query.order === 'oldest' ? 'ASC' : 'DESC';
         const params = [String(doc._id)];
         const where  = ['c."document" = $1'];
+
+        // A note between the staff about a struggling class is not published
+        // to that class — and it must not show up in their counts either.
+        if (!isStaff(req)) where.push(`COALESCE(c."visibility", 'all') = 'all'`);
 
         if (req.query.author === 'students') where.push(`c."authorRole" IN ('student', 'parent')`);
         if (req.query.author === 'staff')    where.push(`c."authorRole" IN ('school_admin', 'teacher')`);
@@ -858,7 +872,7 @@ exports.addComment = async (req, res) => {
         let parent = null;
         if (req.body.parent) {
             const p = await DocumentComment.findOne({ _id: req.body.parent, document: doc._id }).lean();
-            if (!p) return res.status(404).json({ success: false, message: 'The comment being replied to is gone' });
+            if (!p || (!isStaff(req) && p.visibility === 'staff')) return res.status(404).json({ success: false, message: 'The comment being replied to is gone' });
             // Only one level: a reply to a reply joins the same thread rather
             // than starting a third tier nobody can read on a phone.
             parent = p.parent || p._id;
@@ -872,7 +886,8 @@ exports.addComment = async (req, res) => {
             body,
             files,
             parent,
-            visibility: req.body.visibility === 'staff' ? 'staff' : 'all',
+            // Only staff can keep a comment among staff.
+            visibility: isStaff(req) && req.body.visibility === 'staff' ? 'staff' : 'all',
         });
 
         // Only the person actually being answered is told. A comment on a
@@ -946,8 +961,9 @@ exports.toggleLike = async (req, res) => {
                       ELSE COALESCE("likes", '[]'::jsonb) || to_jsonb($2::text)
                     END
               WHERE "_id" = $1 AND "school" = $3
+                AND ($4::boolean OR COALESCE("visibility", 'all') = 'all')
           RETURNING "likes"`,
-            [req.params.commentId, String(req.userId), String(req.schoolId)],
+            [req.params.commentId, String(req.userId), String(req.schoolId), isStaff(req)],
         );
         if (!rows.length) return res.status(404).json({ success: false, message: 'Comment not found' });
 

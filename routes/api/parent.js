@@ -65,6 +65,8 @@ router.get('/results/:resultId',   resultGuard, formalExamCtrl.parentGetResultDe
 // Documents
 router.get('/documents',      docGuard, docViewer.parentGetDocuments);
 router.get('/documents/:id',  docGuard, docCtrl.parentGetDocument);
+router.post('/documents/read',     docGuard, docViewer.markRead);
+router.post('/documents/:id/read', docGuard, docViewer.markRead);
 
 // Holidays
 router.get('/holidays', holidayGuard, holidayCtrl.parentGetHolidays);

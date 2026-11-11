@@ -163,6 +163,8 @@ router.get('/document-categories', docGuard, async (req, res) => {
 // ── Documents ─────────────────────────────────────────────────────────────────
 router.get('/documents',                             docGuard, docViewer.teacherGetDocuments);
 router.post('/documents',                            docGuard, uploadDocument.array('files', 10), docCtrl.teacherUpload);
+router.post('/documents/read',                       docGuard, docViewer.markRead);
+router.post('/documents/:id/read',                   docGuard, docViewer.markRead);
 router.get('/documents/:id',                         docGuard, docCtrl.teacherGetDocument);
 router.put('/documents/:id',                         docGuard, uploadDocument.array('files', 10), docCtrl.teacherEditDocument);
 router.delete('/documents/:id',                      docGuard, docCtrl.teacherDeleteDocument);

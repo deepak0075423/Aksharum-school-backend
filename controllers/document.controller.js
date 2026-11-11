@@ -10,6 +10,9 @@ const SectionSubjectTeacher= require('../models/SectionSubjectTeacher');
 const DocumentCategory     = require('../models/DocumentCategory');
 const AcademicYear         = require('../models/AcademicYear');
 const DocumentComment      = require('../models/DocumentComment');
+const DocumentRead         = require('../models/DocumentRead');
+const TeacherProfile       = require('../models/TeacherProfile');
+const Subject              = require('../models/Subject');
 const User                 = require('../models/User');
 const pool                 = require('../db/pool');
 const { yearOrderSql } = require('../utils/listOrder');
@@ -471,6 +474,111 @@ function normalizeDocType(value, isAssignment) {
     return isAssignment ? 'assignment' : 'other';
 }
 
+/**
+ * The teachers a document is addressed to by name.
+ *
+ * Only read for `specific_teachers`. Every id has to be a teacher of this
+ * school — the list arrives from a form, and an id from somewhere else would
+ * otherwise sit on the document reaching nobody, or somebody it should not.
+ */
+async function teacherTargets(req, targetType, raw) {
+    if (targetType !== 'specific_teachers') return { ok: true, users: [] };
+    let wanted;
+    try { wanted = Array.isArray(raw) ? raw : JSON.parse(raw || '[]'); } catch { wanted = []; }
+    wanted = [...new Set((Array.isArray(wanted) ? wanted : []).map(String).filter(Boolean))];
+    if (!wanted.length) return { ok: false, message: 'Pick at least one teacher' };
+
+    const found = await User.find({ _id: { $in: wanted }, school: req.schoolId, role: 'teacher' }).distinct('_id');
+    if (found.length !== wanted.length) {
+        return { ok: false, message: 'Some of the chosen teachers are not on this school\'s staff' };
+    }
+    return { ok: true, users: wanted };
+}
+
+/**
+ * The files a document holds after an edit.
+ *
+ * `keepFiles` is the stored names of the files already on it that should stay;
+ * whatever is uploaded with the request is added after them. So an edit can
+ * add a file, take one off, or both — it used to be all or nothing: the first
+ * upload threw away every file already there.
+ *
+ * A caller that sends no `keepFiles` gets the old behaviour (an upload replaces
+ * the lot, no upload changes nothing), so nothing that was written against it
+ * breaks.
+ */
+const MAX_FILES = 10;
+function filesAfterEdit(doc, req) {
+    const had   = Array.isArray(doc.files) ? doc.files : [];
+    const fresh = buildFileObjects(req.files);
+
+    if (req.body.keepFiles === undefined) {
+        return { ok: true, files: fresh.length ? fresh : had, changed: fresh.length > 0 };
+    }
+
+    let keep;
+    try { keep = JSON.parse(req.body.keepFiles || '[]'); } catch { keep = []; }
+    const names = new Set((Array.isArray(keep) ? keep : []).map(String));
+    const kept  = had.filter((f) => names.has(String(f.storedName)));
+    const files = [...kept, ...fresh];
+    if (files.length > MAX_FILES) {
+        return { ok: false, message: `A document can hold up to ${MAX_FILES} files` };
+    }
+    return { ok: true, files, changed: fresh.length > 0 || kept.length !== had.length };
+}
+
+/** Work that is handed in needs the paper it is handed in against. */
+const NEEDS_FILE = 'Attach the assignment or its instructions — students need a file to work from';
+
+/**
+ * Every teacher, with the three things the office picks them by.
+ *
+ * `subjects` is what the staff record says they teach joined with what they
+ * are actually timetabled for this year, because either one alone misses
+ * people: a new joiner has a record and no sections yet, and an old record
+ * often lists nothing at all.
+ */
+exports.adminDocumentTeachers = async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT u."_id", u."name", u."profileImage",
+                    tp."department", tp."designation", tp."subjects",
+                    t.names AS "taught"
+               FROM ${qt(User)} u
+               LEFT JOIN ${qt(TeacherProfile)} tp ON tp."user" = u."_id"
+               LEFT JOIN LATERAL (
+                 SELECT array_agg(DISTINCT sb."subjectName") AS names
+                   FROM ${qt(SectionSubjectTeacher)} sst
+                   JOIN ${qt(Subject)} sb ON sb."_id" = sst."subject"
+                   LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = sb."academicYear"
+                  WHERE sst."teacher" = u."_id"
+                    AND (ay."_id" IS NULL OR ay."status" = 'active')
+               ) t ON true
+              WHERE u."school" = $1 AND u."role" = 'teacher' AND COALESCE(u."isActive", true)
+              ORDER BY lower(u."name")`,
+            [String(req.schoolId)],
+        );
+
+        const clean = (v) => String(v || '').trim();
+        const data = rows.map((r) => {
+            const seen = new Set();
+            const subjects = [...(Array.isArray(r.subjects) ? r.subjects : []), ...(r.taught || [])]
+                .map(clean)
+                .filter((x) => x && !seen.has(x.toLowerCase()) && seen.add(x.toLowerCase()))
+                .sort((a, b) => a.localeCompare(b));
+            return {
+                _id: r._id,
+                name: r.name,
+                photo: r.profileImage || '',
+                department: clean(r.department),
+                designation: clean(r.designation),
+                subjects,
+            };
+        });
+        res.json({ success: true, data });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
 exports.adminUpload = async (req, res) => {
     try {
         const { title, description, category, docType, subject, assignmentType,
@@ -483,6 +591,10 @@ exports.adminUpload = async (req, res) => {
 
         const files    = buildFileObjects(req.files);
         const assigned = !!isAssignment && isAssignment !== 'false';
+        if (assigned && !files.length) return res.status(400).json({ success: false, message: NEEDS_FILE });
+
+        const people = await teacherTargets(req, targetType, targetUsers);
+        if (!people.ok) return res.status(400).json({ success: false, message: people.message });
 
         const doc = await Document.create({
             school: req.schoolId,
@@ -496,7 +608,7 @@ exports.adminUpload = async (req, res) => {
             targetType,
             targetClasses:  JSON.parse(targetClasses  || '[]'),
             targetSections: JSON.parse(targetSections || '[]'),
-            targetUsers:    JSON.parse(targetUsers    || '[]'),
+            targetUsers:    people.users,
             tags: JSON.parse(tags || '[]'),
             subject: subject || '',
             academicYear:    await currentAcademicYearId(req.schoolId),
@@ -539,7 +651,14 @@ exports.adminEditDocument = async (req, res) => {
         if (targetType !== undefined) doc.targetType  = targetType;
         if (targetClasses  !== undefined) doc.targetClasses  = JSON.parse(targetClasses);
         if (targetSections !== undefined) doc.targetSections = JSON.parse(targetSections);
-        if (targetUsers    !== undefined) doc.targetUsers    = JSON.parse(targetUsers);
+        if (targetUsers !== undefined || targetType !== undefined) {
+            const people = await teacherTargets(
+                req, doc.targetType,
+                targetUsers !== undefined ? targetUsers : (doc.targetUsers || []).map(String),
+            );
+            if (!people.ok) return res.status(400).json({ success: false, message: people.message });
+            doc.targetUsers = people.users;
+        }
         if (tags !== undefined) doc.tags = JSON.parse(tags);
         if (dueDate !== undefined)    doc.dueDate     = dueDate ? new Date(dueDate) : null;
         if (subject !== undefined)    doc.subject     = subject;
@@ -572,9 +691,14 @@ exports.adminEditDocument = async (req, res) => {
             );
         }
 
-        if (req.files?.length) {
-            doc.files = buildFileObjects(req.files);
+        const after = filesAfterEdit(doc, req);
+        if (!after.ok) return res.status(400).json({ success: false, message: after.message });
+        if (after.changed) {
+            doc.files = after.files;
             doc.currentVersion = (doc.currentVersion || 1) + 1;
+        }
+        if (doc.isAssignment && !doc.files?.length) {
+            return res.status(400).json({ success: false, message: NEEDS_FILE });
         }
         await doc.save();
         res.json({ success: true, data: doc });
@@ -591,6 +715,7 @@ exports.adminDeleteDocument = async (req, res) => {
         await Promise.all([
             AssignmentSubmission.deleteMany({ document: doc._id }),
             DocumentComment.deleteMany({ document: doc._id }),
+            DocumentRead.deleteMany({ document: doc._id }),
         ]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -629,6 +754,7 @@ exports.adminBulkDelete = async (req, res) => {
         await Promise.all([
             AssignmentSubmission.deleteMany({ document: { $in: ids } }),
             DocumentComment.deleteMany({ document: { $in: ids } }),
+            DocumentRead.deleteMany({ document: { $in: ids } }),
         ]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -739,6 +865,7 @@ exports.teacherUpload = async (req, res) => {
 
         const files    = buildFileObjects(req.files);
         const assigned = !!isAssignment && isAssignment !== 'false';
+        if (assigned && !files.length) return res.status(400).json({ success: false, message: NEEDS_FILE });
 
         const doc = await Document.create({
             school: req.schoolId,
@@ -825,9 +952,14 @@ exports.teacherEditDocument = async (req, res) => {
             doc.marksEnabled = doc.totalMarks != null;
         }
 
-        if (req.files?.length) {
-            doc.files = buildFileObjects(req.files);
+        const after = filesAfterEdit(doc, req);
+        if (!after.ok) return res.status(400).json({ success: false, message: after.message });
+        if (after.changed) {
+            doc.files = after.files;
             doc.currentVersion = (doc.currentVersion || 1) + 1;
+        }
+        if (doc.isAssignment && !doc.files?.length) {
+            return res.status(400).json({ success: false, message: NEEDS_FILE });
         }
         await doc.save();
         res.json({ success: true, data: doc });
@@ -838,7 +970,10 @@ exports.teacherDeleteDocument = async (req, res) => {
     try {
         const doc = await Document.findOneAndDelete({ _id: req.params.id, school: req.schoolId, uploadedBy: req.userId });
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        await AssignmentSubmission.deleteMany({ document: doc._id });
+        await Promise.all([
+            AssignmentSubmission.deleteMany({ document: doc._id }),
+            DocumentRead.deleteMany({ document: doc._id }),
+        ]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

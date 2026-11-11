@@ -7,6 +7,7 @@ const timetableCtrl  = require('../../controllers/timetable.controller');
 const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const docViewer      = require('../../controllers/documentViewer.controller');
+const docDetail      = require('../../controllers/documentDetail.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
@@ -71,6 +72,12 @@ router.get('/exams/:id/result',          examGuard, examCtrl.getStudentResult);
 router.get('/documents',              docGuard, docViewer.studentGetDocuments);
 router.get('/documents/:id',          docGuard, docCtrl.studentGetDocument);
 router.post('/documents/:id/submit',  docGuard, uploadDocument.array('files', 5), docCtrl.studentSubmitAssignment);
+router.post('/documents/read',        docGuard, docViewer.markRead);
+router.post('/documents/:id/read',    docGuard, docViewer.markRead);
+// The discussion under a document — only what is marked for everyone, and only
+// on a document that is actually on this student's shelf.
+router.get('/documents/:id/comments',  docGuard, docViewer.studentDocumentAccess, docDetail.listComments);
+router.post('/documents/:id/comments', docGuard, docViewer.studentDocumentAccess, docDetail.addComment);
 
 // Holidays
 router.get('/holidays', holidayGuard, holidayCtrl.studentGetHolidays);
