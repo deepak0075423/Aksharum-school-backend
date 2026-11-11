@@ -78,6 +78,15 @@ const DocumentCommentSchema = new db.Schema({
         type: Boolean,
         default: false,
     },
+    /**
+     * The author deleted it, but other people had already replied. Their
+     * replies are theirs, so they stay; this row stays only to hold them
+     * together and reads "This comment was deleted" (body and files cleared).
+     */
+    isDeleted: {
+        type: Boolean,
+        default: false,
+    },
 }, { timestamps: true });
 
 DocumentCommentSchema.index({ document: 1, createdAt: -1 });

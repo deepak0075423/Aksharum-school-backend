@@ -352,14 +352,14 @@ const ROUTES = {
     // ── Employee documents (Employee Directory) ─────────────────────────────
     // The employee's own page: what to upload, and why one was turned down.
     'directory.mydocs': {
-        teacher:      { web: '/teacher/my-documents', mobile: '/(tabs)/notifications' },
+        teacher:      { web: '/teacher/my-documents', mobile: '/modules/my-documents' },
     },
     // A document waiting for the office — opens that person's documents on the
     // review tab. A teacher receiving one administers the module, so the /admin
     // path is theirs (AdminAreaGuard).
     'directory.review': {
-        school_admin: { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification' },
-        teacher:      { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification' },
+        school_admin: { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification?tab=documents&employee={id}' },
+        teacher:      { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification?tab=documents&employee={id}' },
     },
 
     // ── ID cards ─────────────────────────────────────────────────────────────

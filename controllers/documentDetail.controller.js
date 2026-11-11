@@ -20,6 +20,7 @@ const AssignmentSubmission = require('../models/AssignmentSubmission');
 const DocumentComment    = require('../models/DocumentComment');
 const Class              = require('../models/Class');
 const ClassSection       = require('../models/ClassSection');
+const AcademicYear       = require('../models/AcademicYear');
 const StudentProfile     = require('../models/StudentProfile');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const User               = require('../models/User');
@@ -94,11 +95,29 @@ async function audienceSections(doc) {
  * point: "pending" and "not submitted" are the same absence of a row, and only
  * the due date tells them apart.
  */
-function rosterCte({ docId, school, sections, dueDate }) {
+function rosterCte({ docId, school, sections, dueDate, year = null }) {
     const params = [docId, school];
+    // The year a student's section belongs to, when it is NOT the document's
+    // own year — "2025-26" for someone not yet moved up. Such a student is
+    // kept only if they already handed work in; their section is never one of
+    // the section filter's choices, and their label carries the year.
+    let otherYear = 'NULL::text';
+    let yearParam = null;
+    if (year) {
+        params.push(String(year));
+        yearParam = `$${params.length}::uuid`;
+        otherYear = `CASE WHEN c."_id" IS NOT NULL AND c."academicYear" IS DISTINCT FROM ${yearParam} THEN ay."yearName" END`;
+    }
     let scope;
     if (sections === null) {
-        scope = `u."role" = 'student'`;
+        // The whole school — as it stands in the document's own academic year.
+        // A student still placed in an earlier year's section (not yet moved
+        // up, or gone) is not part of a year they are not in; without this the
+        // section filter listed "Class 6 - A" once per year. Anyone who has
+        // already handed work in stays, wherever they are placed.
+        scope = yearParam
+            ? `u."role" = 'student' AND (c."academicYear" = ${yearParam} OR sub."_id" IS NOT NULL)`
+            : `u."role" = 'student'`;
     } else if (!sections.length) {
         // Nobody — a teacher-only document, or a target with nothing selected.
         scope = 'false';
@@ -118,6 +137,7 @@ function rosterCte({ docId, school, sections, dueDate }) {
                sp."currentSection",
                c."className",
                s."sectionName",
+               ${otherYear}        AS "otherYear",
                sub."_id"           AS "submissionId",
                sub."submittedAt",
                sub."marks",
@@ -134,6 +154,7 @@ function rosterCte({ docId, school, sections, dueDate }) {
           JOIN ${qt(User)} u ON u."_id" = sp."user" AND COALESCE(u."isActive", true)
           LEFT JOIN ${qt(ClassSection)} s ON s."_id" = sp."currentSection"
           LEFT JOIN ${qt(Class)} c        ON c."_id" = s."class"
+          LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = c."academicYear"
           LEFT JOIN ${qt(AssignmentSubmission)} sub
                  ON sub."document" = $1::uuid AND sub."student" = u."_id"
          WHERE sp."school" = $2::uuid AND ${scope}
@@ -143,6 +164,9 @@ function rosterCte({ docId, school, sections, dueDate }) {
 
 /** Submitted, however late. The tiles group them; the row still says which. */
 const HANDED_IN = `"state" IN ('submitted', 'late')`;
+
+/** "Class 6 - B", or "Class 6 - B (2025-26)" for a section of another year. */
+const SECTION_LABEL = (empty) => `coalesce("className" || ' - ' || "sectionName" || coalesce(' (' || "otherYear" || ')', ''), '${empty}')`;
 
 // ── Loading the document ─────────────────────────────────────────────────────
 
@@ -323,6 +347,7 @@ exports.getAssignment = async (req, res) => {
         const sections = await audienceSections(doc);
         const { sql: cte, params: base } = rosterCte({
             docId: String(doc._id), school: String(doc.school), sections, dueDate: doc.dueDate,
+            year: doc.academicYear || null,
         });
 
         const bands = scoreBands(doc.totalMarks);
@@ -378,6 +403,8 @@ exports.getAssignment = async (req, res) => {
                         count(*) FILTER (WHERE ${HANDED_IN})::int AS "submitted",
                         avg("marks")::float                      AS "average"
                    FROM roster
+                  -- The section filter offers the document's own year only.
+                  WHERE "otherYear" IS NULL
                   GROUP BY 1, 2
                   ORDER BY 2`,
                 base,
@@ -449,7 +476,8 @@ function shapeStudent(r) {
         photo: r.profileImage || '',
         rollNumber: r.rollNumber || '',
         section: r.currentSection,
-        sectionLabel: r.className && r.sectionName ? `${r.className} - ${r.sectionName}` : '',
+        sectionLabel: r.className && r.sectionName
+            ? `${r.className} - ${r.sectionName}${r.otherYear ? ` (${r.otherYear})` : ''}` : '',
         state: r.state,
         submissionId: r.submissionId,
         submittedAt: r.submittedAt,
@@ -475,6 +503,7 @@ exports.getAssignmentAnalytics = async (req, res) => {
         const sections = await audienceSections(doc);
         const { sql: cte, params: base } = rosterCte({
             docId: String(doc._id), school: String(doc.school), sections, dueDate: doc.dueDate,
+            year: doc.academicYear || null,
         });
         const outOf = Number(doc.totalMarks) > 0 ? Number(doc.totalMarks) : null;
 
@@ -491,7 +520,7 @@ exports.getAssignmentAnalytics = async (req, res) => {
             ),
             pool.query(
                 `WITH ${cte}
-                 SELECT coalesce("className" || ' - ' || "sectionName", 'No section') AS "label",
+                 SELECT ${SECTION_LABEL('No section')} AS "label",
                         count(*)::int                            AS "total",
                         count(*) FILTER (WHERE ${HANDED_IN})::int AS "submitted",
                         avg("marks")::float                      AS "average"
@@ -519,7 +548,7 @@ exports.getAssignmentAnalytics = async (req, res) => {
             pool.query(
                 `WITH ${cte}
                  SELECT "studentId", "name", "profileImage", "rollNumber", "marks", "state",
-                        coalesce("className" || ' - ' || "sectionName", '') AS "sectionLabel"
+                        ${SECTION_LABEL('')} AS "sectionLabel"
                    FROM roster`,
                 base,
             ),
@@ -692,6 +721,7 @@ exports.remindPending = async (req, res) => {
         const sections = await audienceSections(doc);
         const { sql: cte, params } = rosterCte({
             docId: String(doc._id), school: String(doc.school), sections, dueDate: doc.dueDate,
+            year: doc.academicYear || null,
         });
 
         // A named few, or everyone still outstanding.
@@ -755,6 +785,23 @@ exports.duplicate = async (req, res) => {
 /** Staff read every comment; a student or parent only the ones marked for all. */
 const isStaff = (req) => ['school_admin', 'teacher'].includes(req.userRole);
 
+/**
+ * The school's administrators — a school admin, or a teacher reaching the
+ * document through the /admin routes, which already demand admin access to the
+ * Documents module. Only they can delete somebody else's comment. Teachers and
+ * students edit and delete their own words, and nobody else's (user's rule,
+ * Nov 2026).
+ */
+const isAdmin = (req) => req.userRole === 'school_admin'
+    || String(req.baseUrl || '').startsWith('/api/admin');
+
+/**
+ * Pinning lifts a comment to the top without changing or removing a word of
+ * it, so the teacher who shared the document can do it as well as an admin.
+ */
+const canPinOn = (req, doc) => isAdmin(req)
+    || (doc && String(doc.uploadedBy) === String(req.userId));
+
 const buildFiles = (files) => (files || []).map((f) => ({
     originalName: f.originalname,
     storedName:   f.filename,
@@ -791,10 +838,13 @@ exports.listComments = async (req, res) => {
             params.push(`%${String(req.query.search).trim()}%`);
             where.push(`c."body" ILIKE $${params.length}`);
         }
+        // Under a filter a deleted comment matches nothing of its own; the
+        // replies it held are shown by themselves instead.
+        if (req.query.author || req.query.search) where.push('NOT COALESCE(c."isDeleted", false)');
 
         const { rows } = await pool.query(
             `SELECT c."_id", c."body", c."files", c."parent", c."isPinned", c."visibility",
-                    c."likes", c."isEdited", c."authorRole", c."createdAt", c."updatedAt",
+                    c."likes", c."isEdited", c."isDeleted", c."authorRole", c."createdAt", c."updatedAt",
                     u."_id" AS "authorId", u."name" AS "authorName", u."profileImage" AS "authorPhoto"
                FROM ${qt(DocumentComment)} c
                LEFT JOIN ${qt(User)} u ON u."_id" = c."author"
@@ -804,22 +854,44 @@ exports.listComments = async (req, res) => {
         );
 
         const me = String(req.userId);
-        const shape = (r) => ({
-            _id: r._id,
-            body: r.body || '',
-            files: Array.isArray(r.files) ? r.files : [],
-            parent: r.parent,
-            isPinned: !!r.isPinned,
-            visibility: r.visibility || 'all',
-            isEdited: !!r.isEdited,
-            createdAt: r.createdAt,
-            likes: (r.likes || []).length,
-            likedByMe: (r.likes || []).map(String).includes(me),
-            mine: String(r.authorId) === me,
-            author: r.authorId
-                ? { _id: r.authorId, name: r.authorName, role: r.authorRole, photo: r.authorPhoto }
-                : { _id: null, name: 'Removed account', role: r.authorRole, photo: '' },
-        });
+        const admin = isAdmin(req);
+        const pins  = canPinOn(req, doc);
+        const shape = (r) => {
+            const mine = String(r.authorId) === me;
+            // Deleted by its author, kept only for the replies under it.
+            if (r.isDeleted) {
+                return {
+                    _id: r._id, deleted: true, body: '', files: [], parent: r.parent,
+                    isPinned: false, visibility: r.visibility || 'all', isEdited: false,
+                    createdAt: r.createdAt, likes: 0, likedByMe: false, mine: false,
+                    canEdit: false, canDelete: admin, canPin: false,
+                    author: { _id: null, name: '', role: '', photo: '' },
+                };
+            }
+            return {
+                _id: r._id,
+                body: r.body || '',
+                files: Array.isArray(r.files) ? r.files : [],
+                parent: r.parent,
+                isPinned: !!r.isPinned,
+                visibility: r.visibility || 'all',
+                isEdited: !!r.isEdited,
+                createdAt: r.createdAt,
+                likes: (r.likes || []).length,
+                likedByMe: (r.likes || []).map(String).includes(me),
+                mine,
+                // What this reader may do with it — the same rules updateComment
+                // and deleteComment enforce, so the page offers only what works:
+                // your own words to edit or delete; anyone's to delete if you
+                // are an admin; pinning for an admin or the sharing teacher.
+                canEdit: mine,
+                canDelete: mine || admin,
+                canPin: pins && !r.parent,
+                author: r.authorId
+                    ? { _id: r.authorId, name: r.authorName, role: r.authorRole, photo: r.authorPhoto }
+                    : { _id: null, name: 'Removed account', role: r.authorRole, photo: '' },
+            };
+        };
 
         const all     = rows.map(shape);
         const byId    = Object.fromEntries(all.map((c) => [String(c._id), c]));
@@ -827,25 +899,29 @@ exports.listComments = async (req, res) => {
         // A reply whose parent fell outside the filter is promoted rather than
         // dropped — a search for a word that only appears in the reply must
         // still show it.
-        const roots   = all.filter((c) => !c.parent || !byId[String(c.parent)]);
+        let roots     = all.filter((c) => !c.parent || !byId[String(c.parent)]);
 
         for (const r of roots) r.replies = [];
         for (const r of replies) byId[String(r.parent)].replies.push(r);
         for (const r of roots) r.replies.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+        // A deleted comment with nothing left under it for this reader (its
+        // replies were staff-only, say) has nothing to hold together.
+        roots = roots.filter((r) => !r.deleted || r.replies.length);
 
+        const live = all.filter((c) => !c.deleted);
         const isStudent = (c) => c.author.role === 'student' || c.author.role === 'parent';
         res.json({
             success: true,
             data: {
                 threads: roots,
                 summary: {
-                    total:    all.length,
-                    queries:  all.filter(isStudent).length,
-                    replies:  all.filter((c) => !isStudent(c) && c.parent).length,
-                    pinned:   all.filter((c) => c.isPinned).length,
+                    total:    live.length,
+                    queries:  live.filter(isStudent).length,
+                    replies:  live.filter((c) => !isStudent(c) && c.parent).length,
+                    pinned:   live.filter((c) => c.isPinned).length,
                 },
                 // The rail's timeline: the most recent activity, whatever it was on.
-                recent: [...all]
+                recent: [...live]
                     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
                     .slice(0, 6)
                     .map((c) => ({
@@ -895,7 +971,7 @@ exports.addComment = async (req, res) => {
         // in their inbox.
         if (parent) {
             const p = await DocumentComment.findById(parent).lean();
-            if (p && String(p.author) !== String(req.userId)) {
+            if (p && !p.isDeleted && String(p.author) !== String(req.userId)) {
                 notify({
                     school: req.schoolId, sender: req.userId, senderRole: req.userRole,
                     title: '💬 Reply on an assignment',
@@ -910,11 +986,17 @@ exports.addComment = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-/** Edit your own words; pin anybody's. */
+/** Edit your own words; pin a comment if you are an admin or shared the document. */
 exports.updateComment = async (req, res) => {
     try {
         const c = await DocumentComment.findOne({ _id: req.params.commentId, school: req.schoolId });
-        if (!c) return res.status(404).json({ success: false, message: 'Comment not found' });
+        if (!c || c.isDeleted) return res.status(404).json({ success: false, message: 'This comment was deleted' });
+        if (req.body.isPinned !== undefined || req.body.visibility !== undefined) {
+            const doc = await Document.findOne({ _id: c.document, school: req.schoolId }).select('uploadedBy').lean();
+            if (!canPinOn(req, doc)) {
+                return res.status(403).json({ success: false, message: 'Only the school office or the teacher who shared this document can do that' });
+            }
+        }
 
         if (req.body.body !== undefined) {
             if (String(c.author) !== String(req.userId)) {
@@ -938,15 +1020,54 @@ exports.updateComment = async (req, res) => {
 exports.deleteComment = async (req, res) => {
     try {
         const c = await DocumentComment.findOne({ _id: req.params.commentId, school: req.schoolId }).lean();
-        if (!c) return res.status(404).json({ success: false, message: 'Comment not found' });
+        const admin = isAdmin(req);
+        if (!c || (c.isDeleted && !admin)) return res.status(404).json({ success: false, message: 'This comment was already deleted' });
+        const mine = String(c.author) === String(req.userId);
+        if (!mine && !admin) {
+            return res.status(403).json({ success: false, message: 'You can only delete your own comments' });
+        }
 
-        await DocumentComment.deleteOne({ _id: c._id });
-        // Replies go with the comment they answer — left behind they read as
-        // answers to nothing.
-        const { rowCount } = await pool.query(
-            `DELETE FROM ${qt(DocumentComment)} WHERE "parent" = $1`, [String(c._id)],
-        );
-        res.json({ success: true, deletedReplies: rowCount });
+        const T = qt(DocumentComment);
+        let kept = false;
+        let deletedReplies = 0;
+        if (!admin && !c.parent) {
+            // Your own comment, but the replies under it may be other people's —
+            // and you may delete only your own words. When anyone else has
+            // replied, the comment is emptied to "This comment was deleted" and
+            // their replies stay under it.
+            const { rows: [o] } = await pool.query(
+                `SELECT count(*)::int AS n FROM ${T} WHERE "parent" = $1 AND "author" <> $2::uuid`,
+                [String(c._id), String(req.userId)],
+            );
+            if (o.n > 0) {
+                await pool.query(
+                    `UPDATE ${T} SET "isDeleted" = true, "body" = '', "files" = '[]'::jsonb,
+                            "isPinned" = false, "likes" = '[]'::jsonb, "updatedAt" = now()
+                      WHERE "_id" = $1`,
+                    [String(c._id)],
+                );
+                kept = true;
+            }
+        }
+        if (!kept) {
+            await DocumentComment.deleteOne({ _id: c._id });
+            // Replies go with the comment they answer — left behind they read
+            // as answers to nothing. (For anyone but an admin they are all the
+            // author's own by now: other people's replies kept the row above.)
+            ({ rowCount: deletedReplies } = await pool.query(
+                `DELETE FROM ${T} WHERE "parent" = $1`, [String(c._id)],
+            ));
+        }
+        // The last reply under a deleted comment takes the empty shell with it.
+        if (c.parent) {
+            await pool.query(
+                `DELETE FROM ${T} p
+                  WHERE p."_id" = $1 AND COALESCE(p."isDeleted", false)
+                    AND NOT EXISTS (SELECT 1 FROM ${T} r WHERE r."parent" = p."_id")`,
+                [String(c.parent)],
+            );
+        }
+        res.json({ success: true, deletedReplies, kept });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -962,6 +1083,7 @@ exports.toggleLike = async (req, res) => {
                     END
               WHERE "_id" = $1 AND "school" = $3
                 AND ($4::boolean OR COALESCE("visibility", 'all') = 'all')
+                AND NOT COALESCE("isDeleted", false)
           RETURNING "likes"`,
             [req.params.commentId, String(req.userId), String(req.schoolId), isStaff(req)],
         );

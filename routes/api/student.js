@@ -78,6 +78,10 @@ router.post('/documents/:id/read',    docGuard, docViewer.markRead);
 // on a document that is actually on this student's shelf.
 router.get('/documents/:id/comments',  docGuard, docViewer.studentDocumentAccess, docDetail.listComments);
 router.post('/documents/:id/comments', docGuard, docViewer.studentDocumentAccess, docDetail.addComment);
+// A student edits and deletes their own comments, and nobody else's — the
+// controller checks the author.
+router.patch('/documents/comments/:commentId',  docGuard, docDetail.updateComment);
+router.delete('/documents/comments/:commentId', docGuard, docDetail.deleteComment);
 
 // Holidays
 router.get('/holidays', holidayGuard, holidayCtrl.studentGetHolidays);
