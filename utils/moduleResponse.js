@@ -96,6 +96,10 @@ async function buildModuleResponse(req) {
         // (middleware/hostelDesk enforces the same rule on the routes), without
         // the designation that administering the whole module takes.
         hostelDuty: !!(hostelDuty && access.moduleFlags.hostel),
+        // Not a module: My Documents — a member of staff's own paperwork, open
+        // whenever the school collects it through the Employee Directory,
+        // whatever their designation grants.
+        myDocuments: req.userRole === 'teacher' && !!access.moduleFlags.employeeDirectory,
         saturdayConfig: {
             working: ls.saturdayWorking !== false,
             mode:    ls.saturdayMode    || 'all',

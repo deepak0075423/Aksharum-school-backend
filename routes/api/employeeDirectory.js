@@ -24,6 +24,8 @@
 const express = require('express');
 const router  = express.Router();
 const ctrl    = require('../../controllers/employeeDirectory.controller');
+const docsCtrl = require('../../controllers/employeeDocuments.controller');
+const { uploadStaffDoc } = require('../../middleware/upload');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { requireModule, requireModuleAdmin } = require('../../middleware/moduleAccess');
 
@@ -66,6 +68,16 @@ router.delete('/responsibilities/:id', adminGuard, ctrl.removeResponsibility);
 // ── Verification ─────────────────────────────────────────────────────────────
 router.get('/verification', adminGuard, ctrl.getVerificationQueue);
 
+// ── Employee documents: the office's review and reminders ────────────────────
+router.get ('/document-desk',      adminGuard, docsCtrl.getDocumentDesk);
+router.post('/document-reminders', adminGuard, docsCtrl.sendReminders);
+
+// ── My documents: any member of staff, whatever their designation, as long as
+//    the school uses the module. Their own paperwork, never anyone else's.
+const selfGuard = [verifyToken, requirePasswordReset, requireRole('teacher'), docsCtrl.schoolUsesModule];
+router.get ('/me/documents',      selfGuard, docsCtrl.myDocuments);
+router.post('/me/documents/:key', selfGuard, uploadStaffDoc.single('file'), docsCtrl.uploadMyDocument);
+
 // ── Reports (administrative — exports carry no sensitive columns) ────────────
 router.get('/reports',       adminGuard, ctrl.listReports);
 router.get('/reports/:type', adminGuard, ctrl.getReport);
@@ -83,5 +95,6 @@ router.get('/employees/:id/leave',      guard, ctrl.getLeave);
 router.post('/employees/:id/reveal',       adminGuard, ctrl.revealField);
 router.put ('/employees/:id/employment',   adminGuard, ctrl.updateEmployment);
 router.put ('/employees/:id/verification', adminGuard, ctrl.setVerification);
+router.put ('/employees/:id/documents/:key/review', adminGuard, docsCtrl.reviewDocument);
 
 module.exports = router;

@@ -349,6 +349,19 @@ const ROUTES = {
         parent:       { web: '/parent/documents',  mobile: '/modules/documents' },
     },
 
+    // ── Employee documents (Employee Directory) ─────────────────────────────
+    // The employee's own page: what to upload, and why one was turned down.
+    'directory.mydocs': {
+        teacher:      { web: '/teacher/my-documents', mobile: '/(tabs)/notifications' },
+    },
+    // A document waiting for the office — opens that person's documents on the
+    // review tab. A teacher receiving one administers the module, so the /admin
+    // path is theirs (AdminAreaGuard).
+    'directory.review': {
+        school_admin: { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification' },
+        teacher:      { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification' },
+    },
+
     // ── ID cards ─────────────────────────────────────────────────────────────
     // A card issued for the reader (or, for a parent, for their child).
     'idcards.mine': {
@@ -677,6 +690,7 @@ const MODULE_OF = {
     idcards: 'idcards',
     medical: 'medical',
     admission: 'admission',
+    directory: 'employeeDirectory',
 };
 
 const MODULE_LABELS = {
@@ -684,7 +698,7 @@ const MODULE_LABELS = {
     library: 'Library', results: 'Results', timetable: 'Timetable',
     calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
     hostel: 'Hostel', video: 'Videos', feedback: 'Feedback',
-    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', admission: 'Admissions', general: 'General',
+    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', admission: 'Admissions', employeeDirectory: 'Employee Directory', general: 'General',
 };
 
 // Somebody is waiting on the reader, or money is owed. These are the ones that
@@ -697,6 +711,7 @@ const HIGH_TYPES = [
     'fees.mine', 'library.myfines', 'library.manage.fines', 'library.fines',
     'substitutions',
     'documents.item',
+    'directory.mydocs', 'directory.review',
     'medical.desk', 'medical.changes', 'medical.round',
 ];
 

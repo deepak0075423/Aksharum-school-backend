@@ -29,6 +29,8 @@ const {
 } = svc.models;
 
 const { low, trim, pct } = svc;
+const { getActiveAcademicYearLabel } = require('../utils/leaveDays');
+const employeeDocs = require('../services/employeeDocuments');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 // User-facing message only. The stack stays in the server log, never on the wire.
@@ -821,8 +823,18 @@ exports.getEmployee = async (req, res) => {
 
         if (vis.documents) {
             const docs = svc.buildDocuments(p, verificationBySection);
-            out.documents = docs.map((d) => ({ ...d, url: d.sensitive && !vis.governmentId ? '' : d.url }))
-                .filter((d) => !d.sensitive || vis.governmentId);
+            // Each document's own decision, where one has been made — the
+            // section's sign-off only stands in for documents never reviewed.
+            const own = new Map((await employeeDocs.documentsOf(req.schoolId, profile)).documents.map((d) => [d.key, d]));
+            out.documents = docs.map((d) => {
+                const o = own.get(d.key);
+                return {
+                    ...d,
+                    url: d.sensitive && !vis.governmentId ? '' : d.url,
+                    verificationStatus: o?.state === 'resubmitted' ? 'resubmitted' : (o?.state || d.verificationStatus),
+                    rejectionComment: o?.comment || '',
+                };
+            }).filter((d) => !d.sensitive || vis.governmentId);
         }
 
         if (vis.governmentId) {
@@ -1046,16 +1058,30 @@ exports.getLeave = async (req, res) => {
         if (!viewer.modules.leave) return fail(res, 'The leave module is not enabled for your school', 403);
 
         const teacherId = String(found.user._id);
-        const [applications, balances, types] = await Promise.all([
+        const [applications, allBalances, types, activeYear] = await Promise.all([
             LeaveApplication.find({ teacher: teacherId, school: req.schoolId }).lean(),
             LeaveBalance.find({ teacher: teacherId, school: req.schoolId }).lean(),
             LeaveType.find({ school: req.schoolId }).select('name code').lean(),
+            getActiveAcademicYearLabel(req.schoolId).catch(() => null),
         ]);
         const typeName = new Map(types.map((t) => [String(t._id), t.name]));
+
+        // One row per leave type, for ONE year. A balance row exists per
+        // (type × academic year), and every year's rows used to be listed
+        // together with no year beside them — so Casual Leave appeared once
+        // for each year on record, each with different figures. The year shown
+        // is the one the Leave module is counting (the active year); a school
+        // with no active year falls back to the latest year on record.
+        const years = [...new Set(allBalances.map((b) => String(b.academicYear || '')))].sort();
+        const year = activeYear && years.includes(String(activeYear)) ? String(activeYear) : (years[years.length - 1] || null);
+        const balances = allBalances
+            .filter((b) => String(b.academicYear || '') === year)
+            .sort((a, b) => (typeName.get(String(a.leaveType)) || '').localeCompare(typeName.get(String(b.leaveType)) || ''));
         const today = startOfDay(new Date());
 
         const approved = applications.filter((a) => a.status === 'approved');
         ok(res, {
+            balanceYear: year,
             balances: balances.map((b) => ({
                 leaveType: typeName.get(String(b.leaveType)) || '',
                 academicYear: b.academicYear,
@@ -1272,6 +1298,14 @@ exports.setVerification = async (req, res) => {
                     return fail(res, `${VERIFICATION_LABELS[section]} has no document on file to verify. `
                         + 'Upload the paperwork on the employee record first.', 400);
                 }
+                // The section is the sum of its documents: each one on file has
+                // to have been accepted on its own first.
+                const { documents } = await employeeDocs.documentsOf(req.schoolId, found.profile);
+                const open = documents.filter((d) => d.section === section && d.fileName && d.state !== 'verified');
+                if (open.length) {
+                    return fail(res, `Verify or reject each document first — ${open.map((d) => d.label).join(', ')} `
+                        + `${open.length === 1 ? 'has' : 'have'} not been accepted yet.`, 400);
+                }
             }
         }
 
@@ -1304,6 +1338,7 @@ exports.getVerificationQueue = async (req, res) => {
     try {
         const { snap, rows } = await collect(req);
         const verifications = await EmployeeVerification.find({ school: req.schoolId }).lean();
+        const docStates = await employeeDocs.documentsBySchool(req.schoolId, [...snap.profileByUser.values()]);
         const bySection = new Map();
         for (const v of verifications) {
             if (!bySection.has(String(v.employee))) bySection.set(String(v.employee), {});
@@ -1321,9 +1356,20 @@ exports.getVerificationQueue = async (req, res) => {
                 // section off. Empty for the sections this ERP keeps as field
                 // values only — those are reviewed on the employee's profile.
                 const defs = DOCS_BY_SECTION[s] || [];
+                const stateOf = new Map((docStates.get(r._id)?.documents || []).map((d) => [d.key, d]));
                 const documents = defs
                     .filter((d) => trim(profile[d.key]))
-                    .map((d) => ({ key: d.key, label: d.label, url: `${svc.STAFF_DOC_BASE}/${profile[d.key]}` }));
+                    .map((d) => {
+                        const st = stateOf.get(d.key);
+                        return {
+                            key: d.key, label: d.label, url: `${svc.STAFF_DOC_BASE}/${profile[d.key]}`,
+                            fileName: profile[d.key],
+                            // Each document's own decision — verified, rejected,
+                            // pending, or re-submitted after a rejection.
+                            state: st?.state || 'pending', comment: st?.comment || '',
+                            reviewedAt: st?.reviewedAt || null, resubmittedAt: st?.resubmittedAt || null,
+                        };
+                    });
                 return {
                     section: s,
                     label: VERIFICATION_LABELS[s],
