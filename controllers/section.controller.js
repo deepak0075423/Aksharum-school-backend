@@ -385,19 +385,27 @@ exports.removeMonitor = async (req, res) => {
 // day-wise or subject-wise — is decided by services/attendanceScope.js.
 
 // ── Teacher: all sections I'm attached to (class teacher / substitute / subject) ──
+// This academic year's only (Nov 2026). Classes repeat every year, so a
+// teacher who taught 6-A last year and teaches it again was offered "Class 6 -
+// A" twice in the Notifications composer, one of them last year's section with
+// last year's students. Same rule as My Section (services/teacherOwnSections):
+// a section in an active year; a school with no active year keeps them all.
 exports.getMySections = async (req, res) => {
     try {
         const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
-        const [ownSections, subjectLinks] = await Promise.all([
+        const { byClass, bySection } = require('../utils/listOrder');
+        const [ownAll, subjectLinks, current] = await Promise.all([
             ClassSection.find({
                 school: req.schoolId,
                 $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
-            }).populate('class', 'className').lean(),
+            }).populate('class', 'className classNumber').lean(),
             SectionSubjectTeacher.find({ teacher: req.userId })
-                .populate({ path: 'section', populate: { path: 'class', select: 'className' } })
+                .populate({ path: 'section', populate: { path: 'class', select: 'className classNumber' } })
                 .populate('subject', 'subjectName')
                 .lean(),
+            currentYears(req.schoolId),
         ]);
+        const ownSections = ownAll.filter(current.isCurrent);
 
         const map = {};
         ownSections.forEach(sec => {
@@ -405,6 +413,7 @@ exports.getMySections = async (req, res) => {
                 _id: sec._id,
                 sectionName: sec.sectionName,
                 className: sec.class?.className || '',
+                classNumber: sec.class?.classNumber ?? null,
                 studentCount: (sec.enrolledStudents || []).length,
                 roles: [String(sec.classTeacher) === String(req.userId) ? 'Class Teacher' : 'Substitute Teacher'],
                 subjects: [],
@@ -412,13 +421,15 @@ exports.getMySections = async (req, res) => {
         });
         subjectLinks.forEach(link => {
             const sec = link.section;
-            if (!sec?._id) return;
+            // A subject link carries no school of its own — the section's does.
+            if (!sec?._id || String(sec.school) !== String(req.schoolId) || !current.isCurrent(sec)) return;
             const id = sec._id.toString();
             if (!map[id]) {
                 map[id] = {
                     _id: sec._id,
                     sectionName: sec.sectionName,
                     className: sec.class?.className || '',
+                    classNumber: sec.class?.classNumber ?? null,
                     studentCount: (sec.enrolledStudents || []).length,
                     roles: [],
                     subjects: [],
@@ -430,7 +441,8 @@ exports.getMySections = async (req, res) => {
             if (!map[id].roles.includes('Subject Teacher')) map[id].roles.push('Subject Teacher');
         });
 
-        ok(res, Object.values(map));
+        // Class by number, then sections A–Z (utils/listOrder).
+        ok(res, Object.values(map).sort((a, b) => byClass(a, b) || bySection(a, b)));
     } catch (e) { err(res, e); }
 };
 

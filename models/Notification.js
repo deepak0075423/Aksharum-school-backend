@@ -21,8 +21,10 @@ const NotificationSchema = new db.Schema({
                 'all_teachers',     // school_admin → all teachers in school
                 'all_students',     // school_admin → all students in school
                 'all_parents',      // school_admin → all parents in school
+                'all_students_parents', // school_admin → every student AND every parent, at once
                 'class_students',   // school_admin → students in a class
                 'class_parents',    // school_admin → parents of students in a class
+                'class_all',        // school_admin → students + parents in a class
                 'section_students', // school_admin / teacher → students in a section
                 'section_parents',  // school_admin / teacher → parents of students in a section
                 'section_all',      // teacher → students + parents in their section

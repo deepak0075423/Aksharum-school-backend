@@ -67,60 +67,75 @@ exports.getList = async (req, res) => {
 };
 
 // ── Recipient resolution ──────────────────────────────────────────────────────
+const USER_FIELDS = '_id email name school role';
+
+/**
+ * Which students an audience is defined by — the whole school, a class or a
+ * section — or null for an audience that is not about students at all.
+ */
+async function audienceStudents({ targetType, school, classId, sectionId }) {
+    if (['all_students', 'all_students_parents'].includes(targetType)) {
+        const kids = await User.find({ school, role: 'student' }, '_id').lean();
+        return kids.map((k) => String(k._id));
+    }
+    if (['class_students', 'class_parents', 'class_all'].includes(targetType)) {
+        const secs = await ClassSection.find({ class: classId, school }, 'enrolledStudents').lean();
+        return [...new Set(secs.flatMap((s) => (s.enrolledStudents || []).map(String)))];
+    }
+    if (['section_students', 'section_parents', 'section_all'].includes(targetType)) {
+        const sec = await ClassSection.findOne({ _id: sectionId, school }, 'enrolledStudents').lean();
+        return [...new Set((sec?.enrolledStudents || []).map(String))];
+    }
+    return null;
+}
+
+/**
+ * Who a typed notification reaches, and — for each parent in it — which of
+ * their children it is about.
+ *
+ * Sending to students reaches their parents as well (Nov 2026): a parent
+ * reads what their child is told, under that child's name. So "Students in a
+ * class" is the class's students and their parents, and "Parents of a class"
+ * is the parents alone; the old "students + parents" audiences are kept for
+ * notifications already sent with them and mean the same as "students".
+ *
+ * Returns { recipients: [User], aboutOf: Map(parentId → [studentIds]) }.
+ */
 async function resolveRecipients({ targetType, school, classId, sectionId, targetSchools = [] }) {
+    const none = { recipients: [], aboutOf: new Map() };
     switch (targetType) {
         case 'all':
-            return User.find({ school, role: { $in: ['teacher', 'student', 'parent', 'school_admin'] } }, '_id email name school role').lean();
+            return { ...none, recipients: await User.find({ school, role: { $in: ['teacher', 'student', 'parent', 'school_admin'] } }, USER_FIELDS).lean() };
         case 'all_teachers':
-            return User.find({ school, role: 'teacher' }, '_id email name school role').lean();
-        case 'all_students':
-            return User.find({ school, role: 'student' }, '_id email name school role').lean();
+            return { ...none, recipients: await User.find({ school, role: 'teacher' }, USER_FIELDS).lean() };
+        // A notice to every parent is about the school, not one child: it
+        // belongs under each of a parent's children, so it records none.
         case 'all_parents':
-            return User.find({ school, role: 'parent' }, '_id email name school role').lean();
-        case 'class_students': {
-            const secs = await ClassSection.find({ class: classId, school }, 'enrolledStudents').lean();
-            const ids  = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
-            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school role').lean();
-        }
-        case 'class_parents': {
-            const secs       = await ClassSection.find({ class: classId, school }, 'enrolledStudents').lean();
-            const studentIds = [...new Set(secs.flatMap(s => s.enrolledStudents.map(id => id.toString())))];
-            const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
-            const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school role').lean();
-        }
-        case 'section_students': {
-            const sec = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
-            const ids = (sec?.enrolledStudents || []).map(id => id.toString());
-            return User.find({ _id: { $in: ids }, school, role: 'student' }, '_id email name school role').lean();
-        }
-        case 'section_parents': {
-            const sec        = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
-            const studentIds = (sec?.enrolledStudents || []).map(id => id.toString());
-            const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
-            const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            return User.find({ _id: { $in: parentIds }, school, role: 'parent' }, '_id email name school role').lean();
-        }
-        case 'section_all': {
-            const sec        = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
-            const studentIds = (sec?.enrolledStudents || []).map(id => id.toString());
-            const profiles   = await StudentProfile.find({ user: { $in: studentIds }, parent: { $ne: null } }, 'parent').lean();
-            const parentIds  = [...new Set(profiles.map(p => p.parent.toString()))];
-            const allIds     = [...new Set([...studentIds, ...parentIds])];
-            return User.find({ _id: { $in: allIds }, school }, '_id email name school role').lean();
-        }
+            return { ...none, recipients: await User.find({ school, role: 'parent' }, USER_FIELDS).lean() };
         // Super-admin targets — only school_admin recipients
         case 'all_schools':
-            return User.find({ role: 'school_admin' }, '_id email name school role').lean();
+            return { ...none, recipients: await User.find({ role: 'school_admin' }, USER_FIELDS).lean() };
         case 'specific_school': {
             const schoolIds = (targetSchools.length ? targetSchools : (school ? [school] : []))
                 .map(String).filter(Boolean);
-            if (!schoolIds.length) return [];
-            return User.find({ school: { $in: schoolIds }, role: 'school_admin' }, '_id email name school role').lean();
+            if (!schoolIds.length) return none;
+            return { ...none, recipients: await User.find({ school: { $in: schoolIds }, role: 'school_admin' }, USER_FIELDS).lean() };
         }
-        default:
-            return [];
+        default: break;
     }
+
+    const studentIds = await audienceStudents({ targetType, school, classId, sectionId });
+    if (!studentIds) return none;
+    if (!studentIds.length) return none;
+
+    const { childrenByParent } = require('../services/notifyService');
+    const aboutOf  = await childrenByParent(studentIds);
+    const parentsOnly = ['class_parents', 'section_parents'].includes(targetType);
+    const [students, parents] = await Promise.all([
+        parentsOnly ? [] : User.find({ _id: { $in: studentIds }, school, role: 'student' }, USER_FIELDS).lean(),
+        aboutOf.size ? User.find({ _id: { $in: [...aboutOf.keys()] }, school, role: 'parent' }, USER_FIELDS).lean() : [],
+    ]);
+    return { recipients: [...students, ...parents], aboutOf };
 }
 
 function dispatchEmails({ recipients, title, body, schoolName, schoolId, school, receiptOf }) {
@@ -168,20 +183,24 @@ function dispatchEmails({ recipients, title, body, schoolName, schoolId, school,
  */
 async function teacherSectionIds(userId, schoolId) {
     const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
-    const [own, links] = await Promise.all([
+    const { currentYears } = require('../services/teacherOwnSections');
+    const [own, links, current] = await Promise.all([
         ClassSection.find({
             school: schoolId,
             $or: [{ classTeacher: userId }, { substituteTeacher: userId }],
-        }, '_id').lean(),
+        }, '_id academicYear').lean(),
         SectionSubjectTeacher.find({ teacher: userId }, 'section').lean(),
+        currentYears(schoolId),
     ]);
     const linked = links.map((l) => String(l.section)).filter(Boolean);
     // A subject link carries no school of its own, so those sections are
     // re-read school-scoped rather than trusted.
     const checked = linked.length
-        ? await ClassSection.find({ _id: { $in: linked }, school: schoolId }, '_id').lean()
+        ? await ClassSection.find({ _id: { $in: linked }, school: schoolId }, '_id academicYear').lean()
         : [];
-    return new Set([...own, ...checked].map((s) => String(s._id)));
+    // This academic year's sections only (Nov 2026) — the composer offers no
+    // other, and last year's section is last year's students.
+    return new Set([...own, ...checked].filter(current.isCurrent).map((s) => String(s._id)));
 }
 
 // ── Send ──────────────────────────────────────────────────────────────────────
@@ -203,8 +222,8 @@ exports.send = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Select at least one channel (In-App or Email)' });
 
         // Role-based target type whitelist
-        const adminTargets = ['all','all_teachers','all_students','all_parents',
-                              'class_students','class_parents',
+        const adminTargets = ['all','all_teachers','all_students','all_parents','all_students_parents',
+                              'class_students','class_parents','class_all',
                               'section_students','section_parents','section_all'];
         if (req.userRole !== 'super_admin' && !adminTargets.includes(targetType))
             return res.status(403).json({ success: false, message: 'Invalid target type for your role' });
@@ -226,7 +245,7 @@ exports.send = async (req, res) => {
         }
 
         // Contextual field validation
-        if (['class_students','class_parents'].includes(targetType) && !classId)
+        if (['class_students','class_parents','class_all'].includes(targetType) && !classId)
             return res.status(400).json({ success: false, message: 'Please select a class' });
         if (['section_students','section_parents','section_all'].includes(targetType) && !sectionId)
             return res.status(400).json({ success: false, message: 'Please select a section' });
@@ -240,7 +259,7 @@ exports.send = async (req, res) => {
 
         // Resolve first — sending to an empty audience is a mistake worth
         // reporting, not a stored notification nobody ever receives.
-        const recipients = await resolveRecipients({ targetType, school: req.schoolId, classId, sectionId, targetSchools });
+        const { recipients, aboutOf } = await resolveRecipients({ targetType, school: req.schoolId, classId, sectionId, targetSchools });
         if (!recipients.length)
             return res.status(400).json({ success: false, message: 'No recipients matched this target — nothing was sent.' });
 
@@ -262,6 +281,8 @@ exports.send = async (req, res) => {
                 // Super-admin sends have no schoolId of their own — scope each
                 // receipt to the recipient's school so it stays queryable.
                 school:       req.schoolId || u.school || null,
+                // A parent's copy says which of their children it is about.
+                ...(aboutOf.has(String(u._id)) ? { about: aboutOf.get(String(u._id)) } : {}),
             }));
             // A typed broadcast has no destination of its own, so each reader's
             // link opens the notification itself — which needs their own receipt
@@ -342,46 +363,81 @@ exports.getInboxApi = async (req, res) => {
 };
 
 /**
- * Which of a parent's children each notification is about.
+ * Is this receipt of a parent's about this child? — as a SQL condition.
  *
- * A message about one student — a library fine, an absence, a result — is
- * sent to that student AND their parents, but the notification itself names no
- * child. So a parent with two children saw one child's fine on the other's
- * dashboard. The receipts already say who else got it: the children holding a
- * receipt for the same notification are the ones it concerns.
+ * `alias` is the parent's receipt; `kid` a text expression naming one child,
+ * `kids` a text[] expression naming all of the parent's children. Decided in
+ * this order, the first that has an answer winning:
  *
- * `forChildren: []` means none of them received it — a message to parents as
- * such, or a school-wide notice — and belongs on every child's view. This
- * reads the existing rows, so notifications sent before it are tagged too.
+ *   1. the receipt says which children it is about (`about`, written since
+ *      Nov 2026 by the composer and by modules that tell parents alone);
+ *   2. the notification's link names a child (`link.params.child` — the
+ *      medical room, attendance notices);
+ *   3. some of the parent's children got it too — then it is theirs (a
+ *      library fine, a result, anything sent to "students and their parents");
+ *   4. it went to a section or a class — then it is about the children in it
+ *      (older notices to "parents of Class 6");
+ *   5. otherwise it is about none of them in particular — a notice to every
+ *      parent, a school-wide message — and belongs under each child.
+ *
+ * Rules 2–4 read rows that already exist, so notifications sent before the
+ * `about` column are placed correctly too.
+ */
+function childCond(alias, kid, kids) {
+    const R = NotificationReceipt.tableName;
+    const N = Notification.tableName;
+    const S = ClassSection.tableName;
+    return `(SELECT CASE
+        WHEN jsonb_typeof(${alias}.about) = 'array' AND ${alias}.about ?| ${kids}
+            THEN ${alias}.about ? ${kid}
+        WHEN nn.link->'params'->>'child' = ANY(${kids})
+            THEN nn.link->'params'->>'child' = ${kid}
+        WHEN EXISTS (SELECT 1 FROM "${R}" kc WHERE kc.notification = nn._id AND kc.recipient = ANY((${kids})::uuid[]))
+            THEN EXISTS (SELECT 1 FROM "${R}" kc WHERE kc.notification = nn._id AND kc.recipient = (${kid})::uuid)
+        WHEN COALESCE(nn.target->>'section', '') <> ''
+            THEN EXISTS (SELECT 1 FROM "${S}" cs WHERE cs._id::text = nn.target->>'section'
+                           AND jsonb_typeof(cs."enrolledStudents") = 'array' AND cs."enrolledStudents" ? ${kid})
+        WHEN COALESCE(nn.target->>'class', '') <> ''
+            THEN EXISTS (SELECT 1 FROM "${S}" cs WHERE cs.class::text = nn.target->>'class'
+                           AND jsonb_typeof(cs."enrolledStudents") = 'array' AND cs."enrolledStudents" ? ${kid})
+        ELSE true END
+      FROM "${N}" nn WHERE nn._id = ${alias}.notification)`;
+}
+
+/**
+ * Which of a parent's children each notification is about — the dashboard
+ * inbox's `forChildren`, by the same rule as the mailbox (childCond).
+ * `forChildren: []` means none of them in particular: a message to parents as
+ * such, or a school-wide notice, which shows on every child's view.
  */
 async function tagChildren(rows, req) {
     const { childrenOf } = require('../services/parentChildren');
     const kids = (await childrenOf(req.userId, req.schoolId, '_id')).map((k) => String(k._id));
-    const notifIds = [...new Set(rows.map((r) => String(r.notification?._id || r.notification || '')).filter(Boolean))];
-
-    const held = kids.length && notifIds.length
-        ? await NotificationReceipt.find({ notification: { $in: notifIds }, recipient: { $in: kids } })
-            .select('notification recipient').lean()
-        : [];
-    const byNotif = new Map();
-    for (const h of held) {
-        const key = String(h.notification);
-        if (!byNotif.has(key)) byNotif.set(key, new Set());
-        byNotif.get(key).add(String(h.recipient));
+    const ids = rows.map((r) => String(r._id)).filter(Boolean);
+    const byReceipt = new Map();
+    if (kids.length && ids.length) {
+        const { query } = require('../db/pool');
+        const R = NotificationReceipt.tableName;
+        const { rows: hits } = await query(
+            `SELECT r._id::text AS id, k.kid
+               FROM "${R}" r CROSS JOIN unnest($2::text[]) AS k(kid)
+              WHERE r._id::text = ANY($1::text[]) AND ${childCond('r', 'k.kid', '$2::text[]')}`,
+            [ids, kids],
+        );
+        for (const h of hits) {
+            if (!byReceipt.has(h.id)) byReceipt.set(h.id, []);
+            byReceipt.get(h.id).push(h.kid);
+        }
     }
     for (const r of rows) {
-        r.forChildren = [...(byNotif.get(String(r.notification?._id || r.notification || '')) || [])];
+        const on = byReceipt.get(String(r._id)) || [];
+        // Under every child = about none of them in particular.
+        r.forChildren = on.length === kids.length && kids.length > 1 ? [] : on;
     }
 }
 
 /**
- * A parent's mailbox, narrowed to one child.
- *
- * Nothing on a notification names the child it is about, but a message about a
- * student goes to that student as well as their parents — so child A's view is
- * every notification A also holds a receipt for, plus every one that none of
- * the parent's children hold (a notice to parents, a school-wide message),
- * which belongs to every child's view. The same rule tags the dashboard inbox.
+ * A parent's mailbox, narrowed to one child (childCond decides what is whose).
  *
  * `?child=` (or `child` in the body) is matched against the parent's own
  * children and ignored otherwise — the query only ever reads the caller's own
@@ -398,25 +454,102 @@ async function childScope(req) {
     const kids = (await childrenOf(req.userId, req.schoolId, '_id')).map((k) => String(k._id));
     if (kids.length < 2 || !kids.includes(wanted)) return null;
 
-    const R = NotificationReceipt.tableName;
     return {
         params: [wanted, kids],
-        sql: (alias, next) => `(EXISTS (SELECT 1 FROM "${R}" kc
-                                  WHERE kc.notification = ${alias}.notification AND kc.recipient = $${next}::uuid)
-             OR NOT EXISTS (SELECT 1 FROM "${R}" kc
-                             WHERE kc.notification = ${alias}.notification AND kc.recipient = ANY($${next + 1}::uuid[])))`,
+        sql: (alias, next) => childCond(alias, `$${next}::text`, `$${next + 1}::text[]`),
     };
 }
+
+/**
+ * Which academic year's notifications are on screen (Nov 2026).
+ *
+ * A notification stores no academic year, so it belongs to the year it arrived
+ * in — and a year runs from its own start date to the NEXT year's start date,
+ * so nothing that arrived in the gap between one year's end and the next one's
+ * start falls out of both. The earliest year reaches back to the beginning and
+ * the latest has no end.
+ *
+ * `year` (query or body): absent → no narrowing at all (the phone app and the
+ * bell still read the whole mailbox); 'current' → the school's active year;
+ * an id → that year; 'all' → everything, with the years still listed so the
+ * page can offer them.
+ *
+ * Returns null when nothing was asked, else
+ *   { years, selected, clause(col, next) → { sql, params } }
+ * where `clause` is '' when the choice is "all" or the school has no years.
+ */
+async function yearWindow(req) {
+    const wanted = String(req.query?.year || req.body?.year || '');
+    if (!wanted || !req.schoolId) return null;
+    const { query } = require('../db/pool');
+    const { yearOrderSql } = require('../utils/listOrder');
+    const { rows } = await query(
+        `SELECT "_id", "yearName", "status", "startDate" FROM "academicyears"
+          WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
+        [String(req.schoolId)],
+    );
+    const years = rows.map((r) => ({ _id: String(r._id), name: r.yearName, status: r.status }));
+
+    const pick = wanted === 'all' ? null
+        : wanted === 'current'
+            ? rows.find((r) => r.status === 'active')
+              // No year marked active: the one today falls in, by start date.
+              || [...rows].filter((r) => r.startDate && new Date(r.startDate) <= new Date())
+                  .sort((a, b) => new Date(b.startDate) - new Date(a.startDate))[0]
+              || null
+            : rows.find((r) => String(r._id) === wanted) || null;
+
+    if (!pick) {
+        return { years, selected: wanted === 'all' ? 'all' : null, clause: () => ({ sql: '', params: [] }) };
+    }
+
+    const byStart = rows.filter((r) => r.startDate).sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+    const at = byStart.findIndex((r) => String(r._id) === String(pick._id));
+    const from = at > 0 ? byStart[at].startDate : null;                       // the earliest reaches back
+    const to   = at >= 0 && at < byStart.length - 1 ? byStart[at + 1].startDate : null;   // the latest has no end
+
+    return {
+        years,
+        selected: String(pick._id),
+        clause: (col, next) => {
+            const parts = [];
+            const params = [];
+            if (from) { params.push(from); parts.push(`${col} >= $${next + params.length - 1}::timestamptz`); }
+            if (to)   { params.push(to);   parts.push(`${col} <  $${next + params.length - 1}::timestamptz`); }
+            return { sql: parts.length ? parts.join(' AND ') : '', params };
+        },
+    };
+}
+
+/** " AND <year condition>" with its parameters, for a statement whose parameters so far end at `used`. */
+function yearAnd(win, col, used) {
+    if (!win) return { sql: '', params: [] };
+    const c = win.clause(col, used + 1);
+    return c.sql ? { sql: ` AND ${c.sql}`, params: c.params } : { sql: '', params: [] };
+}
+
+/**
+ * A–Z by what the reader sees. Titles are stored with a leading emoji
+ * ("🎉 Holiday: …", "📚 Book issued") that the page strips before showing
+ * them, so sorting on the stored text put every emoji-led title in one block
+ * ahead of the rest ("Your ID card is ready" before "A dose was not recorded").
+ * Leading symbols, emoji and spaces are dropped and case is ignored.
+ */
+const TITLE_KEY = (alias) => `lower(regexp_replace(${alias}.title, '^[^[:alnum:]]+', ''))`;
 
 exports.markAllRead = async (req, res) => {
     try {
         const scope = await childScope(req);
-        if (scope) {
+        const win   = await yearWindow(req);
+        if (scope || win) {
             const { query } = require('../db/pool');
+            const params = [req.userId, ...(scope ? scope.params : [])];
+            const y = yearAnd(win, 'r."createdAt"', params.length);
             await query(
                 `UPDATE "${NotificationReceipt.tableName}" r SET "isRead" = true, "readAt" = NOW()
-                  WHERE r.recipient = $1 AND NOT COALESCE(r."isRead", false) AND ${scope.sql('r', 2)}`,
-                [req.userId, ...scope.params],
+                  WHERE r.recipient = $1 AND NOT COALESCE(r."isRead", false)
+                    ${scope ? `AND ${scope.sql('r', 2)}` : ''}${y.sql}`,
+                [...params, ...y.params],
             );
         } else {
             await NotificationReceipt.updateMany({ recipient: req.userId, isRead: false }, { isRead: true, readAt: new Date() });
@@ -527,9 +660,13 @@ exports.deleteAll = async (req, res) => {
         // A parent looking at one child empties that child's view, not the
         // other child's notifications they cannot see on screen.
         const kid = await childScope(req);
+        // And only the academic year on screen — "Delete all 40" must not
+        // also take last year's notifications the reader cannot see.
+        const params = [req.userId, ...(kid ? kid.params : [])];
+        const y = yearAnd(await yearWindow(req), 'r."createdAt"', params.length);
         const { rowCount } = await query(
-            `DELETE FROM "${R}" r WHERE r.recipient = $1${scope}${kid ? ` AND ${kid.sql('r', 2)}` : ''}`,
-            [req.userId, ...(kid ? kid.params : [])],
+            `DELETE FROM "${R}" r WHERE r.recipient = $1${scope}${kid ? ` AND ${kid.sql('r', 2)}` : ''}${y.sql}`,
+            [...params, ...y.params],
         );
 
         _pushCount(req.userId);
@@ -551,7 +688,7 @@ const SENT_SORTS = {
     newest:     'n."createdAt" DESC',
     oldest:     'n."createdAt" ASC',
     recipients: 'COALESCE(n."recipientCount", 0) DESC, n."createdAt" DESC',
-    title:      'n.title ASC, n."createdAt" DESC',
+    title:      `${TITLE_KEY('n')} ASC, n."createdAt" DESC`,
 };
 
 exports.getSent = async (req, res) => {
@@ -581,6 +718,12 @@ exports.getSent = async (req, res) => {
         if (req.query.q && String(req.query.q).trim()) {
             params.push(`%${String(req.query.q).trim()}%`);
             where.push(`(n.title ILIKE $${params.length} OR n.body ILIKE $${params.length})`);
+        }
+        // The academic year on screen — sent within it.
+        const win = await yearWindow(req);
+        if (win) {
+            const c = win.clause('n."createdAt"', params.length + 1);
+            if (c.sql) { where.push(c.sql); params.push(...c.params); }
         }
 
         const whereSql = `WHERE ${where.join(' AND ')}`;
@@ -628,7 +771,130 @@ exports.getSent = async (req, res) => {
             success: true, data,
             total: countRes.rows[0]?.n || 0,
             page, pages: Math.max(1, Math.ceil((countRes.rows[0]?.n || 0) / limit)),
+            ...(win ? { years: win.years, year: win.selected } : {}),
         });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+/**
+ * One sent notification, opened from the Sent tab (Nov 2026): everything
+ * about it, and how its audience has taken it.
+ *
+ * Only the sender's own — the same rule as the Sent list it is opened from.
+ * `stats` counts the in-app copies (an email-only send has none), split by
+ * role, so "212 recipients" reads as "180 students and 32 parents".
+ */
+exports.getSentDetail = async (req, res) => {
+    try {
+        const { query } = require('../db/pool');
+        const links = notificationLinks;
+        const N = Notification.tableName;
+        const R = NotificationReceipt.tableName;
+        const U = User.tableName;
+
+        const { rows } = await query(
+            `SELECT n._id, n.title, n.body, n."createdAt", n.channels, n.target, n.link, n.school,
+                    n."senderRole", COALESCE(n."recipientCount", 0)::int AS "recipientCount",
+                    COALESCE(n."emailSent", false) AS "emailSent",
+                    ${links.prioritySql('n.link', 'n.priority')} AS priority,
+                    s.name AS "senderName"
+               FROM "${N}" n LEFT JOIN "${U}" s ON s._id = n.sender
+              WHERE n._id::text = $1 AND n.sender = $2`,
+            [String(req.params.id), req.userId],
+        );
+        const n = rows[0];
+        if (!n) return res.status(404).json({ success: false, message: 'Notification not found' });
+
+        const [byRole, place] = await Promise.all([
+            query(
+                `SELECT u.role,
+                        COUNT(*)::int AS total,
+                        COUNT(*) FILTER (WHERE COALESCE(r."isRead", false))::int AS opened,
+                        COUNT(*) FILTER (WHERE COALESCE(r."isCleared", false))::int AS archived
+                   FROM "${R}" r JOIN "${U}" u ON u._id = r.recipient
+                  WHERE r.notification = $1
+                  GROUP BY u.role ORDER BY total DESC`,
+                [n._id],
+            ),
+            // The class and section it went to, by name.
+            query(
+                `SELECT (SELECT c."className" FROM "classes" c WHERE c._id::text = $1) AS "className",
+                        (SELECT cs."sectionName" FROM "${ClassSection.tableName}" cs WHERE cs._id::text = $2) AS "sectionName",
+                        (SELECT c."className" FROM "${ClassSection.tableName}" cs JOIN "classes" c ON c._id = cs.class
+                          WHERE cs._id::text = $2) AS "sectionClass"`,
+                [String(n.target?.class || ''), String(n.target?.section || '')],
+            ),
+        ]);
+
+        const roles = byRole.rows;
+        const delivered = roles.reduce((t, r) => t + r.total, 0);
+        const opened    = roles.reduce((t, r) => t + r.opened, 0);
+        const archived  = roles.reduce((t, r) => t + r.archived, 0);
+        const where     = place.rows[0] || {};
+        const moduleKey = links.moduleOf(n.link);
+
+        res.json({
+            success: true,
+            data: {
+                ...n,
+                kind:   (n.target?.type || 'individual') === 'individual' ? 'activity' : 'announcement',
+                module: { key: moduleKey, label: links.moduleLabel(moduleKey) },
+                sender: { name: n.senderName || '' },
+                place:  {
+                    className:   where.className || where.sectionClass || null,
+                    sectionName: where.sectionName || null,
+                },
+                stats: { delivered, opened, unopened: delivered - opened, archived, byRole: roles },
+            },
+        });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+/**
+ * Who a sent notification reached, a page at a time: name, role, opened or
+ * not and when. `q` (name), `read` ('opened' | 'unopened'), `role`.
+ * A parent's row says which child it was about.
+ */
+exports.getSentRecipients = async (req, res) => {
+    try {
+        const { query } = require('../db/pool');
+        const N = Notification.tableName;
+        const R = NotificationReceipt.tableName;
+        const U = User.tableName;
+
+        const own = await query(`SELECT _id FROM "${N}" WHERE _id::text = $1 AND sender = $2`, [String(req.params.id), req.userId]);
+        if (!own.rows[0]) return res.status(404).json({ success: false, message: 'Notification not found' });
+
+        const page  = Math.max(1, Math.floor(Number(req.query.page) || 1));
+        const limit = Math.min(100, Math.max(1, Math.floor(Number(req.query.limit) || 10)));
+        const params = [own.rows[0]._id];
+        const where  = ['r.notification = $1'];
+        if (req.query.read === 'opened')   where.push('COALESCE(r."isRead", false)');
+        if (req.query.read === 'unopened') where.push('NOT COALESCE(r."isRead", false)');
+        if (req.query.role) { params.push(String(req.query.role)); where.push(`u.role = $${params.length}`); }
+        if (req.query.q && String(req.query.q).trim()) {
+            params.push(`%${String(req.query.q).trim()}%`);
+            where.push(`(u.name ILIKE $${params.length} OR u.email ILIKE $${params.length})`);
+        }
+        const whereSql = `WHERE ${where.join(' AND ')}`;
+
+        const [list, count] = await Promise.all([
+            query(
+                `SELECT r._id, u._id AS "userId", u.name, u.role,
+                        COALESCE(r."isRead", false) AS "isRead", r."readAt",
+                        COALESCE(r."isCleared", false) AS "isCleared",
+                        (SELECT string_agg(k.name, ', ' ORDER BY k.name) FROM "${U}" k
+                          WHERE jsonb_typeof(r.about) = 'array' AND r.about ? k._id::text) AS "aboutNames"
+                   FROM "${R}" r JOIN "${U}" u ON u._id = r.recipient
+                   ${whereSql}
+                  ORDER BY COALESCE(r."isRead", false), lower(u.name)
+                  LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+                params,
+            ),
+            query(`SELECT COUNT(*)::int AS n FROM "${R}" r JOIN "${U}" u ON u._id = r.recipient ${whereSql}`, params),
+        ]);
+        const total = count.rows[0]?.n || 0;
+        res.json({ success: true, data: list.rows, total, page, pages: Math.max(1, Math.ceil(total / limit)) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -672,7 +938,7 @@ const SORTS = {
     oldest:   'r."createdAt" ASC',
     unread:   'COALESCE(r."isRead", false) ASC, r."createdAt" DESC',
     priority: '{{RANK}} ASC, r."createdAt" DESC',
-    title:    'n.title ASC, r."createdAt" DESC',
+    title:    `${TITLE_KEY('n')} ASC, r."createdAt" DESC`,
 };
 
 exports.getAllNotifications = async (req, res) => {
@@ -703,6 +969,14 @@ exports.getAllNotifications = async (req, res) => {
         // tab badges — it is which mailbox is on screen, not a filter within it.
         const kid = await childScope(req);
         if (kid) { where.push(kid.sql('r', params.length + 1)); params.push(...kid.params); }
+
+        // The academic year on screen. Like the child, it is which mailbox is
+        // shown rather than a filter within it, so the tab badges follow it.
+        const win = await yearWindow(req);
+        if (win) {
+            const c = win.clause('r."createdAt"', params.length + 1);
+            if (c.sql) { where.push(c.sql); params.push(...c.params); }
+        }
 
         if (box === 'inbox')    where.push('NOT COALESCE(r."isCleared", false)');
         if (box === 'archived') where.push('COALESCE(r."isCleared", false)');
@@ -744,15 +1018,20 @@ exports.getAllNotifications = async (req, res) => {
             // "Inbox 3" must not drop to 0 because the reader searched for a word.
             // Sent is counted here too, so the tab carries its number before
             // anybody has opened it.
-            query(
-                `SELECT COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false))::int AS inbox,
-                        COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false)
-                                           AND NOT COALESCE(r."isRead", false))::int AS unread,
-                        COUNT(*) FILTER (WHERE COALESCE(r."isCleared", false))::int AS archived,
-                        (SELECT COUNT(*)::int FROM "${N}" WHERE sender = $1) AS sent
-                   FROM "${R}" r WHERE r.recipient = $1${kid ? ` AND ${kid.sql('r', 2)}` : ''}`,
-                [req.userId, ...(kid ? kid.params : [])],
-            ),
+            (() => {
+                const bp = [req.userId, ...(kid ? kid.params : [])];
+                const yr = yearAnd(win, 'r."createdAt"', bp.length);
+                const ys = yearAnd(win, 'sn."createdAt"', bp.length + yr.params.length);
+                return query(
+                    `SELECT COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false))::int AS inbox,
+                            COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false)
+                                               AND NOT COALESCE(r."isRead", false))::int AS unread,
+                            COUNT(*) FILTER (WHERE COALESCE(r."isCleared", false))::int AS archived,
+                            (SELECT COUNT(*)::int FROM "${N}" sn WHERE sn.sender = $1${ys.sql}) AS sent
+                       FROM "${R}" r WHERE r.recipient = $1${kid ? ` AND ${kid.sql('r', 2)}` : ''}${yr.sql}`,
+                    [...bp, ...yr.params, ...ys.params],
+                );
+            })(),
             // Who the switch offers. Only a parent has one, and it travels with
             // the list so the page needs no second request to draw it.
             req.userRole === 'parent'
@@ -793,6 +1072,7 @@ exports.getAllNotifications = async (req, res) => {
             page, pages: Math.max(1, Math.ceil(total / limit)),
             modules: links.MODULE_OPTIONS,
             ...(children ? { children, child: kid ? kid.params[0] : null } : {}),
+            ...(win ? { years: win.years, year: win.selected } : {}),
         });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
@@ -836,11 +1116,13 @@ exports.archiveRead = async (req, res) => {
         const { query } = require('../db/pool');
         const R = NotificationReceipt.tableName;
         const kid = await childScope(req);
+        const params = [req.userId, ...(kid ? kid.params : [])];
+        const y = yearAnd(await yearWindow(req), 'r."createdAt"', params.length);
         const { rowCount } = await query(
             `UPDATE "${R}" r SET "isCleared" = true, "clearedAt" = NOW()
               WHERE r.recipient = $1 AND COALESCE(r."isRead", false) AND NOT COALESCE(r."isCleared", false)
-                ${kid ? `AND ${kid.sql('r', 2)}` : ''}`,
-            [req.userId, ...(kid ? kid.params : [])],
+                ${kid ? `AND ${kid.sql('r', 2)}` : ''}${y.sql}`,
+            [...params, ...y.params],
         );
         res.json({ success: true, archived: rowCount });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }

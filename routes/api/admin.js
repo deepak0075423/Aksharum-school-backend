@@ -147,7 +147,7 @@ router.get('/parents',                      guard, adminCtrl.getParents);
 router.get('/parents/export',               guard, adminCtrl.exportParents);
 
 // All classes with sections in one call (for student form dropdowns) — active academic year only
-router.get('/classes-with-sections', guard, async (req, res) => {
+async function classesWithSections(req, res) {
     try {
         const AcademicYear = require('../../models/AcademicYear');
         const Class        = require('../../models/Class');
@@ -168,7 +168,8 @@ router.get('/classes-with-sections', guard, async (req, res) => {
         sections.forEach(s => { const k = s.class.toString(); (secMap[k] = secMap[k] || []).push(s); });
         res.json({ success: true, data: classes.map(c => ({ ...c, sections: secMap[c._id.toString()] || [] })) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
+}
+router.get('/classes-with-sections', guard, classesWithSections);
 
 // ── Academic Years ──────────────────────────────────────────────────────────
 router.get('/academic-years',                  guard, classCtrl.getAcademicYears);
@@ -369,6 +370,10 @@ router.post('/regularization/student',  attendanceGuard, attendanceCtrl.adminReg
 // ── Notifications ─────────────────────────────────────────────────────────────
 router.get('/notifications',        notifGuard, notifCtrl.getList);
 router.post('/notifications/send',  notifGuard, notifCtrl.send);
+// The composer's class → section picker. Behind the module's own guard: a
+// teacher whose designation grants admin on Notifications is refused the
+// school-admin-only /classes-with-sections, and got an empty picker.
+router.get('/notifications/classes', notifGuard, classesWithSections);
 
 // ── Aptitude Exams ────────────────────────────────────────────────────────────
 // The admin routes reach the teacher's question handlers for ANY exam in the

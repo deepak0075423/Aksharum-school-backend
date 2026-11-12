@@ -8,6 +8,12 @@ const NotificationReceiptSchema = new db.Schema({
     readAt:       { type: Date,    default: null },
     isCleared:    { type: Boolean, default: false },
     clearedAt:    { type: Date,    default: null },
+    // On a parent's receipt: which of their children it is about (Nov 2026).
+    // A parent of two reads their mailbox one child at a time, and a notice
+    // sent to parents alone — a class's parents, a sick-room note — names no
+    // child anywhere else. Empty/NULL = not recorded; the reader then decides
+    // from the notification itself (notification.controller childCond).
+    about:        [{ type: db.Types.UUID, ref: 'User' }],
 }, { timestamps: true });
 
 // One receipt per (notification × recipient)

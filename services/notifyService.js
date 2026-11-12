@@ -154,13 +154,18 @@ function _emailHtml({ school, recipientName, title, body, openUrl }) {
  *                                    module's notification is, and notificationLinks
  *                                    derives it. Pass one only when the same link
  *                                    type carries both routine and urgent news.
+ * @param {Array}   [opts.about]     The students it is about, when the parents
+ *                                    receive it without the students — so a
+ *                                    parent of two reads it under that child only
+ *                                    (each parent's receipt records which of
+ *                                    their own children it concerns).
  */
 function notify(opts) {
     setImmediate(() => _notify(opts).catch(e =>
         console.error('[notify] failed:', e.message)));
 }
 
-async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false, link = null, priority = null, attachmentFor = null }) {
+async function _notify({ school, sender, senderRole, title, body, recipients = [], email = false, includeSender = false, link = null, priority = null, attachmentFor = null, about = null }) {
     if (!sender || !title || !body) return;
 
     const ids = [...new Set(
@@ -187,11 +192,13 @@ async function _notify({ school, sender, senderRole, title, body, recipients = [
     // The inserted receipts already carry the ids each reader's link is built
     // from, so the fan-out does not need a second pass over the table — which
     // matters: a school-wide notification writes thousands of rows.
+    const aboutOf = about?.length ? await childrenByParent(about) : new Map();
     const inserted = await NotificationReceipt.insertMany(
         ids.map(uid => ({
             notification: notification._id,
             recipient:    uid,
             school:       school || null,
+            ...(aboutOf.has(uid) ? { about: aboutOf.get(uid) } : {}),
         })),
         { ordered: false }
     ).catch(() => []);
@@ -256,7 +263,7 @@ async function schoolAdminIds(schoolId) {
 }
 
 /**
- * These students and every parent of theirs the school knows.
+ * Every (student, parent) pair the school knows for these students.
  *
  * A parent is linked to a child two ways, and the two drift: the student
  * record's own `parent` pointer, and the parent account's list of `children`
@@ -266,7 +273,7 @@ async function schoolAdminIds(schoolId) {
  * in every module that sends one. Both links are read now, and a parent counts
  * only as an active parent account at the child's own school.
  */
-async function withParents(studentIds) {
+async function parentLinks(studentIds) {
     const ids = [...new Set((studentIds || []).map(String).filter(Boolean))];
     if (!ids.length) return [];
     const pool = require('../db/pool');
@@ -285,14 +292,36 @@ async function withParents(studentIds) {
                    CASE WHEN jsonb_typeof(pp."children") = 'array' THEN pp."children" ELSE '[]'::jsonb END) AS e(id)
              WHERE e.id = ANY($1::text[])
          )
-         SELECT DISTINCT l."parent"
+         SELECT DISTINCT l."student", l."parent"
            FROM links l
            JOIN ${T(User)} kid ON kid."_id"::text = l."student"
            JOIN ${T(User)} p   ON p."_id"::text = l."parent"
                 AND p."role" = 'parent' AND p."isActive" IS NOT FALSE AND p."school" = kid."school"`,
         [ids],
     ).catch((e) => { console.error('[notify] parents lookup failed:', e.message); return { rows: [] }; });
-    return [...new Set([...ids, ...rows.map((r) => String(r.parent))])];
+    return rows.map((r) => ({ student: String(r.student), parent: String(r.parent) }));
 }
 
-module.exports = { notify, deliver, schoolAdminIds, withParents };
+/**
+ * Which of these students each parent is a parent of: Map(parentId → [studentIds]).
+ * What a parent's receipt records as `about`, so a parent of two reads a
+ * notice about one child under that child only.
+ */
+async function childrenByParent(studentIds) {
+    const out = new Map();
+    for (const { student, parent } of await parentLinks(studentIds)) {
+        if (!out.has(parent)) out.set(parent, []);
+        out.get(parent).push(student);
+    }
+    return out;
+}
+
+/** These students and every parent of theirs the school knows. */
+async function withParents(studentIds) {
+    const ids = [...new Set((studentIds || []).map(String).filter(Boolean))];
+    if (!ids.length) return [];
+    const links = await parentLinks(ids);
+    return [...new Set([...ids, ...links.map((l) => l.parent)])];
+}
+
+module.exports = { notify, deliver, schoolAdminIds, withParents, parentLinks, childrenByParent };

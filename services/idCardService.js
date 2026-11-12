@@ -275,6 +275,7 @@ async function tellHolders(ctx, kind, year, cards) {
         if (parentIds.length) {
             notifyService.notify({
                 school: ctx.schoolId, sender: ctx.userId, senderRole: ctx.userRole, link, recipients: parentIds,
+                about: holders,   // a parent of two reads it under the child whose card it is
                 title: `🪪 Your child's ID card${yearName} is ready`,
                 body: 'Open ID Cards to see it, download it or print it.',
             });

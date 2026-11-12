@@ -15,6 +15,9 @@ router.get('/inbox',                     guard, ctrl.getInboxApi);
 router.get('/all',                       guard, ctrl.getAllNotifications);
 router.get('/unread-count',              guard, ctrl.getUnreadCount);
 router.get('/sent',                      guard, ctrl.getSent);
+// One sent notification opened from the Sent tab: its details, then who it reached.
+router.get('/sent/:id',                  guard, ctrl.getSentDetail);
+router.get('/sent/:id/recipients',       guard, ctrl.getSentRecipients);
 router.post('/mark-all-read',            guard, ctrl.markAllRead);
 router.post('/clear-all',               guard, ctrl.clearAll);
 router.post('/archive-read',            guard, ctrl.archiveRead);

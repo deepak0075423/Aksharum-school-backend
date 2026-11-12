@@ -99,6 +99,11 @@ async function publish(id, req, { from = ['draft', 'scheduled'] } = {}) {
         title: ann.urgent ? `🚨 ${ann.title}` : ann.title,
         body: files.length ? `${ann.message}\n\nAttached: ${files.map((f) => path.basename(f)).join(', ')}` : ann.message,
         recipients: ids, email: !!ann.sendEmail || !!ann.urgent,
+        // Parents alone: say which residents it is about, so a parent of two
+        // reads it under the child who lives in the hostel.
+        about: ann.audience === 'parents'
+            ? await recipientsFor({ school: ann.school, hostels: ann.hostels, audience: 'residents' }).catch(() => null)
+            : null,
         link: { type: 'hostel' },
         attachmentFor: files.length ? () => files.map((f) => ({ filename: path.basename(f), path: f })) : null,
     });
