@@ -154,6 +154,43 @@ async function yearForDate(schoolId, date) {
     return years.find(y => y.status === 'active')?._id || null;
 }
 
+/**
+ * The school's academic years, in order, and which one is "this year" — the
+ * one marked active, else the one today falls in (Nov 2026). Every holiday
+ * screen opens on this year rather than on all of them.
+ */
+async function schoolYears(schoolId) {
+    const { yearOrderSql } = require('../utils/listOrder');
+    const { query } = require('../db/pool');
+    const { rows } = await query(
+        `SELECT "_id", "yearName", "status", "startDate", "endDate" FROM "academicyears"
+          WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
+        [String(schoolId)],
+    );
+    const now = Date.now();
+    const current = rows.find((y) => y.status === 'active')
+        || rows.find((y) => y.startDate && y.endDate
+            && new Date(y.startDate).getTime() <= now && now <= new Date(y.endDate).getTime())
+        || null;
+    return {
+        years: rows.map((y) => ({ _id: String(y._id), name: y.yearName, status: y.status })),
+        currentYear: current ? String(current._id) : null,
+    };
+}
+
+/**
+ * The academicYear filter a read asks for: `year` = 'all' → none; a year id →
+ * that year; absent → this year, plus the old rows written before holidays
+ * carried a year (they were all this year's).
+ */
+async function yearFilter(req) {
+    const wanted = String(req.query?.year || '');
+    if (wanted === 'all') return undefined;
+    if (wanted && wanted !== 'current') return wanted;
+    const { currentYear } = await schoolYears(req.schoolId);
+    return currentYear ? { $in: [currentYear, null] } : undefined;
+}
+
 // ── Admin: list ───────────────────────────────────────────────────────────────
 exports.adminGetHolidays = async (req, res) => {
     try {
@@ -167,7 +204,9 @@ exports.adminGetHolidays = async (req, res) => {
             .populate('academicYear', 'yearName year label')
             .sort({ startDate: 1 })
             .lean();
-        res.json({ success: true, data: holidays });
+        // Every year the school has, and which is this one: the screen opens on
+        // this year and can switch to any other, or to all of them.
+        res.json({ success: true, data: holidays, ...(await schoolYears(req.schoolId)) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -516,9 +555,11 @@ async function getApplicableHolidays(req, res) {
     try {
         const StudentProfile = require('../models/StudentProfile');
 
+        // This academic year unless another is asked for (the admin screen's
+        // "Applies to me" follows its year picker).
         const filter = { school: req.schoolId };
-        const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
-        if (activeYear) filter.academicYear = { $in: [activeYear._id, null] };
+        const yr = await yearFilter(req);
+        if (yr) filter.academicYear = yr;
 
         const allHolidays = await Holiday.find(filter).sort({ startDate: 1 }).lean();
 
@@ -591,8 +632,8 @@ exports.parentGetHolidays = async (req, res) => {
         const { childCards }   = require('../services/parentChildren');
 
         const filter = { school: req.schoolId };
-        const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
-        if (activeYear) filter.academicYear = { $in: [activeYear._id, null] };
+        const yr = await yearFilter(req);   // this academic year by default
+        if (yr) filter.academicYear = yr;
 
         // Name, class and section exactly as every parent page's child switch
         // shows them; the class ids beside them decide which class days apply.
@@ -643,8 +684,8 @@ exports.teacherGetClassHolidays = async (req, res) => {
         const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 
         const filter = { school: req.schoolId };
-        const activeYear = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
-        if (activeYear) filter.academicYear = { $in: [activeYear._id, null] };
+        const yr = await yearFilter(req);   // this academic year by default
+        if (yr) filter.academicYear = yr;
 
         const teacherClassIds = new Set();
 
