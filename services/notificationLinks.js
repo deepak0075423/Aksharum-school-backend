@@ -334,13 +334,15 @@ const ROUTES = {
     },
 
     // ── Documents ────────────────────────────────────────────────────────────
-    // One document, opened on its own page. Students and parents have no such
-    // page — their list IS the destination, and {id} there becomes ?focus=.
+    // One document, opened on its own page. On the web, students, parents and
+    // teachers land on their list with the card flagged (?focus=, written out
+    // because the phone's path takes the {id}); on the phone every role opens
+    // the document's page (Nov 2026).
     'documents.item': {
-        school_admin: { web: '/admin/documents/{id}',  mobile: '/modules/admin/documents' },
-        teacher:      { web: '/teacher/documents',     mobile: '/modules/documents' },
-        student:      { web: '/student/documents',     mobile: '/modules/documents' },
-        parent:       { web: '/parent/documents',      mobile: '/modules/documents' },
+        school_admin: { web: '/admin/documents/{id}',            mobile: '/modules/document-detail?id={id}' },
+        teacher:      { web: '/teacher/documents?focus={id}',    mobile: '/modules/document-detail?id={id}' },
+        student:      { web: '/student/documents?focus={id}',    mobile: '/modules/document-detail?id={id}' },
+        parent:       { web: '/parent/documents?focus={id}',     mobile: '/modules/document-detail?id={id}' },
     },
     'documents.list': {
         school_admin: { web: '/admin/documents',   mobile: '/modules/admin/documents' },
