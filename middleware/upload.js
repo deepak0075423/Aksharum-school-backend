@@ -42,9 +42,9 @@ const chatFilter = (req, file, cb) => {
     cb(ok ? null : new Error('Unsupported file type'), ok);
 };
 
-// Video media (local S3-driver fallback). Real deployments upload direct-to-S3
-// via a presigned PUT (see services/videoStorage.getUploadTarget); this handles
-// the local/dev path.
+// Video media for the old flat video module (retired Nov 2026 — Video Learning
+// uploads now go through services/lms/uploads). Kept so nothing that imports
+// it breaks.
 const videoFilter = (req, file, cb) => {
     const ok = /\.(mp4|webm|mov|m4v|ogg)$/i.test(file.originalname) || /^video\//.test(file.mimetype);
     cb(ok ? null : new Error('Only video files are allowed (MP4, WebM, MOV)'), ok);
@@ -95,6 +95,23 @@ const admissionFilter = (req, file, cb) => {
 };
 const uploadAdmissionDoc = multer({ storage: diskStorage('admission-docs'), fileFilter: admissionFilter, limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
 
+// Video Learning pictures — book covers, chapter and video thumbnails. Public
+// (uploads/lms-images): they are drawn on every card. No SVG: it can carry script.
+const lmsImageFilter = (req, file, cb) => {
+    const ok = /\.(jpg|jpeg|png|webp)$/i.test(file.originalname) && /^image\/(jpeg|png|webp)$/.test(file.mimetype);
+    cb(ok ? null : Object.assign(new Error('Upload a JPG, PNG or WebP picture'), { status: 400 }), ok);
+};
+const uploadLmsImage = multer({ storage: diskStorage('lms-images'), fileFilter: lmsImageFilter, limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
+
+// What a school attaches to a book request — a photo of the cover, a book
+// list. Saved under uploads/lms-requests, which server.js does NOT serve: read
+// through /api/video after a check that the reader may see the request.
+const lmsRequestFilter = (req, file, cb) => {
+    const ok = /\.(pdf|jpg|jpeg|png|webp)$/i.test(file.originalname);
+    cb(ok ? null : Object.assign(new Error('Attach a PDF or a photo (JPG, PNG, WebP)'), { status: 400 }), ok);
+};
+const uploadLmsRequestDoc = multer({ storage: diskStorage('lms-requests'), fileFilter: lmsRequestFilter, limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
+
 /**
  * A multipart form's text fields only exist once multer has read it, so the
  * rules server.js applies to every other body — phone numbers
@@ -126,6 +143,6 @@ const withPhoneCheck = (instance) => {
     return instance;
 };
 [uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo,
-    uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc, uploadAdmissionDoc].forEach(withPhoneCheck);
+    uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc, uploadAdmissionDoc, uploadLmsImage, uploadLmsRequestDoc].forEach(withPhoneCheck);
 
-module.exports = { uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
+module.exports = { uploadLmsImage, uploadLmsRequestDoc, uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

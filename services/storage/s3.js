@@ -58,6 +58,34 @@ function sign({ method, url, headers = {}, body = '', payloadHash = null, region
     };
 }
 
+/**
+ * A pre-signed address (SigV4 in the query string): whoever holds it may make
+ * exactly this request until it expires — how a browser uploads a file
+ * straight to a private bucket, or reads one object from it, without ever
+ * seeing a credential. `headers` are the ones the caller must send unchanged
+ * (a PUT's content-type); the payload itself is not signed.
+ */
+function presign({ method = 'GET', url, expires = 300, headers = {}, region, service = 's3', accessKeyId, secretAccessKey, date = new Date() }) {
+    const u = new URL(url);
+    const when = amzDate(date);
+    const day = when.slice(0, 8);
+    const scope = `${day}/${region}/${service}/aws4_request`;
+    const lower = Object.fromEntries(Object.entries({ ...headers, host: u.host }).map(([k, v]) => [k.toLowerCase(), String(v).trim().replace(/\s+/g, ' ')]));
+    const names = Object.keys(lower).sort();
+    const signedHeaders = names.join(';');
+    const params = [...u.searchParams.entries(),
+        ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'], ['X-Amz-Credential', `${accessKeyId}/${scope}`], ['X-Amz-Date', when],
+        ['X-Amz-Expires', String(Math.max(1, Math.min(604800, Math.floor(expires))))], ['X-Amz-SignedHeaders', signedHeaders]];
+    const query = params.map(([k, v]) => [encode(k), encode(v)])
+        .sort((a, b) => (a[0] === b[0] ? (a[1] < b[1] ? -1 : 1) : a[0] < b[0] ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join('&');
+    const path = u.pathname.split('/').map((seg) => encode(decodeURIComponent(seg))).join('/') || '/';
+    const canonicalRequest = [method.toUpperCase(), path, query, names.map((n) => `${n}:${lower[n]}\n`).join(''), signedHeaders, 'UNSIGNED-PAYLOAD'].join('\n');
+    const stringToSign = ['AWS4-HMAC-SHA256', when, scope, sha256(canonicalRequest)].join('\n');
+    const key = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, day), region), service), 'aws4_request');
+    const signature = crypto.createHmac('sha256', key).update(stringToSign, 'utf8').digest('hex');
+    return `${u.origin}${path}?${query}&X-Amz-Signature=${signature}`;
+}
+
 function config() {
     const c = {
         bucket: process.env.S3_BUCKET || '', region: process.env.S3_REGION || 'us-east-1',
@@ -113,4 +141,4 @@ async function deleteObject(key) {
     if (!r.ok && r.status !== 404) throw new Error(`S3 delete failed: HTTP ${r.status}`);
 }
 
-module.exports = { sign, encode, config, objectUrl, putObject, getObject, getBuffer, headObject, deleteObject, EMPTY_HASH };
+module.exports = { sign, presign, encode, config, objectUrl, putObject, getObject, getBuffer, headObject, deleteObject, EMPTY_HASH };

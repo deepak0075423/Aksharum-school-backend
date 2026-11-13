@@ -293,26 +293,59 @@ const ROUTES = {
         school_admin: { web: '/admin/hostel/dashboard', mobile: '/modules/admin/hostel' },
     },
 
-    // ── Video library ────────────────────────────────────────────────────────
+    // ── Video Learning (rebuilt Nov 2026: Board → Class → Subject → Book → Chapter → Videos) ──
+    // A book, chapter or video a teacher released to the reader.
+    'video.book': {
+        student:      { web: '/student/videos/books/{id}',    mobile: '/modules/video-book?id={id}' },
+        teacher:      { web: '/teacher/videos/books/{id}',    mobile: '/modules/teacher-videos' },
+        school_admin: { web: '/admin/videos/setup',           mobile: '/modules/admin-videos' },
+    },
+    'video.chapter': {
+        student:      { web: '/student/videos/chapters/{id}', mobile: '/modules/video-chapter?id={id}' },
+        teacher:      { web: '/teacher/videos/books',         mobile: '/modules/teacher-videos' },
+    },
+    'video.watch': {
+        student:      { web: '/student/videos/watch/{id}',    mobile: '/modules/video-player?id={id}' },
+        teacher:      { web: '/teacher/videos/books',         mobile: '/modules/teacher-videos' },
+    },
+    // A student finished something the teacher released: that student's report.
+    'video.progress': {
+        teacher:      { web: '/teacher/videos/progress/students/{student}', mobile: '/modules/teacher-videos' },
+        school_admin: { web: '/admin/videos/overview',        mobile: '/modules/admin-videos' },
+    },
+    // The library has something new for the school to choose.
+    'video.setup': {
+        school_admin: { web: '/admin/videos/setup',           mobile: '/modules/admin-videos' },
+        // A teacher who receives one administers the module (AdminAreaGuard lets them in).
+        teacher:      { web: '/admin/videos/setup',           mobile: '/modules/admin-videos' },
+    },
+    // A book / chapter request: filed (Super Admin) or moved on (the school).
+    'video.requests': {
+        super_admin:  { web: '/super-admin/videos/requests',  mobile: '/(tabs)/notifications' },
+        school_admin: { web: '/admin/videos/requests',        mobile: '/modules/admin-videos' },
+        teacher:      { web: '/admin/videos/requests',        mobile: '/modules/admin-videos' },
+    },
+    // The types the old flat library wrote. Notifications stored with them
+    // still open somewhere sensible — the screens they named are gone.
     'video.item': {
-        student:      { web: '/student/videos/{id}',  mobile: '/modules/video-player?id={id}' },
-        parent:       { web: '/parent/dashboard',     mobile: '/modules/videos' },
-        teacher:      { web: '/teacher/videos/catalog', mobile: '/modules/teacher-videos' },
-        school_admin: { web: '/admin/videos/browse',  mobile: '/modules/admin-videos' },
+        student:      { web: '/student/videos',               mobile: '/modules/videos' },
+        parent:       { web: '/parent/dashboard',             mobile: '/(tabs)' },
+        teacher:      { web: '/teacher/videos/books',         mobile: '/modules/teacher-videos' },
+        school_admin: { web: '/admin/videos/overview',        mobile: '/modules/admin-videos' },
     },
     'video.list': {
-        student:      { web: '/student/videos',         mobile: '/modules/videos' },
-        parent:       { web: '/parent/dashboard',       mobile: '/modules/videos' },
-        teacher:      { web: '/teacher/videos/catalog', mobile: '/modules/teacher-videos' },
-        school_admin: { web: '/admin/videos/browse',    mobile: '/modules/admin-videos' },
+        student:      { web: '/student/videos',               mobile: '/modules/videos' },
+        parent:       { web: '/parent/dashboard',             mobile: '/(tabs)' },
+        teacher:      { web: '/teacher/videos/books',         mobile: '/modules/teacher-videos' },
+        school_admin: { web: '/admin/videos/overview',        mobile: '/modules/admin-videos' },
     },
     'video.mine': {
-        teacher:      { web: '/teacher/videos/catalog', mobile: '/modules/teacher-videos' },
-        school_admin: { web: '/admin/videos/browse',    mobile: '/modules/admin-videos' },
+        teacher:      { web: '/teacher/videos/books',         mobile: '/modules/teacher-videos' },
+        school_admin: { web: '/admin/videos/overview',        mobile: '/modules/admin-videos' },
     },
     'video.approvals': {
-        school_admin: { web: '/admin/videos/approvals', mobile: '/modules/admin-videos' },
-        teacher:      { web: '/teacher/videos/catalog', mobile: '/modules/teacher-videos' },
+        school_admin: { web: '/admin/videos/overview',        mobile: '/modules/admin-videos' },
+        teacher:      { web: '/teacher/videos/books',         mobile: '/modules/teacher-videos' },
     },
 
     // ── Teacher feedback ─────────────────────────────────────────────────────
@@ -699,7 +732,7 @@ const MODULE_LABELS = {
     leave: 'Leave', attendance: 'Attendance', fees: 'Fees', payroll: 'Payroll',
     library: 'Library', results: 'Results', timetable: 'Timetable',
     calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
-    hostel: 'Hostel', video: 'Videos', feedback: 'Feedback',
+    hostel: 'Hostel', video: 'Video Learning', feedback: 'Feedback',
     academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', admission: 'Admissions', employeeDirectory: 'Employee Directory', general: 'General',
 };
 
@@ -708,7 +741,7 @@ const MODULE_LABELS = {
 const HIGH_TYPES = [
     'leave.approvals', 'compoff.approvals',
     'attendance.regularizations', 'attendance.corrections', 'attendance.alert',
-    'inventory.requests', 'transport.requests', 'video.approvals',
+    'inventory.requests', 'transport.requests', 'video.requests',
     'feedback.pending', 'feedback.form',
     'fees.mine', 'library.myfines', 'library.manage.fines', 'library.fines',
     'substitutions',

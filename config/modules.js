@@ -22,7 +22,7 @@ const MODULES = [
     { key: 'inventory',    label: 'Inventory',        icon: '📦', adminCapable: true,  description: 'Stock, assets, purchase requests and orders' },
     { key: 'transport',    label: 'Transport',        icon: '🚌', adminCapable: true,  description: 'Fleet, routes, trips, tracking and transport fees' },
     { key: 'hostel',       label: 'Hostel',           icon: '🏨', adminCapable: true,  description: 'Hostels, rooms, beds, admissions, mess, outpass and hostel fees' },
-    { key: 'videoLibrary', label: 'Video Learning',   icon: '🎬', adminCapable: true,  description: 'Video library, assignments and approvals' },
+    { key: 'videoLibrary', label: 'Video Learning',   icon: '🎬', adminCapable: true,  description: 'Book-based video lessons: the school\'s books, teacher releases and student watch tracking' },
     { key: 'feedback',     label: 'Teacher Feedback', icon: '⭐', adminCapable: true,  description: 'Feedback campaigns, school-wide analytics and reports' },
     { key: 'leave',        label: 'Leave',            icon: '🏖️', adminCapable: true,  description: 'Leave applications, policies, balances and comp off' },
     { key: 'document',     label: 'Documents',        icon: '📁', adminCapable: true,  description: 'Document sharing and submissions' },

@@ -95,6 +95,7 @@ const STEPS = [
               WHERE "status" IN ('requested', 'accepted', 'arrived', 'treatment')`,
     },
     ...admissionSteps(),
+    ...lmsSteps(),
 ];
 
 /**
@@ -173,6 +174,87 @@ function admissionSteps() {
 }
 
 /**
+ * Video Learning (Nov 2026): what the Lms* tables need beyond syncAll().
+ *
+ *   - one LIVE assignment of a book per class and section (an ended one is
+ *     history and does not count), one open request per school for the same
+ *     thing, one book per board, class, subject, title, edition and publisher,
+ *     one provider that new uploads go to — the services check first, and
+ *     these hold the race;
+ *   - foreign keys between the module's OWN tables, as for admissions: a
+ *     chapter goes with its book and a heartbeat with its session (CASCADE),
+ *     while a board, book, chapter or video that a school's assignment, a
+ *     release or a student's progress points at cannot be deleted (RESTRICT) —
+ *     which is the rule "used content is archived, never removed", enforced
+ *     by the database as well as by services/lms/catalog. References out to
+ *     schools, users, classes and sections keep the app's no-foreign-key rule.
+ */
+function lmsSteps() {
+    const indexes = [
+        ['lmsbookassignments: one live assignment per class, section and book',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_lmsbookassignments_live"
+               ON "lmsbookassignments" ("class", (COALESCE("section"::text, '')), "book") WHERE "status" = 'active'`],
+        ['lmsrequests: one open request per school for the same thing',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_lmsrequests_open"
+               ON "lmsrequests" ("school", "dedupeKey")
+            WHERE "status" IN ('pending', 'under_review', 'approved', 'in_progress') AND "dedupeKey" <> ''`],
+        ['lmsbooks: one book per board, class, subject, title, edition and publisher',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_lmsbooks_identity"
+               ON "lmsbooks" ("board", "classLevel", "subject", lower(btrim("title")), lower(btrim(COALESCE("edition", ''))), lower(btrim(COALESCE("publisher", ''))))
+            WHERE "status" <> 'archived'`],
+        ['lmsproviders: one provider for new uploads',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_lmsproviders_default" ON "lmsproviders" (("isDefault")) WHERE "isDefault"`],
+        ['lmsvideos: one asset per Vimeo or YouTube video',
+            `CREATE UNIQUE INDEX IF NOT EXISTS "ux_lmsvideos_provider_asset"
+               ON "lmsvideos" ("provider", "providerAssetId") WHERE "providerAssetId" <> ''`],
+        ['lmsreleases: releases of a section that are open or booked',
+            `CREATE INDEX IF NOT EXISTS "ix_lmsreleases_live" ON "lmsreleases" ("section", "releaseAt") WHERE "status" IN ('scheduled', 'active')`],
+        ['lmsprogresses: a section\'s progress on a chapter video',
+            `CREATE INDEX IF NOT EXISTS "ix_lmsprogresses_cv_student" ON "lmsprogresses" ("chapterVideo", "student")`],
+    ];
+    // [constraint, child table, column, parent table, on delete]
+    const keys = [
+        ['fk_lmssubjectmaps_board',      'lmssubjectmaps',     'board',        'lmsboards',          'RESTRICT'],
+        ['fk_lmssubjectmaps_subject',    'lmssubjectmaps',     'subject',      'lmssubjects',        'RESTRICT'],
+        ['fk_lmsbooks_board',            'lmsbooks',           'board',        'lmsboards',          'RESTRICT'],
+        ['fk_lmsbooks_subject',          'lmsbooks',           'subject',      'lmssubjects',        'RESTRICT'],
+        ['fk_lmschapters_book',          'lmschapters',        'book',         'lmsbooks',           'CASCADE'],
+        ['fk_lmschaptervideos_chapter',  'lmschaptervideos',   'chapter',      'lmschapters',        'CASCADE'],
+        ['fk_lmschaptervideos_book',     'lmschaptervideos',   'book',         'lmsbooks',           'CASCADE'],
+        ['fk_lmschaptervideos_video',    'lmschaptervideos',   'video',        'lmsvideos',          'RESTRICT'],
+        ['fk_lmsvideos_subject',         'lmsvideos',          'subject',      'lmssubjects',        'SET NULL'],
+        ['fk_lmsuploads_video',          'lmsuploads',         'video',        'lmsvideos',          'CASCADE'],
+        ['fk_lmsjobs_video',             'lmsjobs',            'video',        'lmsvideos',          'CASCADE'],
+        ['fk_lmsschoolconfigs_board',    'lmsschoolconfigs',   'board',        'lmsboards',          'RESTRICT'],
+        ['fk_lmsschoolsubjects_subject', 'lmsschoolsubjects',  'lmsSubject',   'lmssubjects',        'RESTRICT'],
+        ['fk_lmsbookassignments_book',   'lmsbookassignments', 'book',         'lmsbooks',           'RESTRICT'],
+        ['fk_lmsrequests_book',          'lmsrequests',        'book',         'lmsbooks',           'SET NULL'],
+        ['fk_lmsreleases_assignment',    'lmsreleases',        'assignment',   'lmsbookassignments', 'RESTRICT'],
+        ['fk_lmsreleases_book',          'lmsreleases',        'book',         'lmsbooks',           'RESTRICT'],
+        ['fk_lmsreleases_chapter',       'lmsreleases',        'chapter',      'lmschapters',        'RESTRICT'],
+        ['fk_lmsreleases_chaptervideo',  'lmsreleases',        'chapterVideo', 'lmschaptervideos',   'RESTRICT'],
+        ['fk_lmsprogresses_book',        'lmsprogresses',      'book',         'lmsbooks',           'RESTRICT'],
+        ['fk_lmsprogresses_chapter',     'lmsprogresses',      'chapter',      'lmschapters',        'RESTRICT'],
+        ['fk_lmsprogresses_chaptervideo','lmsprogresses',      'chapterVideo', 'lmschaptervideos',   'RESTRICT'],
+        ['fk_lmsprogresses_video',       'lmsprogresses',      'video',        'lmsvideos',          'RESTRICT'],
+        ['fk_lmswatchsessions_progress', 'lmswatchsessions',   'progress',     'lmsprogresses',      'CASCADE'],
+        ['fk_lmsheartbeats_session',     'lmsheartbeats',      'session',      'lmswatchsessions',   'CASCADE'],
+    ];
+    return [
+        ...indexes.map(([name, sql]) => ({ name, sql })),
+        ...keys.map(([con, child, col, parent, onDelete]) => ({
+            name: `${child}.${col} → ${parent} (${onDelete})`,
+            sql: `DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${con}') THEN
+                        ALTER TABLE "${child}" ADD CONSTRAINT "${con}"
+                            FOREIGN KEY ("${col}") REFERENCES "${parent}"("_id") ON DELETE ${onDelete};
+                    END IF;
+                  END $$`,
+        })),
+    ];
+}
+
+/**
  * Data changes that must happen exactly once, not on every boot: each is
  * claimed in the "datamigrations" ledger first (one row per name), so of two
  * servers booting together only one runs it; a step that fails gives its
@@ -199,6 +281,17 @@ const ONCE = [
         run: async () => {
             const r = await require('../services/phoneBackfill').normalizeStoredPhones({ apply: true });
             return `${r.changed} of ${r.scanned} phone numbers rewritten as ten digits, ${r.leftAlone} left as they are${r.skipped ? `, ${r.skipped} saved meanwhile` : ''}`;
+        },
+    },
+    {
+        // Video Learning was rebuilt around books and chapters (Nov 2026). The
+        // videos of the old master library are copied into the new asset
+        // library, once, so nothing uploaded before is lost; the old tables
+        // are left exactly as they were.
+        name: 'video learning: old master videos copied into the asset library (Nov 2026)',
+        run: async () => {
+            const r = await require('../services/lms/legacy').copyMasterVideos();
+            return `${r.copied} of ${r.found} old master videos copied, ${r.skipped} already there`;
         },
     },
 ];

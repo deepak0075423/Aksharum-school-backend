@@ -97,11 +97,17 @@ app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1);
 // ── Rate limiting (Redis-backed, shared across cluster workers; fails open) ────
 // Generous global guard against a single abusive client / retry storm, plus a
 // tighter bucket on auth endpoints to blunt credential-stuffing. All env-tunable.
-app.use('/api', rateLimit({
+const apiLimiter = rateLimit({
     prefix: 'api',
     windowSec: Number(process.env.RL_API_WINDOW) || 60,
     max:       Number(process.env.RL_API_MAX)    || 1200,
-}));
+});
+// A video player reports every few seconds for as long as it plays, and a whole
+// class watches from one address — together they would spend this per-ADDRESS
+// allowance on their own. Those two calls are limited per PERSON instead
+// (routes/api/video.js), and the video bytes by their signed address.
+const VIDEO_PLAYBACK = /^\/video\/(student\/sessions\/[^/]+\/heartbeat|stream\/|hls\/)/;
+app.use('/api', (req, res, next) => (VIDEO_PLAYBACK.test(req.path) ? next() : apiLimiter(req, res, next)));
 // Tighter bucket on the brute-forceable, UNauthenticated surface only (login /
 // OTP / password-reset / magic-link). Deliberately excludes /refresh and /me —
 // those scale with user count and would false-positive for a whole school behind
@@ -141,6 +147,12 @@ const PRIVATE_UPLOADS = {
     'hostel-docs': 'Hostel files are opened from the hostel screens',
     'medical-docs': 'Medical files are opened from the Medical Room screens',
     'admission-docs': 'Admission documents are opened from the admission screens',
+    // Video Learning: the videos themselves, and what a school attaches to a
+    // request. A video is only ever played through /api/video/stream/<token>.
+    'lms-videos': 'Videos are played from the Video Learning screens',
+    'lms-requests': 'Request attachments are opened from the Video Learning screens',
+    // The old video module kept uploads here, open to anyone with the address.
+    videos: 'Videos are played from the Video Learning screens',
 };
 const privateFiles = require('./services/privateFiles');
 app.use('/uploads', async (req, res, next) => {
@@ -621,23 +633,10 @@ if (isPrimaryWorker) {
     // instance never acts twice.
     require('./services/admission/sweep').start();
 
-    // ── Video scheduled-publish worker ────────────────────────────────────────
-    // Flips master videos from 'scheduled' → 'published' once scheduledAt passes.
-    (function scheduleVideoPublisher() {
-        const Video = require('./models/Video');
-        setInterval(async () => {
-            try {
-                const due = await Video.find(
-                    { status: 'scheduled', scheduledAt: { $lte: new Date() }, isDeleted: false }, '_id',
-                ).lean();
-                if (due.length) {
-                    await Video.updateMany(
-                        { _id: { $in: due.map((v) => v._id) } },
-                        { $set: { status: 'published', publishedAt: new Date(), scheduledAt: null } },
-                    );
-                    console.log(`[Video] Auto-published ${due.length} scheduled video(s)`);
-                }
-            } catch (err) { console.error('[Video] scheduled-publish error:', err.message); }
-        }, 60 * 1000); // check every minute
-    }());
+    // ── Video Learning clock ──────────────────────────────────────────────────
+    // Uploaded videos are processed, scheduled releases open (and their students
+    // are told), expired ones close, quiet watch sessions end, reminders go out.
+    // Every step claims its rows first (services/lms/sweep.js), so a restart or
+    // a second instance never acts twice.
+    require('./services/lms/sweep').start();
 }

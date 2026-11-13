@@ -37,8 +37,10 @@ const TransportAssignment   = require('../models/TransportAssignment');
 const TransportTrip         = require('../models/TransportTrip');
 const TransportFeeInvoice   = require('../models/TransportFeeInvoice');
 const TransportComplaint    = require('../models/TransportComplaint');
-const VideoProgress         = require('../models/VideoProgress');
-const VideoAssignment       = require('../models/VideoAssignment');
+// Video Learning's own tables (rebuilt Nov 2026 — services/lms): what a student
+// watched is LmsProgress, what they were given is a teacher's LmsRelease.
+const LmsProgress           = require('../models/LmsProgress');
+const lmsPool               = require('../db/pool');
 const AssignmentSubmission  = require('../models/AssignmentSubmission');
 const Document              = require('../models/Document');
 const Timetable             = require('../models/Timetable');
@@ -470,14 +472,14 @@ async function batchMetrics(studentIds, sectionIds, modules, schoolId, activeYea
 
     if (modules.videoLibrary) {
         jobs.push((async () => {
-            const progress = await VideoProgress.find({ student: { $in: studentIds }, school: schoolId })
-                .select('student completed progressPercent').lean();
+            const progress = await LmsProgress.find({ student: { $in: studentIds }, school: schoolId, watchedSeconds: { $gt: 0 } })
+                .select('student status').lean();
             const byStudent = {};
             progress.forEach((p) => { (byStudent[String(p.student)] = byStudent[String(p.student)] || []).push(p); });
             studentIds.forEach((id) => {
                 const list = byStudent[id] || [];
                 out[id].videosWatched   = list.length;
-                out[id].videosCompleted = list.filter((p) => p.completed).length;
+                out[id].videosCompleted = list.filter((p) => p.status === 'completed').length;
             });
         })());
     }
@@ -1186,58 +1188,62 @@ function invoiceSummary(invoices) {
 async function videosBlock(ctx) {
     const { user, profile, schoolId } = ctx;
     const sectionId = sid(profile.currentSection);
+    const q = async (sql, params) => (await lmsPool.query(sql, params)).rows;
 
-    const [progress, assignments] = await Promise.all([
-        VideoProgress.find({ student: user._id, school: schoolId })
-            .populate('video', 'title durationSec thumbnailUrl')
-            .sort({ lastWatchedAt: -1 }).lean(),
-        VideoAssignment.find({
-            school: schoolId, isDeleted: false,
-            $or: [
-                ...(sectionId ? [{ section: sectionId }] : []),
-                { students: user._id },
-            ],
-        }).select('title status endDate mandatory minWatchPercent videos students recipientCount').lean(),
+    // The same shape this tab has always been given, read from the book-based
+    // module: `progress` is what the student watched, and what used to be
+    // "assignments" is what teachers have released to them.
+    const [progress, releases] = await Promise.all([
+        q(`SELECT p."_id", p."status", p."watchedPercent", p."watchedSeconds", p."sessionsCount", p."lastWatchedAt",
+                  v."title", v."thumbnailUrl", v."durationSec"
+             FROM "lmsprogresses" p JOIN "lmsvideos" v ON v."_id" = p."video"
+            WHERE p."student" = $1 AND p."school" = $2 AND p."watchedSeconds" > 0
+            ORDER BY p."lastWatchedAt" DESC NULLS LAST`, [user._id, schoolId]),
+        sectionId ? q(`
+            SELECT r."_id", r."level", r."status", r."releaseAt", r."expiresAt", k."title" AS "bookTitle", ch."title" AS "chapterTitle", v."title" AS "videoTitle",
+                   (SELECT count(*) FROM "lmschaptervideos" cv
+                      JOIN "lmschapters" c2 ON c2."_id" = cv."chapter" AND c2."status" = 'active'
+                     WHERE cv."book" = r."book" AND cv."isActive"
+                       AND (r."level" = 'book' OR cv."chapter" = r."chapter") AND (r."level" <> 'video' OR cv."_id" = r."chapterVideo"))::int AS "videoCount"
+              FROM "lmsreleases" r JOIN "lmsbooks" k ON k."_id" = r."book"
+              LEFT JOIN "lmschapters" ch ON ch."_id" = r."chapter" LEFT JOIN "lmsvideos" v ON v."_id" = r."video"
+             WHERE r."school" = $1 AND r."section" = $2 AND r."releaseAt" <= now()
+               AND (r."audience" = 'all' OR r."students" ? $3)
+             ORDER BY r."releaseAt" DESC LIMIT 50`, [schoolId, sectionId, String(user._id)]) : [],
     ]);
 
-    // Only assignments that actually reach this student (a section-wide row may
-    // still carry an explicit recipient list).
-    const mine = assignments.filter((a) => {
-        const list = (a.students || []).map(String);
-        return !list.length || list.includes(String(user._id));
-    });
-
-    const completed  = progress.filter((p) => p.completed);
+    const live = (r) => ['scheduled', 'active'].includes(r.status) && (!r.expiresAt || new Date(r.expiresAt) > new Date());
+    const completed  = progress.filter((p) => p.status === 'completed');
     const watchedSec = sum(progress, (p) => p.watchedSeconds);
 
     return {
         summary: {
-            assignments:      mine.length,
-            activeAssignments: mine.filter((a) => low(a.status) === 'active').length,
+            assignments:      releases.length,
+            activeAssignments: releases.filter(live).length,
             videosStarted:    progress.length,
             videosCompleted:  completed.length,
             completionRate:   pct(completed.length, progress.length),
             watchHours:       Math.round((watchedSec / 3600) * 10) / 10,
-            avgProgress:      progress.length ? Math.round((sum(progress, (p) => p.progressPercent) / progress.length) * 10) / 10 : null,
-            replays:          sum(progress, (p) => p.replayCount || 0),
+            avgProgress:      progress.length ? Math.round((sum(progress, (p) => (p.status === 'completed' ? 100 : p.watchedPercent)) / progress.length) * 10) / 10 : null,
+            replays:          sum(progress, (p) => Math.max(0, (p.sessionsCount || 0) - 1)),
             lastWatchedAt:    progress.length ? progress[0].lastWatchedAt : null,
         },
         recent: progress.slice(0, 15).map((p) => ({
             _id:        p._id,
-            title:      p.video?.title || 'Video',
-            // Already populated for the title — carrying it costs nothing and
-            // is the difference between a list and something worth looking at.
-            thumbnail:  p.video?.thumbnailUrl || '',
-            durationMin: p.video?.durationSec ? Math.round(p.video.durationSec / 60) : null,
-            progress:   p.progressPercent,
-            completed:  p.completed,
+            title:      p.title || 'Video',
+            thumbnail:  p.thumbnailUrl || '',
+            durationMin: p.durationSec ? Math.round(p.durationSec / 60) : null,
+            progress:   p.status === 'completed' ? 100 : p.watchedPercent,
+            completed:  p.status === 'completed',
             watchedMin: Math.round((p.watchedSeconds || 0) / 60),
             lastAt:     p.lastWatchedAt,
         })),
-        assignments: mine.slice(0, 15).map((a) => ({
-            _id: a._id, title: a.title, status: low(a.status),
-            dueDate: a.endDate, mandatory: !!a.mandatory,
-            videoCount: (a.videos || []).length,
+        assignments: releases.slice(0, 15).map((r) => ({
+            _id: r._id,
+            title: r.level === 'book' ? r.bookTitle : r.level === 'chapter' ? `${r.chapterTitle} — ${r.bookTitle}` : `${r.videoTitle} — ${r.bookTitle}`,
+            status: live(r) ? 'active' : (r.status === 'active' || r.status === 'scheduled' ? 'expired' : r.status),
+            dueDate: r.expiresAt, mandatory: false,
+            videoCount: r.videoCount,
         })),
     };
 }

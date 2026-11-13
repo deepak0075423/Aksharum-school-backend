@@ -20,7 +20,8 @@ const ROLES = Object.keys(INBOX);
 // rather than trusting one line to hold it all.
 const used = new Map();   // type → [file:line]
 for (const dir of DIRS) {
-    for (const f of fs.readdirSync(path.join(ROOT, dir)).filter(n => n.endsWith('.js'))) {
+    // Sub-folders too (services/lms, services/admission, controllers/lms…).
+    for (const f of fs.readdirSync(path.join(ROOT, dir), { recursive: true }).map(String).filter(n => n.endsWith('.js'))) {
         const rel  = `${dir}/${f}`;
         const text = fs.readFileSync(path.join(ROOT, rel), 'utf8');
         for (const m of text.matchAll(/\blink:\s*(?![:=])/g)) {
