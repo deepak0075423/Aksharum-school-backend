@@ -787,10 +787,16 @@ exports.teacherGetClassHolidays = async (req, res) => {
             return res.json({ success: true, data: [], types, classes: [] });
         }
 
+        // Every day the teacher's classes do not meet: a holiday declared for
+        // one of them, and a whole-school holiday, which closes them all. Only
+        // the class ones used to be listed, so a school-wide day off never
+        // showed here at all (Nov 2026, user report).
         const classHolidays = await Holiday.find({
             ...filter,
-            'applicability.scope': 'specific_classes',
-            'applicability.classes': { $in: [...teacherClassIds] },
+            $or: [
+                { 'applicability.scope': 'specific_classes', 'applicability.classes': { $in: [...teacherClassIds] } },
+                { 'applicability.scope': { $in: ['all', null] } },
+            ],
         })
             .populate('applicability.classes', 'className')
             .sort({ startDate: 1 })
@@ -811,15 +817,23 @@ exports.teacherGetClassHolidays = async (req, res) => {
 
         res.json({
             success: true,
-            data: classHolidays.map((h) => ({
-                ...h,
-                // Which of the named classes are the reader's own; the rest are
-                // other people's and are counted rather than listed.
-                myClasses: [...new Set((h.applicability?.classes || [])
-                    .filter((c) => mine.has(String(c._id)))
-                    .map((c) => c.className)
-                    .filter(Boolean))],
-            })),
+            data: classHolidays
+                // A legacy department-only row is not a day off for classes.
+                .filter((h) => h.applicability?.scope !== 'specific_departments')
+                .map((h) => {
+                    const wholeSchool = (h.applicability?.scope || 'all') === 'all';
+                    return {
+                        ...h,
+                        wholeSchool,
+                        // Which of the named classes are the reader's own; the rest are
+                        // other people's and are counted rather than listed. A
+                        // whole-school day closes every one of the reader's classes.
+                        myClasses: wholeSchool ? names : [...new Set((h.applicability?.classes || [])
+                            .filter((c) => mine.has(String(c._id)))
+                            .map((c) => c.className)
+                            .filter(Boolean))],
+                    };
+                }),
             types,
             classes: names,
         });
