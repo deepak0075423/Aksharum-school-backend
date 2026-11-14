@@ -53,10 +53,12 @@ router.get('/books/:id/labels',               librarianGuard, libCtrl.copyLabels
 router.get('/books/:id/copies/:copyId/barcode', librarianGuard, libCtrl.copyBarcode);
 
 // Counter scanner — one copy code in, the desk's next move out
+router.get('/scan/search',        librarianGuard, libCtrl.searchCopies);
 router.get('/scan',               librarianGuard, libCtrl.scanCopy);
 
 // Member lookup — the issue counter's typeahead
 router.get('/members',            librarianGuard, libCtrl.searchMembers);
+router.get('/members/:id',        librarianGuard, libCtrl.getMember);
 // Classes and sections for the circulation filters
 router.get('/classes',            librarianGuard, libCtrl.getClassList);
 

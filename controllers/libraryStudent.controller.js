@@ -34,6 +34,13 @@ exports.getDashboard = async (req, res) => {
             expireStaleHolds(req.schoolId, null, { actor: req.userId, actorRole: req.userRole }),
         ]);
 
+        // A member's recent movements are this academic year's — plus anything
+        // still out, whenever it was borrowed — so a new year does not open on
+        // last year's loans.
+        const yr = await require('../utils/activeYear').activeYearWindow(req.schoolId);
+        const inYear = yr
+            ? { $or: [{ status: { $in: ACTIVE_ISSUANCE } }, { issueDate: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }] }
+            : {};
         const [myIssuances, myFines, myReservations, counts, cats, history] = await Promise.all([
             LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, status: { $in: ACTIVE_ISSUANCE } })
                 .populate('book', 'title isbn authors category coverImage')
@@ -59,7 +66,7 @@ exports.getDashboard = async (req, res) => {
             ),
             // The member's own last few movements, returns included — the live
             // list above only ever holds what they still have.
-            LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId })
+            LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, ...inYear })
                 .populate('book', 'title')
                 .sort({ issueDate: -1 }).limit(8).lean(),
         ]);
@@ -85,8 +92,10 @@ exports.getDashboard = async (req, res) => {
 // What the catalogue may be ordered by, and the column behind it. A whitelist,
 // because the value arrives from the query string.
 const SEARCH_SORTS = {
-    title_asc:  { title: 1 },
-    title_desc: { title: -1 },
+    // A–Z means A–Z whatever the case — a plain column sort put every title
+    // starting with a lowercase letter after "Z".
+    title_asc:  { title: 'asc_ci' },
+    title_desc: { title: 'desc_ci' },
     newest:     { createdAt: -1 },
     available:  { availableCopies: -1 },
 };

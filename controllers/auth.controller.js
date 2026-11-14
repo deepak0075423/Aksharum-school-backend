@@ -326,7 +326,16 @@ exports.getMe = async (req, res) => {
     // The seats this session can move between, so the app can draw the switcher
     // on a plain page load and not only right after sign-in.
     const accounts = await identity.switchTargets(req.user);
-    res.json({ success: true, user: { ...user, accounts } });
+    // A teacher's (or staff member's) designation — "Librarian", "Vice
+    // Principal" — is what the header and the sidebar show instead of the
+    // system role. A school admin is shown as School Admin either way.
+    let designation = '';
+    if (req.user.role === 'teacher') {
+        const tp = await require('../models/TeacherProfile')
+            .findOne({ user: req.user._id }).select('designation').lean().catch(() => null);
+        designation = String(tp?.designation || '').trim();
+    }
+    res.json({ success: true, user: { ...user, accounts, designation } });
 };
 
 exports.refreshToken = async (req, res) => {

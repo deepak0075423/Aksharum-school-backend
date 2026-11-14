@@ -348,17 +348,24 @@ function normalizeSort(sort) {
             s.startsWith('-') ? [s.slice(1), -1] : [s, 1]
         ));
     }
-    return Object.entries(sort).map(([k, v]) => [k, (v === -1 || v === '-1' || v === 'desc' || v === 'descending') ? -1 : 1]);
+    // 'asc_ci' / 'desc_ci': A–Z ignoring case ("algebra" between "Algebra" and
+    // "Biology", not after "Zoology"). Opt-in, so every existing sort keeps
+    // the plain column order (and its index).
+    return Object.entries(sort).map(([k, v]) => [k,
+        (v === -1 || v === '-1' || v === 'desc' || v === 'descending' || v === 'desc_ci') ? -1 : 1,
+        v === 'asc_ci' || v === 'desc_ci']);
 }
 
 function orderClause(parsed, sort) {
     const norm = normalizeSort(sort);
     if (!norm.length) return '';
     const parts = [];
-    for (const [path, dir] of norm) {
+    for (const [path, dir, ci] of norm) {
         const r = resolvePath(parsed, path);
         const d = dir === -1 ? 'DESC' : 'ASC';
-        if (r.mode === 'column') parts.push(`${qi(r.name)} ${d}`);
+        // Case-insensitive, with the exact value as the tie-break so the order is stable.
+        if (r.mode === 'column' && ci) parts.push(`lower(${qi(r.name)}) ${d}, ${qi(r.name)} ${d}`);
+        else if (r.mode === 'column') parts.push(`${qi(r.name)} ${d}`);
         else if (r.mode === 'json') {
             const expr = jsonPathExpr(qi(r.name), r.segs, true);
             const kind = r.leaf ? r.leaf.kind : 'mixed';

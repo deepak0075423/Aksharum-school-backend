@@ -63,8 +63,14 @@ exports.getOverview = async (req, res) => {
         const profileByUser = Object.fromEntries(profiles.map((p) => [String(p.user), p]));
 
         // Three queries for every child at once rather than three per child.
+        // This academic year's loans, plus anything still out from before —
+        // a parent opening the new year should not be shown last year's books.
+        const yr = await require('../utils/activeYear').activeYearWindow(req.schoolId);
+        const inYear = yr
+            ? { $or: [{ status: { $in: ACTIVE_ISSUANCE } }, { issueDate: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }] }
+            : {};
         const [loansRaw, fines, holds] = await Promise.all([
-            LibraryIssuance.find({ school: req.schoolId, issuedTo: { $in: ids } })
+            LibraryIssuance.find({ school: req.schoolId, issuedTo: { $in: ids }, ...inYear })
                 .populate('book', 'title isbn authors category coverImage')
                 .populate('bookCopy', 'uniqueCode')
                 .sort({ issueDate: -1 }).lean(),

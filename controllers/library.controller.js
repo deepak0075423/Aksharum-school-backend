@@ -17,6 +17,8 @@ const School             = require('../models/School');
 const { barcodeSvg, labelSheetHtml } = require('../services/barcode');
 const { wantsXlsx, sendXlsx, day }   = require('../services/libraryExport');
 const Class                          = require('../models/Class');
+const AcademicYear                   = require('../models/AcademicYear');
+const bookRules                      = require('../services/libraryBookRules');
 const ClassSection                   = require('../models/ClassSection');
 const TeacherProfile     = require('../models/TeacherProfile');
 const { notify }         = require('../services/notifyService');
@@ -192,8 +194,16 @@ exports.getDashboard = async (req, res) => {
              WHERE i."school" = $1 ${where}
              ORDER BY ${order} LIMIT ${limit}`;
 
+        // Recent issuances are this academic year's: when the school moves to
+        // a new year the list starts over instead of showing last year's loans.
+        // The overdue list stays live — a book overdue since last year is still
+        // out and still the librarian's problem.
+        const yr = await require('../utils/activeYear').activeYearWindow(req.schoolId);
         const [recentRows, overdueRows] = await Promise.all([
-            pool.query(listSql('', 'i."issueDate" DESC', 10), [String(req.schoolId)]),
+            yr
+                ? pool.query(listSql(`AND i."issueDate" >= $2 AND ($3::timestamptz IS NULL OR i."issueDate" <= $3)`, 'i."issueDate" DESC', 10),
+                    [String(req.schoolId), yr.start, yr.end])
+                : pool.query(listSql('', 'i."issueDate" DESC', 10), [String(req.schoolId)]),
             pool.query(listSql(`AND i."status" = 'overdue'`, 'i."dueDate" ASC', 8), [String(req.schoolId)]),
         ]);
 
@@ -221,6 +231,7 @@ exports.getDashboard = async (req, res) => {
             data: {
                 ...tiles,
                 recent:  recentRows.rows.map(shape),
+                recentYear: yr?.yearName || null,
                 overdueList: overdueRows.rows.map(shape),
             },
         });
@@ -250,11 +261,13 @@ const BOOK_STATUS_SQL = `CASE
 
 // What may be sorted on, and the column behind it. A whitelist because the
 // value lands in the ORDER BY — never interpolate a query parameter there.
+// Text columns order A–Z ignoring case: a plain column sort put every title
+// that starts with a lowercase letter after "Z".
 const BOOK_SORTS = {
-    title:     'b."title"',
-    authors:   'b."authors"',
+    title:     'lower(b."title")',
+    authors:   'lower(b."authors"::text)',
     isbn:      'b."isbn"',
-    category:  'b."category"',
+    category:  'lower(b."category")',
     available: 'b."availableCopies"',
     total:     'b."totalCopies"',
     status:    '"status"',
@@ -363,43 +376,6 @@ exports.getBooks = async (req, res) => {
 };
 
 /**
- * The catalogue fields that are neither text nor a list: a year somebody can
- * mistype as 20255, a page count that cannot be negative. Both are optional —
- * blank stays blank rather than becoming zero.
- */
-function bibliographic(body) {
-    const out = {};
-    const year = body.publishedYear;
-    if (year !== undefined) {
-        if (year === '' || year === null) out.publishedYear = null;
-        else {
-            const n = Number(year);
-            const max = new Date().getFullYear() + 1;   // next year's editions do exist
-            if (!Number.isInteger(n) || n < 1450 || n > max)
-                return { error: `Publication year must be a whole year between 1450 and ${max}` };
-            out.publishedYear = n;
-        }
-    }
-    const pages = body.pages;
-    if (pages !== undefined) {
-        if (pages === '' || pages === null) out.pages = null;
-        else {
-            const n = Number(pages);
-            if (!Number.isInteger(n) || n < 1 || n > 20000)
-                return { error: 'Number of pages must be a whole number between 1 and 20000' };
-            out.pages = n;
-        }
-    }
-    if (body.subjects !== undefined) {
-        const list = Array.isArray(body.subjects)
-            ? body.subjects
-            : String(body.subjects).split(',');
-        out.subjects = [...new Set(list.map((t) => String(t).trim()).filter(Boolean))].slice(0, 20);
-    }
-    return { value: out };
-}
-
-/**
  * The copy codes for a new batch: the library's own sequence, or the ones a
  * school already has written inside its books.
  *
@@ -425,14 +401,14 @@ async function codesFor(schoolId, count, typed) {
 
 exports.createBook = async (req, res) => {
     try {
-        const { title, isbn, authors, publisher, category, edition, language, description } = req.body;
-        if (!title?.trim()) return res.status(400).json({ success: false, message: 'Title is required' });
-        if (title.trim().length > 300) return res.status(400).json({ success: false, message: 'Title is too long (max 300 characters)' });
-        if (isbn && !isValidIsbn(isbn))
-            return res.status(400).json({ success: false, message: 'ISBN must be 10 or 13 digits (hyphens and spaces are fine)' });
-
-        const extra = bibliographic(req.body);
-        if (extra.error) return res.status(400).json({ success: false, message: extra.error });
+        // Every field checked by the one rule set (services/libraryBookRules),
+        // the copies' acquisition details included — the form mirrors it.
+        const checked = bookRules.checkBook(req.body);
+        if (checked.error) return bookRules.refuse(res, checked);
+        const copyDetail = bookRules.checkCopy(req.body);
+        if (copyDetail.error) return bookRules.refuse(res, copyDetail);
+        const { title, isbn = '', authors = [], publisher = '', category = '', edition = '',
+                language = 'English', description = '', ...extra } = checked.value;
 
         // Copies can be registered in the same breath as the title. A catalogue
         // entry with none of them cannot be issued or reserved, and asking for
@@ -456,16 +432,16 @@ exports.createBook = async (req, res) => {
         if (picked.error) return res.status(400).json({ success: false, message: picked.error });
 
         const book = await LibraryBook.create({
-            school: req.schoolId, title: title.trim(), isbn: isbn || '',
-            authors: authors || [], publisher: publisher || '', category: category || '',
-            edition: edition || '', language: language || 'English', description: description || '',
-            coverImage: '', ...extra.value,
+            school: req.schoolId, title, isbn,
+            authors, publisher, category,
+            edition, language, description,
+            coverImage: '', ...extra,
             createdBy: req.userId,
         });
         audit(req.schoolId, req.userId, req.userRole, 'BOOK_CREATED', 'Book', book._id, null, book.toObject());
 
         if (count > 0) {
-            const { condition, rackLocation, acquisitionDate, vendor, billNumber, cost } = req.body;
+            const { condition, rackLocation, acquisitionDate, vendor, billNumber, cost } = copyDetail.value;
             const { codes } = picked;
             await LibraryBookCopy.insertMany(codes.map((code) => buildCopy(
                 req.schoolId, book._id, code, req.userId,
@@ -650,11 +626,11 @@ exports.updateBook = async (req, res) => {
     try {
         const old  = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!old)  return res.status(404).json({ success: false, message: 'Book not found' });
-        const { title, isbn, authors, publisher, category, edition, language, description } = req.body;
-        if (title !== undefined && !title?.trim())
-            return res.status(400).json({ success: false, message: 'Title is required' });
-        if (isbn && !isValidIsbn(isbn))
-            return res.status(400).json({ success: false, message: 'ISBN must be 10 or 13 digits (hyphens and spaces are fine)' });
+        // Only what was sent is checked; an ISBN left as it was is not
+        // re-judged, so a book catalogued before these rules can still be edited.
+        const checked = bookRules.checkBook(req.body, { partial: true, old });
+        if (checked.error) return bookRules.refuse(res, checked);
+        const { title, isbn, authors, publisher, category, edition, language, description } = checked.value;
 
         // Renaming a book onto an entry that already exists is the same mistake
         // as adding it twice, so it is caught the same way.
@@ -665,11 +641,9 @@ exports.updateBook = async (req, res) => {
         }, old._id);
         if (dup) return duplicateResponse(res, dup);
 
-        const extra = bibliographic(req.body);
-        if (extra.error) return res.status(400).json({ success: false, message: extra.error });
-
-        const update = { ...extra.value };
-        if (title       !== undefined) update.title       = title.trim();
+        const update = {};
+        for (const k of ['publishedYear', 'pages', 'subjects']) if (checked.value[k] !== undefined) update[k] = checked.value[k];
+        if (title       !== undefined) update.title       = title;
         if (isbn        !== undefined) update.isbn        = isbn;
         if (authors     !== undefined) update.authors     = authors;
         if (publisher   !== undefined) update.publisher   = publisher;
@@ -784,9 +758,14 @@ exports.exportBooks = async (req, res) => {
 // teacher — the same wall the member lookup ran into.
 exports.getClassList = async (req, res) => {
     try {
+        // The current academic year's classes only: every year has its own
+        // "Class 6", and a student's class (what these filters match) is their
+        // active-year placement. A school with no active year yet sees them all.
+        const active = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).select('_id').lean();
+        const inYear = active ? { academicYear: active._id } : {};
         const [classes, sections] = await Promise.all([
-            Class.find({ school: req.schoolId }).select('className classNumber').sort({ classNumber: 1 }).lean(),
-            ClassSection.find({ school: req.schoolId }).select('sectionName class').sort({ sectionName: 1 }).lean(),
+            Class.find({ school: req.schoolId, ...inYear }).select('className classNumber').sort({ classNumber: 1 }).lean(),
+            ClassSection.find({ school: req.schoolId, ...inYear }).select('sectionName class').sort({ sectionName: 1 }).lean(),
         ]);
         const byClass = sections.reduce((m, s) => { (m[String(s.class)] ||= []).push({ _id: s._id, name: s.sectionName }); return m; }, {});
         res.json({
@@ -857,7 +836,16 @@ exports.bulkUpload = async (req, res) => {
         for (const e of entries) {
             const key = normIsbn(e.doc.isbn) || `${normText(e.doc.title)}|${normText(e.doc.edition)}`;
             if (seen.has(key)) { skipped.push({ title: e.doc.title, reason: 'repeated in this file' }); continue; }
-            if (e.doc.isbn && !isValidIsbn(e.doc.isbn)) { skipped.push({ title: e.doc.title, reason: 'invalid ISBN' }); continue; }
+            // The form's rules, row by row — a row that would be refused on the
+            // form is skipped here with the same reason.
+            const ok = bookRules.checkBook({
+                title: e.doc.title, isbn: e.doc.isbn, authors: e.doc.authors, publisher: e.doc.publisher,
+                category: e.doc.category, edition: e.doc.edition, language: e.doc.language, description: e.doc.description,
+            });
+            if (ok.error) { skipped.push({ title: e.doc.title, reason: ok.error }); continue; }
+            Object.assign(e.doc, ok.value);
+            const rack = bookRules.checkCopy({ rackLocation: e.rackLocation });
+            if (rack.error) { skipped.push({ title: e.doc.title, reason: rack.error }); continue; }
             const dup = await findDuplicateBook(req.schoolId, e.doc);
             if (dup) { skipped.push({ title: e.doc.title, reason: 'already in the catalogue' }); continue; }
             seen.add(key);
@@ -893,7 +881,9 @@ exports.addCopy = async (req, res) => {
         const book = await LibraryBook.findOne({ _id: req.params.id, school: req.schoolId });
         if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
 
-        const { condition, rackLocation, acquisitionDate, vendor, billNumber, cost } = req.body;
+        const detail = bookRules.checkCopy(req.body);
+        if (detail.error) return bookRules.refuse(res, detail);
+        const { condition, rackLocation, acquisitionDate, vendor, billNumber, cost } = detail.value;
         const count = Math.floor(Number(req.body.count ?? 1));
         if (!Number.isFinite(count) || count < 1 || count > MAX_COPIES_PER_ADD)
             return res.status(400).json({ success: false, message: `Number of copies must be between 1 and ${MAX_COPIES_PER_ADD}` });
@@ -922,18 +912,16 @@ exports.editCopy = async (req, res) => {
         const old  = await LibraryBookCopy.findOne({ _id: req.params.copyId, book: req.params.id, school: req.schoolId }).lean();
         if (!old)  return res.status(404).json({ success: false, message: 'Copy not found' });
 
-        const { condition, rackLocation, vendor, billNumber, cost, acquisitionDate } = req.body;
+        const detail = bookRules.checkCopy(req.body);
+        if (detail.error) return bookRules.refuse(res, detail);
+        const { condition, rackLocation, vendor, billNumber, cost, acquisitionDate } = detail.value;
         const update = {};
         if (condition    !== undefined) update.condition    = condition;
         if (rackLocation !== undefined) update.rackLocation = rackLocation;
         if (vendor       !== undefined) update.vendor       = vendor;
         if (billNumber   !== undefined) update.billNumber   = billNumber;
         if (acquisitionDate !== undefined) update.acquisitionDate = acquisitionDate ? new Date(acquisitionDate) : null;
-        if (cost !== undefined) {
-            const n = Number(cost);
-            if (!Number.isFinite(n) || n < 0) return res.status(400).json({ success: false, message: 'Cost must be a positive amount' });
-            update.cost = n;
-        }
+        if (cost !== undefined) update.cost = cost;
 
         const copy = await LibraryBookCopy.findByIdAndUpdate(req.params.copyId, update, { new: true }).lean();
         audit(req.schoolId, req.userId, req.userRole, 'COPY_UPDATED', 'BookCopy', copy._id, old, copy);
@@ -1089,6 +1077,42 @@ exports.copyLabels = async (req, res) => {
 
 // What the counter scanner talks to: one copy code in, everything the desk
 // needs to act on it out — the book, the copy, and whoever currently has it.
+/**
+ * Copies whose code (or book title / ISBN) contains what was typed — the scan
+ * dialog's list while someone is still typing "LIB-COPY-00…". A scanner sends
+ * the whole code and goes through scanCopy; this is for a person at the desk.
+ */
+exports.searchCopies = async (req, res) => {
+    try {
+        const q = String(req.query.q || '').trim();
+        if (q.length < 2) return res.json({ success: true, data: [], total: 0 });
+        const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+        const { rows } = await pool.query(
+            `SELECT c."_id", c."uniqueCode", c."status", c."rackLocation",
+                    b."_id" AS "bookId", b."title", b."isbn",
+                    u."name" AS "holder", i."dueDate",
+                    count(*) OVER ()::int AS "_total"
+               FROM "${LibraryBookCopy.tableName}" c
+               JOIN "${LibraryBook.tableName}" b ON b."_id" = c."book"
+               LEFT JOIN LATERAL (
+                   SELECT ii."issuedTo", ii."dueDate" FROM "${LibraryIssuance.tableName}" ii
+                    WHERE ii."bookCopy" = c."_id" AND ii."status" = ANY($3::text[]) LIMIT 1
+               ) i ON true
+               LEFT JOIN "${User.tableName}" u ON u."_id" = i."issuedTo"
+              WHERE c."school" = $1
+                AND (c."uniqueCode" ILIKE $2 OR b."title" ILIKE $2 OR b."isbn" ILIKE $2)
+              ORDER BY (lower(c."uniqueCode") = lower($4)) DESC, c."uniqueCode"
+              LIMIT 30`,
+            [String(req.schoolId), like, ACTIVE_ISSUANCE, q],
+        );
+        res.json({
+            success: true,
+            total: rows[0]?._total || 0,
+            data: rows.map(({ _total, ...r }) => r),
+        });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
 exports.scanCopy = async (req, res) => {
     try {
         const code = String(req.query.code || '').trim();
@@ -1195,6 +1219,56 @@ exports.searchMembers = async (req, res) => {
         }).sort((a, b) => a.name.localeCompare(b.name));
 
         res.json({ success: true, data });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * One member, in full — what the Reservations eye opens: who they are, how to
+ * reach them (a student's parent too), their class or post, and where they
+ * stand with the library right now.
+ */
+exports.getMember = async (req, res) => {
+    try {
+        const user = await User.findOne({ _id: req.params.id, school: req.schoolId, role: { $in: BORROWER_ROLES } })
+            .select('name email phone role isActive profileImage').lean();
+        if (!user) return res.status(404).json({ success: false, message: 'Member not found' });
+
+        const [profile, staff, loans, fines, holds] = await Promise.all([
+            user.role === 'student'
+                ? StudentProfile.findOne({ user: user._id }).select('admissionNumber rollNumber currentClass currentSection parent gender')
+                    .populate('currentClass', 'className classNumber').populate('currentSection', 'sectionName')
+                    .populate('parent', 'name phone email').lean()
+                : null,
+            user.role !== 'student'
+                ? TeacherProfile.findOne({ user: user._id }).select('employeeId designation department').lean()
+                : null,
+            LibraryIssuance.find({ school: req.schoolId, issuedTo: user._id, status: { $in: ACTIVE_ISSUANCE } })
+                .select('dueDate').lean(),
+            LibraryFine.find({ school: req.schoolId, user: user._id, status: 'pending' })
+                .select('amount waivedAmount paidAmount').lean(),
+            LibraryReservation.countDocuments({ school: req.schoolId, reservedBy: user._id, status: { $in: ['pending', 'ready'] } }),
+        ]);
+        const now = new Date();
+        const cls = profile
+            ? [profile.currentClass?.className || (profile.currentClass?.classNumber ? `Class ${profile.currentClass.classNumber}` : ''),
+               profile.currentSection?.sectionName].filter(Boolean).join(' – ')
+            : '';
+        res.json({
+            success: true,
+            data: {
+                _id: user._id, name: user.name, email: user.email || '', phone: user.phone || '',
+                role: user.role, isActive: user.isActive !== false, photo: user.profileImage || '',
+                identifier: profile?.admissionNumber || staff?.employeeId || '',
+                identifierLabel: profile ? 'Admission number' : 'Employee ID',
+                className: cls, rollNumber: profile?.rollNumber || '', gender: profile?.gender || '',
+                designation: staff?.designation || '', department: staff?.department || '',
+                parent: profile?.parent ? { name: profile.parent.name, phone: profile.parent.phone || '', email: profile.parent.email || '' } : null,
+                booksOut: loans.length,
+                overdue: loans.filter((l) => new Date(l.dueDate) < now).length,
+                finesDue: Math.round(fines.reduce((n, f) => n + outstandingOf(f), 0) * 100) / 100,
+                liveHolds: holds,
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -1948,8 +2022,17 @@ async function withFineContext(schoolId, rows) {
  * what `paidAt` and `waivedAt` are for.
  */
 async function fineStats(schoolId) {
+    // The current academic year's window, for "Total fines" (collected this
+    // year). A school with no active year counts everything.
+    const year = await AcademicYear.findOne({ school: schoolId, status: 'active' }).select('yearName startDate endDate').lean();
     const { rows } = await pool.query(
         `SELECT
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}"
+              WHERE "school" = $1 AND COALESCE("paidAmount", 0) > 0
+                AND ($2::timestamptz IS NULL OR "paidAt" >= $2) AND ($3::timestamptz IS NULL OR "paidAt" <= $3))  AS "collectedYear",
+           (SELECT count(*)::int FROM "${LibraryFine.tableName}"
+              WHERE "school" = $1 AND COALESCE("paidAmount", 0) > 0
+                AND ($2::timestamptz IS NULL OR "paidAt" >= $2) AND ($3::timestamptz IS NULL OR "paidAt" <= $3))  AS "collectedYearCount",
            (SELECT COALESCE(sum("amount" - COALESCE("waivedAmount",0) - COALESCE("paidAmount",0)), 0)::float
               FROM "${LibraryFine.tableName}" WHERE "school" = $1
                AND "amount" - COALESCE("waivedAmount",0) - COALESCE("paidAmount",0) > 0)          AS "outstanding",
@@ -1972,9 +2055,9 @@ async function fineStats(schoolId) {
            (SELECT COALESCE(sum("waivedAmount"), 0)::float FROM "${LibraryFine.tableName}"
               WHERE "school" = $1 AND "waivedAt" >= date_trunc('month', now()) - interval '1 month'
                 AND "waivedAt" < date_trunc('month', now()))                                      AS "waivedPrev"`,
-        [String(schoolId)],
+        [String(schoolId), year?.startDate || null, year?.endDate ? new Date(new Date(year.endDate).getTime() + 86399999) : null],
     );
-    return rows[0];
+    return { ...rows[0], yearName: year?.yearName || null };
 }
 
 exports.getFines = async (req, res) => {
@@ -1982,7 +2065,6 @@ exports.getFines = async (req, res) => {
         const { status, userId, fineType, role, classId, sectionId, from, to, q } = req.query;
         const { page, limit, skip } = paging(req.query);
         const filter = { school: req.schoolId };
-        if (status)   filter.status = status;
         if (userId)   filter.user   = userId;
         if (FINE_TYPES.includes(fineType)) filter.fineType = fineType;
 
@@ -2049,6 +2131,16 @@ exports.getFines = async (req, res) => {
             filter.$and = [{ $or: or.length ? or : [{ _id: null }] }];
         }
 
+        // The status tab is applied last and only to the list: the tab counts
+        // describe everything the OTHER filters match, so they do not change as
+        // you move between tabs. Each tab lists exactly what its count counts —
+        // the money, not the status column: a fine part-paid and part-written-
+        // off is under both Paid and Written off, as it is in the counts.
+        const counted = { ...filter };
+        if (status === 'pending') filter.status = 'pending';
+        else if (status === 'paid')   filter.paidAmount   = { ...(filter.paidAmount || {}), $gt: 0 };
+        else if (status === 'waived') filter.waivedAmount = { $gt: 0 };
+
         const query = () => LibraryFine.find(filter)
             .populate('user',       'name email role')
             .populate('issuance',   'issueDate dueDate book')
@@ -2088,7 +2180,7 @@ exports.getFines = async (req, res) => {
         const [fines, total, summaryRows] = await Promise.all([
             query().skip(skip).limit(limit).lean(),
             LibraryFine.countDocuments(filter),
-            LibraryFine.find(filter).select('status amount waivedAmount paidAmount').lean(),
+            LibraryFine.find(counted).select('status amount waivedAmount paidAmount').lean(),
         ]);
 
         // Totalled from the arithmetic rather than by status, so a part-waived
@@ -2101,10 +2193,10 @@ exports.getFines = async (req, res) => {
             if ((row.paidAmount   || 0) > 0) { summary.paid.amount    += Number(row.paidAmount);    summary.paid.count    += 1; }
             if ((row.waivedAmount || 0) > 0) { summary.waived.amount  += Number(row.waivedAmount);  summary.waived.count  += 1; }
         }
-        for (const key of ['pending', 'paid', 'waived']) {
-            summary.total.amount += summary[key].amount;
-            summary.total.count  += summary[key].count;
-        }
+        // "All" is every fine once — not the three buckets added up, which
+        // counted a part-paid, part-waived fine twice.
+        summary.total.count  = summaryRows.length;
+        summary.total.amount = summaryRows.reduce((n, r) => n + Number(r.amount || 0), 0);
 
         res.json({
             success: true,

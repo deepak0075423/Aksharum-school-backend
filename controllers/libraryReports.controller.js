@@ -37,7 +37,7 @@ const Class           = require('../models/Class');
 const ClassSection    = require('../models/ClassSection');
 const { notify }      = require('../services/notifyService');
 const {
-    sweepOverdue, ACTIVE_ISSUANCE, BORROWER_ROLES, borrowerAudience, audit, fmtLibDate,
+    sweepOverdue, ACTIVE_ISSUANCE, BORROWER_ROLES, borrowerAudience, audit, fmtLibDate, getOrCreatePolicy,
 } = require('../services/libraryRules');
 
 const T = {
@@ -213,23 +213,43 @@ exports.overdueRegister = async (req, res) => {
         await sweepOverdue(req.schoolId);
 
         const { page, limit, offset } = paging(req.query);
-        const values = [String(req.schoolId), ACTIVE_ISSUANCE];
-        const w = conditions(['i."school" = $1', 'i."status" = ANY($2::text[])', 'i."dueDate" < now()'], values);
+        // The late fine a loan still out has built up so far — the rule the
+        // return counter charges by (libraryRules.calcFine): days past the due
+        // date after the grace days, at the policy's daily rate, and nothing
+        // for a teacher unless the school fines teachers. Raised fines alone
+        // were always ₹0 here, since a late fine is only raised on return.
+        const policy = await getOrCreatePolicy(req.schoolId);
+        const values = [String(req.schoolId), ACTIVE_ISSUANCE,
+            Number(policy?.finePerDay) || 0, Number(policy?.gracePeriodDays) || 0, !!policy?.teacherFinesEnabled];
+        // The register holds two kinds of row: a book still out past its due
+        // date, and a book already back whose fine is still unpaid. Listing
+        // only the first left a returned-late student's ₹33 fine nowhere on
+        // the page — 0 overdue, ₹0 outstanding.
+        const OUT_LATE = `(i."status" = ANY($2::text[]) AND i."dueDate" < now())`;
+        // Class, role and search — shared by the rows and the unpaid-fine totals.
+        const flt = conditions(['true'], values);
+        const ACCRUED = `(CASE WHEN NOT ${OUT_LATE} THEN 0
+                               WHEN u."role" = 'teacher' AND NOT $5::boolean THEN 0
+                               ELSE GREATEST(0, (CURRENT_DATE - i."dueDate"::date) - $4::int) * $3::numeric END)::float`;
+        // Days late: to today for a book still out, to the day it came back otherwise.
+        const LATE_DAYS = `GREATEST(0, (COALESCE(i."returnDate"::date, CURRENT_DATE) - i."dueDate"::date))`;
 
-        w.add('sp."currentClass" = $?::uuid', uuid(req.query.classId));
-        w.add('sp."currentSection" = $?::uuid', uuid(req.query.sectionId));
-        w.add('u."role" = $?', BORROWER_ROLES.includes(req.query.role) ? req.query.role : '');
-        w.add(
+        flt.add('sp."currentClass" = $?::uuid', uuid(req.query.classId));
+        flt.add('sp."currentSection" = $?::uuid', uuid(req.query.sectionId));
+        flt.add('u."role" = $?', BORROWER_ROLES.includes(req.query.role) ? req.query.role : '');
+        flt.add(
             '(u."name" ILIKE $? OR b."title" ILIKE $? OR b."isbn" ILIKE $? OR c."uniqueCode" ILIKE $?)',
             req.query.q ? like(req.query.q) : '',
         );
+        const w = conditions(['i."school" = $1', `(${OUT_LATE} OR fn."owed" > 0)`, `(${flt.sql()})`], values);
         // Lateness buckets rather than a status filter: everything on this
         // report is overdue, so "status" would filter nothing. How late it is
         // is the thing that decides who gets chased first.
         const LATE = {
-            week:  '(CURRENT_DATE - i."dueDate"::date) BETWEEN 1 AND 7',
-            month: '(CURRENT_DATE - i."dueDate"::date) BETWEEN 8 AND 30',
-            long:  '(CURRENT_DATE - i."dueDate"::date) > 30',
+            week:  `${LATE_DAYS} BETWEEN 1 AND 7`,
+            month: `${LATE_DAYS} BETWEEN 8 AND 30`,
+            long:  `${LATE_DAYS} > 30`,
+            unpaid: `NOT ${OUT_LATE}`,
         };
         w.raw(LATE[req.query.lateness]);
 
@@ -257,25 +277,48 @@ exports.overdueRegister = async (req, res) => {
                     c."uniqueCode"  AS "copy",
                     i."issueDate"   AS "issued",
                     i."dueDate"     AS "due",
-                    GREATEST(0, (CURRENT_DATE - i."dueDate"::date))::int AS "daysLate",
-                    fn."owed"       AS "fine",
+                    ${LATE_DAYS}::int AS "daysLate",
+                    (fn."owed" + ${ACCRUED}) AS "fine",
                     i."status"      AS "status",
                     (count(*) OVER ())::int AS "_total"
                     ${FROM}
-             ORDER BY i."dueDate" ASC
+             ORDER BY ${OUT_LATE} DESC, i."dueDate" ASC
              LIMIT ${rowLimit} ${wantsXlsx(req) ? '' : `OFFSET ${offset}`}`,
             values,
         );
 
+        // The active academic year, for "Outstanding this year".
+        const yr = await require('../utils/activeYear').activeYearWindow(req.schoolId);
         const { rows: agg } = await pool.query(
-            `SELECT count(*)::int AS "loans",
-                    COALESCE(sum(fn."owed"), 0)::float AS "owed",
-                    COALESCE(max(CURRENT_DATE - i."dueDate"::date), 0)::int AS "worst",
-                    count(DISTINCT i."issuedTo")::int AS "members"
+            `SELECT count(*)::int AS "rows",
+                    count(*) FILTER (WHERE ${OUT_LATE})::int AS "loans",
+                    count(DISTINCT i."issuedTo") FILTER (WHERE ${OUT_LATE})::int AS "members",
+                    COALESCE(sum(${ACCRUED}), 0)::float AS "accrued",
+                    COALESCE(max(CURRENT_DATE - i."dueDate"::date) FILTER (WHERE ${OUT_LATE}), 0)::int AS "worst"
                     ${FROM}`,
             values,
         );
-        const a = agg[0] || {};
+        // Unpaid fines, from the fine records themselves (every fine, whether
+        // its book is out or back), narrowed by the same class / role / search
+        // as the rows. Waived parts and payments already taken are left out.
+        const { rows: owedRows } = await pool.query(
+            `SELECT COALESCE(sum(${OUTSTANDING}), 0)::float AS "owed",
+                    count(*) FILTER (WHERE ${OUTSTANDING} > 0)::int AS "count",
+                    COALESCE(sum(${OUTSTANDING}) FILTER (WHERE $${values.length + 1}::timestamptz IS NULL
+                        OR (f."createdAt" >= $${values.length + 1} AND ($${values.length + 2}::timestamptz IS NULL OR f."createdAt" <= $${values.length + 2}))), 0)::float AS "owedYear"
+               FROM ${T.fine} f
+               JOIN ${T.iss}  i ON i."_id" = f."issuance"
+               JOIN ${T.user} u ON u."_id" = i."issuedTo"
+               JOIN ${T.book} b ON b."_id" = i."book"
+               JOIN ${T.copy} c ON c."_id" = i."bookCopy"
+               ${BORROWER_JOIN('u')}
+              WHERE f."school" = $1 AND f."status" = 'pending' AND ${OUTSTANDING} > 0
+                AND (${flt.sql()})
+                -- The rows' parameters ride along unused here; typed, so Postgres accepts them.
+                AND $2::text[] IS NOT NULL AND $3::numeric IS NOT NULL AND $4::int IS NOT NULL AND $5::boolean IS NOT NULL`,
+            [...values, yr?.start || null, yr?.end || null],
+        );
+        const a = { ...(agg[0] || {}), ...(owedRows[0] || {}) };
 
         deliver(req, res, report, {
             rows: rows.map((r) => ({
@@ -284,11 +327,15 @@ exports.overdueRegister = async (req, res) => {
                 fine: money(r.fine), daysLate: num(r.daysLate),
                 class: text(r.class), isbn: text(r.isbn),
             })),
-            total: num(a.loans), page, limit,
+            total: num(a.rows), page, limit,
             summary: [
                 stat('Books overdue', num(a.loans), 'num', 'Out past the due date'),
                 stat('Members holding them', num(a.members), 'num'),
-                stat('Fines outstanding', money(a.owed), 'money', 'Charged and unpaid'),
+                stat('Fines outstanding', money(a.owed), 'money',
+                    `${num(a.count)} unpaid fine${num(a.count) === 1 ? '' : 's'}, books out or back`),
+                stat(yr ? `Outstanding in ${yr.yearName}` : 'Outstanding this year', money(a.owedYear), 'money',
+                    'Unpaid fines raised this academic year'),
+                stat('Late fines building up', money(a.accrued), 'money', 'On books still out — charged on return'),
                 stat('Longest overdue', num(a.worst), 'days', 'Days past the due date'),
             ],
         });
@@ -481,6 +528,14 @@ exports.memberHistory = async (req, res) => {
         );
         if (!who.length) return res.status(404).json({ success: false, message: 'Member not found in this school' });
 
+        // A late book still out has a fine building up that is only raised on
+        // return — counted here by the return counter's own rule, so the Fine
+        // column is not ₹0 for the very loans that owe the most.
+        const policy = await getOrCreatePolicy(req.schoolId);
+        const rate = who[0].role === 'teacher' && !policy?.teacherFinesEnabled ? 0 : Number(policy?.finePerDay) || 0;
+        const grace = Number(policy?.gracePeriodDays) || 0;
+        const ACCRUED = `(CASE WHEN i."returnDate" IS NULL AND i."status" = ANY('{issued,overdue}'::text[])
+                               THEN GREATEST(0, (CURRENT_DATE - i."dueDate"::date) - ${grace}) * ${rate} ELSE 0 END)::float`;
         const values = [String(req.schoolId), String(userId), from, to];
         const w = conditions([
             'i."school" = $1',
@@ -515,7 +570,7 @@ exports.memberHistory = async (req, res) => {
                     i."returnDate" AS "returned",
                     i."renewalCount" AS "renewals",
                     GREATEST(0, COALESCE(i."returnDate", now())::date - i."dueDate"::date)::int AS "daysLate",
-                    fn."charged"   AS "fine",
+                    (fn."charged" + ${ACCRUED}) AS "fine",
                     i."status"     AS "status",
                     (count(*) OVER ())::int AS "_total"
                     ${FROM}
@@ -529,7 +584,8 @@ exports.memberHistory = async (req, res) => {
                     count(*) FILTER (WHERE i."status" = ANY('{issued,overdue}'::text[]))::int AS "out",
                     count(*) FILTER (WHERE i."status" = 'overdue')::int AS "late",
                     COALESCE(sum(fn."charged"), 0)::float AS "charged",
-                    COALESCE(sum(fn."owed"), 0)::float    AS "owed"
+                    COALESCE(sum(fn."owed"), 0)::float    AS "owed",
+                    COALESCE(sum(${ACCRUED}), 0)::float    AS "accrued"
                     ${FROM}`,
             values,
         );
@@ -547,8 +603,8 @@ exports.memberHistory = async (req, res) => {
             summary: [
                 stat('Loans on record', num(a.loans), 'num'),
                 stat('Still out', num(a.out), 'num', `${num(a.late)} of them overdue`),
-                stat('Fines charged', money(a.charged), 'money'),
-                stat('Still owed', money(a.owed), 'money', 'Unpaid, after any waiver'),
+                stat('Total fine', money(num(a.charged) + num(a.accrued)), 'money', 'Charged, plus late fines building up'),
+                stat('Still owed', money(num(a.owed) + num(a.accrued)), 'money', 'Unpaid, after any waiver'),
             ],
             extra: {
                 member: {
@@ -995,6 +1051,7 @@ const F = {
             { value: 'week',  label: '1–7 days late' },
             { value: 'month', label: '8–30 days late' },
             { value: 'long',  label: 'Over 30 days late' },
+            { value: 'unpaid', label: 'Returned — fine unpaid' },
         ],
     },
     copyStatus: {
