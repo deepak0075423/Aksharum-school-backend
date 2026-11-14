@@ -2,10 +2,14 @@
 /**
  * Roll numbers are unique **within a section**, not school-wide: every section
  * numbers its own students from 1, so a global constraint would be unusable.
+ *
+ * A roll number belongs to the student's row for the section's year
+ * (StudentEnrollment) — the profile only mirrors the active year's — so the
+ * check reads the section's own rows.
  */
-const ClassSection   = require('../models/ClassSection');
-const StudentProfile = require('../models/StudentProfile');
-const User           = require('../models/User');
+const pool              = require('../db/pool');
+const StudentEnrollment = require('../models/StudentEnrollment');
+const User              = require('../models/User');
 
 /**
  * @param   {String} sectionId
@@ -17,16 +21,16 @@ async function rollNumberTaken(sectionId, rollNumber, exceptStudentId = null) {
     const value = String(rollNumber ?? '').trim();
     if (!sectionId || !value) return null;
 
-    const section = await ClassSection.findById(sectionId, 'enrolledStudents').lean();
-    const peers = (section?.enrolledStudents || [])
-        .map(String)
-        .filter(id => id !== String(exceptStudentId || ''));
-    if (!peers.length) return null;
+    const { rows } = await pool.query(
+        `SELECT "student" FROM "${StudentEnrollment.tableName}"
+          WHERE "section" = $1::uuid AND btrim("rollNumber") = $2
+            AND ($3::uuid IS NULL OR "student" <> $3::uuid)
+          LIMIT 1`,
+        [String(sectionId), value, exceptStudentId ? String(exceptStudentId) : null],
+    );
+    if (!rows.length) return null;
 
-    const clash = await StudentProfile.findOne({ user: { $in: peers }, rollNumber: value }).lean();
-    if (!clash) return null;
-
-    const owner = await User.findById(clash.user, 'name').lean();
+    const owner = await User.findById(rows[0].student, 'name').lean();
     return owner?.name || 'another student';
 }
 

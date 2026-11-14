@@ -62,6 +62,12 @@ async function studentsOfYear(schoolId, yearId, { holderIds } = {}) {
              WHERE s."school" = $1::uuid AND s."academicYear" = $2::uuid
         ),
         placed AS (
+            -- The year's own rows first (StudentEnrollment): class and section
+            -- as they were that year, whichever year is active now.
+            SELECT e."student", e."section", e."class", -1 AS "rank"
+              FROM "studentenrollments" e
+             WHERE e."school" = $1::uuid AND e."academicYear" = $2::uuid
+            UNION ALL
             SELECT sp."user" AS "student", s."_id" AS "section", s."class" AS "class", 0 AS "rank"
               FROM ${T.sp} sp JOIN secs s ON s."_id" = sp."currentSection"
              WHERE sp."school" = $1::uuid
@@ -79,7 +85,9 @@ async function studentsOfYear(schoolId, yearId, { holderIds } = {}) {
             SELECT DISTINCT ON ("student") "student", "section", "class" FROM placed ORDER BY "student", "rank"
         )
         SELECT u."_id"::text AS "_id", u."name", u."isActive", u."profileImage",
-               sp."photoFile", sp."admissionNumber", sp."rollNumber", sp."currentSection"::text AS "currentSection",
+               sp."photoFile", sp."admissionNumber", sp."currentSection"::text AS "currentSection",
+               (SELECT ye."rollNumber" FROM "studentenrollments" ye
+                 WHERE ye."student" = u."_id" AND ye."academicYear" = $2::uuid AND ye."section" IS NOT DISTINCT FROM m."section" LIMIT 1) AS "yearRoll",
                sp."bloodGroup", sp."gender",
                to_char((sp."dob" AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS "dob",
                sp."address", sp."city", sp."state", sp."pincode",
@@ -102,7 +110,8 @@ async function studentsOfYear(schoolId, yearId, { holderIds } = {}) {
         photoSource: r.photoFile ? `/uploads/student-docs/${r.photoFile}` : (r.profileImage || ''),
         admissionNumber: r.admissionNumber || '',
         // Only this year's roll is on record: the profile's, when its section is this year's.
-        rollNumber: r.sectionId && r.currentSection === r.sectionId ? String(r.rollNumber || '') : '',
+        // The roll held that year, in that section — not the active year's.
+        rollNumber: r.sectionId ? String(r.yearRoll || '') : '',
         dob: r.dob || '',
         bloodGroup: r.bloodGroup || '',
         gender: r.gender || '',

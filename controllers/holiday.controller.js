@@ -603,9 +603,13 @@ exports.adminGetAuditLog = async (req, res) => {
 async function studentClasses(userId, schoolId, profile) {
     const ClassSection = require('../models/ClassSection');
 
-    const orConds = [{ enrolledStudents: userId }];
-    if (profile?.currentSection) orConds.push({ _id: profile.currentSection });
-    const sections = await ClassSection.find({ school: schoolId, $or: orConds }, 'class sectionName').lean();
+    // The profile's pointer is the student's placement in the active year
+    // (services/enrollment keeps it in step with the rosters). Rosters are no
+    // longer read here: a student stays on last year's roster as last year's
+    // record, and last year's class is not this year's holiday.
+    const sections = profile?.currentSection
+        ? await ClassSection.find({ school: schoolId, _id: profile.currentSection }, 'class sectionName').lean()
+        : [];
 
     const classIds = new Set(sections.map((s) => s.class).filter(Boolean).map(String));
     if (profile?.currentClass) classIds.add(String(profile.currentClass));

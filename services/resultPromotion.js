@@ -19,10 +19,11 @@
  * StudentPromotionHistory against the exam: that is what the scorecard shows
  * beside the result, and what is taken back if the results are withdrawn.
  *
- * Last year's section roll is left as it was — it is that year's record, and
- * the exam's own results are worked out from it. What changes is the student's
- * record (StudentProfile) and next year's roll, through the one helper every
- * other move goes through (utils/sectionMembership).
+ * Last year's placement is left as it was — it is that year's record, and the
+ * exam's own results are worked out from it. A move writes the student's row
+ * for NEXT year (StudentEnrollment) and next year's roster, through the one
+ * writer every other placement goes through (services/enrollment.js); where a
+ * student "is" for this exam is their row for the exam's year.
  *
  * A run first claims the exam in SQL, so the scheduler on two servers, or a
  * publish landing while the scheduler ticks, can never move a student twice —
@@ -34,11 +35,22 @@ const FormalResult = require('../models/FormalResult');
 const ClassSection = require('../models/ClassSection');
 const Class = require('../models/Class');
 const AcademicYear = require('../models/AcademicYear');
-const StudentProfile = require('../models/StudentProfile');
 const StudentPromotionHistory = require('../models/StudentPromotionHistory');
 const User = require('../models/User');
 const { isUuid } = require('../db/schema');
-const { setStudentSection, syncCounts } = require('../utils/sectionMembership');
+const { syncCounts } = require('../utils/sectionMembership');
+const enrollment = require('./enrollment');
+
+/** student id → their row for one academic year (class, section, rollNumber). */
+async function rowsForYear(yearId, studentIds) {
+    if (!isUuid(idOf(yearId)) || !studentIds.length) return new Map();
+    const { rows } = await pool.query(
+        `SELECT "student", "class", "section", "rollNumber" FROM ${enrollment.T.enr}
+          WHERE "academicYear" = $1::uuid AND "student" = ANY($2::uuid[])`,
+        [idOf(yearId), studentIds.filter(isUuid)],
+    );
+    return new Map(rows.map((r) => [idOf(r.student), r]));
+}
 const { notify } = require('./notifyService');
 const designations = require('./designationService');
 const settings = require('./resultSettings');
@@ -133,7 +145,7 @@ function describeTarget(t) {
  *   skip      no longer here to move: left the school, or moved on since
  */
 async function plan(exam, targets = null) {
-    const section = await ClassSection.findById(exam.section).select('class sectionName enrolledStudents').lean();
+    const section = await ClassSection.findById(exam.section).select('class sectionName enrolledStudents academicYear').lean();
     const all = targets || await targetsByClass(exam.school);
     const target = section?.class ? all.get(idOf(section.class)) || null : null;
     const mode = modeOf(exam);
@@ -145,15 +157,17 @@ async function plan(exam, targets = null) {
     const ids = [...new Set([...roster, ...results.map((r) => idOf(r.student))])];
     if (!ids.length) return { target, items: [] };
 
-    const [users, profiles, moved] = await Promise.all([
+    // Where each student is in the EXAM's year (not wherever the active year
+    // points them), and whether someone already placed them next year.
+    const [users, examYear, nextYear, moved] = await Promise.all([
         User.find({ _id: { $in: ids } }).select('name role school isActive').lean(),
-        StudentProfile.find({ user: { $in: ids } }).select('user currentClass currentSection rollNumber').lean(),
+        rowsForYear(section?.academicYear, ids),
+        rowsForYear(target?.year, ids),
         StudentPromotionHistory.find({ exam: exam._id, revertedAt: null }).select('student newClass newSection kind').lean(),
     ]);
     const userOf = new Map(users.map((u) => [idOf(u), u]));
-    const profileOf = new Map(profiles.map((p) => [idOf(p.user), p]));
     const movedOf = new Map(moved.map((m) => [idOf(m.student), m]));
-    const nowClassIds = [...new Set(profiles.map((p) => idOf(p.currentClass)).filter(isUuid))];
+    const nowClassIds = [...new Set([...examYear.values(), ...nextYear.values()].map((p) => idOf(p.class)).filter(isUuid))];
     const nowClasses = nowClassIds.length ? await Class.find({ _id: { $in: nowClassIds } }).select('className classNumber').lean() : [];
     const classOf = new Map(nowClasses.map((c) => [idOf(c), c]));
     const overrideOf = new Map((Array.isArray(exam.promotionOverrides) ? exam.promotionOverrides : []).map((o) => [String(o.student), o]));
@@ -165,8 +179,8 @@ async function plan(exam, targets = null) {
     const items = ids.map((id) => {
         const user = userOf.get(id);
         const r = resultOf.get(id);
-        const p = profileOf.get(id);
-        const base = { student: id, name: user?.name || 'Student', from: p?.currentSection || null, fromClass: p?.currentClass || null, rollNumber: p?.rollNumber || '' };
+        const p = examYear.get(id);
+        const base = { student: id, name: user?.name || 'Student', from: p?.section || null, fromClass: p?.class || null, rollNumber: p?.rollNumber || '' };
         // Roster ids that name no student account are nobody to report on.
         if (!user || user.role !== 'student') return r ? { ...base, outcome: 'skip', reason: 'No longer a student of the school' } : null;
         // What decides this student: the result's verdict, unless the office
@@ -187,10 +201,16 @@ async function plan(exam, targets = null) {
         if (user.isActive === false) return { ...base, outcome: 'skip', reason: 'The student\'s account is switched off' };
         if (!target) return { ...base, outcome: 'skip', reason: 'The exam\'s section no longer belongs to a class' };
 
-        // Moved on since the exam — by hand, or by another promotion.
-        const now = p?.currentClass ? classOf.get(idOf(p.currentClass)) : null;
+        // Moved on since the exam — to another class that year, or placed in
+        // next year already by hand.
+        const now = p?.class ? classOf.get(idOf(p.class)) : null;
         if (now && Number(now.classNumber) !== fromNumber && !(upAfterAll && prior)) {
             return { ...base, outcome: 'skip', reason: `Now in ${now.className}` };
+        }
+        const placedNext = nextYear.get(id);
+        if (placedNext && !(upAfterAll && prior)) {
+            const there = classOf.get(idOf(placedNext.class));
+            return { ...base, outcome: 'skip', reason: `Already placed in ${there?.className || 'a class'} for ${target.year?.yearName || 'next year'}` };
         }
         // Did not pass (or kept back), and repeats: the same class in the next year.
         if (!up) {
@@ -264,8 +284,8 @@ async function apply(exam, items, actor, target = null) {
             const sid = idOf(section);
             if (!rolls.has(sid)) {
                 const peers = (section.enrolledStudents || []).map(String);
-                const held = peers.length ? await StudentProfile.find({ user: { $in: peers } }).select('rollNumber').lean() : [];
-                const used = new Set(held.map((h) => String(h.rollNumber || '').trim()).filter(Boolean));
+                const held = await enrollment.rollsOfSection(sid);
+                const used = new Set([...held.values()].map((r) => String(r || '').trim()).filter(Boolean));
                 rolls.set(sid, { used, next: Math.max(0, ...[...used].map(Number).filter(Number.isFinite)) });
             }
             const st = rolls.get(sid);
@@ -279,9 +299,9 @@ async function apply(exam, items, actor, target = null) {
             }
         }
 
-        const { removedFrom } = await setStudentSection({
-            studentId: it.student, sectionId: section ? idOf(section) : null, schoolId: exam.school,
-            classId: idOf(it.toClass), academicYear: idOf(it.toClass.academicYear), extra, deferCounts: true,
+        const { removedFrom } = await enrollment.place({
+            studentId: it.student, sectionId: section ? idOf(section) : null, classId: idOf(it.toClass),
+            schoolId: exam.school, rollNumber: extra?.rollNumber ?? '', source: 'promotion', actorId: actor || null,
         });
         removedFrom.forEach((s) => touched.add(String(s)));
         if (section) touched.add(idOf(section));
@@ -496,8 +516,12 @@ async function undo(exam, { actor, reason = '' } = {}) {
         if (exam.promotionState) await setPromotion(exam._id, { promotionState: null, promotionDueAt: null });
         return { back: 0, kept: 0 };
     }
-    const profiles = await StudentProfile.find({ user: { $in: moves.map((m) => m.student) } }).select('user currentClass currentSection').lean();
-    const profileOf = new Map(profiles.map((p) => [idOf(p.user), p]));
+    // Where each move put them, read from that move's year.
+    const nowOf = new Map();
+    for (const yearId of new Set(moves.map((m) => idOf(m.academicYear)))) {
+        const rows = await rowsForYear(yearId, moves.filter((m) => idOf(m.academicYear) === yearId).map((m) => idOf(m.student)));
+        rows.forEach((r, sid) => nowOf.set(`${yearId}:${sid}`, r));
+    }
     // Where each student was before this exam moved them at all: the first of
     // its moves. A student placed to repeat and moved up after a re-exam has
     // two, and goes back past both.
@@ -510,17 +534,17 @@ async function undo(exam, { actor, reason = '' } = {}) {
     let back = 0; let kept = 0;
     const at = new Date();
     for (const m of moves) {
-        const p = profileOf.get(idOf(m.student));
-        const still = p && same(p.currentClass, m.newClass)
-            && (same(p.currentSection, m.newSection) || (!idOf(p.currentSection) && !idOf(m.newSection)));
-        if (!still) { kept += 1; continue; }
-        const origin = firstOf.get(idOf(m.student)) || m;
-        const { removedFrom } = await setStudentSection({
-            studentId: m.student, sectionId: origin.oldSection ? idOf(origin.oldSection) : null, schoolId: exam.school,
-            classId: origin.oldClass ? idOf(origin.oldClass) : null, academicYear: idOf(origin.academicYear), deferCounts: true,
-        });
-        removedFrom.forEach((s) => touched.add(String(s)));
-        if (origin.oldSection) touched.add(idOf(origin.oldSection));
+        // Passing out moved nobody, so there is nothing to take back but the record.
+        if (m.kind !== 'passedOut') {
+            const p = nowOf.get(`${idOf(m.academicYear)}:${idOf(m.student)}`);
+            const still = p && same(p.class, m.newClass)
+                && (same(p.section, m.newSection) || (!idOf(p.section) && !idOf(m.newSection)));
+            if (!still) { kept += 1; continue; }
+            // The move's year loses the placement; the exam's year — where they
+            // came from — was never touched, so there is nothing to restore.
+            const { removedFrom } = await enrollment.withdraw({ studentId: m.student, schoolId: exam.school, academicYear: idOf(m.academicYear) });
+            removedFrom.forEach((s) => touched.add(String(s)));
+        }
         await StudentPromotionHistory.updateOne({ _id: m._id }, { $set: { revertedAt: at, revertedBy: actor || null } });
         back += 1;
     }
@@ -542,16 +566,21 @@ async function undo(exam, { actor, reason = '' } = {}) {
 async function takeBack(exam, row, actor, touched) {
     const at = new Date();
     if (row.kind !== 'passedOut') {
-        const p = await StudentProfile.findOne({ user: row.student }).select('currentClass currentSection').lean();
-        const still = p && same(p.currentClass, row.newClass)
-            && (same(p.currentSection, row.newSection) || (!idOf(p.currentSection) && !idOf(row.newSection)));
+        const p = await enrollment.inYear(row.student, idOf(row.academicYear));
+        const still = p && same(p.class, row.newClass)
+            && (same(p.section, row.newSection) || (!idOf(p.section) && !idOf(row.newSection)));
         if (!still) return false;   // moved again since, by somebody — left where they were put
-        const { removedFrom } = await setStudentSection({
-            studentId: row.student, sectionId: row.oldSection ? idOf(row.oldSection) : null, schoolId: exam.school,
-            classId: row.oldClass ? idOf(row.oldClass) : null, academicYear: idOf(row.academicYear), deferCounts: true,
-        });
+        // The move it overtook (a repeat a re-exam pass replaced) stands again,
+        // so the student goes back to that placement; otherwise next year's
+        // placement is simply withdrawn — the exam's year was never touched.
+        const overtaken = row.supersedes ? await StudentPromotionHistory.findById(row.supersedes).lean() : null;
+        const { removedFrom } = overtaken
+            ? await enrollment.place({
+                studentId: row.student, schoolId: exam.school, classId: idOf(overtaken.newClass),
+                sectionId: overtaken.newSection ? idOf(overtaken.newSection) : null, source: 'promotion', actorId: actor || null,
+            })
+            : await enrollment.withdraw({ studentId: row.student, schoolId: exam.school, academicYear: idOf(row.academicYear) });
         removedFrom.forEach((x) => touched.add(String(x)));
-        if (row.oldSection) touched.add(idOf(row.oldSection));
     }
     await StudentPromotionHistory.updateOne({ _id: row._id }, { $set: { revertedAt: at, revertedBy: actor || null } });
     if (row.supersedes) await StudentPromotionHistory.updateOne({ _id: row.supersedes }, { $set: { revertedAt: null, revertedBy: null } });

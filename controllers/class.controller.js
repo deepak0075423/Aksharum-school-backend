@@ -10,7 +10,7 @@ const { inactiveTeacherError } = require('../utils/activeTeacher');
 const { syncSectionChatGroup, sectionGroups } = require('../services/sectionChatService');
 const { rollNumberTaken } = require('../utils/rollNumbers');
 const { capacityError, seatsFor, seatsOf } = require('../utils/sectionCapacity');
-const { setStudentSection, syncCounts }   = require('../utils/sectionMembership');
+const enrollment = require('../services/enrollment');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const ClassSubject          = require('../models/ClassSubject');
 const Subject               = require('../models/Subject');
@@ -202,6 +202,11 @@ exports.setActiveAcademicYear = async (req, res) => {
         const year = await AcademicYear.findByIdAndUpdate(
             target._id, { $set: { status: 'active' } }, { new: true }
         );
+        // Every student's record follows the active year: their class, section
+        // and roll number are now that year's (or, for a student not placed in
+        // it yet, their latest earlier year's). The rows of every year are
+        // untouched — only the pointer moves.
+        await enrollment.refreshSchool(req.schoolId);
         // Which year is active decides who runs a class "this year" — every
         // teacher's My Section may have just appeared or gone. Tell the open
         // sessions rather than leave them on last year's answer.
@@ -1116,12 +1121,14 @@ async function gatherShuffle(req) {
         .sort(byName('sectionName'));
 
     // Everyone in the class: already in a section, or admitted to the class
-    // but not placed yet.
+    // but not placed yet — read from the class's own year, so a shuffle of
+    // next year's class never reaches a student's placement this year.
     const enrolled = sections.flatMap(s => (s.enrolledStudents || []).map(String));
-    const unplaced = await StudentProfile.find(
-        { school: req.schoolId, currentClass: cls._id, currentSection: null }, 'user',
-    ).lean();
-    const studentIds = [...new Set([...enrolled, ...unplaced.map(p => String(p.user))])];
+    const { rows: unplaced } = await pool.query(
+        `SELECT "student" FROM "${require('../models/StudentEnrollment').tableName}"
+          WHERE "class" = $1::uuid AND "section" IS NULL`, [String(cls._id)],
+    );
+    const studentIds = [...new Set([...enrolled, ...unplaced.map(p => String(p.student))])];
     const capacity = sections.reduce((sum, s) => sum + (s.maxStudents || 0), 0);
 
     // Ordered by how the admin should act on them.
@@ -1199,23 +1206,18 @@ exports.shuffleSections = async (req, res) => {
             if (!placed) return err(res, { message: 'Could not place every student — check section capacities.' }, 400);
         }
 
-        // Rewrite rosters, profiles and headcounts
+        // Each student's row for the class's year, the rosters and the records'
+        // pointers, through the one placement writer. Roll numbers are per
+        // section, so a reshuffle clears them — the admin re-runs "Assign Roll
+        // Numbers" after this.
         for (const { section, students } of buckets) {
-            await ClassSection.findByIdAndUpdate(section._id, {
-                $set: {
-                    enrolledStudents: students,
-                    currentCount: students.length,
-                    // Roll numbers are per section, so a reshuffle invalidates
-                    // them — the admin re-runs "Assign Roll Numbers" after this.
-                    rollNumbersAssignedAt: null,
-                },
-            });
-            if (students.length) {
-                await StudentProfile.updateMany(
-                    { user: { $in: students } },
-                    { $set: { currentSection: section._id, currentClass: cls._id, rollNumber: '' } },
-                );
+            for (const studentId of students) {
+                await enrollment.place({
+                    studentId, sectionId: section._id, schoolId: req.schoolId,
+                    rollNumber: '', source: 'shuffle', actorId: req.userId,
+                });
             }
+            await ClassSection.findByIdAndUpdate(section._id, { $set: { rollNumbersAssignedAt: null } });
         }
 
         const shuffledAt = new Date();
@@ -1266,11 +1268,10 @@ exports.deleteClass = async (req, res) => {
         // nothing in the database cascades that away. So a class anyone is still
         // in is refused rather than silently leaving profiles pointing at rows
         // that no longer exist. Move or unassign the students first.
+        // Counted from the class's own year: a class of an ended year still
+        // holds that year's record, and is refused the same way.
         const counts = (await classCounts([cls._id])).get(String(cls._id)) || EMPTY_CLASS_COUNTS;
-        const placed = await StudentProfile.countDocuments({
-            school: req.schoolId,
-            $or: [{ currentClass: cls._id }, { class: cls._id }],
-        });
+        const placed = await enrollment.countIn({ classId: cls._id });
         const students = Math.max(counts.studentCount, placed);
         if (students) {
             return res.status(400).json({
@@ -1357,94 +1358,48 @@ exports.autoAssignStudents = async (req, res) => {
             }
         }
 
-        // ── All sections in school (source for name-matching) ───────────────
-        const allSections = await ClassSection.find({ school: req.schoolId }, '_id sectionName class').lean();
-        const allSectionIds = allSections.map(s => s._id);
-
-        const allClassIds = [...new Set(allSections.map(s => s.class?.toString()).filter(Boolean))];
-        const allClasses  = await Class.find({ _id: { $in: allClassIds } }, '_id className').lean();
-        const allClassNameMap = Object.fromEntries(
-            allClasses.map(c => [c._id.toString(), c.className.trim().toLowerCase()])
+        // ── Where each student was last placed, BEFORE the target year ──────
+        // Read from their year-by-year rows, never from the record's pointer:
+        // the pointer follows whichever year is active, the rows are the record.
+        // Students already placed in the target year are left alone, and no
+        // other year's placement is written.
+        const { rows: sources } = await pool.query(
+            `SELECT DISTINCT ON (e."student") e."student", c."className", s."sectionName"
+               FROM "${require('../models/StudentEnrollment').tableName}" e
+               JOIN ${qt(AcademicYear)} y  ON y."_id" = e."academicYear"
+               JOIN ${qt(AcademicYear)} ty ON ty."_id" = $2::uuid
+               JOIN ${qt(Class)} c ON c."_id" = e."class"
+               JOIN ${qt(ClassSection)} s ON s."_id" = e."section"
+               JOIN ${qt(User)} u ON u."_id" = e."student" AND u."role" = 'student' AND u."isActive" IS NOT FALSE
+              WHERE e."school" = $1::uuid AND y."startDate" < ty."startDate"
+                AND NOT EXISTS (SELECT 1 FROM "${require('../models/StudentEnrollment').tableName}" t
+                                 WHERE t."student" = e."student" AND t."academicYear" = $2::uuid AND t."section" IS NULL)
+              ORDER BY e."student", y."startDate" DESC`,
+            [String(req.schoolId), targetYearId],
         );
 
-        // sectionId → "classname||sectionname" key
-        const sectionKeyMap = {};
-        allSections.forEach(s => {
-            const cn = allClassNameMap[s.class?.toString()] || '';
-            sectionKeyMap[s._id.toString()] = `${cn}||${s.sectionName.trim().toLowerCase()}`;
-        });
-
-        // ── Student profiles ────────────────────────────────────────────────
-        const profiles = await StudentProfile.find(
-            { currentSection: { $in: allSectionIds } },
-            'user currentSection'
-        ).lean();
-
-        // Remove orphaned profiles (student user deleted)
-        const profileUserIds = profiles.map(p => p.user);
-        const realStudents   = await User.find({ _id: { $in: profileUserIds }, role: 'student' }, '_id').lean();
-        const realStudentSet = new Set(realStudents.map(u => u._id.toString()));
-
-        const orphanedIds = profiles.filter(p => !realStudentSet.has(p.user.toString())).map(p => p._id);
-        if (orphanedIds.length) await StudentProfile.deleteMany({ _id: { $in: orphanedIds } });
-
-        const validProfiles = profiles.filter(p => realStudentSet.has(p.user.toString()));
-
-        // ── Match each student to a section in the target year ──────────────
-        // Matching is by "className||sectionName" — works across years as long as names match
+        // ── Match each student to the same-named section in the target year ──
         const sectionAddMap = {};
         let skipped = 0;
-
-        validProfiles.forEach(p => {
-            const userId = p.user.toString();
-
-            // Already enrolled in target year → skip
-            if (targetEnrolledSet.has(userId)) { skipped++; return; }
-
-            // Find the target-year section with the same class+section name
-            const key           = sectionKeyMap[p.currentSection.toString()];
-            const targetSection = key && targetLookup[key];
-            if (!targetSection) return; // No matching section in target year
-
+        for (const src of sources) {
+            const userId = String(src.student);
+            if (targetEnrolledSet.has(userId)) { skipped++; continue; }
+            const key = `${String(src.className).trim().toLowerCase()}||${String(src.sectionName).trim().toLowerCase()}`;
+            const targetSection = targetLookup[key];
+            if (!targetSection) continue;   // no matching section in the target year
             const sid = targetSection._id.toString();
-            if (!sectionAddMap[sid]) sectionAddMap[sid] = [];
-            sectionAddMap[sid].push(p.user);
-        });
-
-        const bulkOps = Object.entries(sectionAddMap).map(([sectionId, userIds]) => ({
-            updateOne: {
-                filter: { _id: sectionId },
-                update: { $addToSet: { enrolledStudents: { $each: userIds } } },
-            },
-        }));
-        if (bulkOps.length) await ClassSection.bulkWrite(bulkOps);
-
-        // Point each promoted student's profile at their new section — and at
-        // the class that section belongs to. Writing only the section left
-        // promoted students recorded against last year's class, which is what
-        // the shuffle and the section picker read.
-        const promotedInto = await ClassSection.find(
-            { _id: { $in: Object.keys(sectionAddMap) } }, '_id class',
-        ).lean();
-        const classOfSection = new Map(promotedInto.map(s => [String(s._id), s.class]));
-        for (const [sectionId, userIds] of Object.entries(sectionAddMap)) {
-            const set = { currentSection: sectionId };
-            const cls = classOfSection.get(String(sectionId));
-            if (cls) set.currentClass = cls;
-            await StudentProfile.updateMany({ user: { $in: userIds } }, { $set: set });
+            (sectionAddMap[sid] = sectionAddMap[sid] || []).push(userId);
         }
 
+        for (const [sectionId, userIds] of Object.entries(sectionAddMap)) {
+            for (const studentId of userIds) {
+                await enrollment.place({
+                    studentId, sectionId, schoolId: req.schoolId, rollNumber: '', source: 'autoAssign', actorId: req.userId,
+                });
+            }
+        }
         const assigned = Object.values(sectionAddMap).reduce((sum, arr) => sum + arr.length, 0);
-
-        // Recalculate currentCount for target year sections
-        const allUpdated = await ClassSection.find(
-            { school: req.schoolId, academicYear: targetYearId },
-            '_id enrolledStudents'
-        ).lean();
-        const countOps = allUpdated.map(s => ({
-            updateOne: { filter: { _id: s._id }, update: { $set: { currentCount: s.enrolledStudents.length } } },
-        }));
-        if (countOps.length) await ClassSection.bulkWrite(countOps);
+        const bulkOps = Object.keys(sectionAddMap);
 
         ok(res, { assigned, skipped, sections: bulkOps.length });
     } catch (e) { err(res, e); }
@@ -1678,19 +1633,21 @@ exports.getSectionDetail = async (req, res) => {
         section.academicYearName = year?.yearName || '';
         section.classSubjectCount = classSubjectCount;
 
-        // Enrich enrolled students with roll number + gender from StudentProfile
+        // Enrich enrolled students with gender and admission number from the
+        // profile, and the roll number they hold IN THIS SECTION — a section
+        // belongs to one year, and the profile only carries the active year's.
         const enrolled = section?.enrolledStudents || [];
         if (enrolled.length) {
-            const profiles = await StudentProfile.find(
-                { user: { $in: enrolled.map(s => s._id) } },
-                'user rollNumber gender admissionNumber',
-            ).lean();
+            const [profiles, rolls] = await Promise.all([
+                StudentProfile.find({ user: { $in: enrolled.map(s => s._id) } }, 'user gender admissionNumber').lean(),
+                enrollment.rollsOfSection(section._id),
+            ]);
             const pMap = {};
             profiles.forEach(p => { pMap[p.user.toString()] = p; });
             section.enrolledStudents = enrolled
                 .map(s => ({
                     ...s,
-                    rollNumber:      pMap[s._id.toString()]?.rollNumber || '',
+                    rollNumber:      rolls.get(s._id.toString()) || '',
                     admissionNumber: pMap[s._id.toString()]?.admissionNumber || '',
                     gender:          pMap[s._id.toString()]?.gender || '',
                 }))
@@ -1723,12 +1680,10 @@ exports.assignRollNumbers = async (req, res) => {
         students.sort((a, b) =>
             String(a.name || '').localeCompare(String(b.name || ''), 'en', { numeric: true, sensitivity: 'base' }));
 
-        // Sequential 1..N in alphabetical name order
+        // Sequential 1..N in alphabetical name order — on each student's row
+        // for this section's year, so another year's roll numbers stay put.
         for (let i = 0; i < students.length; i++) {
-            await StudentProfile.updateOne(
-                { user: students[i]._id },
-                { $set: { rollNumber: String(i + 1) } },
-            );
+            await enrollment.setRoll({ studentId: students[i]._id, sectionId: section._id, rollNumber: String(i + 1), actorId: req.userId });
         }
         await ClassSection.findByIdAndUpdate(section._id, { rollNumbersAssignedAt: new Date() });
 
@@ -1756,13 +1711,9 @@ exports.updateStudentRollNumber = async (req, res) => {
             if (takenBy) return err(res, { message: `Roll number ${rollNumber} is already used by ${takenBy} in this section.` }, 400);
         }
 
-        // Writing to StudentProfile is what every other screen reads, so the
-        // change shows up on the student record too — not just here.
-        await StudentProfile.updateOne(
-            { user: studentId, school: req.schoolId },
-            { $set: { rollNumber } },
-            { upsert: true },
-        );
+        // The roll belongs to this section's year; the student record shows it
+        // too while that is the active year.
+        await enrollment.setRoll({ studentId, sectionId, rollNumber, actorId: req.userId });
         ok(res, { student: studentId, rollNumber });
     } catch (e) { err(res, e); }
 };
@@ -1812,32 +1763,39 @@ exports.getAssignableStudents = async (req, res) => {
             .filter(u => !alreadyHere.has(String(u._id)))
             .sort(byName('name'));
 
-        const profiles = candidates.length
-            ? await StudentProfile.find(
-                { user: { $in: candidates.map(u => u._id) } },
-                'user rollNumber gender admissionNumber currentClass currentSection',
-            ).lean()
-            : [];
+        const ids = candidates.map(u => String(u._id));
+        const [profiles, yearRows] = await Promise.all([
+            ids.length ? StudentProfile.find({ user: { $in: ids } }, 'user gender admissionNumber').lean() : [],
+            // Each candidate's placement in THIS section's year — not the active
+            // year's: picking for next year's 6-A asks who is free next year.
+            ids.length ? pool.query(
+                `SELECT "student", "class", "rollNumber" FROM "${require('../models/StudentEnrollment').tableName}"
+                  WHERE "academicYear" = $1::uuid AND "student" = ANY($2::uuid[])`,
+                [String(section.academicYear), ids],
+            ).then((r) => r.rows) : [],
+        ]);
         const pMap = {};
         profiles.forEach(p => { pMap[String(p.user)] = p; });
+        const yMap = new Map(yearRows.map((r) => [String(r.student), r]));
 
         const sameClass = String(section.class);
         const rows = candidates.map(u => {
             const p    = pMap[String(u._id)] || {};
+            const y    = yMap.get(String(u._id)) || {};
             const held = heldBy.get(String(u._id)) || null;
             return {
                 _id:             u._id,
                 name:            u.name,
                 email:           u.email,
                 admissionNumber: p.admissionNumber || '',
-                rollNumber:      p.rollNumber || '',
+                rollNumber:      y.rollNumber || '',
                 gender:          p.gender || '',
                 enrolledIn:      held,
                 assignable:      !held,
                 reason:          held ? `Already in ${held}` : '',
                 // Students admitted to this class but never placed are the ones
                 // the admin is nearly always looking for — surfaced first below.
-                sameClass:       !held && String(p.currentClass || '') === sameClass,
+                sameClass:       !held && String(y.class || '') === sameClass,
             };
         });
 
@@ -1874,7 +1832,7 @@ exports.assignStudentToSection = async (req, res) => {
         )];
         if (!requested.length) return err(res, { message: 'studentId is required' }, 400);
 
-        const section = await ClassSection.findById(req.params.sectionId).lean();
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }).lean();
         if (!section) return err(res, { message: 'Section not found' }, 404);
 
         const roster = new Set((section.enrolledStudents || []).map(String));
@@ -1907,13 +1865,10 @@ exports.assignStudentToSection = async (req, res) => {
 
         // Where the numbering has reached, so a batch continues 12, 13, 14…
         let nextRoll = null;
+        const sectionRolls = await enrollment.rollsOfSection(section._id);
         if (section.rollNumbersAssignedAt) {
-            const peers = (section.enrolledStudents || []).map(String);
-            const peerProfiles = peers.length
-                ? await StudentProfile.find({ user: { $in: peers } }, 'rollNumber').lean()
-                : [];
-            nextRoll = peerProfiles.reduce((max, p) => {
-                const n = Number(String(p.rollNumber || '').trim());
+            nextRoll = [...sectionRolls.values()].reduce((max, r) => {
+                const n = Number(String(r || '').trim());
                 return Number.isFinite(n) ? Math.max(max, n) : max;
             }, 0);
         }
@@ -1942,7 +1897,9 @@ exports.assignStudentToSection = async (req, res) => {
             // the sequence instead of arriving without a roll number.
             let assignedRoll = null;
             if (nextRoll !== null) {
-                const mine = await StudentProfile.findOne({ user: studentId }, 'rollNumber').lean();
+                // The roll they hold this year (moving between two sections of
+                // the same year), kept when nobody here has it.
+                const mine = await enrollment.inYear(studentId, section.academicYear);
                 const currentRoll = String(mine?.rollNumber || '').trim();
                 const keepExisting = currentRoll && !(await rollNumberTaken(section._id, currentRoll, studentId));
                 if (keepExisting) {
@@ -1954,23 +1911,18 @@ exports.assignStudentToSection = async (req, res) => {
                 }
             }
 
-            // Roster and student record are written together — see
-            // utils/sectionMembership. It creates the record when the student
-            // has none, so enrolling can never leave a student on the class list
-            // with their own class and section blank. Headcounts are recomputed
-            // once after the loop rather than per student.
-            await setStudentSection({
+            // The student's row for THIS section's year, the roster and the
+            // record's pointer, written together by the one placement writer.
+            // Their placement in any other year is not touched.
+            const placed = await enrollment.place({
                 studentId,
-                sectionId:   req.params.sectionId,
-                schoolId:    req.schoolId,
-                classId:     section.class,
-                extra:       assignedRoll ? { rollNumber: assignedRoll } : null,
-                deferCounts: true,
+                sectionId:  section._id,
+                schoolId:   req.schoolId,
+                rollNumber: assignedRoll ?? undefined,
+                actorId:    req.userId,
             });
-            enrolled.push({ _id: studentId, name, rollNumber: assignedRoll });
+            enrolled.push({ _id: studentId, name, rollNumber: assignedRoll ?? (placed.rollNumber || null) });
         }
-
-        if (enrolled.length) await syncCounts([req.params.sectionId]);
 
         // A single-student call that could not be honoured still reads as an
         // error, the way the picker has always treated it.
@@ -1993,11 +1945,13 @@ exports.removeStudentFromSection = async (req, res) => {
     try {
         const { studentId } = req.body;
         if (!studentId) return err(res, { message: 'studentId is required' }, 400);
-        // Roster and profile are two halves of one fact — see
-        // utils/sectionMembership. Passing no section unenrols them from every
-        // section and recomputes the headcounts from the actual rosters, so the
-        // counter cannot drift below zero the way $inc could.
-        await setStudentSection({ studentId, sectionId: null, schoolId: req.schoolId });
+        const section = await ClassSection.findOne({ _id: req.params.sectionId, school: req.schoolId }, '_id enrolledStudents').lean();
+        if (!section) return err(res, { message: 'Section not found' }, 404);
+        if (!(section.enrolledStudents || []).map(String).includes(String(studentId)))
+            return err(res, { message: 'That student is not in this section' }, 400);
+        // Out of THIS section, for this section's year only: they stay admitted
+        // to the class that year, and every other year's placement is untouched.
+        await enrollment.unplace({ studentId, sectionId: section._id, schoolId: req.schoolId, actorId: req.userId });
         ok(res, { message: 'Student removed' });
     } catch (e) { err(res, e); }
 };
@@ -2139,9 +2093,7 @@ exports.deleteSection = async (req, res) => {
         // cascades that away, so a section anyone is still in is refused —
         // move them to another section of the class first.
         const enrolled = (sec.enrolledStudents || []).length;
-        const placed   = await StudentProfile.countDocuments({
-            school: req.schoolId, currentSection: sec._id,
-        });
+        const placed   = await enrollment.countIn({ sectionId: sec._id });
         const students = Math.max(enrolled, placed);
         if (students) {
             return res.status(400).json({

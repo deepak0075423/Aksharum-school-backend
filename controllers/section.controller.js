@@ -315,22 +315,11 @@ exports.createAnnouncement = async (req, res) => {
  * left out, and one with no profile row at all is kept.
  */
 async function studentsOfSection(section) {
-    const StudentProfile = require('../models/StudentProfile');
-    const roster = [...new Set((section.enrolledStudents || []).map(String))];
-
-    const profiles = await StudentProfile.find({
-        $or: [
-            { currentSection: section._id },
-            ...(roster.length ? [{ user: { $in: roster } }] : []),
-        ],
-    }).select('user currentSection').lean();
-
-    const seen = new Set(profiles.map((p) => String(p.user)));
-    const ids = new Set(profiles
-        .filter((p) => !p.currentSection || String(p.currentSection) === String(section._id))
-        .map((p) => String(p.user)));
-    for (const id of roster) if (!seen.has(id)) ids.add(id);
-    return [...ids];
+    // A section's roster is exactly its year's placements (services/enrollment
+    // keeps it so), so the roster is who the section holds — whichever year is
+    // active. Reading the profile's pointer here would leave out every student
+    // of a section that is not in the active year.
+    return [...new Set((section.enrolledStudents || []).map(String))];
 }
 
 /**

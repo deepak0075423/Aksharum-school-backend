@@ -32,6 +32,7 @@
  */
 const crypto = require('crypto');
 const pool = require('../db/pool');
+const { rollInSection, rollInYear, rollOrder } = require('../utils/yearRoll');
 const School = require('../models/School');
 const AcademicYear = require('../models/AcademicYear');
 const ClassSection = require('../models/ClassSection');
@@ -133,7 +134,8 @@ async function attendanceOf(studentIds, year) {
 /** The students themselves, with the section the year placed them in when no exam says. */
 async function studentsOf(schoolId, yearId, studentIds) {
     const { rows } = await pool.query(`
-        SELECT u."_id", u."name", u."profileImage", sp."rollNumber", sp."admissionNumber", sp."dob",
+        SELECT u."_id", u."name", u."profileImage", ${rollInYear('u."_id"', '$2::uuid', 'sp."rollNumber"')} AS "rollNumber",
+               sp."admissionNumber", sp."dob",
                ys."_id" AS "sectionId", ys."sectionName", yc."className", yc."classNumber"
           FROM ${T.users} u
           LEFT JOIN LATERAL (SELECT * FROM ${T.profiles} p WHERE p."user" = u."_id" ORDER BY p."createdAt" DESC NULLS LAST LIMIT 1) sp ON true
@@ -393,7 +395,7 @@ async function rollOf(sectionId) {
            AND u."_id"::text IN (SELECT v FROM jsonb_array_elements_text(${jarr('s."enrolledStudents"')}) v)
           LEFT JOIN LATERAL (SELECT "rollNumber" FROM ${T.profiles} WHERE "user" = u."_id" ORDER BY "createdAt" DESC NULLS LAST LIMIT 1) sp ON true
          WHERE s."_id" = $1::uuid
-         ORDER BY NULLIF(regexp_replace(COALESCE(sp."rollNumber", ''), '\\D', '', 'g'), '')::bigint NULLS LAST, u."name"`, [String(sectionId)]);
+         ORDER BY ${rollOrder(rollInSection('u."_id"', 's."_id"', 'sp."rollNumber"'))}, u."name"`, [String(sectionId)]);
     return rows.map((r) => String(r._id));
 }
 

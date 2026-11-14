@@ -1,4 +1,5 @@
 'use strict';
+const { rollInSection } = require('../utils/yearRoll');
 /**
  * Admin → Attendance.
  *
@@ -178,7 +179,8 @@ async function studentDay({ schoolId, yearId, classId, sectionId, day, search, s
     const base = `
     WITH ${ctes},
     day AS (
-        SELECT u."_id", u."name", u."profileImage" AS "photo", sp."rollNumber",
+        SELECT u."_id", u."name", u."profileImage" AS "photo",
+               ${rollInSection('roster."student"', 'roster."section"', 'sp."rollNumber"')} AS "rollNumber",
                secs."className", secs."classNumber", secs."sectionName", roster."section",
                d."status", d."markedAt", d."markedBy", d."remarks", d."registers"
           FROM roster
@@ -197,7 +199,7 @@ async function studentDay({ schoolId, yearId, classId, sectionId, day, search, s
                WHERE a."section" = roster."section" AND a."date" >= ${from} AND a."date" < ${to}
                  ${registerKey}
           ) d ON true
-         ${like ? `WHERE (u."name" ILIKE ${like} OR sp."rollNumber" ILIKE ${like})` : ''}
+         ${like ? `WHERE (u."name" ILIKE ${like} OR ${rollInSection('roster."student"', 'roster."section"', 'sp."rollNumber"')} ILIKE ${like})` : ''}
     )`;
 
     const STATUS_SQL = {
@@ -798,14 +800,15 @@ exports.reports = async (req, res) => {
                  GROUP BY s."_id", s."className", s."classNumber", s."sectionName"
                  ORDER BY s."classNumber", s."sectionName"`, p.list),
             pool.query(`${withMarks}
-                SELECT u."_id", u."name", u."profileImage" AS "photo", sp."rollNumber",
+                SELECT u."_id", u."name", u."profileImage" AS "photo",
+                       ${rollInSection('roster."student"', 'roster."section"', 'sp."rollNumber"')} AS "rollNumber",
                        s."className", s."sectionName", ${tally}
                   FROM roster
                   JOIN ${T(User)} u ON u."_id" = roster."student"
                   JOIN secs s ON s."_id" = roster."section"
                   LEFT JOIN ${T(StudentProfile)} sp ON sp."user" = roster."student" AND sp."school" = $1
                   LEFT JOIN marks m ON m."student" = roster."student"
-                 GROUP BY u."_id", u."name", u."profileImage", sp."rollNumber", s."className", s."sectionName"`, p.list),
+                 GROUP BY u."_id", u."name", u."profileImage", sp."rollNumber", roster."student", roster."section", s."className", s."sectionName"`, p.list),
             pool.query(`${withMarks}
                 SELECT ${tally}, count(DISTINCT m."date")::int AS "days",
                        count(DISTINCT (m."section", m."date", m."subject"))::int AS "registers",

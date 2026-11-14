@@ -1,4 +1,5 @@
 'use strict';
+const { rollInSection, rollOrder } = require('../utils/yearRoll');
 // ─────────────────────────────────────────────────────────────────────────────
 //  Which registers a teacher may take — and read, rank and correct.
 //
@@ -238,23 +239,24 @@ function holdsRegister(scope, sectionId, subjectId) {
 }
 
 /**
- * Active students of a section, the section's roster by both pointers — the
- * profile's currentSection, and the section's enrolledStudents for a student
- * whose profile names no section. Ordered by roll number, then name.
+ * Active students of a section — its roster, which is exactly the section's
+ * year's placements (services/enrollment keeps it so), with the roll number
+ * each holds IN this section. Ordered by roll number, then name. Reading the
+ * profile's pointer instead left a section outside the active year empty.
  */
 async function sectionStudents(schoolId, sectionId) {
     const { rows } = await pool.query(
-        `SELECT u."_id", u."name", u."profileImage" AS "photo", sp."rollNumber"
+        `SELECT u."_id", u."name", u."profileImage" AS "photo",
+                ${rollInSection('u."_id"', '$1::uuid', 'sp."rollNumber"')} AS "rollNumber"
            FROM ${T(User)} u
            LEFT JOIN ${T(StudentProfile)} sp ON sp."user" = u."_id" AND sp."school" = $2
           WHERE u."role" = 'student' AND u."school" = $2 AND u."isActive" IS NOT FALSE
-            AND (sp."currentSection" = $1
-                 OR (sp."currentSection" IS NULL AND u."_id"::text IN (
-                        SELECT jsonb_array_elements_text(
-                                 CASE WHEN jsonb_typeof(cs."enrolledStudents") = 'array'
-                                      THEN cs."enrolledStudents" ELSE '[]'::jsonb END)
-                          FROM ${T(ClassSection)} cs WHERE cs."_id" = $1)))
-          ORDER BY NULLIF(regexp_replace(COALESCE(sp."rollNumber", ''), '\\D', '', 'g'), '')::numeric NULLS LAST, u."name"`,
+            AND u."_id"::text IN (
+                    SELECT jsonb_array_elements_text(
+                             CASE WHEN jsonb_typeof(cs."enrolledStudents") = 'array'
+                                  THEN cs."enrolledStudents" ELSE '[]'::jsonb END)
+                      FROM ${T(ClassSection)} cs WHERE cs."_id" = $1)
+          ORDER BY ${rollOrder(rollInSection('u."_id"', '$1::uuid', 'sp."rollNumber"'))}, u."name"`,
         [String(sectionId), String(schoolId)],
     );
     return rows;

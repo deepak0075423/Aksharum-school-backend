@@ -26,6 +26,7 @@
  * nothing here depends on the database session's zone.
  */
 const pool = require('../db/pool');
+const { rollInSection, rollInYear, rollOrder } = require('../utils/yearRoll');
 const TZ = require('../config/timezone');
 const { isUuid } = require('../db/schema');
 const FormalExam = require('../models/FormalExam');
@@ -668,7 +669,7 @@ async function detail(schoolId, id) {
 /** The section's students with roll and admission numbers, in roll order. */
 async function rosterRows(sectionId) {
     const { rows } = await pool.query(`
-        SELECT u."_id", u."name", u."isActive", sp."rollNumber", sp."admissionNumber"
+        SELECT u."_id", u."name", u."isActive", ${rollInSection('u."_id"', 's."_id"', 'sp."rollNumber"')} AS "rollNumber", sp."admissionNumber"
           FROM ${T.sections} s
           JOIN ${T.users} u ON u."role" = 'student' AND u."isActive" IS NOT FALSE
            AND u."_id" IN (SELECT v::uuid FROM jsonb_array_elements_text(${jarr('s."enrolledStudents"')}) v
@@ -676,7 +677,7 @@ async function rosterRows(sectionId) {
           LEFT JOIN LATERAL (SELECT "rollNumber", "admissionNumber" FROM ${T.profiles}
                               WHERE "user" = u."_id" ORDER BY "createdAt" DESC NULLS LAST LIMIT 1) sp ON true
          WHERE s."_id" = $1::uuid
-         ORDER BY NULLIF(regexp_replace(COALESCE(sp."rollNumber", ''), '\\D', '', 'g'), '')::bigint NULLS LAST, u."name"`,
+         ORDER BY ${rollOrder(rollInSection('u."_id"', 's."_id"', 'sp."rollNumber"'))}, u."name"`,
     [String(sectionId)]);
     return rows;
 }
@@ -785,7 +786,9 @@ async function results(schoolId, id) {
     const subjectIds = cfgs.map((s) => String(s.subject)).filter(isUuid);
     const [{ rows }, { rows: subs }, summary] = await Promise.all([
         pool.query(`
-            SELECT r."_id", r."student", u."name", sp."rollNumber", sp."admissionNumber", r."subjects",
+            SELECT r."_id", r."student", u."name",
+                   ${rollInSection('r."student"', `(SELECT ex."section" FROM ${T.exams} ex WHERE ex."_id" = $1::uuid)`, 'sp."rollNumber"')} AS "rollNumber",
+                   sp."admissionNumber", r."subjects",
                    r."totalMarks", r."totalMaxMarks", r."percentage", r."grade", r."rank", r."isPassed"
               FROM ${T.results} r
               JOIN ${T.users} u ON u."_id" = r."student"
@@ -982,11 +985,11 @@ async function overall(schoolId, q = {}) {
     const outOf = new Map(perSection.rows.map((r) => [String(r.section), num(r.n)]));
     const ids = [...yearsOf.keys()];
     const { rows: people } = ids.length ? await pool.query(`
-        SELECT u."_id"::text AS "_id", u."name", sp."rollNumber", sp."admissionNumber"
+        SELECT u."_id"::text AS "_id", u."name", ${rollInYear('u."_id"', '$2::uuid', 'sp."rollNumber"')} AS "rollNumber", sp."admissionNumber"
           FROM ${T.users} u
           LEFT JOIN LATERAL (SELECT "rollNumber", "admissionNumber" FROM ${T.profiles}
                               WHERE "user" = u."_id" ORDER BY "createdAt" DESC NULLS LAST LIMIT 1) sp ON true
-         WHERE u."_id" = ANY($1::uuid[])`, [ids]) : { rows: [] };
+         WHERE u."_id" = ANY($1::uuid[])`, [ids, String(year._id)]) : { rows: [] };
     const personOf = new Map(people.map((x) => [x._id, x]));
     const rows = ids.map((sid) => {
         const y = yearsOf.get(sid);
@@ -1207,9 +1210,9 @@ async function meritList(schoolId, q = {}) {
         const { years: ys } = await require('./resultOverall').yearsFor(id, year._id, { classNumber: cn });
         const ids = [...ys.keys()];
         const { rows: people } = ids.length ? await pool.query(`
-            SELECT u."_id"::text AS "_id", u."name", sp."rollNumber", sp."admissionNumber" FROM ${T.users} u
+            SELECT u."_id"::text AS "_id", u."name", ${rollInYear('u."_id"', '$2::uuid', 'sp."rollNumber"')} AS "rollNumber", sp."admissionNumber" FROM ${T.users} u
               LEFT JOIN LATERAL (SELECT "rollNumber", "admissionNumber" FROM ${T.profiles} WHERE "user" = u."_id" ORDER BY "createdAt" DESC NULLS LAST LIMIT 1) sp ON true
-             WHERE u."_id" = ANY($1::uuid[])`, [ids]) : { rows: [] };
+             WHERE u."_id" = ANY($1::uuid[])`, [ids, String(year._id)]) : { rows: [] };
         const who = new Map(people.map((x) => [x._id, x]));
         out.rows = ids.map((sid) => {
             const y = ys.get(sid);
@@ -1226,7 +1229,7 @@ async function meritList(schoolId, q = {}) {
     const [typeKey, ...rest] = pick.split('|');
     const title = rest.join('|');
     const { rows } = await pool.query(`
-        SELECT r."student"::text AS "student", u."name", sp."rollNumber", sp."admissionNumber", s."sectionName",
+        SELECT r."student"::text AS "student", u."name", ${rollInSection('r."student"', 'e."section"', 'sp."rollNumber"')} AS "rollNumber", sp."admissionNumber", s."sectionName",
                r."totalMarks", r."totalMaxMarks", r."percentage", r."grade", r."isPassed", r."rank" AS "sectionRank",
                rank() OVER (ORDER BY (r."totalMarks"::numeric / NULLIF(r."totalMaxMarks"::numeric, 0)) DESC NULLS LAST)::int AS "rank",
                count(*) OVER ()::int AS "total",

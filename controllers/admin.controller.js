@@ -11,6 +11,7 @@ const ParentProfile  = require('../models/ParentProfile');
 const ClassSection   = require('../models/ClassSection');
 const Class          = require('../models/Class');
 const AcademicYear   = require('../models/AcademicYear');
+const StudentEnrollment = require('../models/StudentEnrollment');
 const School         = require('../models/School');
 const { GATEWAY_MODULES } = require('../services/paymentGateway');
 const ReceiptTemplate = require('../models/ReceiptTemplate');
@@ -41,7 +42,37 @@ const designationSvc = require('../services/designationService');
 const mailer         = require('../config/mailer');
 const { sendSchoolMail, emailHeaderHtml, getMailContext, sendSchoolAddedEmail, invalidate: invalidateMailer } = require('../utils/schoolMailer');
 const { notify } = require('../services/notifyService');
-const { setStudentSection } = require('../utils/sectionMembership');
+const enrollment = require('../services/enrollment');
+
+/**
+ * The form's class / section / roll, applied as a placement for the year the
+ * class belongs to (the form offers the active year's classes) — through the
+ * one placement writer, so no other year's placement changes. Only what was
+ * sent is applied.
+ */
+async function applyFormPlacement(req, studentId, { currentClass, currentSection, rollNumber }) {
+    const sectionSent = currentSection !== undefined;
+    const classSent   = currentClass !== undefined;
+    const roll        = rollNumber !== undefined ? String(rollNumber ?? '').trim() : undefined;
+    if (sectionSent && currentSection) {
+        return enrollment.place({ studentId, sectionId: currentSection, classId: currentClass || null, schoolId: req.schoolId, rollNumber: roll, actorId: req.userId });
+    }
+    if (classSent && currentClass) {
+        return enrollment.place({ studentId, classId: currentClass, schoolId: req.schoolId, rollNumber: '', actorId: req.userId });
+    }
+    if (sectionSent || classSent) {
+        // Both cleared: no class this (active) year. Other years keep theirs.
+        const active = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }, '_id').lean();
+        if (active) return enrollment.withdraw({ studentId, schoolId: req.schoolId, academicYear: active._id });
+        return null;
+    }
+    if (roll !== undefined) {
+        // Only the roll changed: it belongs to the section the record shows.
+        const p = await StudentProfile.findOne({ user: studentId }, 'currentSection').lean();
+        if (p?.currentSection) await enrollment.setRoll({ studentId, sectionId: p.currentSection, rollNumber: roll, actorId: req.userId });
+    }
+    return null;
+}
 const { validate, isEmail, isPhone, isURL, normalizePhone } = require('../utils/validators');
 const authCache = require('../utils/authCache');
 const { deleteSchoolLogo } = require('../utils/schoolLogoFile');
@@ -804,23 +835,36 @@ function conditions(seed = []) {
 
 // ── Students ─────────────────────────────────────────────────────────────────
 
+// Where the list places each student — `pl` (class, section, rollNumber):
+//   - no year in question: the profile's pointer, i.e. the active year;
+//   - a year picked, or a class / section picked (each belongs to one year):
+//     the student's own row for THAT year (StudentEnrollment), so choosing a
+//     2025-26 class lists who sat in it then, with that year's section and
+//     roll — not wherever they are now.
 // The class shows through the section when there is one, and straight off the
-// profile when the student has been admitted to a class but not placed yet.
-const STUDENT_FROM = `
+// placement when the student is admitted to a class but not placed yet.
+function studentFrom(yearParam) {
+    const pl = yearParam
+        ? `LEFT JOIN LATERAL (SELECT se."section", se."class", se."rollNumber" FROM "${StudentEnrollment.tableName}" se
+                               WHERE se."student" = u."_id" AND se."academicYear" = ${yearParam}::uuid LIMIT 1) pl ON true`
+        : `LEFT JOIN LATERAL (SELECT sp."currentSection" AS "section", sp."currentClass" AS "class", sp."rollNumber") pl ON true`;
+    return `
        FROM ${qt(User)}            u
   LEFT JOIN ${qt(StudentProfile)}  sp ON sp."user" = u."_id"
-  LEFT JOIN ${qt(ClassSection)}    cs ON cs."_id"  = sp."currentSection"
+  ${pl}
+  LEFT JOIN ${qt(ClassSection)}    cs ON cs."_id"  = pl."section"
   LEFT JOIN ${qt(Class)}          csc ON csc."_id" = cs."class"
-  LEFT JOIN ${qt(Class)}          ocl ON ocl."_id" = sp."currentClass"
+  LEFT JOIN ${qt(Class)}          ocl ON ocl."_id" = pl."class"
   LEFT JOIN ${qt(User)}            pu ON pu."_id"  = sp."parent"
   LEFT JOIN ${qt(ParentProfile)}   pp ON pp."user" = sp."parent"`;
+}
 
 const STUDENT_COLUMNS = `
         u."_id", u."name", u."email", u."phone", u."profileImage",
         u."isActive", u."createdAt",
-        sp."rollNumber", sp."admissionNumber", sp."gender", sp."dob",
-        sp."currentSection", cs."sectionName",
-        COALESCE(cs."class", sp."currentClass")           AS "classId",
+        pl."rollNumber", sp."admissionNumber", sp."gender", sp."dob",
+        pl."section" AS "currentSection", cs."sectionName",
+        COALESCE(cs."class", pl."class")                  AS "classId",
         COALESCE(csc."className", ocl."className")        AS "className",
         pu."_id"  AS "parentId",
         pu."name" AS "parentName",
@@ -828,55 +872,59 @@ const STUDENT_COLUMNS = `
                  pp."mother"->>'phone', pp."guardian"->>'phone',
                  NULLIF(pp."emergencyContact", ''))       AS "parentPhone"`;
 
-/**
- * Rows-per-page ordering. Name is the default everywhere; the rest are what the
- * list page offers under "Sort by". Roll numbers are text but read as numbers,
- * so 2 sorts before 10 rather than after it.
- */
 const STUDENT_ORDER = {
     name:     'u."name" ASC',
     name_z:   'u."name" DESC',
     newest:   'u."createdAt" DESC, u."name" ASC',
     oldest:   'u."createdAt" ASC, u."name" ASC',
-    roll:     `CASE WHEN sp."rollNumber" ~ '^[0-9]{1,9}$' THEN sp."rollNumber"::int END ASC NULLS LAST,
-               NULLIF(sp."rollNumber", '') ASC NULLS LAST, u."name" ASC`,
+    roll:     `CASE WHEN pl."rollNumber" ~ '^[0-9]{1,9}$' THEN pl."rollNumber"::int END ASC NULLS LAST,
+               NULLIF(pl."rollNumber", '') ASC NULLS LAST, u."name" ASC`,
     class:    `COALESCE(csc."className", ocl."className") ASC NULLS LAST, cs."sectionName" ASC NULLS LAST, u."name" ASC`,
 };
 
 /**
- * Everything the students list is asked to narrow itself by, in one place.
- * `since` is addedSince()'s answer.
+ * The year the list is about: the one picked, else the year of the class or
+ * section picked. null = no year in question (the active year's pointer).
  */
-function studentFilters(req, since) {
+async function studentListYear(req) {
+    const { classId = '', sectionId = '', academicYear = '' } = req.query;
+    if (isUuid(academicYear)) {
+        const y = await AcademicYear.findOne({ _id: academicYear, school: req.schoolId }, '_id').lean();
+        if (y) return String(y._id);
+    }
+    if (isUuid(sectionId)) {
+        const sec = await ClassSection.findOne({ _id: sectionId, school: req.schoolId }, 'academicYear').lean();
+        if (sec?.academicYear) return String(sec.academicYear);
+    }
+    if (isUuid(classId)) {
+        const cl = await Class.findOne({ _id: classId, school: req.schoolId }, 'academicYear').lean();
+        if (cl?.academicYear) return String(cl.academicYear);
+    }
+    return null;
+}
+
+function studentFilters(req, since, year = null) {
     const c = conditions([String(req.schoolId)]);
     c.where.push(`u."school" = $1`, `u."role" = 'student'`);
+    // The year goes in as $2, so the FROM can name it before any filter is added.
+    const yearParam = year ? `$${c.values.push(year)}` : null;
+    c.from = studentFrom(yearParam);
 
-    const { search = '', status = 'all', gender = '', classId = '', sectionId = '',
-            academicYear = '' } = req.query;
+    const { search = '', status = 'all', gender = '', classId = '', sectionId = '' } = req.query;
     if (search.trim()) {
-        c.add(`(u."name" ILIKE ? OR u."email" ILIKE ? OR sp."rollNumber" ILIKE ? OR sp."admissionNumber" ILIKE ?)`,
+        c.add(`(u."name" ILIKE ? OR u."email" ILIKE ? OR pl."rollNumber" ILIKE ? OR sp."admissionNumber" ILIKE ?)`,
             ...Array(4).fill(`%${search.trim()}%`));
     }
     const st = statusClause(status);
     if (st) c.where.push(st);
     if (since)                  c.add(`u."createdAt" >= ?`, since);
     if (gender)                 c.add(`sp."gender" = ?`, gender);
-    if (isUuid(sectionId))      c.add(`sp."currentSection" = ?::uuid`, sectionId);
-    else if (isUuid(classId))   c.add(`COALESCE(cs."class", sp."currentClass") = ?::uuid`, classId);
-    // Sat in a section of that year's classes — read off the section rosters,
-    // which is what the Classes screen's "Total Students" adds up. For a year
-    // that has ended the rosters are the only record: everyone's profile has
-    // moved on to this year's section. Uncorrelated, so it is hashed once.
-    if (isUuid(academicYear)) {
-        c.add(`u."_id"::text IN (
-                   SELECT e.id
-                     FROM ${qt(ClassSection)} ys
-                     JOIN ${qt(Class)} yc ON yc."_id" = ys."class"
-                    CROSS JOIN LATERAL jsonb_array_elements_text(
-                          CASE WHEN jsonb_typeof(ys."enrolledStudents") = 'array'
-                               THEN ys."enrolledStudents" ELSE '[]'::jsonb END) AS e(id)
-                    WHERE yc."school" = $1 AND yc."academicYear" = ?::uuid)`, academicYear);
-    }
+    if (isUuid(sectionId))      c.add(`pl."section" = ?::uuid`, sectionId);
+    else if (isUuid(classId))   c.add(`COALESCE(cs."class", pl."class") = ?::uuid`, classId);
+    // A year in question lists the students placed in it — class with or
+    // without a section — from their own rows, which is the only record of a
+    // year that has ended.
+    if (yearParam) c.where.push(`pl."class" IS NOT NULL`);
     return c;
 }
 
@@ -884,16 +932,16 @@ exports.getStudents = async (req, res) => {
     try {
         const { page, limit, offset } = paging(req.query);
         const start = await yearStart(req.schoolId);
-        const c     = studentFilters(req, await addedSince(req, start));
+        const c     = studentFilters(req, await addedSince(req, start), await studentListYear(req));
         const order = STUDENT_ORDER[req.query.sort] || STUDENT_ORDER.name;
 
         const [rows, count, stats] = await Promise.all([
             pool.query(
-                `SELECT ${STUDENT_COLUMNS} ${STUDENT_FROM} ${c.sql()}
+                `SELECT ${STUDENT_COLUMNS} ${c.from} ${c.sql()}
                   ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`,
                 c.values,
             ),
-            pool.query(`SELECT count(*)::int AS "n" ${STUDENT_FROM} ${c.sql()}`, c.values),
+            pool.query(`SELECT count(*)::int AS "n" ${c.from} ${c.sql()}`, c.values),
             accountStats(req.schoolId, 'student', start),
         ]);
 
@@ -1359,10 +1407,10 @@ const asList    = (v) => (Array.isArray(v) ? v.join(', ') : (v || ''));
 
 exports.exportStudents = async (req, res) => {
     try {
-        const c     = studentFilters(req, await addedSince(req));
+        const c     = studentFilters(req, await addedSince(req), await studentListYear(req));
         const order = STUDENT_ORDER[req.query.sort] || STUDENT_ORDER.name;
         const { rows } = await pool.query(
-            `SELECT ${STUDENT_COLUMNS} ${STUDENT_FROM} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
+            `SELECT ${STUDENT_COLUMNS} ${c.from} ${c.sql()} ORDER BY ${order} LIMIT ${EXPORT_LIMIT}`,
             c.values,
         );
         sendSheet(res, {
@@ -1468,7 +1516,9 @@ exports.getTeacherDetail = async (req, res) => {
 
 exports.getStudentDetail = async (req, res) => {
     try {
-        const user    = await User.findById(req.params.id).lean();
+        // Scoped to the school: an id from another school is not this admin's student.
+        const user    = await User.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!user) return res.status(404).json({ success: false, message: 'Student not found' });
         const profile = await StudentProfile.findOne({ user: req.params.id })
             .populate('parent', 'name email phone')
             .populate({ path: 'currentSection', select: 'sectionName class', populate: { path: 'class', select: 'className classNumber' } })
@@ -1477,7 +1527,10 @@ exports.getStudentDetail = async (req, res) => {
         const parentProfile = profile?.parent
             ? await ParentProfile.findOne({ user: profile.parent._id || profile.parent }).lean()
             : null;
-        jsonOk(res, { user, profile, parentProfile });
+        // Every academic year they have been placed in, oldest first — each
+        // year's class, section and roll exactly as that year left them.
+        const enrollments = await enrollment.history(req.params.id);
+        jsonOk(res, { user, profile, parentProfile, enrollments });
     } catch (err) { jsonErr(res, err); }
 };
 
@@ -1573,7 +1626,6 @@ exports.updateStudentFull = async (req, res) => {
                 if (sentFields[key] === undefined && !fromUpload.has(key)) delete profileUpdate[key];
             }
         }
-        if (rollNumber      !== undefined) profileUpdate.rollNumber      = rollValue;
         if (admissionNumber !== undefined) {
             const adm = String(admissionNumber).trim();
             if (adm) {
@@ -1586,24 +1638,15 @@ exports.updateStudentFull = async (req, res) => {
         }
         if (profileUpdate.dob !== undefined) profileUpdate.dob = profileUpdate.dob || null;
         if (resolvedParentId !== undefined) profileUpdate.parent         = resolvedParentId;
-        if (currentSection  !== undefined) profileUpdate.currentSection  = currentSection || null;
-        if (currentClass    !== undefined) profileUpdate.currentClass    = currentClass || null;
-        // Keep the class in step when only a section is sent
-        if (currentClass === undefined && currentSection) {
-            const sec = await ClassSection.findOne({ _id: currentSection, school: req.schoolId }, 'class').lean();
-            if (sec?.class) profileUpdate.currentClass = sec.class;
-        }
-
+        // Class, section and roll are a placement, not profile fields: the
+        // pointer on the profile is derived from the year-by-year rows.
+        delete profileUpdate.currentSection; delete profileUpdate.currentClass; delete profileUpdate.rollNumber;
         await StudentProfile.findOneAndUpdate({ user: req.params.id }, profileUpdate, { upsert: true });
-        // Moving a student on the form has to move them on the class too —
-        // otherwise their record says 8-A while 5-A still holds them.
-        if (currentSection !== undefined) {
-            await setStudentSection({
-                studentId: req.params.id,
-                sectionId: currentSection || null,
-                schoolId:  req.schoolId,
-                classId:   profileUpdate.currentClass || null,
-            });
+        try {
+            await applyFormPlacement(req, req.params.id, { currentClass, currentSection, rollNumber });
+        } catch (e) {
+            if (e instanceof enrollment.EnrollmentError) return res.status(e.status).json({ success: false, message: e.message });
+            throw e;
         }
         if (resolvedParentId) {
             await ParentProfile.findOneAndUpdate(
@@ -2252,18 +2295,16 @@ exports.createStudent = async (req, res) => {
         );
         const profileData = { user: user._id, school: req.schoolId, ...buildStudentProfile(profile, uploads) };
         if (resolvedParentId) profileData.parent = resolvedParentId;
+        const { currentSection: placeSection, currentClass: placeClass, rollNumber: placeRoll } = profileData;
+        delete profileData.currentSection; delete profileData.currentClass; delete profileData.rollNumber;
         await withProfile(user, () => StudentProfile.create(profileData));
-        // The profile now says which section they are in; the section itself has
-        // to agree, or the class page, attendance and the timetable fan-out all
-        // miss a student their own record says is enrolled.
-        if (profileData.currentSection) {
-            await setStudentSection({
-                studentId: user._id,
-                sectionId: profileData.currentSection,
-                schoolId:  req.schoolId,
-                classId:   profileData.currentClass || classId,
-            });
-        }
+        // Their class (and section, when chosen) for that class's year — the
+        // row, the roster and the record's pointer, written together.
+        await enrollment.place({
+            studentId: user._id, schoolId: req.schoolId,
+            sectionId: placeSection || null, classId: placeClass || classId,
+            rollNumber: placeSection ? String(placeRoll ?? '').trim() : '', source: 'admission', actorId: req.userId,
+        });
         if (resolvedParentId) {
             await ParentProfile.findOneAndUpdate(
                 { user: resolvedParentId },
@@ -2327,20 +2368,9 @@ exports.deleteUser = async (req, res) => {
             if (!report) return;
             applyForce = report.applyForce;
         }
-        // Remove from all section enrollments
-        const affectedSections = await ClassSection.find({ enrolledStudents: userId }, '_id').lean();
-        if (affectedSections.length) {
-            await ClassSection.updateMany(
-                { enrolledStudents: userId },
-                { $pull: { enrolledStudents: userId } }
-            );
-            // Recalculate currentCount for each affected section
-            const updated = await ClassSection.find({ _id: { $in: affectedSections.map(s => s._id) } }, 'enrolledStudents').lean();
-            const ops = updated.map(s => ({
-                updateOne: { filter: { _id: s._id }, update: { $set: { currentCount: s.enrolledStudents.length } } },
-            }));
-            if (ops.length) await ClassSection.bulkWrite(ops);
-        }
+        // The account is going: its placement in every year, and every roster
+        // that lists it, go with it.
+        await enrollment.forgetStudents([userId]);
         await StudentProfile.deleteOne({ user: userId });
         // A deleted teacher used to leave their profile row behind, which held on
         // to the employee ID and kept it out of circulation for good.
@@ -2384,19 +2414,8 @@ exports.bulkDeleteUsers = async (req, res) => {
             success: true, deleted: 0, skipped,
             message: 'Selected accounts cannot be deleted',
         });
-        // Remove all ids from section enrollments
-        const affectedSections = await ClassSection.find({ enrolledStudents: { $in: ids } }, '_id').lean();
-        if (affectedSections.length) {
-            await ClassSection.updateMany(
-                { enrolledStudents: { $in: ids } },
-                { $pull: { enrolledStudents: { $in: ids } } }
-            );
-            const updated = await ClassSection.find({ _id: { $in: affectedSections.map(s => s._id) } }, 'enrolledStudents').lean();
-            const ops = updated.map(s => ({
-                updateOne: { filter: { _id: s._id }, update: { $set: { currentCount: s.enrolledStudents.length } } },
-            }));
-            if (ops.length) await ClassSection.bulkWrite(ops);
-        }
+        // Every year's placement of these accounts, and every roster listing them.
+        await enrollment.forgetStudents(ids);
         await StudentProfile.deleteMany({ user: { $in: ids } });
         await User.deleteMany({ _id: { $in: ids }, school: req.schoolId });
         await authCache.invalidateMany(ids);
@@ -3103,12 +3122,10 @@ exports.bulkStudents = async (req, res) => {
                     school: req.schoolId,
                     ...buildStudentProfile(profile, {}),
                     admissionNumber,
-                    currentClass: clasDoc._id,
-                    currentSection: section._id,
                     parent: parentId,
-                    // Optional in the sheet: sections assign roll numbers in bulk later.
-                    ...(rollNumber ? { rollNumber } : {}),
                 };
+                // Class, section and roll are a placement (below), not profile fields.
+                delete profileData.currentClass; delete profileData.currentSection; delete profileData.rollNumber;
 
                 // 'created' vs 'updated' — a re-uploaded sheet is mostly the
                 // latter, and the admin has to be able to see that it was.
@@ -3133,11 +3150,14 @@ exports.bulkStudents = async (req, res) => {
                     sendWelcomeEmail(email, name, email, otp, schoolName, req.schoolId);
                     created++;
                 }
-                // Enrol (idempotent) so the section roster matches the sheet
-                await ClassSection.updateOne(
-                    { _id: section._id },
-                    { $addToSet: { enrolledStudents: studentUser._id } },
-                );
+                // The sheet's section, for that section's year: the row, the
+                // roster and the record's pointer. A student already in another
+                // section that year moves; their other years stay as they were.
+                // Optional roll in the sheet — sections assign them in bulk later.
+                await enrollment.place({
+                    studentId: studentUser._id, sectionId: section._id, schoolId: req.schoolId,
+                    rollNumber: rollNumber || undefined, source: 'import', actorId: req.userId,
+                });
                 await ParentProfile.findOneAndUpdate({ user: parentId }, { $addToSet: { children: studentUser._id } });
 
                 push({ type: 'row_done', row: rowNum, name, success: true, action });
@@ -3146,12 +3166,6 @@ exports.bulkStudents = async (req, res) => {
             }
         }
 
-        // Section rosters changed above — bring their headcounts back in line
-        const touched = await ClassSection.find({ school: req.schoolId }, '_id enrolledStudents').lean();
-        const countOps = touched.map(sec => ({
-            updateOne: { filter: { _id: sec._id }, update: { $set: { currentCount: (sec.enrolledStudents || []).length } } },
-        }));
-        if (countOps.length) await ClassSection.bulkWrite(countOps);
 
         // created + updated + errors === total. The client shows all four, so a
         // run that stops early is visible as a shortfall instead of passing for

@@ -101,12 +101,14 @@ exports.teacherGetMarksForm = async (req, res) => {
         // the student profile — the account row has none.
         const [all, takers] = await Promise.all([exams.rosterOf(exam.section), exams.takersOf(exam.section, [subjectId])]);
         const roster   = exams.rollFor(all, takers, subjectId);
-        const [users, profiles] = await Promise.all([
+        const [users, profiles, rolls] = await Promise.all([
             User.find({ _id: { $in: roster } }).select('name email').lean(),
-            require('../models/StudentProfile').find({ user: { $in: roster } }).select('user rollNumber admissionNumber').lean(),
+            require('../models/StudentProfile').find({ user: { $in: roster } }).select('user admissionNumber').lean(),
+            // The roll each holds in the exam's section — that year's, not the active year's.
+            require('../services/enrollment').rollsOfSection(exam.section),
         ]);
         const profileOf = new Map(profiles.map((p) => [String(p.user), p]));
-        const students = users.map((u) => ({ ...u, rollNumber: profileOf.get(String(u._id))?.rollNumber || '', admissionNumber: profileOf.get(String(u._id))?.admissionNumber || '' }));
+        const students = users.map((u) => ({ ...u, rollNumber: rolls.get(String(u._id)) || '', admissionNumber: profileOf.get(String(u._id))?.admissionNumber || '' }));
 
         const sheet = await ExamMarksSheet.findOne({ exam: examId, subject: subjectId }).lean();
         const subjectConfig = exam.subjects.find(s => s.subject.toString() === subjectId);

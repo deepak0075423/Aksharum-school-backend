@@ -2170,7 +2170,9 @@ async function reExamBoard(ctx, id, { teacherId = null } = {}) {
                                   WHERE "user" = ANY($1::uuid[]) ORDER BY "user", "createdAt" DESC NULLS LAST`, [ids]) : { rows: [] },
     ]);
     const nameOf = new Map(users.map((u) => [String(u._id), u]));
-    const rollOf = new Map(rolls.rows.map((r) => [r.user, r]));
+    // Admission numbers from the record; roll numbers as held in the exam's section.
+    const sectionRolls = await require('./enrollment').rollsOfSection(exam.section);
+    const rollOf = new Map(rolls.rows.map((r) => [r.user, { ...r, rollNumber: sectionRolls.has(r.user) ? sectionRolls.get(r.user) : r.rollNumber }]));
     const subOf = new Map(subs.map((x) => [String(x._id), x]));
     const rx = exam.reExam || {};
     const markOf = new Map((Array.isArray(rx.marks) ? rx.marks : []).map((m) => [`${m.student}:${m.subject}`, m]));

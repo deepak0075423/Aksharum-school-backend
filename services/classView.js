@@ -29,8 +29,11 @@ const EMPTY = { subjectTeachers: [], monitors: [], classmates: [], announcements
  */
 async function findSection(profile, studentId, schoolId) {
     if (profile?.currentSection) return profile.currentSection;
-    const scope = schoolId ? { enrolledStudents: studentId, school: schoolId } : { enrolledStudents: studentId };
-    const bySection = await ClassSection.findOne(scope).select('_id').lean();
+    // No pointer: fall back to a roster of the ACTIVE year only — a student
+    // stays on earlier years' rosters as those years' record.
+    const active = schoolId ? await AcademicYear.findOne({ school: schoolId, status: 'active' }).select('_id').lean() : null;
+    if (!active) return null;
+    const bySection = await ClassSection.findOne({ enrolledStudents: studentId, school: schoolId, academicYear: active._id }).select('_id').lean();
     return bySection?._id || null;
 }
 

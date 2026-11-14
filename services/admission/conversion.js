@@ -358,8 +358,7 @@ async function convert(req, app, input = {}) {
 
             // The student record.
             const profile = {
-                user: studentId, school: app.school, admissionNumber,
-                currentClass: app.class, currentSection: section?._id || null, parent: parentId,
+                user: studentId, school: app.school, admissionNumber, parent: parentId,
                 gender: ['Male', 'Female', 'Other'].includes(textOf(m['student.gender'])) ? textOf(m['student.gender']) : '',
                 dob: /^\d{4}-\d{2}-\d{2}$/.test(textOf(m['student.dob'])) ? new Date(`${m['student.dob']}T00:00:00Z`) : (app.studentDob || null),
                 bloodGroup: textOf(m['student.bloodGroup']) === 'Not known' ? '' : textOf(m['student.bloodGroup']),
@@ -408,15 +407,13 @@ async function convert(req, app, input = {}) {
                     [pp._id, String(studentId), JSON.stringify(fill(pp.father, blocks.father)), JSON.stringify(fill(pp.mother, blocks.mother)), JSON.stringify(fill(pp.guardian, blocks.guardian))]);
             }
 
-            // The section's roster agrees with the record.
-            if (section) {
-                await q(`UPDATE "${ClassSection.tableName}"
-                            SET "enrolledStudents" = CASE WHEN COALESCE("enrolledStudents", '[]'::jsonb) @> to_jsonb($2::text) THEN "enrolledStudents"
-                                                          ELSE COALESCE("enrolledStudents", '[]'::jsonb) || to_jsonb($2::text) END,
-                                "currentCount" = jsonb_array_length(CASE WHEN COALESCE("enrolledStudents", '[]'::jsonb) @> to_jsonb($2::text) THEN "enrolledStudents"
-                                                          ELSE COALESCE("enrolledStudents", '[]'::jsonb) || to_jsonb($2::text) END)
-                          WHERE "_id" = $1`, [String(section._id), String(studentId)]);
-            }
+            // Their placement for the admission's year — the class (and section,
+            // when one was given): the row, the roster and the record's pointer,
+            // in this same transaction, through the one placement writer.
+            await require('../enrollment').place({
+                studentId, schoolId: app.school, classId: app.class, sectionId: section?._id || null,
+                rollNumber: '', source: 'admission', actorId: req.userId || null,
+            }, q);
 
             // Fees: the structure that charges this student, from this month.
             let feeAssignment = null;

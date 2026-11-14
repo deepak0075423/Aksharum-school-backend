@@ -294,6 +294,18 @@ const ONCE = [
             return `${r.copied} of ${r.found} old master videos copied, ${r.skipped} already there`;
         },
     },
+    {
+        // Placements became year by year (Nov 2026): one StudentEnrollment row
+        // per student per academic year, built from the section rosters and the
+        // profiles' pointers; rosters are rewritten from the rows and every
+        // pointer recomputed. See services/enrollmentBackfill.js.
+        name: 'students: year-by-year enrolments built from rosters and profiles (Nov 2026)',
+        run: async () => {
+            const r = await require('../services/enrollmentBackfill').reconcile();
+            return `${r.fromRosters} enrolments from rosters, ${r.fromProfiles} from profiles, `
+                + `${r.rostersRewritten} rosters corrected, ${r.pointersMoved} profile pointers moved`;
+        },
+    },
 ];
 
 async function runOnce() {

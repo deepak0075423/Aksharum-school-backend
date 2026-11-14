@@ -155,9 +155,11 @@ async function studentSchedule(schoolId, studentId) {
         pool.query(`
             SELECT s."_id" FROM ${T.sections} s
              WHERE s."school" = $1::uuid
-               AND (s."enrolledStudents" @> jsonb_build_array($2::text)
-                    OR s."_id" = (SELECT p."currentSection" FROM ${T.profiles} p WHERE p."user" = $3::uuid ORDER BY p."createdAt" DESC NULLS LAST LIMIT 1))`,
-        [String(schoolId), String(studentId), String(studentId)]),
+               AND s."_id" = (SELECT p."currentSection" FROM ${T.profiles} p WHERE p."user" = $2::uuid ORDER BY p."createdAt" DESC NULLS LAST LIMIT 1)`,
+        // The record's section — the student's placement in the active year.
+        // Every roster they were ever on is not "their section": last year's
+        // rosters keep them as last year's record.
+        [String(schoolId), String(studentId)]),
     ]);
     const exams = await examsFor(schoolId, rows.map((r) => r._id), { family: true, studentId });
     return { student, exams, next: nextPaper(exams), today: todayIso(schoolId) };

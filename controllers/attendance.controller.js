@@ -506,11 +506,12 @@ async function computeSectionRanking(sectionId, schoolId) {
     for (const r of records) (marksOf[String(r.student)] = marksOf[String(r.student)] || []).push(r.status);
 
     const ids = section.enrolledStudents || [];
-    const [students, profiles] = await Promise.all([
+    // Roll numbers as held IN this section (its year), not the active year's.
+    const [students, rolls] = await Promise.all([
         User.find({ _id: { $in: ids } }).select('name').lean(),
-        StudentProfile.find({ user: { $in: ids } }).select('user rollNumber').lean(),
+        require('../services/enrollment').rollsOfSection(section._id),
     ]);
-    const rollById = Object.fromEntries(profiles.map(p => [String(p.user), p.rollNumber]));
+    const rollById = Object.fromEntries(rolls);
 
     const list = students.map(s => {
         const t = sa.tally(marksOf[String(s._id)] || []);

@@ -7,7 +7,7 @@ const School       = require('../models/School');
 const User         = require('../models/User');
 const TeacherProfile  = require('../models/TeacherProfile');
 const StudentProfile  = require('../models/StudentProfile');
-const { setStudentSection } = require('../utils/sectionMembership');
+const enrollment = require('../services/enrollment');
 const ParentProfile   = require('../models/ParentProfile');
 const ClassSection    = require('../models/ClassSection');
 const Class           = require('../models/Class');
@@ -700,10 +700,9 @@ exports.bulkStudents = async (req, res) => {
             const { user: studentUser } = await identity.createMembership(
                 { name, email, phone, password: otp }, { role: 'student', school: schoolId },
             );
-            await StudentProfile.create({ user: studentUser._id, school: schoolId, admissionNumber: admNo, dob, gender, bloodGroup, category, address, currentSection: section._id, parent: parentUserId });
-            // The section has to know too — a profile pointing at a class the
-            // class does not list is a student every roster-based screen misses.
-            await setStudentSection({ studentId: studentUser._id, sectionId: section._id, schoolId });
+            await StudentProfile.create({ user: studentUser._id, school: schoolId, admissionNumber: admNo, dob, gender, bloodGroup, category, address, parent: parentUserId });
+            // The section for its year: the row, the roster and the record's pointer.
+            await enrollment.place({ studentId: studentUser._id, sectionId: section._id, schoolId, source: 'import', actorId: req.userId || null });
             await ParentProfile.findOneAndUpdate({ user: parentUserId }, { $addToSet: { children: studentUser._id } });
             sendWelcomeEmail(email, name, email, otp, schoolName, schoolId);
 
