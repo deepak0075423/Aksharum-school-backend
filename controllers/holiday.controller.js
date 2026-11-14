@@ -6,6 +6,7 @@ const XLSX         = require('xlsx');
 
 const School = require('../models/School');
 const { sheetTextProblem } = require('../middleware/textSafety');
+const { withTransaction, lock } = require('../services/dbTx');
 
 // Legacy slugs kept working alongside the school's own configured list
 const LEGACY_TYPES = ['public', 'school_specific', 'optional', 'exam_break'];
@@ -191,6 +192,40 @@ async function yearFilter(req) {
     return currentYear ? { $in: [currentYear, null] } : undefined;
 }
 
+// ── The same holiday is not added twice ──────────────────────────────────────
+// Two holidays are the same holiday when they have the same type, the same
+// first and last day, and reach some of the same people: a whole-school day
+// reaches everyone; two class holidays meet only when they share a class. So
+// "Public Holiday, 17 Nov" cannot be entered twice — under any name — while
+// Class 5's picnic and Class 8's excursion on one day are two holidays.
+const dayKeyOf = (d) => new Date(d).toISOString().slice(0, 10);
+const reachOf = (h) => (h?.applicability?.scope === 'specific_classes'
+    ? new Set((h.applicability.classes || []).map((c) => String(c?._id || c)))
+    : null);                                       // null: the whole school
+const reachesSame = (a, b) => !a || !b || [...a].some((x) => b.has(x));
+const sameHoliday = (a, b) => a.type === b.type
+    && dayKeyOf(a.startDate) === dayKeyOf(b.startDate) && dayKeyOf(a.endDate) === dayKeyOf(b.endDate)
+    && reachesSame(reachOf(a), reachOf(b));
+
+/** The holiday already on the calendar that `h` would repeat, or null. */
+async function duplicateOf(schoolId, h, ignoreId = null) {
+    const day = 86400000;
+    const near = await Holiday.find({
+        school: schoolId, type: h.type,
+        startDate: { $gte: new Date(new Date(h.startDate).getTime() - day), $lte: new Date(new Date(h.startDate).getTime() + day) },
+    }).lean();
+    return near.find((x) => String(x._id) !== String(ignoreId || '') && sameHoliday(x, h)) || null;
+}
+
+const duplicateMessage = (dup) => {
+    const one = dayKeyOf(dup.startDate) === dayKeyOf(dup.endDate);
+    return `“${dup.name}” is already on the calendar as a ${dup.type} on ${one ? 'this date' : 'these dates'}. `
+        + 'A holiday with the same date and type cannot be added again.';
+};
+const refuseDuplicate = (res, dup) => res.status(409).json({
+    success: false, code: 'DUPLICATE_HOLIDAY', message: duplicateMessage(dup), existing: { _id: dup._id, name: dup.name },
+});
+
 // ── Admin: list ───────────────────────────────────────────────────────────────
 exports.adminGetHolidays = async (req, res) => {
     try {
@@ -225,7 +260,7 @@ exports.adminCreateHoliday = async (req, res) => {
         const end   = new Date(endDate);
         if (end < start) return res.status(400).json({ success: false, message: 'End date must be on or after start date' });
 
-        const holiday = await Holiday.create({
+        const doc = {
             school:       req.schoolId,
             name:         name.trim(),
             startDate:    start,
@@ -239,9 +274,17 @@ exports.adminCreateHoliday = async (req, res) => {
                 // 'specific_departments' was removed from the form; anything
                 // else unexpected falls back to school-wide.
                 scope:   applicability?.scope === 'specific_classes' ? 'specific_classes' : 'all',
-                classes: applicability?.classes || [],
+                classes: applicability?.scope === 'specific_classes' ? (applicability?.classes || []) : [],
             },
+        };
+        // Checked and saved under one lock per school, type and day, so two
+        // presses of Save (or two admins) cannot both get the same holiday in.
+        const { dup, holiday } = await withTransaction(async (tx) => {
+            await lock(tx, `holiday:${req.schoolId}:${type}:${dayKeyOf(start)}`);
+            const already = await duplicateOf(req.schoolId, doc);
+            return already ? { dup: already } : { holiday: await Holiday.create(doc) };
         });
+        if (dup) return refuseDuplicate(res, dup);
 
         // Fire-and-forget in-app notifications. Back-filling last year's
         // calendar should not ring every phone in the school, so the caller can
@@ -274,6 +317,22 @@ exports.adminUpdateHoliday = async (req, res) => {
             const typeErr = await invalidType(req.schoolId, type);
             if (typeErr) return res.status(400).json({ success: false, message: typeErr });
             update.type = type;
+        }
+
+        const current = await Holiday.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!current) return res.status(404).json({ success: false, message: 'Holiday not found' });
+        // What it will be once saved — which must not be a holiday already there.
+        const next = { ...current, ...update };
+        if (new Date(next.endDate) < new Date(next.startDate)) {
+            return res.status(400).json({ success: false, message: 'End date must be on or after start date' });
+        }
+        // Asked only when the edit moves it — its type, its days or who it is
+        // for. Renaming one of two look-alikes entered before this rule
+        // existed is how they get told apart, and must not be refused.
+        const footprint = (h) => [h.type, dayKeyOf(h.startDate), dayKeyOf(h.endDate), ...[...(reachOf(h) || ['all'])].sort()].join('|');
+        if (footprint(next) !== footprint(current)) {
+            const dup = await duplicateOf(req.schoolId, next, current._id);
+            if (dup) return refuseDuplicate(res, dup);
         }
 
         const holiday = await Holiday.findOneAndUpdate(
@@ -330,11 +389,27 @@ exports.adminImportHolidays = async (req, res) => {
             const type    = matchType(rawType) || allowedTypes[0];
 
             docs.push({
+                _line: lineNo,
                 school: req.schoolId, name, startDate, endDate, type, description,
                 createdBy: req.userId,
                 applicability: { scope: 'all', classes: [] },
             });
         });
+
+        // A row that repeats a holiday already on the calendar — or an earlier
+        // row of the same file — is left out and said so, like any other row
+        // that cannot be imported.
+        const fresh = [];
+        for (const d of docs) {
+            const inFile = fresh.find((x) => sameHoliday(x, d));
+            const onCalendar = inFile ? null : await duplicateOf(req.schoolId, d);
+            if (inFile || onCalendar) {
+                errors.push(`Row ${d._line}: “${d.name}” has the same date and type as “${(inFile || onCalendar).name}”, which is ${inFile ? `row ${inFile._line} of this file` : 'already on the calendar'}`);
+            } else fresh.push(d);
+        }
+        docs.length = 0;
+        docs.push(...fresh);
+        docs.forEach((d) => { delete d._line; });
 
         // A preview parses and reports, and writes nothing. It is the same code
         // path as the real import, so what it shows is what will land.

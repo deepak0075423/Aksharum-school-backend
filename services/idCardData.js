@@ -136,24 +136,27 @@ async function studentsById(schoolId, holderIds) {
 /* ── Employees ───────────────────────────────────────────────────────────── */
 
 /**
- * Teaching or not — the Employee Directory's rule, kept in step with
- * admin.controller STAFF_TYPE: a stated value wins; otherwise subjects on the
- * profile, a section led or covered, or a subject taught on a section in the
- * active year make a teacher.
+ * Teaching or not, for the card a person carries.
+ *
+ * A stated value on the profile wins. Otherwise subjects on the profile, or a
+ * section led, covered or taught in ANY academic year, make a teacher.
+ *
+ * Deliberately wider than the Employee Directory's rule (admin.controller
+ * STAFF_TYPE), which looks at the active year only. A card lasts from year to
+ * year: read against the active year alone, every teacher not yet given
+ * sections for a new year moved to the Staff list the day it began — and
+ * "Update card details" on their teacher card was refused with a 409 ("is now
+ * non-teaching staff"). Nov 2026, from a production report.
  */
-const ACTIVE_YEAR_SECTION = `(
-        NOT EXISTS (SELECT 1 FROM ${T.years} ay WHERE ay."school" = u."school" AND ay."status" = 'active')
-     OR s."academicYear" IN (SELECT ay."_id" FROM ${T.years} ay WHERE ay."school" = u."school" AND ay."status" = 'active'))`;
 const STAFF_TYPE = `(CASE
         WHEN u."role" = 'school_admin' THEN 'admin'
         WHEN tp."staffType" IN ('teaching', 'non_teaching') THEN tp."staffType"
         WHEN jsonb_typeof(tp."subjects") = 'array' AND jsonb_array_length(tp."subjects") > 0 THEN 'teaching'
         WHEN EXISTS (SELECT 1 FROM ${T.sections} s
                       WHERE s."school" = u."school"
-                        AND (s."classTeacher" = u."_id" OR s."substituteTeacher" = u."_id")
-                        AND ${ACTIVE_YEAR_SECTION})
+                        AND (s."classTeacher" = u."_id" OR s."substituteTeacher" = u."_id"))
           OR EXISTS (SELECT 1 FROM ${T.sst} sst JOIN ${T.sections} s ON s."_id" = sst."section"
-                      WHERE sst."teacher" = u."_id" AND s."school" = u."school" AND ${ACTIVE_YEAR_SECTION})
+                      WHERE sst."teacher" = u."_id" AND s."school" = u."school")
         THEN 'teaching'
         ELSE 'non_teaching' END)`;
 

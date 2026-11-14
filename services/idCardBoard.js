@@ -91,6 +91,10 @@ async function rowsFor(schoolId, kind, yc, year) {
     const out = [];
     for (const [id, { row, inScope, removed }] of byId) {
         const card = latest.get(id) || null;
+        // A switched-off account that never had a card here is nobody's card
+        // holder: listing (and counting) it made the totals larger than the
+        // school's own staff list. One that does have a card stays, flagged.
+        if (!card && row.isActive === false) continue;
         const status = card ? rules.effectiveStatus(card, yc) : (open ? 'pending' : 'none');
         let changes = [];
         if (card && inScope && rules.isActionable(card, yc)) {
@@ -117,6 +121,7 @@ async function rowsFor(schoolId, kind, yc, year) {
             sectionName: row.sectionName || card?.snapshot?.sectionName || '',
             classNumber: row.classNumber ?? card?.snapshot?.classNumber ?? null,
             rollNumber: row.rollNumber || '',
+            role: row.role || '',
             card: card ? {
                 _id: String(card._id), number: card.number, status, stored: card.status,
                 statusLabel: rules.STATUS_LABEL[status], statusReason: card.statusReason || '',
@@ -340,7 +345,14 @@ async function overview(schoolId) {
         students: s,
         nextStudents: yc.next ? n : null,
         teachers: t,
-        staff: f,
+        // What the Staff figure is made of — non-teaching staff (teacher
+        // accounts with no teaching) and the office's administrator accounts —
+        // so it can be squared with the Teachers page, which counts neither.
+        staff: {
+            ...f,
+            nonTeaching: staff.filter((r) => r.inScope && r.isActive && r.role !== 'school_admin').length,
+            admins: staff.filter((r) => r.inScope && r.isActive && r.role === 'school_admin').length,
+        },
         parents: p,
         expired: exp?.expired || 0,
         expiredYears: exp?.years || 0,
