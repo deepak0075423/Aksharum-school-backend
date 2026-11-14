@@ -50,6 +50,37 @@ function withReportWindow(filter, { fromDate, toDate }, academicYearRange) {
     return Object.keys(range).length ? { ...filter, fromDate: range } : filter;
 }
 
+/**
+ * Which academic year a request list is showing. A leave belongs to the year
+ * its start date falls in — the rule the overview tiles, reports and export
+ * already use. No year asked for = the school's active year (so a new active
+ * year starts with an empty list, not last year's requests); 'all' = every year.
+ * `years` is the picker's list, newest first.
+ */
+async function leaveYearScope(schoolId, wanted) {
+    const rows = await AcademicYear.find({ school: schoolId }).lean();
+    const years = rows
+        .map((y) => ({ label: academicYearLabel(y), startDate: y.startDate, endDate: y.endDate, status: y.status }))
+        .sort((a, b) => new Date(b.startDate) - new Date(a.startDate));
+    const active = years.find((y) => y.status === 'active')?.label || null;
+    if (wanted === 'all') return { label: 'all', active, years, from: null, to: null };
+    const row = years.find((y) => y.label === (wanted || active));
+    // A school with no year on record yet sees everything rather than nothing.
+    if (!row) return { label: wanted || null, active, years, from: null, to: null };
+    return { label: row.label, active, years, from: row.startDate ? new Date(row.startDate) : null, to: row.endDate ? new Date(row.endDate) : null };
+}
+
+/** The list's own From/To dates, narrowed to the year in force (their overlap). */
+function withYearAndDates(filter, { fromDate, toDate }, scope) {
+    const lo = [fromDate && new Date(fromDate), scope?.from].filter((d) => d && !isNaN(d));
+    const hi = [toDate && new Date(toDate), scope?.to].filter((d) => d && !isNaN(d));
+    if (!lo.length && !hi.length) return filter;
+    filter.fromDate = {};
+    if (lo.length) filter.fromDate.$gte = new Date(Math.max(...lo));
+    if (hi.length) filter.fromDate.$lte = new Date(Math.min(...hi));
+    return filter;
+}
+
 const isCompOffType = lt => lt?.category === 'compoff' || String(lt?.code || '').toUpperCase() === 'COMPOFF';
 
 // ── Notification audiences ───────────────────────────────────────────────────
@@ -700,13 +731,15 @@ function localDayUTC(d = new Date()) {
 exports.adminGetLeaveOverview = async (req, res) => {
     try {
         const school = String(req.schoolId);
-        const ay     = await getActiveAcademicYearLabel(req.schoolId);
-        const ayRow  = ay ? await AcademicYear.findOne({ school: req.schoolId, yearName: ay }).lean() : null;
+        // The year the Requests list is showing (the active one by default),
+        // so the tiles above it count exactly what it lists.
+        const scope  = await leaveYearScope(req.schoolId, req.query.academicYear);
+        const ay     = scope.label === 'all' ? scope.active : scope.label;
 
-        // No academic year on record yet — count everything rather than nothing,
-        // so a school still setting itself up sees its own data.
-        const from = ayRow?.startDate ? new Date(ayRow.startDate) : new Date(0);
-        const to   = ayRow?.endDate   ? new Date(ayRow.endDate)   : new Date('2999-12-31');
+        // No academic year on record yet (or 'all') — count everything rather
+        // than nothing, so a school still setting itself up sees its own data.
+        const from = scope.from || new Date(0);
+        const to   = scope.to   || new Date('2999-12-31');
 
         const today  = localDayUTC();
         const weekTo = new Date(today);
@@ -808,8 +841,11 @@ exports.adminGetLeaveOverview = async (req, res) => {
             success: true,
             data: {
                 academicYear: ay || null,
-                window: ayRow?.startDate
-                    ? { startDate: ayRow.startDate, endDate: ayRow.endDate }
+                // What the tiles counted: a year, 'all', or null (no year on record).
+                countedYear: scope.label,
+                activeAcademicYear: scope.active,
+                window: scope.from
+                    ? { startDate: scope.from, endDate: scope.to }
                     : null,
                 counts,
                 days: {
@@ -878,18 +914,15 @@ async function narrowToDepartment(filter, schoolId, department) {
 exports.adminGetRequests = async (req, res) => {
     try {
         const { status, teacherId, leaveType, fromDate, toDate, page = 1, limit = 20, focus,
-                q, sort: sortKey, mode, department } = req.query;
+                q, sort: sortKey, mode, department, academicYear } = req.query;
         const filter = { school: req.schoolId };
         if (status)    filter.status    = status;
         if (teacherId) filter.teacher   = teacherId;
         if (leaveType) filter.leaveType = leaveType;
         await narrowToDepartment(filter, req.schoolId, department);
         if (mode === 'half_day' || mode === 'full_day') filter.leaveMode = mode;
-        if (fromDate || toDate) {
-            filter.fromDate = {};
-            if (fromDate) filter.fromDate.$gte = new Date(fromDate);
-            if (toDate)   filter.fromDate.$lte = new Date(toDate);
-        }
+        const scope = await leaveYearScope(req.schoolId, academicYear);
+        withYearAndDates(filter, { fromDate, toDate }, scope);
 
         // One search box over four columns across three tables: the teacher's
         // name and employee id, the leave type's name and code, and the reason.
@@ -964,6 +997,7 @@ exports.adminGetRequests = async (req, res) => {
         res.json({
             success: true, data: apps, total,
             page: effectivePage, pages: Math.ceil(total / +limit),
+            academicYear: scope.label, activeAcademicYear: scope.active, academicYears: scope.years,
             // false tells the caller the record is not in this filtered set, so
             // it can widen the filters instead of showing a page without it.
             ...(focus ? { focusFound } : {}),
@@ -1859,21 +1893,32 @@ exports.adminSettleEmployeeLeave = async (req, res) => {
         const ay = academicYear || await getActiveAcademicYearLabel(req.schoolId);
         if (!ay) return res.status(400).json({ success: false, message: 'No active academic year' });
 
-        const [balances, types] = await Promise.all([
+        const [balances, types, policies] = await Promise.all([
             LeaveBalance.find({ teacher: teacherId, school: req.schoolId, academicYear: ay }).lean(),
             LeaveType.find({ school: req.schoolId }).lean(),
+            leavePolicy.getAllPolicies(req.schoolId),
         ]);
         const byType = Object.fromEntries(types.map(t => [String(t._id), t]));
+        // Encashment is a POLICY rule — the Policies screen is where it is set.
+        // This read the leave type's own columns, which are only the seed for a
+        // type never given a policy, so ticking "Encashable" or changing "Max
+        // encashable days" on the policy changed nothing here (Nov 2026).
+        const policyOf = Object.fromEntries(policies.map(p => [String(p.leaveType?._id || p.leaveType), p]));
 
         const lines = balances.map(b => {
             const t = byType[String(b.leaveType)];
+            const pol = policyOf[String(b.leaveType)];
+            const remaining = remainingOf(b);
+            const encashable = !!(pol ? pol.encashable : t?.encashable);
+            const cap = Number(pol ? pol.maxEncashableDays : t?.maxEncashableDays) || 0;
             return {
                 leaveType: { _id: b.leaveType, name: t?.name || null, code: t?.code || null },
-                remaining: remainingOf(b),
-                // Encashable is a policy figure; the payout itself is a payroll
-                // decision, so this reports rather than pays.
-                encashable: !!t?.encashable,
-                maxEncashableDays: t?.maxEncashableDays || 0,
+                remaining,
+                // The payout itself is a payroll decision, so this reports rather than pays.
+                encashable,
+                maxEncashableDays: cap,
+                // What may actually be paid out: the remainder, up to the cap (0 = no cap).
+                encashableDays: encashable ? (cap > 0 ? Math.min(remaining, cap) : remaining) : 0,
             };
         }).filter(l => l.remaining > 0);
 
@@ -1904,7 +1949,7 @@ exports.adminSettleEmployeeLeave = async (req, res) => {
                 title: '📄 Leave settled on exit',
                 body: `Your leave balances for ${ay} have been finalised — ${days(lapsed)} closed out.`
                     + (encashable.length
-                        ? `\n${encashable.map((l) => `${l.leaveType.name}: ${l.remaining} day(s) encashable`).join(', ')}. `
+                        ? `\n${encashable.map((l) => `${l.leaveType.name}: ${l.encashableDays} day(s) encashable`).join(', ')}. `
                             + 'Encashment itself is settled through payroll.'
                         : ''),
                 email: true,
@@ -2375,21 +2420,14 @@ exports.adminGetReports = async (req, res) => {
 
 exports.adminExportRequests = async (req, res) => {
     try {
-        const { status, teacherId, leaveType, fromDate, toDate, department } = req.query;
+        const { status, teacherId, leaveType, fromDate, toDate, department, academicYear } = req.query;
         const filter = { school: req.schoolId };
         if (status)    filter.status    = status;
         if (teacherId) filter.teacher   = teacherId;
         if (leaveType) filter.leaveType = leaveType;
         await narrowToDepartment(filter, req.schoolId, department);
-        if (fromDate || toDate) {
-            filter.fromDate = {};
-            if (fromDate) filter.fromDate.$gte = new Date(fromDate);
-            if (toDate)   filter.fromDate.$lte = new Date(toDate);
-        } else {
-            // No range asked for: the active academic year, not all history.
-            const ayRow = await AcademicYear.findOne({ school: req.schoolId, status: 'active' }).lean();
-            if (ayRow?.startDate) filter.fromDate = { $gte: new Date(ayRow.startDate), $lte: new Date(ayRow.endDate) };
-        }
+        // The same year the list on screen is showing (the active one by default).
+        withYearAndDates(filter, { fromDate, toDate }, await leaveYearScope(req.schoolId, academicYear));
 
         const apps = await LeaveApplication.find(filter)
             .populate('teacher',   'name email employeeId')
@@ -2509,16 +2547,17 @@ exports.adminExportReports = async (req, res) => {
 
 exports.teacherGetMyLeaves = async (req, res) => {
     try {
-        const { status, leaveType, mode, fromDate, toDate, page = 1, limit = 20 } = req.query;
+        const { status, leaveType, mode, fromDate, toDate, page = 1, limit = 20, academicYear } = req.query;
         const filter = { teacher: req.userId, school: req.schoolId };
         if (status)    filter.status    = status;
         if (leaveType) filter.leaveType = leaveType;
         if (mode === 'half_day' || mode === 'full_day') filter.leaveMode = mode;
-        if (fromDate || toDate) {
-            filter.fromDate = {};
-            if (fromDate) filter.fromDate.$gte = new Date(fromDate);
-            if (toDate)   filter.fromDate.$lte = new Date(toDate);
-        }
+        // The active academic year unless another (or 'all') is asked for — the
+        // year the office has moved the school to is the one the list shows.
+        const scope = await leaveYearScope(req.schoolId, academicYear);
+        withYearAndDates(filter, { fromDate, toDate }, scope);
+        const yearSql = scope.from && scope.to ? ` AND "fromDate" >= $3 AND "fromDate" <= $4` : '';
+        const yearArgs = scope.from && scope.to ? [scope.from, scope.to] : [];
 
         const [apps, total, byStatus] = await Promise.all([
             LeaveApplication.find(filter)
@@ -2529,21 +2568,22 @@ exports.teacherGetMyLeaves = async (req, res) => {
                 .limit(+limit)
                 .lean(),
             LeaveApplication.countDocuments(filter),
-            // The tiles describe this teacher's whole history, so they ignore
-            // every filter — a tile that is also the filter must not move when
-            // it is pressed.
+            // The tiles describe this teacher's year, so they ignore every other
+            // filter — a tile that is also the filter must not move when it is
+            // pressed.
             pool.query(
                 `SELECT "status", count(*)::int AS "n"
                    FROM ${qt(LeaveApplication)}
-                  WHERE "teacher" = $1::uuid AND "school" = $2::uuid
+                  WHERE "teacher" = $1::uuid AND "school" = $2::uuid${yearSql}
                   GROUP BY "status"`,
-                [String(req.userId), String(req.schoolId)],
+                [String(req.userId), String(req.schoolId), ...yearArgs],
             ),
         ]);
 
         const stat = (k) => byStatus.rows.find((r) => r.status === k)?.n || 0;
         res.json({
             success: true, data: apps, total, page: +page, pages: Math.ceil(total / +limit),
+            academicYear: scope.label, activeAcademicYear: scope.active, academicYears: scope.years,
             counts: {
                 total:     byStatus.rows.reduce((n, r) => n + r.n, 0),
                 pending:   stat('pending'),
