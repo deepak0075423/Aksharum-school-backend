@@ -29,7 +29,7 @@ describe('admission — enquiries and sources', () => {
     });
 
     it('follows up on a date — the owner is reminded once — and logs each contact', async () => {
-        const pub = await H.api('POST', `/admission/public/portals/${portal.slug}/enquiries`, { body: { name: 'Imran Qureshi', email: 'imran@family.test', message: 'Do you have seats in Class 1?', source: 'newspaper' } });
+        const pub = await H.api('POST', `/admission/public/portals/${portal.slug}/enquiries`, { body: { name: 'Imran Qureshi', email: 'imran@family.test', message: 'Do you have seats in Class 1?', source: 'newspaper', consent: true } });
         assert.equal(pub.status, 200, JSON.stringify(pub.body));
         const list = (await H.api('GET', '/admission/admin/enquiries?assignedTo=none', { token: s.adminToken })).body;
         const e = list.data.find((x) => x.name === 'Imran Qureshi');

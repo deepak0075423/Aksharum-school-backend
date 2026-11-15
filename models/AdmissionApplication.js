@@ -67,6 +67,9 @@ const AdmissionApplicationSchema = new db.Schema({
     admissionFeeAmount:   { type: Number, default: 0 },
     admissionFeeStatus:   { type: String, default: 'not_required' },
     feeWaivers:   { type: db.Types.JSON, default: () => [] },
+    // Raised by one each time the office cancels the pay links it has sent
+    // (services/admission/payLink.js): a link made before that stops working.
+    payLinkEpoch: { type: Number, default: 0 },
     docStatus:    { type: String, default: 'none' },     // none | missing | uploaded | under_review | rejected | verified
     offerStatus:  { type: String, default: '' },
     // The latest published list decision: { list, listName, listNo, decision, rank, waitPosition }.

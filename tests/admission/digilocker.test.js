@@ -78,7 +78,17 @@ describe('admission — documents from DigiLocker', () => {
         assert.equal(forged.headers.get('location'), 'http://front.test/');
         const r = await callback({ code: 'good-code', state });
         assert.equal(r.status, 303);
-        assert.equal(r.headers.get('location'), `http://front.test/${portal.slug}/applications/${app._id}?digilocker=connected`);
+        assert.equal(r.headers.get('location'), `http://front.test/${portal.slug}/applications/${app._id}?digilocker=return&dl_state=${state}&dl_code=good-code`);
+        // Coming back connects nothing: only the application's owner, signed in, can finish it.
+        const [waiting] = await H.q(`SELECT "status", "token" FROM "admissiondigilockersessions" WHERE "state" = $1`, [state]);
+        assert.deepEqual([waiting.status, waiting.token || ''], ['started', '']);
+        const stranger = await H.registerGuest(s, portal.slug, { email: `stranger-${H.rand()}@family.test` });
+        const complete = (token, body) => H.api('POST', `/admission/portal/applications/${app._id}/digilocker/complete`, { token, body });
+        assert.equal((await complete(stranger.token, { state, code: 'good-code' })).status, 404, 'somebody else\'s browser cannot finish it');
+        assert.equal((await complete(g.token, { state: 'not-a-state', code: 'good-code' })).status, 409);
+        const done = await complete(g.token, { state, code: 'good-code' });
+        assert.equal(done.status, 200, JSON.stringify(done.body));
+        assert.equal(done.body.data.connected, true);
         assert.ok(seen.verifier, 'the verifier was sent with the code');
         const [row] = await H.q(`SELECT "status", "token", "account", "codeVerifier" FROM "admissiondigilockersessions" WHERE "state" = $1`, [state]);
         assert.equal(row.status, 'connected');
@@ -126,7 +136,8 @@ describe('admission — documents from DigiLocker', () => {
         const r = await H.api('POST', `/admission/portal/applications/${app._id}/digilocker/start`, { token: g.token, body: { client: 'app', returnTo: 'https://evil.test/' } });
         const st = new URL(r.body.data.url).searchParams.get('state');
         const back = await callback({ code: 'good-code', state: st });
-        assert.equal(back.headers.get('location'), `aksharum://modules/applicant-application?id=${app._id}&digilocker=connected`);
+        assert.equal(back.headers.get('location'), `aksharum://modules/applicant-application?id=${app._id}&digilocker=return&dl_state=${st}&dl_code=good-code`);
+        assert.equal((await H.api('POST', `/admission/portal/applications/${app._id}/digilocker/complete`, { token: g.token, body: { state: st, code: 'good-code' } })).status, 200);
         const v = (await H.api('GET', `/admission/portal/applications/${app._id}/digilocker`, { token: g.token })).body.data;
         assert.equal(v.status, 'connected');
     });

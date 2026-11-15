@@ -165,4 +165,35 @@ async function refundPayment(schoolId, moduleKey, paymentId, amount, notes = {})
     }
 }
 
-module.exports = { GATEWAY_MODULES, resolveGateway, publicGateway, createOrder, verifySignature, orderPayment, refundPayment };
+/**
+ * Where a refund stands at the gateway now.
+ * @returns {{status: string, refundId: string} | {error: string}}
+ */
+async function refundStatus(schoolId, moduleKey, refundId) {
+    const c = await client(schoolId, moduleKey);
+    if (c.error) return { error: c.error };
+    try {
+        const r = await c.rzp.refunds.fetch(refundId);
+        return { refundId: r.id, status: r.status };
+    } catch (e) {
+        return { error: e?.error?.description || e?.message || 'The gateway could not be reached' };
+    }
+}
+
+/**
+ * Every refund the gateway holds for a payment — how a refund is found again
+ * when the server stopped between asking for it and writing down the answer.
+ * @returns {{refunds: Array<{refundId, status, amount, notes}>} | {error: string}}
+ */
+async function paymentRefunds(schoolId, moduleKey, paymentId) {
+    const c = await client(schoolId, moduleKey);
+    if (c.error) return { error: c.error };
+    try {
+        const list = await c.rzp.payments.fetchMultipleRefund(paymentId);
+        return { refunds: (list?.items || []).map((r) => ({ refundId: r.id, status: r.status, amount: r.amount / 100, notes: r.notes || {} })) };
+    } catch (e) {
+        return { error: e?.error?.description || e?.message || 'The gateway could not be reached' };
+    }
+}
+
+module.exports = { GATEWAY_MODULES, resolveGateway, publicGateway, createOrder, verifySignature, orderPayment, refundPayment, refundStatus, paymentRefunds };

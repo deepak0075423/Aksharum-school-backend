@@ -140,6 +140,20 @@ function payableKind(app, kind) {
     if (['withdrawn', 'cancelled', 'rejected', 'declined', 'ineligible'].includes(app.status)) refuse('This application is closed', 409);
 }
 
+/**
+ * payableKind, plus what needs a look at the round: the application fee is not
+ * taken on a draft that can no longer be submitted (the round closed, the last
+ * date passed) — the family used to be able to pay, and then not submit.
+ */
+async function assertPayable(app, kind) {
+    payableKind(app, kind);
+    if (kind === 'application_fee' && app.status === 'draft') {
+        const { rows: [round] } = await pool.query(`SELECT * FROM "admissionrounds" WHERE "_id" = $1`, [String(app.round)]);
+        const closed = require('./applications').roundClosedReason(round, app.class);
+        if (closed) refuse(`${closed} — the application fee is not taken on an application that can no longer be submitted`, 409, { code: 'ROUND_CLOSED' });
+    }
+}
+
 async function receiptNumber(app, q) {
     const settings = await settingsSvc.getSettings(app.school);
     const school = await School.findById(app.school).select('name code').lean();
@@ -157,13 +171,49 @@ async function afterPaid(app, payment, req) {
     notify.toApplicant(app, 'payment_receipt', {
         receipt_number: payment.receiptNumber, amount_paid: fmt.money(payment.amount), payment_date: fmt.fmtDate(payment.paidAt), payment_for: LABEL[payment.kind],
     });
+    if (payment.kind === 'admission_fee') await afterAdmissionFee(app, payment, req).catch((e) => console.error('[admission] after the admission fee:', e.message));
+}
+
+/**
+ * The admission fee came in. An application waiting on it ("Admission fee
+ * due") used to stay there with nobody told: now the admission is confirmed
+ * by itself where the school asked for that and nothing else stands in the
+ * way — and otherwise the office hears that it is ready to confirm.
+ */
+async function afterAdmissionFee(app, payment, req) {
+    const { rows: [fresh] } = await pool.query(`SELECT * FROM "${AdmissionApplication.tableName}" WHERE "_id" = $1`, [String(app._id)]);
+    if (!fresh || !['selected', 'accepted', 'payment_pending'].includes(fresh.status)) return;
+    const settings = await settingsSvc.getSettings(fresh.school);
+    const selection = require('./selection');
+    const blockers = await selection.confirmationBlockers(fresh, settings);
+    const online = payment.mode === 'online';
+    if (blockers.length) {
+        // By the family's own doing (online) the office was not there to see it.
+        if (online) require('./staffAlerts').aboutApplication(fresh, {
+            title: `Admission fee received: ${fresh.studentName || fresh.applicationNumber}`,
+            body: `${fmt.money(payment.amount)} paid online (receipt ${payment.receiptNumber}). Still to do before confirming: ${blockers.join('; ')}.`,
+        });
+        return;
+    }
+    const stage = require('./workflow').compile(settings.workflow).stage('confirmation');
+    if (settings.conversion.autoConfirm && !stage?.requiresApproval) {
+        try {
+            await selection.confirm(null, fresh);
+            events.recordQuietly(fresh.school, { application: fresh._id, type: 'system', action: 'auto_confirmed', message: 'Admission confirmed automatically — the fee is settled and nothing else was waiting' });
+            return;
+        } catch (e) { console.error('[admission] auto-confirm:', e.message); }
+    }
+    require('./staffAlerts').aboutApplication(fresh, {
+        title: `Ready to confirm: ${fresh.studentName || fresh.applicationNumber}`,
+        body: `The admission fee is settled (receipt ${payment.receiptNumber}). ${fresh.applicationNumber} can be confirmed now.`,
+    });
 }
 
 // ── Online ───────────────────────────────────────────────────────────────────
 
 /** Open a gateway order for what is due — or, on an instalment plan, for the next instalment only. */
 async function createOrder(req, app, kind, { part = 'all' } = {}) {
-    payableKind(app, kind);
+    await assertPayable(app, kind);
     const full = await balance(app, kind);
     if (full.due <= 0) refuse('Nothing is due', 409, { code: 'NOTHING_DUE' });
     let b = full;
@@ -219,10 +269,110 @@ async function reconcile(req, app, paymentRowId) {
     return markPaid(req, app, pay, r.paymentId);
 }
 
+/** The same, for the family's or the office's "check with the gateway" on the fee's latest open order. */
+async function reconcileLatest(req, app, kind) {
+    const { rows: [pay] } = await pool.query(
+        `SELECT "_id" FROM "${AdmissionPayment.tableName}" WHERE "application" = $1 AND "mode" = 'online' AND "status" = 'created'${kind ? ' AND "kind" = $2' : ''} ORDER BY "createdAt" DESC LIMIT 1`,
+        kind ? [String(app._id), kind] : [String(app._id)]);
+    if (!pay) refuse('There is no online payment waiting to be confirmed on this application', 409, { code: 'NOTHING_OPEN' });
+    return reconcile(req, app, pay._id);
+}
+
+/**
+ * Sweep: online orders nobody came back from (Nov 2026). The family's bank
+ * took the money, the browser was closed before our page heard — and the
+ * payment stayed "started" for good: no receipt, the fee still due, nothing
+ * to tell the family or the office. Each open order is asked about at the
+ * gateway, a few minutes after it was opened and then less and less often for
+ * two days; one the gateway never captured is closed after that.
+ */
+async function reconcileOpen(limit = 40) {
+    const { rows } = await pool.query(
+        `SELECT p.* FROM "${AdmissionPayment.tableName}" p
+          WHERE p."mode" = 'online' AND p."status" = 'created' AND COALESCE(p."orderId", '') <> ''
+            AND p."createdAt" < now() - interval '3 minutes'
+            AND (p."checkedAt" IS NULL OR p."checkedAt" < now() - make_interval(mins => LEAST(360, 5 * (2 ^ LEAST(COALESCE(p."checks", 0), 7))::int)))
+          ORDER BY p."checkedAt" ASC NULLS FIRST LIMIT $1`, [limit]);
+    const out = { checked: 0, paid: 0, closed: 0 };
+    for (const pay of rows) {
+        const claimed = await pool.query(
+            `UPDATE "${AdmissionPayment.tableName}" SET "checkedAt" = now(), "checks" = COALESCE("checks", 0) + 1
+              WHERE "_id" = $1 AND "status" = 'created' AND "checkedAt" IS NOT DISTINCT FROM $2 RETURNING "_id"`, [pay._id, pay.checkedAt]);
+        if (!claimed.rowCount) continue;
+        out.checked += 1;
+        const r = await gateway.orderPayment(pay.school, 'admission', pay.orderId);
+        if (r.error) continue;                       // the gateway is off or unreachable — asked again later
+        if (r.paid) {
+            const { rows: [app] } = await pool.query(`SELECT * FROM "${AdmissionApplication.tableName}" WHERE "_id" = $1`, [pay.application]);
+            if (!app) continue;
+            try {
+                await markPaid(null, app, pay, r.paymentId);
+                events.recordQuietly(app.school, { application: app._id, type: 'payment', action: 'reconciled', message: `Online payment ${r.paymentId} was confirmed with the gateway — the family's browser had not come back` });
+                out.paid += 1;
+            } catch (e) { console.error('[admission] reconcile:', e.message); }
+        } else if (new Date(pay.createdAt).getTime() < Date.now() - 48 * 3600 * 1000) {
+            // Two days on and never paid: the order is dead.
+            await patch(AdmissionPayment, pay._id, { status: 'cancelled', notes: 'Never paid — closed after two days' }, { where: { status: 'created' }, touch: false });
+            out.closed += 1;
+        }
+    }
+    return out;
+}
+
+/**
+ * Sweep: refunds sent through the gateway and not yet settled. One the gateway
+ * has since processed (or refused) is brought up to date; one that never got
+ * as far as the gateway — the server stopped between writing the refund and
+ * asking for it — is looked for there, and if it is not there it is marked
+ * failed, so the money is no longer counted as given back, and the office is told.
+ */
+async function followRefunds(limit = 40) {
+    const { rows } = await pool.query(
+        `SELECT r.*, p."paymentId" AS "gatewayPaymentId", p."receiptNumber" FROM "admissionrefunds" r JOIN "${AdmissionPayment.tableName}" p ON p."_id" = r."payment"
+          WHERE r."status" = 'pending' AND r."mode" = 'gateway' AND r."createdAt" < now() - interval '2 minutes'
+          ORDER BY r."updatedAt" ASC LIMIT $1`, [limit]);
+    const out = { checked: 0, processed: 0, failed: 0 };
+    for (const r of rows) {
+        out.checked += 1;
+        let status = null; let refundId = r.gatewayRefundId || ''; let error = '';
+        if (refundId) {
+            const g = await gateway.refundStatus(r.school, 'admission', refundId);
+            if (g.error) { await pool.query(`UPDATE "admissionrefunds" SET "updatedAt" = now() WHERE "_id" = $1`, [r._id]); continue; }
+            status = g.status;
+        } else {
+            const g = await gateway.paymentRefunds(r.school, 'admission', r.gatewayPaymentId);
+            if (g.error) { await pool.query(`UPDATE "admissionrefunds" SET "updatedAt" = now() WHERE "_id" = $1`, [r._id]); continue; }
+            const found = g.refunds.find((x) => String(x.notes?.refund || '') === String(r._id));
+            if (found) { refundId = found.refundId; status = found.status; }
+            else { status = 'failed'; error = 'The refund never reached the payment gateway — make it again'; }
+        }
+        const next = status === 'processed' ? 'processed' : status === 'failed' ? 'failed' : 'pending';
+        const { rows: [row] } = await pool.query(
+            `UPDATE "admissionrefunds" SET "status" = $2, "gatewayRefundId" = $3, "error" = $4, "processedAt" = CASE WHEN $2 = 'processed' THEN now() ELSE "processedAt" END, "updatedAt" = now()
+              WHERE "_id" = $1 AND "status" = 'pending' RETURNING *`, [r._id, next, refundId, error || (next === 'failed' ? 'The gateway did not complete the refund' : '')]);
+        if (!row || next === 'pending') continue;
+        const { rows: [app] } = await pool.query(`SELECT * FROM "${AdmissionApplication.tableName}" WHERE "_id" = $1`, [r.application]);
+        if (!app) continue;
+        await refreshStatus(app, r.kind).catch(() => {});
+        if (next === 'processed') {
+            out.processed += 1;
+            events.recordQuietly(app.school, { application: app._id, type: 'payment', action: 'refund_processed', visibility: 'applicant', message: `${fmt.money(r.amount)} refunded on receipt ${r.receiptNumber} — the payment gateway has sent it` });
+        } else {
+            out.failed += 1;
+            events.recordQuietly(app.school, { application: app._id, type: 'payment', action: 'refund_failed', message: `Refund of ${fmt.money(r.amount)} on receipt ${r.receiptNumber} did not go through — ${row.error}` });
+            require('./staffAlerts').toAdmins(app.school, {
+                title: 'A refund did not go through', body: `${fmt.money(r.amount)} on receipt ${r.receiptNumber} (${app.applicationNumber || 'an application'}): ${row.error}.`,
+                link: { type: 'admission.application', entityId: String(app._id) },
+            });
+        }
+    }
+    return out;
+}
+
 async function markPaid(req, app, pay, gatewayPaymentId) {
     const paid = await withTransaction(async (q) => {
         const number = await receiptNumber(app, q);
-        const row = await patch(AdmissionPayment, pay._id, { status: 'paid', paymentId: gatewayPaymentId, receiptNumber: number, paidAt: new Date() }, { where: { status: ['created', 'failed'] }, q });
+        const row = await patch(AdmissionPayment, pay._id, { status: 'paid', paymentId: gatewayPaymentId, receiptNumber: number, paidAt: new Date() }, { where: { status: ['created', 'failed', 'cancelled'] }, q });
         return row;
     }).catch((e) => {
         if (e.code === '23505' || e.code === 11000) refuse('This payment has already been recorded', 409);
@@ -240,6 +390,11 @@ async function markPaid(req, app, pay, gatewayPaymentId) {
             application: app._id, by: req, type: 'payment', action: 'excess',
             message: `${fmt.money(b.excess)} more than the ${LABEL[paid.kind]} was received (online payment ${gatewayPaymentId}) — refund it from the payment gateway`,
         });
+        // A note in the history was all there was: the office now hears of it, and it is listed under Payments → Refunds owed.
+        require('./staffAlerts').toAdmins(app.school, {
+            title: 'Money to give back', body: `${fmt.money(b.excess)} more than the ${LABEL[paid.kind]} was received on ${fresh.applicationNumber || 'an application'} (receipt ${paid.receiptNumber}). Refund it from the application's Fees tab.`,
+            link: { type: 'admission.application', entityId: String(app._id) },
+        });
     }
     return paid;
 }
@@ -248,7 +403,7 @@ async function markPaid(req, app, pay, gatewayPaymentId) {
 
 async function recordOffline(req, app, input) {
     const kind = input.kind;
-    payableKind(app, kind);
+    await assertPayable(app, kind);
     const mode = OFFLINE_MODES.includes(input.mode) ? input.mode : null;
     if (!mode) refuse('Choose how it was paid', 400, { field: 'mode' });
     const amount = moneyIn(input.amount);
@@ -265,6 +420,8 @@ async function recordOffline(req, app, input) {
         const { sql, params } = buildInsert(AdmissionPayment, {
             school: app.school, application: app._id, applicant: app.applicant, kind, amount: round2(amount), mode, status: 'paid',
             reference, receiptNumber: number, paidAt, notes: str(input.notes, 300), recordedBy: req.userId,
+            // A cheque or a draft is money once the bank says so.
+            clearance: ['cheque', 'dd'].includes(mode) ? 'pending' : '',
         });
         return (await q(sql, params)).rows[0];
     });
@@ -284,10 +441,81 @@ async function voidPayment(req, app, paymentRowId, reason) {
     const { rows: [rf] } = await pool.query(`SELECT COUNT(*)::int AS n FROM "admissionrefunds" WHERE "payment" = $1 AND "status" IN ('pending', 'processed')`, [pay._id]);
     if (rf.n) refuse('Money has been refunded on this payment — it cannot be cancelled', 409);
     if (app.status === 'enrolled') refuse('The student is enrolled — adjust fees in the Fees module', 409);
-    await patch(AdmissionPayment, pay._id, { status: 'void', voidedBy: req.userId, voidReason: why }, { where: { status: 'paid' } });
+    const done = await patch(AdmissionPayment, pay._id, { status: 'void', voidedBy: req.userId, voidReason: why }, { where: { status: 'paid' } });
+    if (!done) refuse('The payment changed — refresh and try again', 409);
     await refreshStatus(app, pay.kind);
     events.recordQuietly(app.school, { application: app._id, by: req, type: 'payment', action: 'voided', message: `Receipt ${pay.receiptNumber} (${fmt.money(pay.amount)}) cancelled — ${why}` });
-    return { ok: true };
+    const unconfirmed = pay.kind === 'admission_fee' ? await unconfirmIfUnpaid(req, app, `Receipt ${pay.receiptNumber} was cancelled — ${why}`) : false;
+    return { ok: true, unconfirmed };
+}
+
+/**
+ * A confirmed admission whose fee is no longer settled — its receipt was
+ * cancelled (a bounced cheque) — is not confirmed any more: it goes back to
+ * waiting for the fee, the seat still held by its offer until the fee date.
+ * It used to stay "Confirmed" with the fee due. An enrolled student is the
+ * Fees module's business, and the void is refused there.
+ */
+async function unconfirmIfUnpaid(req, app, reason) {
+    const { rows: [fresh] } = await pool.query(`SELECT * FROM "${AdmissionApplication.tableName}" WHERE "_id" = $1`, [String(app._id)]);
+    if (!fresh || fresh.status !== 'confirmed') return false;
+    const settings = await settingsSvc.getSettings(fresh.school);
+    if (!settings.conversion.requireAdmissionFeePaid) return false;
+    const b = await balance(fresh, 'admission_fee');
+    if (b.due <= 0) return false;
+    const { rows: [r] } = await pool.query(`SELECT "confirmWith" FROM "admissionrounds" WHERE "_id" = $1`, [String(fresh.round)]);
+    const plan = r?.confirmWith === 'first' ? await scheduleOf(fresh, b) : null;
+    if (plan && plan[0].owing <= 0) return false;      // the first instalment still stands, and that was enough
+    const after = [];
+    await withTransaction(async (q) => {
+        const { rows: [offer] } = await q(`SELECT "_id" FROM "admissionoffers" WHERE "application" = $1 AND "status" = 'confirmed' ORDER BY "issuedAt" DESC LIMIT 1 FOR UPDATE`, [String(fresh._id)]);
+        if (offer) await q(`UPDATE "admissionoffers" SET "status" = 'accepted', "updatedAt" = now() WHERE "_id" = $1`, [offer._id]);
+        await require('./applications').move(req, fresh, 'payment_pending', { system: true, undo: true, q, after, quiet: true, reason, set: { offerStatus: offer ? 'accepted' : fresh.offerStatus } });
+    });
+    for (const fn of after) { try { await fn(); } catch (e) { console.error('[admission] after un-confirming:', e.message); } }
+    events.recordQuietly(fresh.school, { application: fresh._id, by: req, type: 'payment', action: 'unconfirmed', visibility: 'applicant', message: `The admission is no longer confirmed — ${fmt.money(b.due)} of the admission fee is due again` });
+    notify.toApplicant(fresh, 'status_update', { status: 'Admission fee due', remarks: `A payment towards the admission fee could not be kept (${reason}). ${fmt.money(b.due)} is due again — the admission is confirmed once it is paid.` });
+    return true;
+}
+
+/** The bank has paid a cheque or draft. */
+async function clearPayment(req, app, paymentRowId) {
+    if (!isId(String(paymentRowId))) refuse('Payment not found', 404);
+    const { rows: [row] } = await pool.query(
+        `UPDATE "${AdmissionPayment.tableName}" SET "clearance" = 'cleared', "clearedAt" = now(), "clearedBy" = $4, "updatedAt" = now()
+          WHERE "_id" = $1 AND "application" = $2 AND "school" = $3 AND "status" = 'paid' AND "clearance" = 'pending' RETURNING *`,
+        [String(paymentRowId), String(app._id), String(app.school), String(req.userId)]);
+    if (!row) refuse('Only a cheque or draft waiting to clear can be marked cleared', 409);
+    events.recordQuietly(app.school, { application: app._id, by: req, type: 'payment', action: 'cleared', message: `${row.mode === 'dd' ? 'Draft' : 'Cheque'} ${row.reference} (receipt ${row.receiptNumber}) cleared` });
+    return row;
+}
+
+/** Cheques and drafts on this application the bank has not paid yet. */
+async function unclearedOn(applicationId, kind = 'admission_fee') {
+    const { rows } = await pool.query(
+        `SELECT "reference", "mode", "amount", "receiptNumber" FROM "${AdmissionPayment.tableName}" WHERE "application" = $1 AND "kind" = $2 AND "status" = 'paid' AND "clearance" = 'pending'`,
+        [String(applicationId), kind]);
+    return rows;
+}
+
+/**
+ * What the school's refund rule gives back on the admission fee today
+ * (Settings → Fees → refund rules: so many per cent within so many days of
+ * payment). A figure for the office to read in the refund dialog — nothing is
+ * refunded by itself. null when the school has set no rule.
+ */
+async function refundGuide(app) {
+    const settings = await settingsSvc.getSettings(app.school);
+    const rules = settings.fees.refundRules || [];
+    if (!rules.length) return null;
+    const { rows: [first] } = await pool.query(
+        `SELECT MIN("paidAt") AS at FROM "${AdmissionPayment.tableName}" WHERE "application" = $1 AND "kind" = 'admission_fee' AND "status" = 'paid'`, [String(app._id)]);
+    if (!first?.at) return null;
+    const days = Math.floor((Date.now() - new Date(first.at).getTime()) / 86400000);
+    const rule = rules.find((r) => days <= r.withinDays) || null;
+    const b = await balance(app, 'admission_fee');
+    const percent = rule ? rule.percent : 0;
+    return { days, percent, rule, paid: b.paid, amount: round2((b.paid * percent) / 100), rules };
 }
 
 /** Grant one of the school's waivers on a fee. */
@@ -364,7 +592,8 @@ async function refund(req, app, paymentRowId, input = {}) {
     });
     let out = row;
     if (pay.mode === 'online') {
-        const g = await gateway.refundPayment(app.school, 'admission', pay.paymentId, amount, { application: String(app._id), reason: why.slice(0, 200) });
+        // `refund` names our row at the gateway, so a refund whose answer was never written down can be found again (followRefunds).
+        const g = await gateway.refundPayment(app.school, 'admission', pay.paymentId, amount, { application: String(app._id), refund: String(row._id), reason: why.slice(0, 200) });
         out = (await pool.query(
             `UPDATE "admissionrefunds" SET "status" = $2, "gatewayRefundId" = $3, "error" = $4, "processedAt" = CASE WHEN $2 = 'processed' THEN now() ELSE NULL END, "updatedAt" = now() WHERE "_id" = $1 RETURNING *`,
             [row._id, g.error ? 'failed' : (g.status === 'processed' ? 'processed' : 'pending'), g.refundId || '', g.error || ''])).rows[0];
@@ -383,13 +612,46 @@ async function refund(req, app, paymentRowId, input = {}) {
     return out;
 }
 
+/**
+ * Sweep: an instalment of the admission fee that has passed its date unpaid.
+ * The family is told once, and so is the office — the only reminder used to
+ * go out before the date, and after it there was silence.
+ */
+async function instalmentsOverdue(schoolId) {
+    const { rows: plans } = await pool.query(
+        `SELECT o."_id", o."schedule", o."application" FROM "admissionoffers" o
+           JOIN "${AdmissionApplication.tableName}" a ON a."_id" = o."application" AND a."admissionFeeStatus" = 'due' AND a."status" IN ('accepted', 'payment_pending', 'confirmed', 'enrolled')
+          WHERE o."school" = $1 AND o."status" IN ('accepted', 'confirmed') AND jsonb_typeof(o."schedule") = 'array' AND jsonb_array_length(o."schedule") > 1
+          LIMIT 300`, [String(schoolId)]);
+    let n = 0;
+    for (const o of plans) {
+        const { rows: [app] } = await pool.query(`SELECT * FROM "${AdmissionApplication.tableName}" WHERE "_id" = $1`, [o.application]);
+        if (!app) continue;
+        for (const part of await scheduleOf(app) || []) {
+            if (part.owing <= 0 || !part.dueAt || new Date(part.dueAt).getTime() > Date.now() - 12 * 3600 * 1000) continue;
+            const { rowCount } = await pool.query(
+                `UPDATE "admissionoffers" SET "schedule" = jsonb_set("schedule", ARRAY[$2::text, 'overdueAt'], to_jsonb(now()::text))
+                  WHERE "_id" = $1 AND ("schedule" -> $3::int ->> 'overdueAt') IS NULL`, [o._id, String(part.index), part.index]);
+            if (!rowCount) continue;
+            notify.toApplicant(app, 'instalment_overdue', { fee_amount: fmt.money(part.owing), payment_deadline: fmt.fmtDate(part.dueAt), admission_deadline: fmt.fmtDate(part.dueAt), offer_deadline: fmt.fmtDate(part.dueAt) });
+            events.recordQuietly(app.school, { application: app._id, type: 'payment', action: 'instalment_overdue', message: `${part.label}: ${fmt.money(part.owing)} was due on ${fmt.fmtDate(part.dueAt)} and is unpaid` });
+            require('./staffAlerts').aboutApplication(app, {
+                title: `Instalment overdue: ${app.studentName || app.applicationNumber}`,
+                body: `${part.label} of the admission fee — ${fmt.money(part.owing)} — was due on ${fmt.fmtDate(part.dueAt)} and has not been paid.`,
+            });
+            n += 1;
+        }
+    }
+    return n;
+}
+
 /** Everything about an application's fees, for the applicant and the office. */
 async function summary(app) {
     const [a, b] = await Promise.all([balance(app, 'application_fee'), balance(app, 'admission_fee')]);
     const { rows: payments } = await pool.query(
-        `SELECT "_id", "kind", "amount", "mode", "status", "receiptNumber", "reference", "paidAt", "createdAt", "voidReason", "orderId"
-           FROM "${AdmissionPayment.tableName}" WHERE "application" = $1 AND "status" <> 'created' ORDER BY "createdAt" DESC`, [String(app._id)]);
-    const { rows: [open] } = await pool.query(`SELECT "_id", "kind", "orderId", "createdAt" FROM "${AdmissionPayment.tableName}" WHERE "application" = $1 AND "status" = 'created' ORDER BY "createdAt" DESC LIMIT 1`, [String(app._id)]);
+        `SELECT "_id", "kind", "amount", "mode", "status", "receiptNumber", "reference", "paidAt", "createdAt", "voidReason", "orderId", "clearance", "clearedAt"
+           FROM "${AdmissionPayment.tableName}" WHERE "application" = $1 AND "status" NOT IN ('created', 'cancelled') ORDER BY "createdAt" DESC`, [String(app._id)]);
+    const { rows: [open] } = await pool.query(`SELECT "_id", "kind", "amount", "orderId", "createdAt", "checkedAt" FROM "${AdmissionPayment.tableName}" WHERE "application" = $1 AND "status" = 'created' AND "mode" = 'online' ORDER BY "createdAt" DESC LIMIT 1`, [String(app._id)]);
     const { rows: refunds } = await pool.query(
         `SELECT r."_id", r."payment", r."kind", r."amount", r."mode", r."status", r."reference", r."reason", r."error", r."createdAt", r."processedAt", p."receiptNumber"
            FROM "admissionrefunds" r LEFT JOIN "${AdmissionPayment.tableName}" p ON p."_id" = r."payment" WHERE r."application" = $1 ORDER BY r."createdAt" DESC`, [String(app._id)]);
@@ -401,6 +663,7 @@ async function summary(app) {
         payments,
         refunds,
         openOrder: open || null,
+        refundGuide: await refundGuide(app).catch(() => null),
     };
 }
 
@@ -411,6 +674,7 @@ async function gatewayInfo(schoolId) {
 }
 
 module.exports = {
-    KINDS, LABEL, OFFLINE_MODES, REFUND_MODES, balance, feeStatus, refreshStatus, payableKind, createOrder, verifyOnline, reconcile, recordOffline, voidPayment,
+    KINDS, LABEL, OFFLINE_MODES, REFUND_MODES, balance, feeStatus, refreshStatus, payableKind, assertPayable, createOrder, verifyOnline, reconcile, recordOffline, voidPayment,
     applyWaiver, removeWaiver, summary, gatewayInfo, refund, scheduleOf, planFor,
+    reconcileLatest, reconcileOpen, followRefunds, clearPayment, unclearedOn, refundGuide, unconfirmIfUnpaid, instalmentsOverdue,
 };

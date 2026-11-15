@@ -91,7 +91,8 @@ async function commonValues(schoolId, { school = null, settings = null } = {}) {
  * Send one admission email. Never throws for a delivery failure — the failure
  * is logged and returned — but does refuse an unknown event.
  *
- * opts: { to, recipient, application, values, isTest, template: {subject, body} (preview/test of unsaved wording) }
+ * opts: { to, recipient, application, values, isTest, template: {subject, body} (preview/test of unsaved wording),
+ *         logId (a queued row this send finishes — see enqueue) }
  * Returns { status: 'sent'|'failed'|'logged'|'skipped', logId, error }.
  */
 async function send(schoolId, event, opts = {}) {
@@ -108,9 +109,21 @@ async function send(schoolId, event, opts = {}) {
         school: schoolId, event, to, application: opts.application || null, recipient: opts.recipient || null,
         templateVersion: tpl.version, isTest: !!opts.isTest, context, attempt: opts.attempt || 1,
     };
+    // One row per email: a queued one (enqueue) is finished in place, so the
+    // delivery log never shows the same email twice.
+    const record = async (fields) => {
+        if (opts.logId) {
+            const { rows: [row] } = await pool.query(
+                `UPDATE "${AdmissionEmailLog.tableName}" SET "subject" = $2, "status" = $3, "error" = $4, "driver" = $5, "messageId" = $6, "body" = $7, "templateVersion" = $8, "attempt" = $9, "lastTriedAt" = now()
+                  WHERE "_id" = $1 RETURNING "_id"`,
+                [String(opts.logId), fields.subject || '', fields.status, fields.error || '', fields.driver || driver(), fields.messageId || '', fields.body || '', tpl.version, logBase.attempt]);
+            if (row) return row;
+        }
+        return AdmissionEmailLog.create({ ...logBase, ...fields, lastTriedAt: new Date() });
+    };
 
     if (!tpl.enabled && !opts.isTest) {
-        const row = await AdmissionEmailLog.create({ ...logBase, subject: '', status: 'skipped', error: 'This email is switched off', driver: driver() });
+        const row = await record({ subject: '', status: 'skipped', error: 'This email is switched off', driver: driver() });
         return { status: 'skipped', logId: row._id, error: 'This email is switched off' };
     }
     // Reserved top-level domains (RFC 2606 / 6761) can never receive mail;
@@ -118,7 +131,7 @@ async function send(schoolId, event, opts = {}) {
     // sender reputation. Test data uses them, so this also keeps test runs off
     // the real mail server whatever process they reach.
     if (driver() !== 'log' && /\.(test|example|invalid|localhost)$/i.test(to.split('@')[1] || '')) {
-        const row = await AdmissionEmailLog.create({ ...logBase, subject: '', status: 'skipped', error: 'Reserved test domain — not delivered', driver: driver() });
+        const row = await record({ subject: '', status: 'skipped', error: 'Reserved test domain — not delivered', driver: driver() });
         return { status: 'skipped', logId: row._id, error: 'Reserved test domain — not delivered' };
     }
 
@@ -126,7 +139,7 @@ async function send(schoolId, event, opts = {}) {
     const stop = await suppressed(schoolId, to);
     if (stop) {
         const why = `On the do-not-send list — ${stop.source === 'complaint' ? 'marked a message as spam' : stop.source === 'manual' ? 'added by the office' : 'the address bounced'}${stop.reason ? `: ${stop.reason.slice(0, 160)}` : ''}`;
-        const row = await AdmissionEmailLog.create({ ...logBase, subject: '', status: 'skipped', error: why, driver: driver() });
+        const row = await record({ subject: '', status: 'skipped', error: why, driver: driver() });
         return { status: 'skipped', logId: row._id, error: why };
     }
 
@@ -146,16 +159,16 @@ async function send(schoolId, event, opts = {}) {
         // The log driver keeps the whole message — it exists so development
         // and tests can read what would have been sent, codes included. It
         // sends nothing and is never a production setting.
-        const row = await AdmissionEmailLog.create({ ...logBase, subject: storedSubject, status: 'logged', driver: 'log', body: `${text}\n\n${html}` });
+        const row = await record({ subject: storedSubject, status: 'logged', driver: 'log', body: `${text}\n\n${html}` });
         return { status: 'logged', logId: row._id };
     }
     try {
         const info = await sendSchoolMail(schoolId, { to, subject, html, text, replyTo, fromName, rethrow: true });
-        const row = await AdmissionEmailLog.create({ ...logBase, subject: storedSubject, status: 'sent', driver: 'smtp', messageId: String(info?.messageId || '') });
+        const row = await record({ subject: storedSubject, status: 'sent', driver: 'smtp', messageId: String(info?.messageId || '') });
         return { status: 'sent', logId: row._id };
     } catch (e) {
         const error = String(e?.message || 'Mail server refused the message').slice(0, 500);
-        const row = await AdmissionEmailLog.create({ ...logBase, subject: storedSubject, status: 'failed', driver: 'smtp', error });
+        const row = await record({ subject: storedSubject, status: 'failed', driver: 'smtp', error });
         // The receiving server said this mailbox does not exist (a 5xx to RCPT TO): stop writing to it.
         if (Number(e?.responseCode) >= 550 && Number(e?.responseCode) < 560 && /RCPT/i.test(String(e?.command || ''))) {
             await suppress(schoolId, to, { source: 'smtp_reject', reason: error }).catch(() => {});
@@ -185,9 +198,96 @@ async function suppress(schoolId, email, { source = 'manual', reason = '', by = 
     return AdmissionEmailSuppression.create({ school: schoolId || null, email: address, source, reason: String(reason || '').slice(0, 500), createdBy: by });
 }
 
-/** Fire-and-forget: send after the response, never fail the request. */
+// ── The queue ────────────────────────────────────────────────────────────────
+//
+// Emails used to leave straight from the request that caused them: publishing
+// a list of 300 offers opened 300 connections to the mail server at once, a
+// failure was final unless somebody pressed "send again", and anything still
+// waiting when the server restarted was gone. Now an email is first WRITTEN
+// DOWN (a 'queued' row of the delivery log, with the values it needs), then
+// sent a few at a time; one that fails is tried again, twice, a few minutes
+// apart; and the sweep picks up whatever a restart left behind.
+//
+// One-time codes never go through here — their value is not kept anywhere —
+// and are sent at once, as before.
+
+const PARALLEL = Math.max(1, Number(process.env.ADMISSION_MAIL_PARALLEL) || 3);
+const MAX_ATTEMPTS = 3;
+const waiting = [];
+let running = 0;
+
+function pump() {
+    while (running < PARALLEL && waiting.length) {
+        const id = waiting.shift();
+        running += 1;
+        deliverQueued(id).catch((e) => console.error('[admission mail] queue:', e.message)).finally(() => { running -= 1; pump(); });
+    }
+}
+
+/** Send one written-down email — claimed first, so the sweep and this process never both send it. */
+async function deliverQueued(logId) {
+    const { rows: [row] } = await pool.query(
+        `UPDATE "${AdmissionEmailLog.tableName}" SET "status" = 'sending', "lastTriedAt" = now() WHERE "_id" = $1 AND "status" IN ('queued', 'failed') RETURNING *`, [String(logId)]);
+    if (!row) return null;
+    const retrying = row.error ? 1 : 0;
+    try {
+        return await send(row.school, row.event, { to: row.to, application: row.application, recipient: row.recipient, values: row.context || {}, attempt: (row.attempt || 1) + retrying, logId: row._id });
+    } catch (e) {
+        await pool.query(`UPDATE "${AdmissionEmailLog.tableName}" SET "status" = 'failed', "error" = $2 WHERE "_id" = $1 AND "status" = 'sending'`, [row._id, String(e.message || e).slice(0, 500)]);
+        return null;
+    }
+}
+
+/**
+ * Write an email down and send it soon. Returns once it is written — the
+ * caller's change is already committed and is never held up by the mail server.
+ */
+async function enqueue(schoolId, event, opts = {}) {
+    const def = catalog.EVENTS[event];
+    if (!def) refuse(`Unknown email "${event}"`, 400);
+    const to = String(opts.to || '').trim().toLowerCase();
+    if (!to) return null;
+    // Nothing secret is ever written down: a code email goes at once.
+    if (def.needs?.includes('otp') || Object.keys(opts.values || {}).some((k) => SECRET_KEYS.has(k)) || opts.template || opts.isTest) return send(schoolId, event, opts);
+    // The log driver sends nothing (development, automated tests): there is no mail server to pace.
+    if (driver() === 'log') return send(schoolId, event, opts);
+    const context = Object.fromEntries(Object.entries(opts.values || {}).map(([k, v]) => [k, String(v ?? '').slice(0, 4000)]));
+    const row = await AdmissionEmailLog.create({
+        school: schoolId, event, to, application: opts.application || null, recipient: opts.recipient || null,
+        subject: '', status: 'queued', driver: driver(), context, attempt: 1,
+    });
+    waiting.push(String(row._id));
+    setImmediate(pump);
+    return { status: 'queued', logId: row._id };
+}
+
+/**
+ * Sweep (every minute): what the queue in memory did not get to — emails
+ * written down more than two minutes ago and still waiting (the server
+ * restarted), ones stuck mid-send for ten, and failures due another try
+ * (five minutes after the first, twenty after the second; never a code, never
+ * an address on the do-not-send list — send() skips those itself).
+ */
+async function drain(limit = 60) {
+    await pool.query(
+        `UPDATE "${AdmissionEmailLog.tableName}" SET "status" = 'failed', "error" = 'Interrupted while sending'
+          WHERE "status" = 'sending' AND "lastTriedAt" < now() - interval '10 minutes'`);
+    const { rows } = await pool.query(
+        `SELECT "_id" FROM "${AdmissionEmailLog.tableName}"
+          WHERE ("status" = 'queued' AND "createdAt" < now() - interval '2 minutes')
+             OR ("status" = 'failed' AND NOT "isTest" AND COALESCE("attempt", 1) < $2 AND "createdAt" > now() - interval '1 day'
+                 AND COALESCE("lastTriedAt", "createdAt") < now() - make_interval(mins => CASE WHEN COALESCE("attempt", 1) <= 1 THEN 5 ELSE 20 END)
+                 AND "event" <> ALL($3::text[]) AND "driver" <> 'log')
+          ORDER BY "createdAt" ASC LIMIT $1`,
+        [limit, MAX_ATTEMPTS, catalog.EVENT_KEYS.filter((k) => catalog.EVENTS[k].needs?.includes('otp'))]);
+    for (const r of rows) if (!waiting.includes(String(r._id))) waiting.push(String(r._id));
+    pump();
+    return rows.length;
+}
+
+/** Fire-and-forget: written down and sent after the response; never fails the request. */
 function sendLater(schoolId, event, opts) {
-    setImmediate(() => send(schoolId, event, opts).catch((e) => console.error(`[admission mail] ${event}:`, e.message)));
+    setImmediate(() => enqueue(schoolId, event, opts).catch((e) => console.error(`[admission mail] ${event}:`, e.message)));
 }
 
 /** Send a logged email again — the stored context, today's wording. */
@@ -319,7 +419,7 @@ async function logs(schoolId, { status, event, q: search, page = 1, limit = 25 }
 }
 
 module.exports = {
-    driver, portalLinks, templateFor, frame, commonValues, send, sendLater, retry, preview,
+    driver, portalLinks, templateFor, frame, commonValues, send, sendLater, enqueue, drain, retry, preview,
     listTemplates, saveTemplate, setEnabled, versions, restore, resetToDefault, logs,
     suppressed, suppress,
 };

@@ -264,9 +264,38 @@ exports.updateRound = handler(async (req, res) => {
     const dropped = rows.filter((r) => !kept.has(String(r.class)));
     if (dropped.length) refuse('A class that already has applications cannot be taken out of the round — close it instead', 409, { field: 'classes' });
     if (String(data.academicYear) !== String(current.academicYear) && rows.length) refuse('The academic year of a round with applications cannot change', 409, { field: 'academicYear' });
+    // Seats cannot go below what is already held (offers out, admissions
+    // confirmed) — it used to be allowed, and "available" just read 0 while
+    // the class sat over its number.
+    const classNames = new Map((await Class.find({ school: req.schoolId }).select('_id className').lean()).map((c) => [String(c._id), c.className]));
+    for (const st of await seats.roundState(current._id)) {
+        const next = data.classes.find((c) => String(c.class) === String(st.class));
+        if (!next) continue;
+        const label = classNames.get(String(st.class)) || 'A class';
+        if (next.seats > 0 && next.seats < st.taken) refuse(`${label}: ${st.taken} seats are already held (offers and confirmed admissions) — the class cannot be cut to ${next.seats}`, 409, { field: 'classes' });
+        for (const pool_ of st.pools || []) {
+            if (!pool_.quota) continue;
+            const qd = (next.quotas || []).find((x) => x.key === pool_.quota);
+            const open = qd ? Math.max(0, (Number(qd.seats) || 0) - (Number(qd.released) || 0)) : 0;
+            if (pool_.taken > open) refuse(`${label}: ${pool_.taken} seats of ${pool_.name} are already held — the quota cannot be ${qd ? `cut to ${open}` : 'removed'}`, 409, { field: 'classes' });
+        }
+    }
     const row = await patch(AdmissionRound, current._id, { ...data, updatedBy: req.userId });
-    events.recordQuietly(req.schoolId, { by: req, type: 'config', action: 'round_updated', message: `Round "${row.name}" updated` });
-    res.json({ success: true, data: row });
+    // A changed application fee reaches the drafts still to pay it: a draft
+    // kept the fee of the day it was started, whatever the round said since.
+    let repriced = 0;
+    for (const c of row.classes || []) {
+        const fee = Math.max(0, Number(c.applicationFee ?? row.applicationFee) || 0);
+        const r = await pool.query(
+            `UPDATE "admissionapplications" a SET "applicationFeeAmount" = $3, "applicationFeeStatus" = CASE WHEN $3 > 0 THEN 'due' ELSE 'not_required' END, "updatedAt" = now()
+              WHERE a."round" = $1 AND a."class" = $2 AND a."status" = 'draft' AND a."applicationFeeStatus" IN ('due', 'not_required') AND a."applicationFeeAmount" IS DISTINCT FROM $3
+                AND NOT EXISTS (SELECT 1 FROM "admissionpayments" p WHERE p."application" = a."_id" AND p."kind" = 'application_fee' AND p."status" = 'paid')
+                AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(a."feeWaivers") = 'array' THEN a."feeWaivers" ELSE '[]'::jsonb END) w WHERE w->>'kind' = 'application_fee')`,
+            [String(row._id), String(c.class), fee]);
+        repriced += r.rowCount;
+    }
+    events.recordQuietly(req.schoolId, { by: req, type: 'config', action: 'round_updated', message: `Round "${row.name}" updated${repriced ? ` — the application fee changed on ${repriced} draft(s) not yet paid` : ''}` });
+    res.json({ success: true, data: row, repriced });
 }, TAG);
 
 exports.roundStatus = handler(async (req, res) => {

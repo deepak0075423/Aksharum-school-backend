@@ -34,6 +34,10 @@ const AdmissionListSchema = new db.Schema({
     // nonce, commitment, input, inputHash, seed, poolSize, selected, waitlisted }.
     draw:         { type: db.Types.JSON, default: null },
     cancelReason: { type: String, default: '' },
+    // Set when a result this list was ranked on is corrected after it was built
+    // (services/admission/selection.js flagListsFor): the list must be rebuilt
+    // before it goes any further. Cleared by a rebuild.
+    staleReason:  { type: String, default: '' },
     criteria:     { type: db.Types.JSON, default: () => ({ weights: [], tieBreakers: [], filters: {} }) },
     seats:        { type: Number, default: 0 },
     waitlistSize: { type: Number, default: 0 },

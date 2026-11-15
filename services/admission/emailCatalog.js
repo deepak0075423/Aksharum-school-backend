@@ -512,6 +512,69 @@ Please choose another time on the admission portal.
 
 [[Choose another time|{{portal_link}}]]`,
     },
+    offer_reminder: {
+        label: 'Offer about to lapse', group: 'Selection',
+        description: 'Sent once, before an offer nobody has answered runs out — at the time set under Settings → Email.',
+        placeholders: { ...COMMON, ...APPLICATION, ...OFFER },
+        subject: 'Your admission offer for {{student_name}} lapses on {{offer_deadline}}',
+        body: `Hello {{applicant_name}},
+
+The offer of admission for **{{student_name}}** ({{applying_class}}) has not been answered yet. It lapses on **{{offer_deadline}}** — after that the seat goes to the next family on the list.
+
+[[Respond to the offer|{{offer_link}}]]`,
+    },
+    instalment_overdue: {
+        label: 'Instalment overdue', group: 'Payments',
+        description: 'Sent once when an instalment of the admission fee has passed its date unpaid.',
+        placeholders: { ...COMMON, ...APPLICATION, ...OFFER },
+        subject: 'An instalment of the admission fee is overdue — {{student_name}}',
+        body: `Hello {{applicant_name}},
+
+An instalment of **{{fee_amount}}** of the admission fee for {{student_name}} was due on **{{payment_deadline}}** and has not been received.
+
+Please pay it as soon as you can, or contact the admission office if something is wrong.
+
+[[Pay now|{{application_link}}]]`,
+    },
+    draft_reminder: {
+        label: 'Application not submitted yet', group: 'Application',
+        description: 'Sent once to a family whose application is still a draft when the round is about to close.',
+        placeholders: { ...COMMON, ...APPLICATION, closing_date: P('Last date for applications') },
+        subject: 'Your application for {{applying_class}} is not submitted yet',
+        body: `Hello {{applicant_name}},
+
+You started an application for **{{applying_class}}** ({{academic_year}}) and have not submitted it. Applications close on **{{closing_date}}** — a draft is not considered until it is submitted.
+
+[[Finish my application|{{application_link}}]]`,
+    },
+    documents_reminder: {
+        label: 'Documents still needed', group: 'Application',
+        description: 'Sent once before the date documents are due, to a family that still has a required document to upload.',
+        placeholders: { ...COMMON, ...APPLICATION, document_name: P('The documents still needed'), documents_deadline: P('Documents due by') },
+        subject: 'Documents still needed for {{student_name}} — due {{documents_deadline}}',
+        body: `Hello {{applicant_name}},
+
+These documents are still needed for {{student_name}}'s application ({{application_number}}):
+
+**{{document_name}}**
+
+Please upload them by **{{documents_deadline}}**.
+
+[[Upload documents|{{application_link}}]]`,
+    },
+    rte_allotted: {
+        label: 'RTE seat allotment recorded', group: 'Selection',
+        description: 'Sent when the school records that the state has allotted this child a free seat under the RTE Act.',
+        placeholders: { ...COMMON, ...APPLICATION, external_ref: P('The state\'s allotment reference') },
+        subject: 'RTE allotment recorded for {{student_name}}',
+        body: `Hello {{applicant_name}},
+
+**{{school_name}}** has recorded the allotment of a free seat under the Right to Education Act for **{{student_name}}** ({{applying_class}}), reference {{external_ref}}.
+
+The school will write to you about the documents to bring and the next steps. You can follow the application here:
+
+[[View application|{{application_link}}]]`,
+    },
     status_update: {
         label: 'Status update', group: 'Application', defaultOff: true,
         description: 'Sent for other status changes, when switched on.',
@@ -555,6 +618,7 @@ function sampleValues(school = {}) {
         request_number: 'DPR20270004', request_kind: 'A copy of my information', due_date: '14 March 2027', request_outcome: 'completed',
         amount_refunded: '₹500', refund_reason: 'Paid twice', pay_link: 'https://app.aksharum.com/green-valley/pay/sample', link_expiry: '20 March 2027',
         appeal_number: 'APL20270003', appeal_kind: 're-check of a result', appeal_outcome: 'upheld', appeal_decision: 'The answer sheet was checked again; two marks had not been added.',
+        closing_date: '15 March 2027', documents_deadline: '20 March 2027', external_ref: 'RTE/2027/004512',
         visit_title: 'Campus tour', visit_date: 'Saturday, 6 March 2027', visit_time: '10:30 AM', visit_location: 'Main gate, Green Valley School', visit_people: '3',
     };
 }

@@ -88,6 +88,60 @@ function primaryOf(m, blocks) {
     return blocks.father.name ? 'Father' : blocks.mother.name ? 'Mother' : 'Guardian';
 }
 
+// ── What enrolment reads besides the form ───────────────────────────────────
+
+/**
+ * The family's other applications on this account that are still alive. The
+ * applicant's account can become the student's only when there are none:
+ * turned into a student it can no longer open the admission portal, and a
+ * sibling's application (or this child's for another class) would be cut off.
+ */
+async function otherLiveApplications(app) {
+    const { rows } = await pool.query(
+        `SELECT "applicationNumber", "studentName", "status" FROM "${AdmissionApplication.tableName}"
+          WHERE "school" = $1 AND "applicant" = $2 AND "_id" <> $3 AND "status" NOT IN ('withdrawn', 'cancelled', 'rejected', 'ineligible', 'declined', 'enrolled')`,
+        [String(app.school), String(app.applicant), String(app._id)]);
+    return rows;
+}
+
+/**
+ * A sign-in address for a child who has none of their own: the parent's, with
+ * the child's name after a "+" (anita@gmail.com → anita+riya@gmail.com). Mail
+ * to it arrives in the parent's inbox on Gmail, Outlook and most providers,
+ * and it is a different address as far as signing in goes. A suggestion the
+ * office accepts or types over — never used without being shown.
+ */
+async function suggestStudentEmail(schoolId, parentEmail, studentName) {
+    const m = /^([^@+\s]+)(?:\+[^@]*)?@([^@\s]+\.[^@\s]+)$/.exec(String(parentEmail || '').trim().toLowerCase());
+    if (!m) return '';
+    const tag = String(studentName || '').toLowerCase().replace(/[^a-z ]+/g, ' ').trim().split(/\s+/)[0] || 'student';
+    for (const candidate of [`${m[1]}+${tag}@${m[2]}`, `${m[1]}+${tag}2@${m[2]}`, `${m[1]}+${tag}3@${m[2]}`]) {
+        const link = await identity.linkTarget(candidate, { schoolId, role: 'student' }).catch(() => null);
+        if (link?.mode === 'create') return candidate;
+    }
+    return '';
+}
+
+/** The quota the application's seat came from — its offer's pool, else its verified claim. */
+async function seatQuota(app, q = null) {
+    const run = q || ((sql, p) => pool.query(sql, p));
+    const { rows: [offer] } = await run(`SELECT "quota" FROM "admissionoffers" WHERE "application" = $1 AND "status" = 'confirmed' ORDER BY "issuedAt" DESC LIMIT 1`, [String(app._id)]);
+    const key = offer ? (offer.quota || '') : (['verified', 'allotted'].includes(app.quotaStatus) ? app.quota : '');
+    if (!key) return null;
+    const def = require('./quotas').quotaDef((await require('./quotas').classOf(app.round, app.class, q)).quotas, key);
+    return def ? { key, name: def.name, kind: def.kind, feeRule: def.feeRule || { type: 'normal' }, free: def.kind === 'rte' || def.feeRule?.type === 'free' } : { key, name: key, kind: 'other', feeRule: { type: 'normal' }, free: false };
+}
+
+/** The head of a fee structure that charges the admission fee again, if it has one: { item, head }. */
+async function admissionHead(structure) {
+    const items = (structure?.items || []).filter((i) => i.isActive !== false && Number(i.amount) > 0);
+    if (!items.length) return null;
+    const heads = await require('../../models/FeeHead').find({ _id: { $in: items.map((i) => i.feeHead) } }).select('name type').lean();
+    const byId = new Map(heads.map((h) => [String(h._id), h]));
+    const item = items.find((i) => /\badmission\b/i.test(byId.get(String(i.feeHead))?.name || '') && ['one_time', 'yearly'].includes(byId.get(String(i.feeHead))?.type));
+    return item ? { item, head: byId.get(String(item.feeHead)) } : null;
+}
+
 // ── Preview: what would be created, and what stands in the way ───────────────
 
 async function preview(req, app) {
@@ -126,7 +180,8 @@ async function preview(req, app) {
     // The applicant's own account becoming the student's: only for an address
     // that holds nothing else (a student is never linked).
     const applicantRows = applicant ? await identity.membershipsByEmail(applicant.email) : [];
-    const canUseApplicant = applicantRows.length === 1 && applicantRows[0].role === 'guest';
+    const others = await otherLiveApplications(app);
+    const canUseApplicant = applicantRows.length === 1 && applicantRows[0].role === 'guest' && !others.length;
 
     const docsAll = await documents.currentDocs(app._id);
     const types = await documents.typesOf(app.school);
@@ -135,6 +190,15 @@ async function preview(req, app) {
     if (unverified.length) warnings.push(`${unverified.map((d) => d.name).join(', ')} ${unverified.length === 1 ? 'is' : 'are'} not verified — only verified documents are copied to the student record`);
 
     const feeStructure = school?.modules?.fees ? await structureFor(app.school, app.academicYear, app.class, null) : null;
+    // What the seat's quota and the admission fee already paid mean for Fees.
+    const quota = await seatQuota(app);
+    const paidAtAdmission = (await require('./payments').balance(app, 'admission_fee')).paid;
+    const again = feeStructure && paidAtAdmission > 0 ? await admissionHead(feeStructure) : null;
+    if (quota?.free && feeStructure) warnings.push(`${quota.name}: a free seat — no fee structure is assigned unless you tick it`);
+    else if (quota?.feeRule?.type === 'percent') warnings.push(`${quota.name} carries a ${quota.feeRule.percent}% concession on the admission fee — give the matching concession in Fees if it applies to the school fee too`);
+    if (again) warnings.push(`"${feeStructure.name}" charges ${again.head.name} (₹${Number(again.item.amount).toLocaleString('en-IN')}) — ₹${Number(paidAtAdmission).toLocaleString('en-IN')} was already received at admission and is credited to the student's fee account`);
+    const studentEmailFromForm = textOf(m['student.email']).toLowerCase();
+    const suggestedEmail = studentEmailFromForm ? '' : await suggestStudentEmail(app.school, primary.email || applicant?.email, textOf(m['student.name']) || app.studentName);
     const hostels = school?.modules?.hostel && m['hostel.required'] === true
         ? (await pool.query(`SELECT "_id", "name" FROM "hostels" WHERE "school" = $1 ORDER BY "name"`, [String(app.school)]).catch(() => ({ rows: [] }))).rows : [];
 
@@ -144,8 +208,11 @@ async function preview(req, app) {
         blockers, warnings,
         student: {
             name: textOf(m['student.name']) || app.studentName, dob: textOf(m['student.dob']), gender: textOf(m['student.gender']),
-            email: textOf(m['student.email']).toLowerCase(), phone: textOf(m['student.phone']),
+            email: studentEmailFromForm, phone: textOf(m['student.phone']),
+            // For a child with no address of their own: the parent's, with the child's name after a "+".
+            suggestedEmail,
             canUseApplicantAccount: canUseApplicant, applicantEmail: applicant?.email || '',
+            applicantBusy: others.length ? `${others.length} other application${others.length === 1 ? '' : 's'} (${others.map((o) => o.applicationNumber || o.studentName || 'a draft').join(', ')}) ${others.length === 1 ? 'is' : 'are'} still open on the applicant's account` : '',
         },
         placement: {
             academicYear: { _id: app.academicYear, yearName: year?.yearName || '' },
@@ -163,7 +230,11 @@ async function preview(req, app) {
         },
         options: {
             activation: settings.conversion.activation,
-            fees: { available: !!school?.modules?.fees && settings.conversion.createFeeAssignment, structure: feeStructure ? { _id: feeStructure._id, name: feeStructure.name, totalAmount: feeStructure.totalAmount } : null },
+            fees: {
+                available: !!school?.modules?.fees && settings.conversion.createFeeAssignment, structure: feeStructure ? { _id: feeStructure._id, name: feeStructure.name, totalAmount: feeStructure.totalAmount } : null,
+                freeSeat: !!quota?.free, quota: quota ? { key: quota.key, name: quota.name, kind: quota.kind } : null,
+                paidAtAdmission, admissionHead: again ? { name: again.head.name, amount: again.item.amount, credit: Math.min(paidAtAdmission, Number(again.item.amount) || 0) } : null,
+            },
             transport: { available: !!school?.modules?.transport && settings.conversion.transportRequest, requested: m['transport.required'] === true, address: textOf(m['transport.address']) },
             hostel: { available: !!school?.modules?.hostel && settings.conversion.hostelRequest, requested: m['hostel.required'] === true, hostels },
             medical: { available: !!school?.modules?.medical && settings.conversion.medicalRecord, has: !!(m['medical.allergies'] || m['medical.conditions'] || m['medical.medicines'] || m['medical.doctorName'] || m['medical.dietary']) },
@@ -225,6 +296,30 @@ async function stageDocuments(app, settings) {
 }
 
 /**
+ * A document verified after the student was enrolled (a transfer certificate
+ * that came late) is copied to the student's record like the ones that were
+ * there on the day — when its type maps to a student-record field that is
+ * still empty.
+ */
+async function lateDocument(app, doc) {
+    if (app.status !== 'enrolled' || !app.studentUser || doc.status !== 'verified') return null;
+    const settings = await settingsSvc.getSettings(app.school);
+    if (!settings.conversion.transferDocuments) return null;
+    const type = (await documents.typesOf(app.school)).get(doc.docKey);
+    if (!type?.mapsTo || !require('./defaultForm').STUDENT_FILE_FIELDS[type.mapsTo]) return null;
+    await fs.promises.mkdir(STUDENT_DOCS, { recursive: true });
+    const name = `${Date.now()}-${crypto.randomInt(0, 1e9)}${path.extname(doc.file)}`;
+    const target = path.join(STUDENT_DOCS, name);
+    await require('./fileStore').copyToFile(doc.file, target);
+    const { rowCount } = await pool.query(
+        `UPDATE "${StudentProfile.tableName}" SET "${type.mapsTo}" = $2, "updatedAt" = now() WHERE "user" = $1 AND COALESCE("${type.mapsTo}", '') = ''`,
+        [String(app.studentUser), name]).catch((e) => { console.error('[admission] late document:', e.message); return { rowCount: 0 }; });
+    if (!rowCount) { fs.promises.unlink(target).catch(() => {}); return null; }
+    events.recordQuietly(app.school, { application: app._id, type: 'conversion', action: 'document_added', message: `${type.name} added to the student record` });
+    return { field: type.mapsTo };
+}
+
+/**
  * Convert. input: { section, admissionNumber, studentAccount: 'new'|'applicant',
  * studentEmail, parent: { mode, userId | relation, name, email, phone },
  * options: { fees, transport, hostel: { hostelId }, medical } }.
@@ -259,6 +354,8 @@ async function convert(req, app, input = {}) {
     if (useApplicant) {
         const rows = await identity.membershipsByEmail(applicantUser?.email);
         if (!(rows.length === 1 && rows[0].role === 'guest')) refuse('The applicant\'s account also signs in elsewhere, so it cannot become the student\'s — give the student their own email', 400, { field: 'studentEmail' });
+        const others = await otherLiveApplications(app);
+        if (others.length) refuse(`The applicant's account still has ${others.length === 1 ? 'another application' : `${others.length} other applications`} open (${others.map((o) => o.applicationNumber || o.studentName || 'a draft').join(', ')}) — as the student's account it could no longer open them. Give the student their own email.`, 409, { field: 'studentEmail', code: 'APPLICANT_BUSY' });
         studentEmail = applicantUser.email;
     } else {
         if (!isEmail(studentEmail)) refuse('Give the student a sign-in email of their own', 400, { field: 'studentEmail' });
@@ -313,7 +410,13 @@ async function convert(req, app, input = {}) {
             if (!locked) refuse('Application not found', 404);
             if (locked.status === 'enrolled' && locked.conversion?.status === 'completed') return { replay: true, row: locked };
             if (locked.status !== 'confirmed') refuse('The application changed — refresh and try again', 409);
-            await lock(q, `admission-number:${app.school}`);
+            // The school's admission-number lock — the same one the Students screen takes (utils/admissionNumber).
+            await lock(q, admissionNo.lockKey(app.school));
+            if (typed) {
+                const { rows: [takenNow] } = await q(`SELECT 1 FROM "${StudentProfile.tableName}" WHERE "school" = $1 AND "admissionNumber" = $2 LIMIT 1`, [String(app.school), typed]);
+                if (takenNow) refuse(`Admission number ${typed} is already in use`, 400, { field: 'admissionNumber' });
+            }
+            const quota = await seatQuota(locked, q);
 
             if (section) {
                 const { rows: [sec] } = await q(`SELECT "maxStudents", "enrolledStudents", "sectionName" FROM "${ClassSection.tableName}" WHERE "_id" = $1 FOR UPDATE`, [String(section._id)]);
@@ -359,6 +462,7 @@ async function convert(req, app, input = {}) {
             // The student record.
             const profile = {
                 user: studentId, school: app.school, admissionNumber, parent: parentId,
+                admissionDate: new Date(), admissionQuota: quota?.key || '', admissionQuotaName: quota?.name || '', isRteSeat: quota?.kind === 'rte',
                 gender: ['Male', 'Female', 'Other'].includes(textOf(m['student.gender'])) ? textOf(m['student.gender']) : '',
                 dob: /^\d{4}-\d{2}-\d{2}$/.test(textOf(m['student.dob'])) ? new Date(`${m['student.dob']}T00:00:00Z`) : (app.studentDob || null),
                 bloodGroup: textOf(m['student.bloodGroup']) === 'Not known' ? '' : textOf(m['student.bloodGroup']),
@@ -416,8 +520,12 @@ async function convert(req, app, input = {}) {
             }, q);
 
             // Fees: the structure that charges this student, from this month.
+            // A free seat (RTE, or a quota the school made free) is not put on the
+            // class's fee structure unless the office asks for it outright — it
+            // used to be charged like any other.
             let feeAssignment = null;
-            if (input.options?.fees !== false && settings.conversion.createFeeAssignment && school?.modules?.fees) {
+            const freeSeat = !!quota?.free && input.options?.fees !== true;
+            if (!freeSeat && input.options?.fees !== false && settings.conversion.createFeeAssignment && school?.modules?.fees) {
                 const structure = await structureFor(app.school, app.academicYear, app.class, section?._id);
                 if (structure) {
                     const Sched = require('../feeSchedule');
@@ -442,6 +550,8 @@ async function convert(req, app, input = {}) {
                 section: section ? { _id: String(section._id), name: section.sectionName } : null,
                 feeStructure: feeAssignment ? { _id: String(feeAssignment.structure._id), name: feeAssignment.structure.name, fromMonth: feeAssignment.fromMonth } : null,
                 documents: Object.keys(staged.fields), steps: {},
+                quota: quota ? { key: quota.key, name: quota.name, kind: quota.kind, free: quota.free } : null,
+                feesSkipped: freeSeat ? `${quota.name}: a free seat — no fee structure assigned` : '',
             };
             const row = await require('./applications').move(req, locked, 'enrolled', {
                 system: true, q, after, quiet: true,
@@ -456,7 +566,14 @@ async function convert(req, app, input = {}) {
         });
     } catch (e) {
         for (const f of staged.copied) fs.promises.unlink(f).catch(() => {});
-        if (e.code === '23505' || e.code === 11000) refuse('Another account already uses one of these emails — refresh and check the details', 409);
+        if (e.code === '23505' || e.code === 11000) {
+            // Say what actually clashed — it used to be "one of these emails" whatever it was.
+            const what = `${e.constraint || ''} ${e.detail || ''} ${e.message || ''}`;
+            if (/email/i.test(what)) refuse('Another account already uses one of these emails — refresh and check the details', 409);
+            if (/admission/i.test(what)) refuse('That admission number has just been given to another student — try again', 409, { field: 'admissionNumber' });
+            if (/aadhaar/i.test(what)) refuse('Another student at the school already has this Aadhaar number', 409, { field: 'aadhaar' });
+            refuse('A record with the same details already exists — refresh and check the student, the parent and the section', 409);
+        }
         throw e;
     }
     if (outcome.replay) {
@@ -477,15 +594,34 @@ async function convert(req, app, input = {}) {
             return { charged: r.amount, entries: r.entries };
         });
     } else if (outcome.feeAssignment) steps.fees = { ok: true, charged: 0, note: 'The structure charges when its demand is generated' };
+    else if (outcome.row.conversion?.feesSkipped) steps.fees = { ok: true, charged: 0, note: outcome.row.conversion.feesSkipped };
+    // The admission fee taken at admission, where the structure charges it again:
+    // credited to the student's fee account, so it is not asked for twice.
+    if (outcome.feeAssignment && input.options?.creditAdmissionFee !== false) {
+        const again = await admissionHead(outcome.feeAssignment.structure).catch(() => null);
+        const paid = again ? (await require('./payments').balance(outcome.row, 'admission_fee')).paid : 0;
+        const credit = again ? Math.round(Math.min(paid, Number(again.item.amount) || 0) * 100) / 100 : 0;
+        if (credit > 0) {
+            await run('admissionFee', async () => {
+                const { rows: receipts } = await pool.query(`SELECT "receiptNumber" FROM "admissionpayments" WHERE "application" = $1 AND "kind" = 'admission_fee' AND "status" = 'paid' ORDER BY "paidAt"`, [String(app._id)]);
+                await require('../feeConcessions').appendLedger({
+                    school: app.school, student: outcome.studentId, academicYear: app.academicYear,
+                    entryType: 'credit', category: 'adjustment', amount: credit,
+                    description: `${again.head.name} received at admission — ${receipts.map((r) => r.receiptNumber).filter(Boolean).join(', ') || outcome.row.applicationNumber}`,
+                    referenceType: 'Manual', referenceId: app._id, feeItemId: again.item._id, feeHeadName: again.head.name || '', createdBy: req.userId,
+                });
+                return { credited: credit, head: again.head.name };
+            });
+        }
+    }
     if (school?.modules?.transport && settings.conversion.transportRequest && input.options?.transport !== false && m['transport.required'] === true) {
         await run('transport', async () => {
             const TransportRequest = require('../../models/TransportRequest');
-            const code = await nextNumberFor(TransportRequest, app.school, 'TRQ');
-            const r = await TransportRequest.create({
+            const r = await numbered(TransportRequest, app.school, 'TRQ', (code) => TransportRequest.create({
                 school: app.school, requestCode: code, requestedBy: outcome.parentId, student: outcome.studentId, requestType: 'new_transport',
                 details: { address: textOf(m['transport.address']).slice(0, 300), reason: `Asked for on admission application ${outcome.row.applicationNumber}` },
                 priority: 'normal', status: 'pending',
-            });
+            }));
             return { request: r.requestCode };
         });
     }
@@ -494,13 +630,12 @@ async function convert(req, app, input = {}) {
             const HostelAdmission = require('../../models/HostelAdmission');
             const hostel = await require('../../models/Hostel').findOne({ _id: input.options.hostel.hostelId, school: app.school }).select('name').lean();
             if (!hostel) throw new Error('Hostel not found');
-            const code = await nextNumberFor(HostelAdmission, app.school, 'HA');
             const primary = blocks[(parentPlan.input?.relation || 'Father').toLowerCase()] || {};
-            const r = await HostelAdmission.create({
+            const r = await numbered(HostelAdmission, app.school, 'HA', (code) => HostelAdmission.create({
                 school: app.school, applicationNumber: code, student: outcome.studentId, academicYear: app.academicYear, hostel: hostel._id,
                 reason: `From admission application ${outcome.row.applicationNumber}`, guardianName: primary.name || '', guardianPhone: primary.phone || '',
                 specialRequirements: textOf(m['hostel.notes']).slice(0, 500), status: 'applied', appliedBy: req.userId, appliedAt: new Date(),
-            });
+            }));
             return { application: r.applicationNumber, hostel: hostel.name };
         });
     }
@@ -518,11 +653,25 @@ async function convert(req, app, input = {}) {
     }
     if (outcome.immediate && settings.conversion.sendCredentials) {
         await run('emails', async () => {
+            // Waited for: "emailed" is said only of an email the mail server took
+            // (it used to be recorded as sent the moment it was handed over).
             const admin = require('../../controllers/admin.controller');
-            if (!useApplicant) admin._sendWelcomeEmail(studentEmail, studentName, studentEmail, studentOtp, school.name, app.school);
-            if (outcome.parentCreated) admin._sendWelcomeEmail(parentPlan.input.email, parentPlan.input.name, parentPlan.input.email, parentOtp, school.name, app.school);
-            else if (outcome.parentLinked) require('../../utils/schoolMailer').sendSchoolAddedEmail(parentPlan.input.email, parentPlan.input.name, 'parent', school.name, app.school);
-            return { student: !useApplicant, parent: outcome.parentCreated ? 'credentials' : outcome.parentLinked ? 'added-to-school' : 'existing' };
+            const failed = [];
+            let student = false; let parent = outcome.parentLinked ? 'added-to-school' : 'existing';
+            if (!useApplicant) {
+                student = !!(await admin._sendWelcomeEmail(studentEmail, studentName, studentEmail, studentOtp, school.name, app.school));
+                if (!student) failed.push(`student (${studentEmail})`);
+            }
+            if (outcome.parentCreated) {
+                const ok = !!(await admin._sendWelcomeEmail(parentPlan.input.email, parentPlan.input.name, parentPlan.input.email, parentOtp, school.name, app.school));
+                parent = ok ? 'credentials' : 'not-sent';
+                if (!ok) failed.push(`parent (${parentPlan.input.email})`);
+            } else if (outcome.parentLinked) require('../../utils/schoolMailer').sendSchoolAddedEmail(parentPlan.input.email, parentPlan.input.name, 'parent', school.name, app.school);
+            if (failed.length) {
+                events.recordQuietly(app.school, { application: app._id, by: req, type: 'conversion', action: 'email_failed', message: `Sign-in details could not be emailed to the ${failed.join(' and the ')} — reset the password from the Students screen and hand it over` });
+                return { student, parent, failed, note: `Not emailed: ${failed.join(', ')}` };
+            }
+            return { student, parent };
         });
     }
     const stored = { ...outcome.row.conversion, steps };
@@ -542,6 +691,18 @@ async function nextNumberFor(Model, schoolId, prefix) {
     const { rows } = await pool.query(`SELECT "${field}" AS v FROM "${Model.tableName}" WHERE "school" = $1 AND "${field}" LIKE $2 ORDER BY "${field}" DESC LIMIT 1`, [String(schoolId), `${stem}%`]);
     const last = rows[0] ? Number(String(rows[0].v).slice(stem.length)) || 0 : 0;
     return `${stem}${String(last + 1).padStart(4, '0')}`;
+}
+
+/**
+ * Take the next code and write the row that carries it as one step per school:
+ * the code is read from the rows already there, so two enrolments finishing
+ * together used to be able to read the same "last" and write the same code.
+ */
+function numbered(Model, schoolId, prefix, create) {
+    return withTransaction(async (q) => {
+        await lock(q, `admission-code:${prefix}:${schoolId}`);
+        return create(await nextNumberFor(Model, schoolId, prefix));
+    });
 }
 
 /** The form's health answers in the Medical Room's intake shape. */
@@ -591,6 +752,12 @@ function signInNote(conv) {
 async function activate(req, app) {
     if (app.status !== 'enrolled' || !app.studentUser) refuse('Create the student account first', 409);
     if (app.conversion?.activation !== 'manual' || app.conversion?.activatedAt) refuse('These accounts are already active', 409);
+    // Claimed before anything is sent: a second click finds the activation
+    // already under way (two clicks used to send two different passwords).
+    const { rowCount: claimed } = await pool.query(
+        `UPDATE "${AdmissionApplication.tableName}" SET "conversion" = jsonb_set("conversion", '{activatedAt}', to_jsonb(now()::text))
+          WHERE "_id" = $1 AND "status" = 'enrolled' AND ("conversion"->>'activatedAt') IS NULL`, [String(app._id)]);
+    if (!claimed) refuse('These accounts are already active', 409);
     const school = await School.findById(app.school).select('name').lean();
     const admin = require('../../controllers/admin.controller');
     const sent = [];
@@ -604,9 +771,10 @@ async function activate(req, app) {
         if (!shared && u.isFirstLogin) {
             const otp = admin._generateOTP();
             await pool.query(`UPDATE "users" SET "password" = $2, "isActive" = true WHERE "_id" = $1`, [String(id), await bcrypt.hash(otp, 12)]);
-            admin._sendWelcomeEmail(u.email, u.name, u.email, otp, school.name, app.school);
-            sent.push(`${label}: sign-in details sent to ${u.email}`);
-            emailed.push(label);
+            if (await admin._sendWelcomeEmail(u.email, u.name, u.email, otp, school.name, app.school)) {
+                sent.push(`${label}: sign-in details sent to ${u.email}`);
+                emailed.push(label);
+            } else sent.push(`${label}: switched on, but the email to ${u.email} could not be sent — reset the password from the Students screen`);
         } else {
             await pool.query(`UPDATE "users" SET "isActive" = true WHERE "_id" = $1`, [String(id)]);
             sent.push(`${label}: switched on (keeps the password already used with ${u.email})`);
@@ -618,4 +786,4 @@ async function activate(req, app) {
     return { application: row, sent };
 }
 
-module.exports = { preview, convert, activate, signInNote, mappedValues, guardianBlocks, primaryOf, structureFor, healthFrom };
+module.exports = { preview, convert, activate, signInNote, mappedValues, guardianBlocks, primaryOf, structureFor, healthFrom, suggestStudentEmail, seatQuota, admissionHead, lateDocument };

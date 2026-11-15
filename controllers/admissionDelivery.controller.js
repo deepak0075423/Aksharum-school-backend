@@ -6,6 +6,12 @@
  *                                   complaints — signed with ADMISSION_WEBHOOK_SECRET
  *                                   (HMAC-SHA256 of the raw body, header
  *                                   X-Aksharum-Signature: sha256=<hex>)
+ *   POST /webhooks/email-events/:provider?key=<ADMISSION_WEBHOOK_SECRET>[&school=<id>]
+ *                                   the same news in the provider's OWN format —
+ *                                   sendgrid, ses (through SNS), mailgun, postmark,
+ *                                   brevo. No provider sends our format, so the
+ *                                   first address needed a relay in between; this
+ *                                   one is pasted into the provider's settings as is.
  *   /admin/emails/suppressions …    the school's do-not-send list
  *   /admin/emails/domain-check      SPF, DMARC, DKIM and MX for the address mail is sent from
  *
@@ -52,6 +58,94 @@ exports.webhook = async (req, res) => {
         return res.json({ success: true, data: { received: list.length, suppressed: added, ignored } });
     } catch (err) {
         console.error(`[${TAG}] webhook:`, err.message);
+        return res.status(500).json({ success: false, message: 'Could not record the events' });
+    }
+};
+
+// ── The providers' own formats ───────────────────────────────────────────────
+
+const lower = (v) => String(v || '').toLowerCase();
+
+/** Each adapter turns a provider's payload into [{ email, type: 'bounce'|'complaint', permanent, reason }]. */
+const ADAPTERS = {
+    // SendGrid Event Webhook: an array of events.
+    sendgrid: (body) => (Array.isArray(body) ? body : []).map((e) => {
+        const ev = lower(e?.event);
+        if (ev === 'spamreport') return { email: e.email, type: 'complaint', permanent: true, reason: 'Marked as spam' };
+        if (ev === 'bounce') return { email: e.email, type: 'bounce', permanent: lower(e.type || 'bounce') === 'bounce', reason: e.reason };
+        return null;
+    }),
+    // Amazon SES, delivered by SNS: the notification is a JSON string inside "Message".
+    ses: (body) => {
+        let m = body?.Message ?? body;
+        if (typeof m === 'string') { try { m = JSON.parse(m); } catch { m = {}; } }
+        const kind = lower(m?.notificationType || m?.eventType);
+        if (kind === 'bounce') {
+            return (m.bounce?.bouncedRecipients || []).map((r) => ({ email: r.emailAddress, type: 'bounce', permanent: lower(m.bounce?.bounceType) === 'permanent', reason: r.diagnosticCode || m.bounce?.bounceSubType }));
+        }
+        if (kind === 'complaint') return (m.complaint?.complainedRecipients || []).map((r) => ({ email: r.emailAddress, type: 'complaint', permanent: true, reason: m.complaint?.complaintFeedbackType || 'Marked as spam' }));
+        return [];
+    },
+    // Mailgun: one event under "event-data".
+    mailgun: (body) => {
+        const d = body?.['event-data'] || {};
+        const ev = lower(d.event);
+        if (ev === 'complained') return [{ email: d.recipient, type: 'complaint', permanent: true, reason: 'Marked as spam' }];
+        if (ev === 'failed') return [{ email: d.recipient, type: 'bounce', permanent: lower(d.severity) === 'permanent', reason: d['delivery-status']?.message || d['delivery-status']?.description || d.reason }];
+        return [];
+    },
+    // Postmark: one record per call.
+    postmark: (body) => {
+        const t = lower(body?.RecordType);
+        if (t === 'spamcomplaint') return [{ email: body.Email, type: 'complaint', permanent: true, reason: 'Marked as spam' }];
+        if (t === 'bounce') return [{ email: body.Email, type: 'bounce', permanent: lower(body.Type) === 'hardbounce', reason: body.Description || body.Details }];
+        return [];
+    },
+    // Brevo (Sendinblue): one event per call.
+    brevo: (body) => {
+        const ev = lower(body?.event);
+        if (['spam', 'complaint'].includes(ev)) return [{ email: body.email, type: 'complaint', permanent: true, reason: 'Marked as spam' }];
+        if (['hard_bounce', 'invalid_email'].includes(ev)) return [{ email: body.email, type: 'bounce', permanent: true, reason: body.reason }];
+        return [];
+    },
+};
+
+function keyOk(req) {
+    const secret = process.env.ADMISSION_WEBHOOK_SECRET || '';
+    const sent = String(req.query.key || '');
+    if (!secret || !sent) return false;
+    const h = (v) => crypto.createHash('sha256').update(v).digest();
+    return crypto.timingSafeEqual(h(secret), h(sent));
+}
+
+exports.providerWebhook = async (req, res) => {
+    try {
+        if (!process.env.ADMISSION_WEBHOOK_SECRET) return res.status(404).json({ success: false, message: 'Not found' });
+        const adapt = ADAPTERS[lower(req.params.provider)];
+        if (!adapt) return res.status(404).json({ success: false, message: 'Unknown provider' });
+        if (!keyOk(req)) return res.status(401).json({ success: false, message: 'Bad key' });
+        let body = req.body;
+        // SNS posts JSON as text/plain: read it from the raw bytes when the parser left nothing.
+        if ((!body || (typeof body === 'object' && !Array.isArray(body) && !Object.keys(body).length)) && req.rawBody) {
+            try { body = JSON.parse(req.rawBody.toString('utf8')); } catch { body = {}; }
+        }
+        // SNS asks once to confirm the address: the answer is opening the link it sends — on Amazon's own host only.
+        if (lower(req.params.provider) === 'ses' && body?.Type === 'SubscriptionConfirmation' && /^https:\/\/sns\.[a-z0-9-]+\.amazonaws\.com\//.test(String(body.SubscribeURL || ''))) {
+            await fetch(body.SubscribeURL, { signal: AbortSignal.timeout(10000) }).catch((e) => console.error(`[${TAG}] SNS confirmation:`, e.message));
+            return res.json({ success: true, data: { confirmed: true } });
+        }
+        const school = isId(String(req.query.school || '')) ? String(req.query.school) : null;
+        const list = (adapt(body) || []).filter(Boolean).slice(0, 500);
+        let added = 0; let ignored = 0;
+        for (const e of list) {
+            const email = String(e.email || '').trim().toLowerCase();
+            if (!isEmail(email) || !e.permanent) { ignored += 1; continue; }
+            await mailer.suppress(school, email, { source: e.type === 'complaint' ? 'complaint' : 'bounce', reason: str(e.reason, 300) });
+            added += 1;
+        }
+        return res.json({ success: true, data: { received: list.length, suppressed: added, ignored } });
+    } catch (err) {
+        console.error(`[${TAG}] provider webhook:`, err.message);
         return res.status(500).json({ success: false, message: 'Could not record the events' });
     }
 };

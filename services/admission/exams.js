@@ -197,14 +197,45 @@ async function cancel(req, exam, reason) {
     if (['approved', 'published'].includes(exam.resultsStatus)) refuse('Results of this exam are approved — it cannot be cancelled now', 409);
     const why = str(reason, 300);
     if (!why) refuse('Say why the exam is cancelled — families are told', 400, { field: 'reason' });
-    const row = await patch(AdmissionExam, exam._id, { status: 'cancelled' });
+    const row = await patch(AdmissionExam, exam._id, { status: 'cancelled', resultPublishAt: null }, { where: { status: exam.status } });
+    if (!row) refuse('The exam changed — refresh and try again', 409);
     const { rows } = await pool.query(`SELECT a.* FROM "admissioncandidates" c JOIN ${TA} a ON a."_id" = c."application" WHERE c."exam" = $1 AND c."status" <> 'withdrawn'`, [String(exam._id)]);
+    // Everything the exam held is let go (Nov 2026 — only the exam's own status
+    // used to change): its candidates are taken off it, sittings still open are
+    // voided, and each application goes back to where it stood before it was
+    // scheduled — otherwise it sat at "Exam Scheduled" for good, and the
+    // checks before Evaluated and before an offer still counted the dead exam.
+    await pool.query(`UPDATE "admissionattempts" SET "status" = 'void', "updatedAt" = now() WHERE "exam" = $1 AND "status" = 'in_progress'`, [String(exam._id)]);
+    await pool.query(`UPDATE "admissioncandidates" SET "status" = 'withdrawn', "updatedAt" = now() WHERE "exam" = $1 AND "status" <> 'withdrawn'`, [String(exam._id)]);
     for (const app of rows) {
+        await unschedule(req, exam, app).catch((e) => console.error('[admission] exam cancel:', e.message));
         events.recordQuietly(app.school, { application: app._id, by: req, type: 'exam', action: 'cancelled', message: `${exam.name} has been cancelled — ${why}`, visibility: 'applicant' });
         notify.toApplicant(app, 'status_update', { remarks: `${exam.name} has been cancelled: ${why}. We will write to you with a new date.` });
     }
     events.recordQuietly(req.schoolId, { by: req, type: 'exam', action: 'cancelled', message: `Exam "${exam.name}" cancelled — ${why}` });
     return row;
+}
+
+/**
+ * An application that was at "Exam Scheduled" (or "Interview Scheduled") only
+ * because of this exam goes back to where it was before — when no other exam
+ * of that kind still has it as a candidate.
+ */
+async function unschedule(req, exam, app) {
+    const interview = exam.mode === 'interview';
+    const { rows: [fresh] } = await pool.query(`SELECT * FROM ${TA} WHERE "_id" = $1`, [String(app._id)]);
+    if (!fresh || !(interview ? ['interview_scheduled', 'interview_completed'] : ['exam_scheduled', 'exam_completed']).includes(fresh.status)) return null;
+    const { rows: [left] } = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM "admissioncandidates" c JOIN "admissionexams" e ON e."_id" = c."exam"
+          WHERE c."application" = $1 AND c."status" <> 'withdrawn' AND e."status" <> 'cancelled' AND e."_id" <> $2 AND ${interview ? `e."mode" = 'interview'` : `e."mode" <> 'interview'`}`,
+        [String(app._id), String(exam._id)]);
+    if (left.n) return null;
+    const apps = require('./applications');
+    // Back past "completed" to what stood before the scheduling itself.
+    let to = await apps.previousStatus(fresh);
+    if ((interview ? ['interview_scheduled'] : ['exam_scheduled']).includes(to)) to = await apps.previousStatus({ ...fresh, status: to });
+    if (to === fresh.status) return null;
+    return apps.move(req, fresh, to, { system: true, undo: true, quiet: true }).catch((e) => { if (e.status !== 409) throw e; return null; });
 }
 
 // ── Questions ────────────────────────────────────────────────────────────────
@@ -349,11 +380,17 @@ async function assignCandidates(req, exam, applicationIds) {
     const classes = new Map((await Class.find({ _id: { $in: exam.classes } }).select('className classNumber').lean()).map((c) => [String(c._id), c]));
     const added = [];
     const after = [];
+    const notReady = [];
     const apps = require('./applications');
+    const docsSvc = require('./documents');
+    const docTypes = await docsSvc.typesOf(exam.school);
     for (const a of want) {
         await withTransaction(async (q) => {
             const { rows: [app] } = await q(`SELECT * FROM ${TA} WHERE "_id" = $1 FOR UPDATE`, [String(a._id)]);
             if (!app || workflow.isClosed(app.status)) return;
+            // Documents the school wants verified before an exam (the type's own "before the exam" gate).
+            const short = await docsSvc.gateProblems(app, 'before_exam', { types: docTypes });
+            if (short.length) { notReady.push({ application: app._id, applicationNumber: app.applicationNumber, studentName: app.studentName, problems: short.map((x) => `${x.name} ${x.problem}`) }); return; }
             const roll = await counters.nextNumber(exam.school, 'admitCard', settings.numbering.admitCard, {
                 school, classDoc: classes.get(String(app.class)), year: year?.startDate ? new Date(year.startDate).getFullYear() : null,
             }, q);
@@ -382,7 +419,10 @@ async function assignCandidates(req, exam, applicationIds) {
         notify.toApplicant(app, exam.booking?.enabled ? 'slot_choose' : exam.mode === 'interview' ? 'interview_scheduled' : 'exam_scheduled', values);
         if (exam.mode === 'online') notify.toApplicant(app, 'online_exam_instructions', values);
     }
-    return { added: added.length };
+    if (!added.length && notReady.length) {
+        refuse(`Not scheduled — documents needed before the exam: ${notReady.slice(0, 3).map((n) => `${n.applicationNumber} (${n.problems.join(', ')})`).join('; ')}${notReady.length > 3 ? ` and ${notReady.length - 3} more` : ''}`, 409, { code: 'DOCUMENTS_BEFORE_EXAM', notReady });
+    }
+    return { added: added.length, notReady };
 }
 
 function examValues(exam, cand) {
@@ -401,6 +441,7 @@ async function removeCandidate(req, exam, candidate) {
     if (res.n) refuse('Marks have been entered for this candidate', 409);
     await patch(AdmissionCandidate, candidate._id, { status: 'withdrawn' });
     events.recordQuietly(exam.school, { application: candidate.application, by: req, type: 'exam', action: 'unscheduled', message: `Removed from ${exam.name}` });
+    await unschedule(req, exam, { _id: candidate.application }).catch((e) => console.error('[admission] unschedule:', e.message));
     return { ok: true };
 }
 
@@ -468,6 +509,7 @@ async function markSat(req, exam, applicationId) {
 async function startAttempt(req, exam, app, candidate) {
     if (exam.mode !== 'online') refuse('This exam is not taken online', 409);
     if (exam.status !== 'scheduled') refuse('This exam is not open', 409);
+    if (['approved', 'published'].includes(exam.resultsStatus)) refuse('The results of this exam have been finalised — it can no longer be taken', 409, { code: 'CLOSED' });
     if (!candidate || candidate.status === 'withdrawn') refuse('You are not scheduled for this exam', 403);
     if (workflow.isClosed(app.status)) refuse('This application is closed', 409);
     const now = new Date();
@@ -477,7 +519,12 @@ async function startAttempt(req, exam, app, candidate) {
     if (new Date(exam.endsAt) <= now) refuse('The exam window has closed', 409, { code: 'CLOSED' });
     const { rows: [done] } = await pool.query(`SELECT COUNT(*)::int AS n FROM "admissionattempts" WHERE "exam" = $1 AND "application" = $2 AND "status" <> 'void'`, [String(exam._id), String(app._id)]);
     const allowed = Number(exam.settings?.attemptsAllowed) || 1;
-    if (done.n >= allowed) refuse(allowed === 1 ? 'You have already taken this exam' : `You have used all ${allowed} attempts`, 409, { code: 'NO_ATTEMPTS_LEFT' });
+    if (done.n >= allowed) {
+        // Two "start" requests at the same moment: the other one may have opened the sitting between our two looks.
+        const justOpened = await AdmissionAttempt.findOne({ exam: exam._id, application: app._id, status: 'in_progress' }).lean();
+        if (justOpened) return finishIfDue(req, exam, justOpened);
+        refuse(allowed === 1 ? 'You have already taken this exam' : `You have used all ${allowed} attempts`, 409, { code: 'NO_ATTEMPTS_LEFT' });
+    }
 
     const questions = await AdmissionQuestion.find({ exam: exam._id, isActive: true }).sort({ order: 1 }).lean();
     if (!questions.length) refuse('This exam has no questions yet — please contact the school', 409);
@@ -693,9 +740,44 @@ async function nextSection(req, exam, attempt) {
     return moved;
 }
 
+const MAX_VIOLATIONS = 300;
+
 async function recordViolation(attempt, type) {
-    const kind = ['tab_hidden', 'window_blur', 'fullscreen_exit', 'copy', 'paste', 'context_menu'].includes(type) ? type : 'other';
-    await patch(AdmissionAttempt, attempt._id, {}, { push: { violations: { type: kind, at: new Date() } }, where: { status: 'in_progress' } }).catch(() => {});
+    const kind = ['tab_hidden', 'window_blur', 'fullscreen_exit', 'copy', 'paste', 'context_menu', 'second_device'].includes(type) ? type : 'other';
+    // Capped: the list is something for an evaluator to look at, and a page
+    // (or a script) firing thousands of them must not grow the row without end.
+    await pool.query(
+        `UPDATE "admissionattempts" SET "violations" = COALESCE("violations", '[]'::jsonb) || $2::jsonb, "updatedAt" = now()
+          WHERE "_id" = $1 AND "status" = 'in_progress' AND jsonb_array_length(COALESCE("violations", '[]'::jsonb)) < $3`,
+        [String(attempt._id), JSON.stringify([{ type: kind, at: new Date() }]), MAX_VIOLATIONS]).catch(() => {});
+}
+
+// ── One page at a time ───────────────────────────────────────────────────────
+
+const SESSION_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+/**
+ * The exam page that opened the sitting last holds it. Each page load names
+ * itself (a random id the page makes) and claims the attempt; a save from a
+ * page that no longer holds it is refused, and that page says so — a sitting
+ * open on a second phone or a second tab no longer quietly takes answers from
+ * both. A claim that takes the sitting from another page is noted for the
+ * evaluator, like the other things the page notices.
+ */
+async function claimSession(attempt, session) {
+    const key = String(session || '');
+    if (!SESSION_RE.test(key) || attempt.status !== 'in_progress' || attempt.sessionKey === key) return attempt;
+    const taken = !!attempt.sessionKey;
+    const { rows: [row] } = await pool.query(
+        `UPDATE "admissionattempts" SET "sessionKey" = $2, "updatedAt" = now() WHERE "_id" = $1 AND "status" = 'in_progress' RETURNING *`, [String(attempt._id), key]);
+    if (row && taken) await recordViolation(row, 'second_device');
+    return row || attempt;
+}
+
+function assertSession(attempt, session) {
+    const key = String(session || '');
+    if (!key || !attempt.sessionKey || attempt.status !== 'in_progress') return;
+    if (key !== attempt.sessionKey) refuse('This exam has been opened on another device or in another tab — continue there, or reload this page to take it back', 409, { code: 'OPEN_ELSEWHERE' });
 }
 
 /** Sweep: every open attempt whose time is up. */
@@ -741,11 +823,39 @@ function compute(exam, row) {
     return { total, percentage, grade: gradeFor(exam, percentage), passed };
 }
 
+/** The interview panel of a candidate, when each member scores on their own: two or more people. */
+const panelOf = (candidate) => { const p = (candidate?.panel || []).map(String); return p.length >= 2 ? p : null; };
+
+/** One mark per subject from the panel's sheets: the average of those who marked it. */
+function panelAverage(exam, sheets) {
+    const out = {};
+    for (const sub of exam.subjects || []) {
+        const vals = Object.values(sheets || {}).filter((x) => !x.absent).map((x) => x.marks?.[sub.key]).filter((v) => v != null && Number.isFinite(Number(v))).map(Number);
+        if (vals.length) out[sub.key] = round2(vals.reduce((a, b) => a + b, 0) / vals.length);
+    }
+    return out;
+}
+
 async function upsertResult(req, exam, candidate, { marks, absent = false, remarks, autoScore, manualScore, attempt } = {}) {
     const applicationId = String(candidate.application);
     const existing = await AdmissionResult.findOne({ exam: exam._id, application: applicationId }).lean();
     if (existing && ['approved', 'published'].includes(existing.status)) refuse('This result is approved — correct it instead', 409, { code: 'RESULT_LOCKED' });
     const base = existing || { marks: {}, absent: false };
+    // An interview panel of two or more: each member's marks are their own
+    // sheet, and the candidate's marks are the panel's average (Nov 2026 — the
+    // members used to share one sheet and overwrite each other).
+    let panelMarks = base.panelMarks && typeof base.panelMarks === 'object' ? base.panelMarks : {};
+    const panel = exam.mode === 'interview' && marks !== undefined && req?.userId ? panelOf(candidate) : null;
+    if (panel && panel.includes(String(req.userId))) {
+        panelMarks = { ...panelMarks, [String(req.userId)]: { marks: marks || {}, absent: !!absent, remarks: remarks !== undefined ? str(remarks, 500) : (panelMarks[String(req.userId)]?.remarks || ''), name: req.user?.name || '', at: new Date() } };
+        marks = panelAverage(exam, panelMarks);
+        absent = Object.values(panelMarks).every((x) => x.absent);
+        remarks = Object.values(panelMarks).map((x) => (x.remarks ? `${x.name || 'Panel member'}: ${x.remarks}` : '')).filter(Boolean).join(' · ').slice(0, 500);
+    } else if (panel && Object.keys(panelMarks).length && !absent) {
+        refuse('The panel is marking this candidate — each member enters their own marks and the average is used. A correction after approval changes the final marks.', 409, { code: 'PANEL_MARKS' });
+    } else if (panel && absent) {
+        panelMarks = {};
+    }
     const next = {
         ...base,
         marks: marks !== undefined ? marks : base.marks,
@@ -755,7 +865,7 @@ async function upsertResult(req, exam, candidate, { marks, absent = false, remar
     };
     const figures = compute(exam, next);
     const set = {
-        marks: next.marks, absent: next.absent, autoScore: next.autoScore, manualScore: next.manualScore, ...figures,
+        marks: next.marks, absent: next.absent, autoScore: next.autoScore, manualScore: next.manualScore, ...figures, panelMarks,
         ...(remarks !== undefined ? { remarks: str(remarks, 500) } : {}), enteredBy: req?.userId || null, enteredAt: new Date(),
         candidate: candidate._id || base.candidate || null, status: 'draft',
     };
@@ -857,9 +967,9 @@ async function evaluateAttempt(req, exam, attempt, marksByQuestion) {
 }
 
 /** Results of an exam, with each candidate — the office's working view. */
-async function resultsBoard(exam, { includeRemarks = true } = {}) {
+async function resultsBoard(exam, { includeRemarks = true, viewer = null } = {}) {
     const { rows } = await pool.query(
-        `SELECT c."_id" AS "candidateId", c."rollNumber", c."status" AS "candidateStatus", c."slot", c."slotId", c."room", c."extraMinutes", c."extraReason",
+        `SELECT c."_id" AS "candidateId", c."rollNumber", c."status" AS "candidateStatus", c."slot", c."slotId", c."room", c."extraMinutes", c."extraReason", c."panel", r."panelMarks",
                 a."_id" AS "applicationId", a."applicationNumber", a."studentName", a."class", a."status" AS "applicationStatus",
                 r."_id" AS "resultId", r."marks", r."autoScore", r."manualScore", r."total", r."percentage", r."grade", r."passed", r."absent",
                 r."status" AS "resultStatus", r."remarks", r."published", r."corrections",
@@ -877,14 +987,25 @@ async function resultsBoard(exam, { includeRemarks = true } = {}) {
     const planSvc = require('./examPlan');
     return rows.map((r) => {
         const a = byAttempt.get(String(r.attemptId));
-        const out = { ...r, signals: a ? planSvc.signals(a) : {} };
+        const { panelMarks, panel, ...rest } = r;
+        const out = { ...rest, signals: a ? planSvc.signals(a) : {} };
+        // A panel of two or more: who has marked, and the viewer's own sheet — never a colleague's marks.
+        const members = exam.mode === 'interview' ? panelOf({ panel }) : null;
+        if (members) {
+            const sheets = panelMarks && typeof panelMarks === 'object' ? panelMarks : {};
+            const mine = viewer ? sheets[String(viewer)] : null;
+            out.panel = {
+                size: members.length, entered: members.filter((m) => sheets[m]).length, onPanel: !!viewer && members.includes(String(viewer)),
+                mine: mine ? { marks: mine.marks || {}, absent: !!mine.absent, remarks: mine.remarks || '' } : null,
+            };
+        }
         return includeRemarks ? out : { ...out, remarks: undefined };
     });
 }
 
 /** Check every candidate is marked: what is still missing. */
-async function missingMarks(exam) {
-    const board = await resultsBoard(exam);
+async function missingMarks(exam, opts = {}) {
+    const board = await resultsBoard(exam, opts);
     const missing = [];
     for (const b of board) {
         if (exam.mode === 'online') {
@@ -892,6 +1013,7 @@ async function missingMarks(exam) {
             else if (b.attemptStatus === 'in_progress') missing.push(`${b.rollNumber}: still taking the exam`);
             else if (Number(b.manualPending) > 0) missing.push(`${b.rollNumber}: ${b.manualPending} answer(s) to evaluate`);
         } else if (!b.resultId) missing.push(`${b.rollNumber}: no marks`);
+        else if (b.panel && !b.absent && b.panel.entered > 0 && b.panel.entered < b.panel.size) missing.push(`${b.rollNumber}: ${b.panel.size - b.panel.entered} of ${b.panel.size} panel members have not marked yet`);
     }
     return { board, missing };
 }
@@ -919,6 +1041,12 @@ async function submitResults(req, exam) {
     await pool.query(`UPDATE "admissionresults" SET "status" = 'submitted', "submittedBy" = $2, "submittedAt" = now(), "updatedAt" = now() WHERE "exam" = $1 AND "status" = 'draft'`, [String(exam._id), String(req.userId)]);
     const row = await patch(AdmissionExam, exam._id, { resultsStatus: 'submitted', status: new Date(exam.endsAt || exam.startsAt) < new Date() ? 'completed' : exam.status });
     events.recordQuietly(exam.school, { by: req, type: 'result', action: 'submitted', message: `${exam.name}: results submitted for approval` });
+    if (exam.approvalRequired) {
+        require('./staffAlerts').toAdmins(exam.school, {
+            title: `${exam.name}: results waiting for approval`, body: `${req.user?.name || 'An evaluator'} submitted the results of ${exam.name}. They need an administrator's approval before they can be published.`,
+            link: { type: 'admission.selection' }, except: req.userId,
+        });
+    }
     return row;
 }
 
@@ -929,9 +1057,16 @@ async function approveResults(req, exam) {
     if (!exam.approvalRequired) {
         const { missing } = await missingMarks(exam);
         if (missing.length) refuse(`Marks are not complete: ${missing.slice(0, 5).join('; ')}`, 409);
+    } else {
+        const { rows: [sub] } = await pool.query(`SELECT "submittedBy" FROM "admissionresults" WHERE "exam" = $1 AND "submittedBy" IS NOT NULL ORDER BY "submittedAt" DESC NULLS LAST LIMIT 1`, [String(exam._id)]);
+        await require('./selection').assertSecondPerson(req, exam.school, sub?.submittedBy, 'these results');
     }
     await pool.query(`UPDATE "admissionresults" SET "status" = 'approved', "approvedBy" = $2, "approvedAt" = now(), "updatedAt" = now() WHERE "exam" = $1 AND "status" IN ('draft', 'submitted')`, [String(exam._id), String(req.userId)]);
-    const row = await patch(AdmissionExam, exam._id, { resultsStatus: 'approved', resultsApprovedAt: new Date(), resultsApprovedBy: req.userId, status: 'completed' });
+    // "Completed" once its time is over — an online exam whose window is still
+    // open stays as it is until then (the sweep closes it); approving used to
+    // mark it completed at once, whatever the clock said.
+    const over = new Date(exam.endsAt || exam.startsAt) < new Date();
+    const row = await patch(AdmissionExam, exam._id, { resultsStatus: 'approved', resultsApprovedAt: new Date(), resultsApprovedBy: req.userId, status: over || exam.mode !== 'online' ? 'completed' : exam.status });
     events.recordQuietly(exam.school, { by: req, type: 'result', action: 'approved', message: `${exam.name}: results approved` });
     return row;
 }
@@ -999,6 +1134,10 @@ async function correctResult(req, exam, result, { marks, absent, autoScore, manu
         marks: next.marks, absent: next.absent, autoScore: next.autoScore, manualScore: next.manualScore, ...figures, published,
     }, { push: { corrections: { at: new Date(), by: String(req.userId), byName: req.user?.name || '', reason: why, before, after } } });
     events.recordQuietly(exam.school, { application: result.application, by: req, type: 'result', action: 'corrected', message: `${exam.name}: result corrected — ${why}`, meta: { before, after } });
+    // A list ranked on this exam was built on the old figures.
+    if (before.total !== after.total || before.passed !== after.passed || before.absent !== after.absent) {
+        await require('./selection').flagListsFor(req, exam, result.application).catch((e) => console.error('[admission] list flag:', e.message));
+    }
     return row;
 }
 
@@ -1012,6 +1151,27 @@ async function publishDue() {
         try { await publishResultsNow(null, exam); n += 1; } catch (e) { console.error('[admission] scheduled results:', e.message); }
     }
     return n;
+}
+
+/**
+ * Sweep: an exam whose time is over becomes "completed" by itself — it used
+ * to stay "scheduled" until somebody approved its results. An online exam
+ * closes with its window; a written exam or an interview six hours after its
+ * end (or its start plus its length), and never while a candidate still has a
+ * time ahead or families can still choose one.
+ */
+async function completeDue() {
+    const { rows } = await pool.query(
+        `UPDATE "admissionexams" e SET "status" = 'completed', "updatedAt" = now()
+          WHERE e."status" = 'scheduled'
+            AND ((e."mode" = 'online' AND e."endsAt" IS NOT NULL AND e."endsAt" < now() - interval '2 minutes')
+              OR (e."mode" <> 'online'
+                  AND COALESCE(e."endsAt", e."startsAt" + make_interval(mins => COALESCE(e."durationMinutes", 60)::int)) < now() - interval '6 hours'
+                  AND NOT COALESCE((e."booking"->>'enabled')::boolean, false)
+                  AND NOT EXISTS (SELECT 1 FROM "admissioncandidates" c WHERE c."exam" = e."_id" AND c."status" = 'scheduled' AND c."slot" > now() - interval '6 hours')))
+            AND NOT EXISTS (SELECT 1 FROM "admissionattempts" t WHERE t."exam" = e."_id" AND t."status" = 'in_progress')
+          RETURNING e."_id"`);
+    return rows.length;
 }
 
 /** What a family sees of their result: the published snapshot, only once published. */
@@ -1033,4 +1193,5 @@ module.exports = {
     startAttempt, attemptView, saveAnswers, submitAttempt, finishIfDue, recordViolation, autoSubmitDue, scoreAttempt,
     compute, enterMarks, evaluateAttempt, resultsBoard, missingMarks, submitResults, approveResults, publishResults, publishResultsNow,
     correctResult, publishDue, publishedView, canEvaluate, markingScope, closeOnlineAbsentees,
+    unschedule, claimSession, assertSession, completeDue, panelOf,
 };

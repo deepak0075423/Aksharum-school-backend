@@ -40,6 +40,8 @@ const AdmissionAttemptSchema = new db.Schema({
     currentSection: { type: Number, default: 0 },
     extraMinutes: { type: Number, default: 0 },
     clientInfo:   { type: db.Types.JSON, default: null },
+    // The exam page that holds the sitting — the one that opened it last (services/admission/exams.js claimSession).
+    sessionKey:   { type: String, default: '' },
 }, { timestamps: true });
 
 AdmissionAttemptSchema.index({ exam: 1, application: 1, attemptNo: 1 }, { unique: true });

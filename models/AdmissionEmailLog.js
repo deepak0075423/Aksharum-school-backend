@@ -16,7 +16,9 @@ const AdmissionEmailLogSchema = new db.Schema({
     recipient:   { type: db.Types.UUID, ref: 'User', default: null },
     to:          { type: String, required: true },
     subject:     { type: String, default: '' },
-    status:      { type: String, enum: ['sent', 'failed', 'logged', 'skipped'], default: 'sent' },
+    // queued → sending → sent | failed | logged | skipped (services/admission/mailer.js: the queue).
+    status:      { type: String, enum: ['queued', 'sending', 'sent', 'failed', 'logged', 'skipped'], default: 'sent' },
+    lastTriedAt: { type: Date, default: null },
     error:       { type: String, default: '' },
     messageId:   { type: String, default: '' },
     driver:      { type: String, default: 'smtp' },

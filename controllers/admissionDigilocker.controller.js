@@ -19,6 +19,12 @@ exports.start = handler(async (req, res) => {
     res.json({ success: true, data: await digilocker.start(req, app, { client: req.body?.client === 'app' ? 'app' : 'web' }) });
 }, TAG);
 
+/** The signed-in owner finishes the connection with what their browser came back with. */
+exports.complete = handler(async (req, res) => {
+    const app = await access.ownApplication(req, req.params.id);
+    res.json({ success: true, data: await digilocker.complete(req, app, { state: req.body?.state, code: req.body?.code }) });
+}, TAG);
+
 exports.importFile = handler(async (req, res) => {
     const app = await access.ownApplication(req, req.params.id);
     res.status(201).json({ success: true, data: await digilocker.importFile(req, app, { uri: req.body?.uri, docKey: req.body?.docKey }) });

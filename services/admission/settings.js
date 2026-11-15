@@ -98,6 +98,8 @@ function defaults() {
             registerText: { title: 'Create your applicant account', subtitle: 'One account lets you apply, upload documents and track every step.' },
             privacyNotice: DEFAULT_PRIVACY,
             privacyVersion: 1,
+            // Every earlier wording of the notice, newest first: { version, text, until, minor }.
+            privacyHistory: [],
             declaration: 'I declare that the information given in this application is true and complete to the best of my knowledge, and I understand that admission may be cancelled if any of it is found to be incorrect.',
             enquiries: true,
         },
@@ -123,6 +125,9 @@ function defaults() {
             draftMigration: 'migrate',               // migrate | keep
             duplicateCheck: true,
             allowWithdraw: true,
+            // A class's age rule (round → class → who is eligible) is checked when an
+            // application is submitted. Off: it is shown to families and not enforced.
+            enforceAge: true,
         },
         workflow: { stages: workflow.defaultStages() },
         selection: {
@@ -131,10 +136,20 @@ function defaults() {
             offerValidityDays: 7,
             allowApplicantResponse: true,
             visibility: { showRank: true, showScore: false, showNames: false },
+            // Whoever sends a list or a set of results for approval is not the one
+            // who approves it (a school with a single admission administrator is let through).
+            twoPersonApproval: true,
         },
-        fees: { waivers: [], receiptNote: 'This is a computer-generated receipt and does not need a signature.' },
+        // refundRules: how much of the ADMISSION fee the school gives back when a
+        // family leaves, by days since it was paid — [{ withinDays, percent }],
+        // read top to bottom; later than the last rule: nothing. A guide for the
+        // office (the refund dialog shows it), never an automatic refund.
+        fees: { waivers: [], refundRules: [], receiptNote: 'This is a computer-generated receipt and does not need a signature.' },
         conversion: {
             activation: 'immediate',                 // immediate | manual
+            // Confirm the admission by itself once the fee is settled and nothing else
+            // stands in the way. Only where the Confirmation stage needs no approval.
+            autoConfirm: false,
             requireAdmissionFeePaid: true,
             requireDocumentsVerified: true,
             sendCredentials: true,
@@ -147,12 +162,15 @@ function defaults() {
         email: {
             replyTo: '',
             fromName: '',
-            reminders: { examHoursBefore: 24, paymentDaysBefore: 2 },
+            // 0 switches a reminder off.
+            reminders: { examHoursBefore: 24, paymentDaysBefore: 2, offerDaysBefore: 2, draftDaysBefore: 3, documentsDaysBefore: 3 },
         },
         // Data protection (services/admission/privacy.js): how long what is held
         // is kept, who answers privacy questions, how fast requests are answered.
         privacy: {
-            retention: { enabled: true, unsuccessfulMonths: 12, abandonedDraftDays: 180, enquiryMonths: 12, deliveryLogMonths: 6 },
+            // enrolledMonths: after this long an enrolled student's application drops its
+            // Aadhaar numbers and sensitive answers — the student record is where they live.
+            retention: { enabled: true, unsuccessfulMonths: 12, abandonedDraftDays: 180, enquiryMonths: 12, deliveryLogMonths: 6, enrolledMonths: 12 },
             officer: { name: '', email: '', phone: '' },
             requestDays: 30,
         },
@@ -198,8 +216,17 @@ function normalizePortal(p = {}, current = defaults().portal) {
         };
     });
     const privacyNotice = text(p.privacyNotice ?? d.privacyNotice, 'Privacy notice', { max: 8000 });
-    // A changed notice is a new version: applicants agree to the version they saw.
-    const privacyVersion = privacyNotice !== d.privacyNotice ? (Number(d.privacyVersion) || 1) + 1 : (Number(d.privacyVersion) || 1);
+    // A changed notice is a new version, and every family agrees again —
+    // unless the school says the change is only wording (a spelling put right,
+    // a phone number updated: `privacyMinor`), which keeps the version. Either
+    // way the wording it replaces is kept, so what a family agreed to on a
+    // given day can always be shown.
+    const changed = privacyNotice !== d.privacyNotice;
+    const minor = changed && p.privacyMinor === true;
+    const privacyVersion = changed && !minor ? (Number(d.privacyVersion) || 1) + 1 : (Number(d.privacyVersion) || 1);
+    const privacyHistory = changed
+        ? [{ version: Number(d.privacyVersion) || 1, text: d.privacyNotice, until: new Date(), minor }, ...(Array.isArray(d.privacyHistory) ? d.privacyHistory : [])].slice(0, 30)
+        : (Array.isArray(d.privacyHistory) ? d.privacyHistory : []);
     return {
         status: oneOf(p.status ?? d.status, ['open', 'closed', 'maintenance'], 'closed'),
         title: text(p.title ?? d.title, 'Portal title', { max: 80, required: true }),
@@ -237,6 +264,7 @@ function normalizePortal(p = {}, current = defaults().portal) {
         registerText: { title: text(p.registerText?.title ?? d.registerText?.title, 'Registration title', { max: 80 }), subtitle: text(p.registerText?.subtitle ?? d.registerText?.subtitle, 'Registration subtitle', { max: 200 }) },
         privacyNotice,
         privacyVersion,
+        privacyHistory,
         declaration: text(p.declaration ?? d.declaration, 'Declaration', { max: 2000 }),
         enquiries: bool(p.enquiries, d.enquiries ?? true),
     };
@@ -275,6 +303,7 @@ function normalizeApplications(a = {}, current = {}) {
         draftMigration: oneOf(a.draftMigration ?? d.draftMigration, ['migrate', 'keep'], 'migrate'),
         duplicateCheck: bool(a.duplicateCheck, d.duplicateCheck),
         allowWithdraw: bool(a.allowWithdraw, d.allowWithdraw),
+        enforceAge: bool(a.enforceAge, d.enforceAge ?? true),
     };
 }
 
@@ -305,6 +334,7 @@ function normalizeSelection(s = {}, current = {}) {
             showScore: bool(s.visibility?.showScore, d.visibility?.showScore ?? false),
             showNames: bool(s.visibility?.showNames, d.visibility?.showNames ?? false),
         },
+        twoPersonApproval: bool(s.twoPersonApproval, d.twoPersonApproval ?? true),
     };
 }
 
@@ -323,13 +353,23 @@ function normalizeFees(f = {}, current = {}) {
     });
     const keys = new Set();
     for (const w of waivers) { if (keys.has(w.key)) refuse(`Two waivers share the key "${w.key}"`, 400, { field: 'fees' }); keys.add(w.key); }
-    return { waivers, receiptNote: text(f.receiptNote ?? d.receiptNote, 'Receipt note', { max: 300 }) };
+    let lastDays = 0;
+    const refundRules = (Array.isArray(f.refundRules) ? f.refundRules : (d.refundRules || [])).slice(0, 8).map((r, i) => {
+        const withinDays = num(r?.withinDays, { min: 1, max: 730, d: null, int: true });
+        const percent = num(r?.percent, { min: 0, max: 100, d: null });
+        if (withinDays == null || percent == null) refuse(`Refund rule ${i + 1}: give the number of days and the percentage`, 400, { field: 'fees.refundRules' });
+        if (withinDays <= lastDays) refuse(`Refund rule ${i + 1} must cover more days than the rule before it`, 400, { field: 'fees.refundRules' });
+        lastDays = withinDays;
+        return { withinDays, percent };
+    });
+    return { waivers, refundRules, receiptNote: text(f.receiptNote ?? d.receiptNote, 'Receipt note', { max: 300 }) };
 }
 
 function normalizeConversion(c = {}, current = {}) {
     const d = { ...defaults().conversion, ...current };
     return {
         activation: oneOf(c.activation ?? d.activation, ['immediate', 'manual'], 'immediate'),
+        autoConfirm: bool(c.autoConfirm, d.autoConfirm ?? false),
         requireAdmissionFeePaid: bool(c.requireAdmissionFeePaid, d.requireAdmissionFeePaid),
         requireDocumentsVerified: bool(c.requireDocumentsVerified, d.requireDocumentsVerified),
         sendCredentials: bool(c.sendCredentials, d.sendCredentials),
@@ -349,6 +389,9 @@ function normalizeEmail(e = {}, current = {}) {
         reminders: {
             examHoursBefore: num(e.reminders?.examHoursBefore ?? d.reminders?.examHoursBefore, { min: 0, max: 168, d: 24, int: true }),
             paymentDaysBefore: num(e.reminders?.paymentDaysBefore ?? d.reminders?.paymentDaysBefore, { min: 0, max: 30, d: 2, int: true }),
+            offerDaysBefore: num(e.reminders?.offerDaysBefore ?? d.reminders?.offerDaysBefore, { min: 0, max: 30, d: 2, int: true }),
+            draftDaysBefore: num(e.reminders?.draftDaysBefore ?? d.reminders?.draftDaysBefore, { min: 0, max: 30, d: 3, int: true }),
+            documentsDaysBefore: num(e.reminders?.documentsDaysBefore ?? d.reminders?.documentsDaysBefore, { min: 0, max: 30, d: 3, int: true }),
         },
     };
 }
@@ -364,6 +407,7 @@ function normalizePrivacy(p = {}, current = {}) {
             abandonedDraftDays: num(r.abandonedDraftDays, { min: 30, max: 730, d: 180, int: true }),
             enquiryMonths: num(r.enquiryMonths, { min: 1, max: 60, d: 12, int: true }),
             deliveryLogMonths: num(r.deliveryLogMonths, { min: 1, max: 24, d: 6, int: true }),
+            enrolledMonths: num(r.enrolledMonths, { min: 1, max: 120, d: 12, int: true }),
         },
         officer: {
             name: text(o.name, 'The privacy contact\'s name', { max: 80, kind: 'name', field: 'privacy.officer.name' }),

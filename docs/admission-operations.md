@@ -146,6 +146,145 @@ the portal; the module sends no text messages or WhatsApp.
     of schools; a school admin edits the cookie policy (School settings →
     Privacy & cookies).
 
+### Added in November 2026 (the gap audit)
+
+Flow
+- With the **Offer** stage switched off, selection is the seat: the offer is
+  recorded as accepted at once and nothing lapses for want of an answer.
+- **Withdrawn** and **declined** applications can be reopened by an admission
+  administrator (back to Under Review), like rejected and cancelled ones.
+- A teacher who is not an admission administrator **asks** to withdraw an
+  application; an administrator approves it.
+- An **upheld appeal** reopens the application to Under Review and moves it on
+  to the stage chosen — only stages the workflow allows are offered. Appeals
+  cover cancelled applications and lapsed offers too, and the family can
+  attach up to three files. An upheld **re-check of an online exam** corrects
+  its score (auto-marked and evaluator's parts).
+- **Cancelling an exam** takes its candidates off it, voids sittings in
+  progress and returns each application to where it stood before; a cancelled
+  exam no longer counts in the checks before Evaluated or an offer. Removing a
+  candidate does the same for that application.
+- **Publishing a list** writes the list's status and every offer in one
+  transaction.
+- A list's page shows its own **quota's** seats.
+- A draft with a fee paid on it cannot be **deleted** (it is withdrawn and
+  refunded instead); unpaid orders go with a deleted draft.
+- A family that has paid the admission fee reads "Fee received"; the office is
+  told it is ready to confirm, or — with *Confirm by itself once the fee is in*
+  (Settings → Enrolling) and no approval on the Confirmation stage — it is
+  confirmed automatically.
+- **Age rules** of a class (age on a date, born between) are checked when a
+  draft is saved (as a warning on the date of birth) and when it is submitted
+  (*Check each class's age rule*, Settings → Applications; on by default).
+- **Two people** approve lists and results: whoever sent them for approval
+  does not approve them (Settings → Selection; a school with one admission
+  administrator is let through).
+- **Waiting positions** are renumbered when someone is promoted or leaves.
+- A result **corrected** after a merit list was built marks an unpublished
+  list "needs rebuilding" (it cannot be sent or approved until rebuilt); for a
+  published list the office is told.
+- A round's **seats** cannot be cut below the seats already held; a changed
+  **application fee** reaches drafts not yet paid.
+- An **interview panel** of two or more marks one sheet each; the result is the
+  average, and results cannot be submitted until every member has marked.
+- **Extending an offer** moves the fee date and every instalment by the same
+  number of days.
+- An approved exam is **closed** to new sittings; an exam becomes Completed by
+  itself once its time is over (the minute sweep).
+- An online exam is open on **one page at a time**: the page that opened it
+  last holds it; another device's saves are refused and noted for the
+  evaluator. The list of noticed events is capped at 300.
+
+Money
+- Online payments the family's browser never reported are **checked with the
+  gateway** by the minute sweep (sooner, then less often, for two days; then
+  the order is closed). The family ("Check my payment", also on pay links)
+  and the office ("Check with the gateway") can ask at once.
+- Gateway **refunds** still pending are followed up; one that never reached the
+  gateway is marked failed and the office told.
+- **Cheques and drafts** wait to be marked cleared before the admission can be
+  confirmed. Cancelling a receipt (a bounced cheque) on a confirmed admission
+  returns it to *Payment Pending*.
+- The application fee is not taken on a draft whose round has closed.
+- **Payments → Needs attention** lists money to give back, uncleared cheques,
+  unfinished online payments, unsettled refunds and overdue instalments.
+  Instalments past their date are followed up once (family and office).
+- Payment **links** can be cancelled (every link sent so far stops working).
+- A **refund rule** (Settings → Fees: so many per cent within so many days of
+  payment) is shown as a guide in the refund dialog.
+- **Enrolment**: a free quota seat (RTE, or a quota with a free fee rule) is
+  not put on the fee structure unless ticked; the student record keeps the
+  admission date, the quota and whether it is an RTE seat; where the class's
+  fee structure charges an admission head, what was paid at admission is
+  credited to the student's fee account.
+
+Enrolment
+- A child without an email is offered the parent's address with the child's
+  name after a "+" (anita+riya@…) — singly and in bulk enrolment.
+- Admission numbers are given under one lock shared with the Students screen.
+- Documents can be uploaded after confirmation and after enrolment; one
+  verified after enrolment is copied to the student record when its field is
+  empty.
+- Welcome emails are waited for: "emailed" is said only of one the mail server
+  accepted. "Activate accounts" can no longer send two passwords.
+- The applicant's account becomes the student's only when it has no other
+  open application.
+
+Privacy and security
+- Sign-up and reset **codes** are deleted after a day.
+- **Erasure** also clears payment and refund references, offer notes, the quota
+  note and state reference, waiver reasons, panel sheets, extra-time reasons,
+  appeal files, closed privacy requests' text, and the applicant's name on
+  history lines; a retired account's privacy requests and devices go too.
+- Retention also closes **applicant accounts that never applied** (after the
+  abandoned-draft period) and, after *enrolledMonths* (default 12), removes
+  Aadhaar numbers and sensitive answers from enrolled students' applications.
+- A **branch transfer** needs the family's yes on its application page before
+  anything is copied to the other school.
+- **DigiLocker** connects only when the signed-in owner of the application
+  finishes it (the return link no longer connects anything by itself).
+- The **restricted staff view** carries no fees, offers, waivers, legal hold,
+  quota notes or duplicates.
+- A privacy notice edit can be marked **wording only** (no new agreement);
+  earlier wordings are kept and listed.
+- "Forgot password" answers at once for every address; photos lose their
+  **GPS** location (EXIF/XMP) when uploaded; files kept while the virus scanner
+  was down are **rescanned** (a harmful one is removed and the family asked
+  again); a copy replaced on an unsubmitted draft is deleted; a portal
+  **enquiry** records the person's consent.
+- Withdrawing consent withdraws the application named (all, if none is).
+- Applicants can change their **name, mobile and password** (Your data).
+
+Notifications
+- Applicants also get each email's news as a **phone or browser
+  notification** (the app now registers applicants' devices).
+- Staff are told in the app (bell + device notification) about approvals
+  waiting, applications assigned to them, documents uploaded again or late,
+  appeals filed, offers answered, online admission fees received, lists and
+  results waiting for approval, failed refunds, money to give back, a branch
+  move agreed, and a daily summary after 9 am (new applications, approvals,
+  appeals and privacy requests near their date, uncleared cheques, documents
+  past the round's date).
+- New reminders (Settings → Email): an offer about to lapse, a draft not
+  submitted before the round closes, documents still owed near their date.
+  New email templates: *Offer about to lapse*, *Instalment overdue*,
+  *Application not submitted yet*, *Documents still needed*, *RTE seat
+  allotment recorded* (sent when allotments are imported).
+- Emails go through a **queue**: written down first, sent a few at a time
+  (`ADMISSION_MAIL_PARALLEL`, default 3), a failure tried twice more (after 5
+  and 20 minutes), and anything a restart left behind picked up by the sweep.
+  One-time codes are still sent at once and never written down.
+- Document type **gates** are enforced: *at submission* (must be uploaded) and
+  *before the exam* (must be verified before a candidate is scheduled), as
+  well as *before confirmation*.
+
+Not done in this round
+- The portal is still **English only**.
+- The phone app still opens the browser for the **form**, the **online exam**
+  and the **gateway checkout**.
+- Unpaid instalments after enrolment are followed up but **not posted to the
+  Fees module's ledger**.
+
 ---
 
 ## 2. Settings, feature by feature
@@ -160,7 +299,8 @@ public address, without a trailing slash.
 | Setting | Effect |
 |---|---|
 | `ADMISSION_MAIL_DRIVER=log` | Development and tests only: every email is written to the email log, nothing is sent. Any other value (or unset) sends through SMTP. |
-| `ADMISSION_WEBHOOK_SECRET` | Turns on `POST /api/admission/webhooks/email-events` for a mail provider's bounce and complaint reports. The sender signs the raw body with HMAC-SHA256 using this secret and sends the hex digest in the `X-Aksharum-Signature` header (optionally prefixed `sha256=`) — usually from a small relay in front of the mail provider. Unset: the address answers 404. |
+| `ADMISSION_WEBHOOK_SECRET` | Turns on `POST /api/admission/webhooks/email-events` for a mail provider's bounce and complaint reports. The sender signs the raw body with HMAC-SHA256 using this secret and sends the hex digest in the `X-Aksharum-Signature` header (optionally prefixed `sha256=`) — usually from a small relay in front of the mail provider. It also turns on `POST /api/admission/webhooks/email-events/<provider>?key=<the secret>[&school=<school id>]`, which takes the provider's **own** format — `sendgrid`, `ses` (through SNS; the subscription is confirmed automatically), `mailgun`, `postmark`, `brevo` — so it can be pasted into the provider's settings without a relay. Unset: both answer 404. |
+| `ADMISSION_MAIL_PARALLEL` | How many admission emails are sent at once from the queue (default 3). |
 
 A school's own SMTP is set in School settings; the module uses it when present.
 Admissions → Emails → *Getting delivered* shows the do-not-send list (hard
@@ -272,9 +412,9 @@ The jobs run on the primary worker only (`utils/primaryWorker`):
 
 | Job | Every | Does |
 |---|---|---|
-| `sweep.minute` | minute | submits online exams whose time is up, publishes scheduled lists and results, lapses unanswered offers |
+| `sweep.minute` | minute | submits online exams whose time is up, publishes scheduled lists and results, lapses unanswered offers, closes exams whose time is over, checks unfinished online payments and pending refunds with the gateway, sends queued emails and retries failed ones |
 | `exports.worker` | minute | prepares exports asked for in the background; deletes them after a day |
-| `sweep.reminders` | 10 minutes | exam, fee, instalment and visit reminders; enquiry follow-ups; stage digests; the daily retention purge; ends old DigiLocker sessions |
+| `sweep.reminders` | 10 minutes | exam, fee, instalment (before and once after the date), offer-lapse, draft and document reminders, and visit reminders; enquiry follow-ups; stage digests and the office's daily summary (after 9 am); the daily retention purge; deletes day-old sign-up codes; rescans files kept while the virus scanner was down; ends old DigiLocker sessions |
 
 Each run is recorded (`admissionjobruns`, kept seven days). Admissions →
 Dashboard → *How it is running* shows when each job last worked, its last

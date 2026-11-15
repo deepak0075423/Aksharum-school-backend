@@ -184,6 +184,9 @@ exports.enquiry = handler(async (req, res) => {
     if (phone && !isPhone(phone)) refuse('Enter a valid 10-digit mobile number', 400, { field: 'phone' });
     const message = str(b.message, 1000);
     const bad = textProblem(message, 'Your message'); if (bad) refuse(bad, 400, { field: 'message' });
+    // The school keeps a name and a way to reach it: the person says yes to
+    // that, and the yes is kept with the enquiry (nothing recorded it before).
+    if (b.consent !== true) refuse('Please agree to the school using these details to reply to you', 400, { field: 'consent', code: 'CONSENT_REQUIRED' });
     let classId = null;
     if (b.class && isId(String(b.class))) {
         const { rows } = await pool.query(`SELECT "_id" FROM "classes" WHERE "_id" = $1 AND "school" = $2`, [String(b.class), String(school._id)]);
@@ -194,7 +197,7 @@ exports.enquiry = handler(async (req, res) => {
         `SELECT "_id" FROM "admissionenquiries" WHERE "school" = $1 AND ("email" = $2 AND $2 <> '' OR "phone" = $3 AND $3 <> '') AND "createdAt" > now() - interval '10 minutes' LIMIT 1`,
         [String(school._id), email, phone]);
     if (!dup.length) {
-        await AdmissionEnquiry.create({ school: school._id, name, email, phone, class: classId, message, source: str(b.source, 60) });
+        await AdmissionEnquiry.create({ school: school._id, name, email, phone, class: classId, message, source: str(b.source, 60), consentAt: new Date(), consentVersion: Number(settings.portal.privacyVersion) || 1 });
         const admins = await require('../services/designationService').moduleAdminIds(school._id, 'admission');
         if (admins.length) {
             require('../services/notifyService').notify({
@@ -213,6 +216,7 @@ async function linkedApplication(req) {
     const link = require('../services/admission/payLink').read(req.params.token, req.portal.school._id);
     const { rows: [app] } = await pool.query(`SELECT * FROM "admissionapplications" WHERE "_id" = $1 AND "school" = $2`, [link.applicationId, String(req.portal.school._id)]);
     if (!app) refuse('This payment link is not valid', 404);
+    require('../services/admission/payLink').assertCurrent(link, app);
     return { app, link };
 }
 
@@ -248,6 +252,14 @@ exports.payLinkVerify = handler(async (req, res) => {
     const pay = await require('../services/admission/payments').verifyOnline(VIA_LINK, app, {
         orderId: b.razorpay_order_id || b.orderId, paymentId: b.razorpay_payment_id || b.paymentId, signature: b.razorpay_signature || b.signature,
     });
+    res.json({ success: true, data: { receiptNumber: pay.receiptNumber, amount: pay.amount, paidAt: pay.paidAt, paymentId: pay._id } });
+}, TAG);
+
+/** "I paid, but the page did not say so": the gateway is asked about this link's open order. */
+exports.payLinkCheck = handler(async (req, res) => {
+    const { app, link } = await linkedApplication(req);
+    const payments = require('../services/admission/payments');
+    const pay = await payments.reconcileLatest(VIA_LINK, app, link.kind);
     res.json({ success: true, data: { receiptNumber: pay.receiptNumber, amount: pay.amount, paidAt: pay.paidAt, paymentId: pay._id } });
 }, TAG);
 

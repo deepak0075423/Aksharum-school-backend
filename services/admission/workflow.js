@@ -45,7 +45,10 @@ const MOVABLE = STAGES.filter((s) => s.movable).map((s) => s.key);
  *   stage      the stage it belongs to (null: closes the application wherever it is)
  *   system     set only by its own action, never by the transition endpoint
  *   closed     the application is finished; only a reopen leaves it
- *   reopenable an administrator may reopen it (back to Under Review)
+ *   reopenable an administrator may reopen it (back to Under Review). Every
+ *              closed status but Enrolled is: a family that withdrew or
+ *              declined by mistake has to have a way back, and only the
+ *              school can give it (the seat it held has gone on by then).
  *   sendBack   allowed even though its stage is earlier than the current one
  *   applicant  how the family's tracking page words it
  */
@@ -69,12 +72,12 @@ const STATUSES = {
     rejected:            { stage: 'selection',             label: 'Rejected',            tone: 'red',    closed: true, reopenable: true, applicant: 'Not selected' },
     offer_issued:        { stage: 'offer',                 label: 'Offer Issued',        tone: 'teal',   system: true,  applicant: 'Admission offered' },
     accepted:            { stage: 'offer',                 label: 'Accepted',            tone: 'green',  system: true,  applicant: 'Offer accepted' },
-    declined:            { stage: 'offer',                 label: 'Declined',            tone: 'gray',   system: true, closed: true, applicant: 'Offer declined' },
+    declined:            { stage: 'offer',                 label: 'Declined',            tone: 'gray',   system: true, closed: true, reopenable: true, applicant: 'Offer declined' },
     offer_expired:       { stage: 'offer',                 label: 'Offer Expired',       tone: 'gray',   system: true, reopenable: true, applicant: 'Offer expired' },
     payment_pending:     { stage: 'fee_payment',           label: 'Payment Pending',     tone: 'amber',  system: true,  applicant: 'Admission fee due' },
     confirmed:           { stage: 'confirmation',          label: 'Confirmed',           tone: 'green',  system: true,  applicant: 'Admission confirmed' },
     enrolled:            { stage: 'activation',            label: 'Enrolled',            tone: 'green',  system: true, closed: true, applicant: 'Enrolled — welcome to the school' },
-    withdrawn:           { stage: null,                    label: 'Withdrawn',           tone: 'gray',   closed: true, applicant: 'Withdrawn' },
+    withdrawn:           { stage: null,                    label: 'Withdrawn',           tone: 'gray',   closed: true, reopenable: true, applicant: 'Withdrawn' },
     cancelled:           { stage: null,                    label: 'Cancelled',           tone: 'gray',   closed: true, reopenable: true, applicant: 'Cancelled by the school' },
 };
 const STATUS_KEYS = Object.keys(STATUSES);
@@ -202,11 +205,13 @@ const stageOf = (status) => STATUSES[status]?.stage || null;
 /**
  * May `app` move to `to`?
  *
- * ctx: { flow (compile()), isAdmin, actorId, facts (factsFor), system, reopen }
+ * ctx: { flow (compile()), isAdmin, actorId, facts (factsFor), system, reopen, undo }
+ *   undo   a system action taking back its own step (an exam cancelled, a
+ *          candidate removed): the application returns to where it stood.
  * Returns { ok: true, needsApproval } or { ok: false, reason }.
  */
 function canMove(app, to, ctx) {
-    const { flow, isAdmin = false, actorId = null, facts = null, system = false, reopen = false } = ctx;
+    const { flow, isAdmin = false, actorId = null, facts = null, system = false, reopen = false, undo = false } = ctx;
     const from = app.status;
     const toMeta = STATUSES[to];
     const fromMeta = STATUSES[from];
@@ -225,12 +230,16 @@ function canMove(app, to, ctx) {
     }
     if (to === 'withdrawn' || to === 'cancelled') {
         if (to === 'cancelled' && !isAdmin && !system) return { ok: false, reason: 'Only an admission administrator can cancel an application' };
-        return { ok: true, needsApproval: false };
+        // Closing an application for a family is an administrator's decision: a
+        // member of staff may ask for it, and it waits for one to approve.
+        return { ok: true, needsApproval: to === 'withdrawn' && !isAdmin && !system };
     }
     if (from === 'enrolled') return { ok: false, reason: 'The student is enrolled — changes go through the student record now' };
 
     const toStage = toMeta.stage;
-    if (!flow.enabled(toStage)) return { ok: false, reason: `${flow.stage(toStage)?.label || toStage} is switched off in this school's workflow` };
+    // A stage switched off is one nobody moves an application into by hand. The
+    // system's own steps still record what happened (an offer accepted, lapsed).
+    if (!system && !flow.enabled(toStage)) return { ok: false, reason: `${flow.stage(toStage)?.label || toStage} is switched off in this school's workflow` };
 
     const fromRank = flow.rank(fromMeta?.stage);
     const toRank = flow.rank(toStage);
@@ -240,8 +249,8 @@ function canMove(app, to, ctx) {
     // And the lapse itself: an offer withdrawn, or accepted but its fee not
     // paid in time, falls back from Fee Payment to Offer Expired — only ever
     // as the system's own act (closing the offer), never chosen by a person.
-    const lapsing = system && to === 'offer_expired' && ['offer_issued', 'accepted', 'payment_pending'].includes(from);
-    const backwards = toRank < fromRank && !afterLapse && !lapsing;
+    const lapsing = system && to === 'offer_expired' && ['offer_issued', 'accepted', 'payment_pending', 'selected'].includes(from);
+    const backwards = toRank < fromRank && !afterLapse && !lapsing && !(system && undo);
     if (backwards && !(toMeta.sendBack && fromRank <= flow.rank('selection'))) {
         return { ok: false, reason: `An application at ${fromMeta?.label || from} cannot go back to ${toMeta.label}` };
     }

@@ -31,6 +31,16 @@ const AdmissionPaymentSchema = new db.Schema({
     recordedBy:    { type: db.Types.UUID, ref: 'User', default: null },
     voidedBy:      { type: db.Types.UUID, ref: 'User', default: null },
     voidReason:    { type: String, default: '' },
+    // A cheque or draft: 'pending' until the office marks it cleared (a bounced
+    // one is cancelled, with that reason). '' for money that needs no clearing,
+    // and for rows from before clearance was tracked.
+    clearance:     { type: String, default: '' },
+    clearedAt:     { type: Date, default: null },
+    clearedBy:     { type: db.Types.UUID, ref: 'User', default: null },
+    // An online order nobody came back from: when the gateway was last asked
+    // about it, and how many times (services/admission/payments.js reconcileOpen).
+    checkedAt:     { type: Date, default: null },
+    checks:        { type: Number, default: 0 },
 }, { timestamps: true });
 
 AdmissionPaymentSchema.index({ school: 1, application: 1 });

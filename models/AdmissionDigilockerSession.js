@@ -16,7 +16,7 @@ const AdmissionDigilockerSessionSchema = new db.Schema({
     applicant:    { type: db.Types.UUID, ref: 'User', required: true },
     state:        { type: String, required: true, unique: true },
     codeVerifier: { type: String, default: '' },
-    status:       { type: String, enum: ['started', 'connected', 'failed', 'ended'], default: 'started' },
+    status:       { type: String, enum: ['started', 'finishing', 'connected', 'failed', 'ended'], default: 'started' },
     // Where the family started: 'app' sends them back into the phone app (APP_SCHEME), else the portal.
     client:       { type: String, enum: ['web', 'app'], default: 'web' },
     token:        { type: String, default: '' },

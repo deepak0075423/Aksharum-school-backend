@@ -64,6 +64,8 @@ router.get('/public/groups/:slug', rateLimit({ prefix: 'adm-group', windowSec: 6
 router.get('/digilocker/callback', rateLimit({ prefix: 'adm-digilocker', windowSec: 60, max: 30 }), digi.callback);
 // A mail provider's bounce and complaint reports — signed, not signed in (controllers/admissionDelivery).
 router.post('/webhooks/email-events', rateLimit({ prefix: 'adm-webhook', windowSec: 60, max: 120 }), delivery.webhook);
+// The same, in a mail provider's own format (sendgrid, ses, mailgun, postmark, brevo) — keyed by ?key=.
+router.post('/webhooks/email-events/:provider', rateLimit({ prefix: 'adm-webhook', windowSec: 60, max: 600 }), require('express').text({ type: 'text/*', limit: '1mb' }), delivery.providerWebhook);
 // PIN code → state and district, for the application form's address (services/pincodes.js).
 router.get('/public/pincodes/:pincode', rateLimit({ prefix: 'adm-pin', windowSec: 60, max: 40 }), pub.pincode);
 
@@ -72,6 +74,7 @@ const payLinkLimiter = rateLimit({ prefix: 'adm-paylink', windowSec: 60, max: 30
 router.get(`${P}/pay/:token`, payLinkLimiter, access.publicPortal, pub.payLink);
 router.post(`${P}/pay/:token/order`, payLinkLimiter, access.publicPortal, pub.payLinkOrder);
 router.post(`${P}/pay/:token/verify`, payLinkLimiter, access.publicPortal, pub.payLinkVerify);
+router.post(`${P}/pay/:token/check`, payLinkLimiter, access.publicPortal, pub.payLinkCheck);
 router.get(`${P}/pay/:token/receipt/:paymentId`, payLinkLimiter, access.publicPortal, pub.payLinkReceipt);
 // The school's cookie policy, and each answer to its banner (controllers/cookiePolicy).
 const cookies = require('../../controllers/cookiePolicy.controller');
@@ -82,6 +85,9 @@ router.post(`${P}/cookie-consent`, consentLimiter, access.publicPortal, cookies.
 // ── The applicant ────────────────────────────────────────────────────────────
 const guest = [verifyToken, requireRole('guest'), access.guestPortal];
 router.get('/portal/me', guest, portal.me);
+// Their own name, mobile and password (an applicant could change none of them while signed in).
+router.put('/portal/profile', guest, accountLimiter, portal.updateProfile);
+router.post('/portal/password', guest, accountLimiter, portal.changePassword);
 router.get('/portal/rounds', guest, portal.rounds);
 router.get('/portal/updates', guest, portal.updates);
 router.get('/portal/applications', guest, portal.list);
@@ -104,17 +110,22 @@ router.get('/portal/visit-bookings/:bookingId/calendar.ics', guest, booking.visi
 // Re-checks of results and appeals against decisions (controllers/admissionAppeal).
 router.get('/portal/applications/:id/digilocker', guest, digi.view);
 router.post('/portal/applications/:id/digilocker/start', guest, digi.start);
+router.post('/portal/applications/:id/digilocker/complete', guest, digi.complete);
 router.post('/portal/applications/:id/digilocker/import', guest, digi.importFile);
+router.post('/portal/applications/:id/transfers/:transferId/respond', guest, portal.answerTransfer);
 router.get('/portal/group', guest, group.familyGroup);
 router.put('/portal/group/preferences', guest, group.setPreferences);
 router.get('/portal/applications/:id/appeals', guest, appeal.familyList);
 router.post('/portal/applications/:id/appeals', guest, appeal.file);
 router.post('/portal/applications/:id/appeals/:appealId/withdraw', guest, appeal.withdraw);
+router.post('/portal/applications/:id/appeals/:appealId/files', guest, uploadAdmissionDoc.single('file'), appeal.attach);
+router.get('/portal/applications/:id/appeals/:appealId/files/:fileId', guest, appeal.familyFile);
 router.get('/portal/applications/:id/documents/:docId/file', guest, portal.documentFile);
 router.post('/portal/applications/:id/pay', guest, portal.payOrder);
 router.post('/portal/applications/:id/pay-link', guest, accountLimiter, portal.payLink);
 router.post('/portal/applications/:id/pay/verify', guest, portal.payVerify);
 router.post('/portal/applications/:id/payments/:paymentId/reconcile', guest, portal.payReconcile);
+router.post('/portal/applications/:id/pay/check', guest, portal.payCheck);
 router.get('/portal/applications/:id/payments/:paymentId/receipt', guest, portal.receipt);
 router.post('/portal/applications/:id/offer/respond', guest, portal.respondOffer);
 router.get('/portal/applications/:id/lists', guest, portal.lists);
@@ -222,6 +233,9 @@ router.get('/admin/applications/:id/duplicates', A, applications.duplicates);
 router.post('/admin/applications/:id/duplicates/clear', A, applications.clearDuplicate);
 router.post('/admin/applications/:id/documents', A, uploadAdmissionDoc.single('file'), applications.uploadOnBehalf);
 router.post('/admin/applications/:id/payments', A, applications.recordPayment);
+router.post('/admin/applications/:id/payments/check', A, applications.checkPayment);
+router.post('/admin/applications/:id/payments/:paymentId/clear', A, applications.clearPayment);
+router.post('/admin/applications/:id/pay-links/cancel', A, applications.cancelPayLinks);
 router.post('/admin/applications/:id/payments/:paymentId/void', A, applications.voidPayment);
 router.post('/admin/applications/:id/payments/:paymentId/refund', A, applications.refund);
 router.post('/admin/applications/:id/pay-link', A, applications.payLink);
@@ -252,6 +266,7 @@ router.get('/admin/documents', A, applications.documentQueue);
 router.post('/admin/documents/:docId/review', A, applications.reviewDocument);
 router.get('/admin/documents/:docId/file', A, applications.documentFile);
 router.get('/admin/payments', A, applications.payments);
+router.get('/admin/payments/attention', A, applications.paymentsAttention);
 
 router.get('/admin/exams', A, exam.list);
 router.post('/admin/exams', A, exam.create);
@@ -279,6 +294,7 @@ router.get('/admin/appeals', A, appeal.officeList);
 router.get('/admin/appeals/:id', A, appeal.detail);
 router.patch('/admin/appeals/:id/assign', A, appeal.assign);
 router.post('/admin/appeals/:id/decide', A, appeal.decide);
+router.get('/admin/appeals/:id/files/:fileId', A, appeal.officeFile);
 router.get('/admin/visits', A, booking.officeVisits);
 router.post('/admin/visits', A, booking.openVisits);
 router.patch('/admin/visits/:id', A, booking.updateVisit);

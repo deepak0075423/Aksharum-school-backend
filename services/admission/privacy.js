@@ -60,14 +60,29 @@ async function eraseApplication(app, { reason = 'retention', by = null } = {}) {
         await q(`DELETE FROM "admissiondocuments" WHERE "application" = $1`, [String(app._id)]);
         await q(`DELETE FROM "admissionattempts" WHERE "application" = $1`, [String(app._id)]);
         await q(`UPDATE "admissionresults" SET "remarks" = '', "updatedAt" = now() WHERE "application" = $1`, [String(app._id)]);
-        await q(`UPDATE "admissionevents" SET "message" = CASE WHEN "type" = 'status' THEN split_part("message", ' — ', 1) ELSE 'Details erased' END, "meta" = '{}'::jsonb WHERE "application" = $1`, [String(app._id)]);
+        // The history keeps what happened and when — not who the family was: a
+        // line written by the applicant no longer carries their name.
+        await q(`UPDATE "admissionevents" SET "message" = CASE WHEN "type" = 'status' THEN split_part("message", ' — ', 1) ELSE 'Details erased' END, "meta" = '{}'::jsonb,
+                        "actorName" = CASE WHEN "actorRole" = 'guest' THEN 'Applicant' ELSE "actorName" END WHERE "application" = $1`, [String(app._id)]);
         await q(`DELETE FROM "admissionemaillogs" WHERE "application" = $1`, [String(app._id)]);
-        await q(`UPDATE "admissionpayments" SET "notes" = '', "updatedAt" = now() WHERE "application" = $1`, [String(app._id)]);
+        // Money records stay (amount, date, receipt, the gateway's own ids) without
+        // the family's details: a cheque or transaction number names an account.
+        await q(`UPDATE "admissionpayments" SET "notes" = '', "reference" = '', "voidReason" = CASE WHEN "voidReason" <> '' THEN 'Details erased' ELSE '' END, "updatedAt" = now() WHERE "application" = $1`, [String(app._id)]);
+        await q(`UPDATE "admissionrefunds" SET "reason" = CASE WHEN "reason" <> '' THEN 'Details erased' ELSE '' END, "reference" = '', "updatedAt" = now() WHERE "application" = $1`, [String(app._id)]);
+        await q(`UPDATE "admissionoffers" SET "responseNote" = '', "reason" = CASE WHEN "reason" <> '' THEN 'Details erased' ELSE '' END, "updatedAt" = now() WHERE "application" = $1`, [String(app._id)]);
+        await q(`UPDATE "admissioncandidates" SET "extraReason" = CASE WHEN COALESCE("extraReason", '') <> '' THEN 'Details erased' ELSE '' END WHERE "application" = $1`, [String(app._id)]);
+        await q(`UPDATE "admissionresults" SET "panelMarks" = '{}'::jsonb WHERE "application" = $1`, [String(app._id)]);
         await q(`UPDATE "admissionlistentries" SET "reason" = CASE WHEN "reason" <> '' THEN 'Details erased' ELSE '' END WHERE "application" = $1`, [String(app._id)]);
-        await q(`UPDATE "admissionappeals" SET "reason" = 'Details erased', "decision" = CASE WHEN "decision" <> '' THEN 'Details erased' ELSE '' END, "internalNote" = '', "outcome" = '{}'::jsonb, "updatedAt" = now() WHERE "application" = $1`, [String(app._id)]);
+        const { rows: appealFiles } = await q(`SELECT "files" FROM "admissionappeals" WHERE "application" = $1`, [String(app._id)]);
+        for (const a of appealFiles) files.push(...(Array.isArray(a.files) ? a.files : []).map((f) => f.file).filter(Boolean));
+        await q(`UPDATE "admissionappeals" SET "reason" = 'Details erased', "decision" = CASE WHEN "decision" <> '' THEN 'Details erased' ELSE '' END, "internalNote" = '', "outcome" = '{}'::jsonb, "files" = '[]'::jsonb, "updatedAt" = now() WHERE "application" = $1`, [String(app._id)]);
+        // A privacy request about this application keeps its number, kind and dates — not what was written in it.
+        await q(`UPDATE "admissiondatarequests" SET "details" = CASE WHEN "details" <> '' THEN 'Details erased' ELSE '' END, "updatedAt" = now() WHERE "application" = $1 AND "status" IN ('done', 'declined')`, [String(app._id)]);
         await q(
             `UPDATE ${TA} SET "data" = '{}'::jsonb, "retiredData" = '{}'::jsonb, "studentName" = 'Erased applicant', "studentDob" = NULL, "studentGender" = '',
                     "guardianName" = '', "guardianEmail" = '', "guardianPhone" = '', "source" = '', "closedReason" = '', "pendingTransition" = NULL,
+                    "quotaNote" = '', "externalRef" = '',
+                    "feeWaivers" = COALESCE((SELECT jsonb_agg(w - 'reason' - 'byName') FROM jsonb_array_elements(CASE WHEN jsonb_typeof("feeWaivers") = 'array' THEN "feeWaivers" ELSE '[]'::jsonb END) w), '[]'::jsonb),
                     "flags" = '{}'::jsonb, "erasedAt" = now(), "erasureReason" = $2, "updatedAt" = now()
               WHERE "_id" = $1`, [String(app._id), str(reason, 200)]);
     });
@@ -87,6 +102,12 @@ async function retireApplicant(schoolId, userId) {
         `UPDATE "users" SET "name" = 'Erased applicant', "email" = 'erased+' || "_id"::text || '@invalid.example', "phone" = '', "isActive" = false, "password" = md5(random()::text)
           WHERE "_id" = $1 AND "school" = $2 AND "role" = 'guest' AND "email" NOT LIKE 'erased+%'`, [String(userId), String(schoolId)]);
     await pool.query(`UPDATE "admissionapplicants" SET "phone" = '', "source" = '' WHERE "user" = $1`, [String(userId)]);
+    // Their name and address also sat on their privacy requests and on every history line they wrote.
+    await pool.query(
+        `UPDATE "admissiondatarequests" SET "applicantName" = 'Erased applicant', "applicantEmail" = '', "details" = CASE WHEN "details" <> '' THEN 'Details erased' ELSE '' END, "updatedAt" = now()
+          WHERE "school" = $1 AND "applicant" = $2`, [String(schoolId), String(userId)]);
+    await pool.query(`UPDATE "admissionevents" SET "actorName" = 'Applicant' WHERE "school" = $1 AND "actor" = $2`, [String(schoolId), String(userId)]);
+    await pool.query(`DELETE FROM "pushdevices" WHERE "user" = $1`, [String(userId)]).catch(() => {});
     await pool.query(`UPDATE "admissionvisitbookings" SET "name" = 'Erased applicant', "email" = '', "phone" = '', "note" = '', "updatedAt" = now() WHERE "school" = $1 AND "applicant" = $2`, [String(schoolId), String(userId)]);
     return rowCount > 0;
 }
@@ -141,11 +162,53 @@ async function runRetention(schoolId, settings, { by = null, limit = 500 } = {})
     }
     out.enquiries = (await pool.query(`DELETE FROM "admissionenquiries" WHERE "school" = $1 AND "createdAt" < now() - make_interval(months => $2)`, [String(schoolId), r.enquiryMonths])).rowCount;
     out.deliveryLogs = (await pool.query(`DELETE FROM "admissionemaillogs" WHERE "school" = $1 AND "createdAt" < now() - make_interval(months => $2)`, [String(schoolId), r.deliveryLogMonths])).rowCount;
+    // Accounts that never applied: registered, looked around, and never came
+    // back. Nothing else ever removed them.
+    const { rows: idle } = await pool.query(
+        `SELECT u."_id" FROM "users" u LEFT JOIN "admissionapplicants" p ON p."user" = u."_id"
+          WHERE u."school" = $1 AND u."role" = 'guest' AND u."email" NOT LIKE 'erased+%'
+            AND GREATEST(u."createdAt", COALESCE(p."lastLoginAt", u."createdAt")) < now() - make_interval(days => $2)
+            AND NOT EXISTS (SELECT 1 FROM ${TA} a WHERE a."applicant" = u."_id")
+            AND NOT EXISTS (SELECT 1 FROM "admissiondatarequests" r WHERE r."applicant" = u."_id" AND r."status" IN ('open', 'in_progress'))
+          LIMIT $3`, [String(schoolId), r.abandonedDraftDays, limit]);
+    for (const u of idle) touched.add(String(u._id));
     for (const u of touched) { if (await retireApplicant(schoolId, u).catch(() => false)) out.accounts += 1; }
-    if (out.erased || out.drafts || out.enquiries || out.deliveryLogs) {
-        events.recordQuietly(schoolId, { by, type: 'privacy', action: 'retention', message: `Retention: ${out.erased} application(s) erased, ${out.drafts} old draft(s), ${out.enquiries} enquiry(ies) and ${out.deliveryLogs} delivery log(s) deleted`, meta: out });
+    out.minimised = await minimiseEnrolled(schoolId, r.enrolledMonths || 12, { limit }).catch((e) => { console.error('[admission privacy] minimise:', e.message); return 0; });
+    if (out.erased || out.drafts || out.enquiries || out.deliveryLogs || out.accounts || out.minimised) {
+        events.recordQuietly(schoolId, { by, type: 'privacy', action: 'retention', message: `Retention: ${out.erased} application(s) erased, ${out.drafts} old draft(s), ${out.enquiries} enquiry(ies) and ${out.deliveryLogs} delivery log(s) deleted, ${out.accounts} unused account(s) closed, ${out.minimised} enrolled application(s) reduced to what the school still needs`, meta: out });
     }
     return out;
+}
+
+/**
+ * An enrolled student's application, some months on: the student record holds
+ * what the school needs now, so the application keeps its answers except the
+ * ones that should not sit in two places for ever — Aadhaar numbers and the
+ * questions the school marked sensitive. Their documents stay (the student
+ * record has its own copies of the ones it uses; the rest are the admission's).
+ */
+async function minimiseEnrolled(schoolId, months, { limit = 500 } = {}) {
+    const { rows } = await pool.query(
+        `SELECT * FROM ${TA} WHERE "school" = $1 AND "status" = 'enrolled' AND "erasedAt" IS NULL
+            AND NOT COALESCE(("legalHold"->>'on')::boolean, false) AND ("flags"->>'minimisedAt') IS NULL
+            AND COALESCE("statusChangedAt", "updatedAt") < now() - make_interval(months => $2)
+          LIMIT $3`, [String(schoolId), Math.max(1, Number(months) || 12), limit]);
+    let n = 0;
+    for (const app of rows) {
+        const schema = await require('./applications').schemaOf(app);
+        const drop = formEngine.allFields(schema).filter((f) => formEngine.isAadhaarField(f) || f.sensitive).map((f) => f.key);
+        const data = { ...(app.data || {}) };
+        for (const k of drop) delete data[k];
+        await patch(AdmissionApplication, app._id, { data, retiredData: {}, flags: { ...(app.flags || {}), minimisedAt: new Date() } }, { where: { status: 'enrolled' }, touch: false });
+        n += 1;
+    }
+    return n;
+}
+
+/** Sign-up and reset codes are for minutes: their rows (a name, a phone, an address, a password's hash) go after a day. */
+async function purgeCodes() {
+    const { rowCount } = await pool.query(`DELETE FROM "admissionotps" WHERE "createdAt" < now() - interval '1 day'`);
+    return rowCount;
 }
 
 // ── Legal hold ───────────────────────────────────────────────────────────────
@@ -230,10 +293,15 @@ async function exportMine(req) {
 
 // ── Requests ─────────────────────────────────────────────────────────────────
 
+/** From the school's counter — counted from the rows, two requests made together used to get the same number. */
 async function nextRequestNumber(schoolId) {
     const y = new Date().getFullYear();
+    const counters = require('./counters');
     const { rows: [r] } = await pool.query(`SELECT COUNT(*)::int AS n FROM "admissiondatarequests" WHERE "school" = $1 AND "createdAt" >= make_date($2, 1, 1)`, [String(schoolId), y]);
-    return `DPR${y}${String(r.n + 1).padStart(4, '0')}`;
+    // The counter starts where the rows already there leave off.
+    let n = await counters.advance(schoolId, `privacy-request:${y}`);
+    while (n <= r.n) n = await counters.advance(schoolId, `privacy-request:${y}`);
+    return `DPR${y}${String(n).padStart(4, '0')}`;
 }
 
 async function createRequest(req, input = {}) {
@@ -257,10 +325,14 @@ async function createRequest(req, input = {}) {
         school: req.schoolId, applicant: req.userId, application, number: await nextRequestNumber(req.schoolId), kind, details,
         dueAt: new Date(Date.now() + days * 86400000), applicantName: req.user?.name || '', applicantEmail: req.user?.email || '',
     });
-    // Withdrawing consent stops the processing now: every open application is withdrawn.
+    // Withdrawing consent stops the processing now: the application it names is
+    // withdrawn — every open one only when the family named none (it used to
+    // be all of them whatever was chosen, a sibling's included).
     if (kind === 'withdraw_consent') {
         const apps = require('./applications');
-        const { rows } = await pool.query(`SELECT * FROM ${TA} WHERE "school" = $1 AND "applicant" = $2 AND "status" NOT IN ('draft', 'confirmed', 'enrolled') AND "erasedAt" IS NULL`, [String(req.schoolId), String(req.userId)]);
+        const { rows } = await pool.query(
+            `SELECT * FROM ${TA} WHERE "school" = $1 AND "applicant" = $2 AND "status" NOT IN ('draft', 'confirmed', 'enrolled') AND "erasedAt" IS NULL${application ? ' AND "_id" = $3' : ''}`,
+            application ? [String(req.schoolId), String(req.userId), String(application)] : [String(req.schoolId), String(req.userId)]);
         for (const a of rows) {
             if (workflow.isClosed(a.status)) continue;
             await apps.move(req, a, 'withdrawn', { system: true, actorIsApplicant: true, reason: 'Consent withdrawn by the family' }).catch(() => {});
@@ -342,6 +414,6 @@ async function eraseForRequest(req, id) {
 
 module.exports = {
     UNSUCCESSFUL, KINDS, KIND_LABEL,
-    eraseApplication, retireApplicant, retentionPreview, runRetention, setLegalHold, logAccess, reveal, accessLog,
+    eraseApplication, retireApplicant, retentionPreview, runRetention, setLegalHold, logAccess, reveal, accessLog, minimiseEnrolled, purgeCodes,
     exportMine, createRequest, myRequests, officeRequests, answerRequest, eraseForRequest,
 };

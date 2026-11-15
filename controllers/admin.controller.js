@@ -96,10 +96,12 @@ const generateOTP = () => {
     return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 };
 
+// Resolves to the mail server's answer, or null when the email could not be
+// sent — callers that tell someone "emailed" wait for it; the rest ignore it.
 const sendWelcomeEmail = (to, name, email, otp, schoolName, schoolId = null) => {
     const loginUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login`;
     // Fetch branding (logo) then send through the school's own SMTP when configured
-    getMailContext(schoolId).then(({ school }) => {
+    return getMailContext(schoolId).then(({ school }) => {
     const html = `
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333">
       ${emailHeaderHtml(school, `Welcome to ${schoolName}!`)}
@@ -130,13 +132,13 @@ const sendWelcomeEmail = (to, name, email, otp, schoolName, schoolId = null) => 
         </p>
       </div>
     </div>`;
-    sendSchoolMail(schoolId, {
+    return sendSchoolMail(schoolId, {
         to,
         subject: `Your ${schoolName} account is ready — action required`,
         html,
         fromName: schoolName,
     });
-    }).catch(err => console.error(`[email] welcome failed for ${to}:`, err.message));
+    }).catch(err => { console.error(`[email] welcome failed for ${to}:`, err.message); return null; });
 };
 
 // Reused by the admission conversion (services/admission/conversion.js), so a
@@ -2297,7 +2299,19 @@ exports.createStudent = async (req, res) => {
         if (resolvedParentId) profileData.parent = resolvedParentId;
         const { currentSection: placeSection, currentClass: placeClass, rollNumber: placeRoll } = profileData;
         delete profileData.currentSection; delete profileData.currentClass; delete profileData.rollNumber;
-        await withProfile(user, () => StudentProfile.create(profileData));
+        // The number is settled and the record written under the school's
+        // admission-number lock (utils/admissionNumber.withLock), shared with
+        // the admission module — two students admitted at the same moment can
+        // no longer be given the same number.
+        await withProfile(user, () => admissionNo.withLock(req.schoolId, async () => {
+            if (typedAdm) {
+                const admTaken = await StudentProfile.findOne({ school: req.schoolId, admissionNumber: typedAdm }).lean();
+                if (admTaken) throw new Error(`Admission number ${typedAdm} is already in use.`);
+            } else {
+                profileData.admissionNumber = await admissionNo.nextAdmissionNumber(schoolDoc || { _id: req.schoolId }, classDoc);
+            }
+            return StudentProfile.create(profileData);
+        }));
         // Their class (and section, when chosen) for that class's year — the
         // row, the roster and the record's pointer, written together.
         await enrollment.place({

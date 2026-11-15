@@ -174,9 +174,16 @@ async function makeRound(s, form, { seats1 = 2, seats2 = 10, applicationFee = 0,
 
 /** The last code emailed to an address (log driver keeps the body). */
 async function lastCode(schoolId, email, event = 'email_otp') {
-    const rows = await q(`SELECT "body" FROM "admissionemaillogs" WHERE "school" = $1 AND "to" = $2 AND "event" = $3 ORDER BY "createdAt" DESC LIMIT 1`, [schoolId, email.toLowerCase(), event]);
-    const m = rows[0]?.body?.match(/\b(\d{6})\b/);
-    return m ? m[1] : null;
+    // A reset code is mailed after the answer has gone back (the page answers
+    // every address alike, at once) — so it is waited for, briefly.
+    for (let i = 0; i < 30; i += 1) {
+        const rows = await q(`SELECT "body" FROM "admissionemaillogs" WHERE "school" = $1 AND "to" = $2 AND "event" = $3 ORDER BY "createdAt" DESC LIMIT 1`, [schoolId, email.toLowerCase(), event]);
+        const m = rows[0]?.body?.match(/\b(\d{6})\b/);
+        if (m) return m[1];
+        if (event !== 'password_reset') return null;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    return null;
 }
 
 /** Register + verify an applicant on a portal; returns { token, user, email }. */

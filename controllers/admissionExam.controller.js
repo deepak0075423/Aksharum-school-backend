@@ -198,8 +198,10 @@ exports.admitCard = handler(async (req, res) => {
 exports.results = handler(async (req, res) => {
     const { exam, scope } = await examForPanel(req, req.params.id);
     const isAdmin = await access.isAdmin(req);
-    const { board, missing } = await exams.missingMarks(exam);
-    const mine = scope.all ? board : board.filter((b) => scope.candidates.has(String(b.candidateId)));
+    const { board, missing } = await exams.missingMarks(exam, { viewer: req.userId });
+    const all = scope.all ? board : board.filter((b) => scope.candidates.has(String(b.candidateId)));
+    // A panel member who is not an administrator sees their own sheet, not the running average of the others'.
+    const mine = isAdmin ? all : all.map((b) => (b.panel?.onPanel ? { ...b, marks: b.panel.mine?.marks || {}, total: null, percentage: null, grade: '', passed: null, remarks: b.panel.mine?.remarks || '' } : b));
     res.json({
         success: true,
         data: {

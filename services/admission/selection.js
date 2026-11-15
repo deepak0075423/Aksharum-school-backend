@@ -273,7 +273,7 @@ async function build(list) {
             });
             await q(sql, params);
         }
-        await q(`UPDATE "admissionlists" SET "generatedAt" = now(), "updatedAt" = now() WHERE "_id" = $1`, [String(list._id)]);
+        await q(`UPDATE "admissionlists" SET "generatedAt" = now(), "staleReason" = '', "updatedAt" = now() WHERE "_id" = $1`, [String(list._id)]);
     });
     return { lines: lines.length, selected, waitlisted: waiting, seatsAvailable: st.available };
 }
@@ -468,13 +468,34 @@ async function submitForApproval(req, list) {
     if (isLottery(list) && !list.draw) refuse('Make the draw before sending the list for approval', 409, { code: 'NOT_DRAWN' });
     const { rows: [n] } = await pool.query(`SELECT COUNT(*)::int AS n FROM ${TE} WHERE "list" = $1`, [String(list._id)]);
     if (!n.n) refuse('The list has nobody on it — check its filters', 409);
+    if (list.staleReason) refuse(`${list.staleReason} Rebuild the list before sending it for approval.`, 409, { code: 'LIST_STALE' });
     const row = await patch(AdmissionList, list._id, { status: 'pending_approval', submittedBy: req.userId }, { where: { status: 'draft' } });
     events.recordQuietly(list.school, { by: req, type: 'list', action: 'submitted', message: `${list.name} sent for approval` });
+    require('./staffAlerts').toAdmins(list.school, {
+        title: `${list.name} is waiting for approval`, body: `${req.user?.name || 'A colleague'} sent the list for approval. Someone else has to approve it before it can be published.`,
+        link: { type: 'admission.selection' }, except: req.userId,
+    });
     return publicList(row);
+}
+
+/**
+ * Two people for a decision: whoever sent a list (or a set of results) for
+ * approval is not the one who approves it — unless the school has switched
+ * the rule off, or has only one admission administrator to do both.
+ */
+async function assertSecondPerson(req, schoolId, submittedBy, what) {
+    if (!submittedBy || String(submittedBy) !== String(req.userId)) return;
+    const settings = await settingsSvc.getSettings(schoolId);
+    if (settings.selection.twoPersonApproval === false) return;
+    const admins = await require('../designationService').moduleAdminIds(schoolId, 'admission');
+    if (admins.filter((id) => String(id) !== String(req.userId)).length === 0) return;
+    refuse(`You sent ${what} for approval — another admission administrator has to approve it`, 403, { code: 'SECOND_PERSON' });
 }
 
 async function approve(req, list) {
     if (list.status !== 'pending_approval') refuse('The list is not waiting for approval', 409);
+    if (list.staleReason) refuse(`${list.staleReason} Send the list back to draft and rebuild it.`, 409, { code: 'LIST_STALE' });
+    await assertSecondPerson(req, list.school, list.submittedBy, 'this list');
     const row = await patch(AdmissionList, list._id, { status: 'approved', approvedBy: req.userId, approvedAt: new Date() }, { where: { status: 'pending_approval' } });
     events.recordQuietly(list.school, { by: req, type: 'list', action: 'approved', message: `${list.name} approved` });
     return publicList(row);
@@ -517,22 +538,34 @@ async function issueOffer(q, app, { req = null, list = null, terms, settings, af
     // The round's instalment plan, fixed for this offer.
     const { rows: [rplan] } = await q(`SELECT "instalments" FROM "admissionrounds" WHERE "_id" = $1`, [String(app.round)]);
     const schedule = require('./payments').planFor(rplan, terms.fee, terms.feeDueAt);
+    // A school that runs no Offer stage asks the family nothing: being selected
+    // IS the seat. The offer row still holds the seat and carries the fee and
+    // its date, but it is recorded as accepted at once — there is no answer to
+    // wait for, and so none to lapse. (It used to be issued like any other: the
+    // family could not accept it — "Offer is switched off" — and it lapsed.)
+    const answer = flow.enabled('offer');
     const { sql, params } = buildInsert(AdmissionOffer, {
         school: app.school, application: app._id, round: app.round, class: app.class, list: list?._id || null, offerNumber: number, schedule,
-        status: 'issued', issuedAt: new Date(), respondBy: terms.respondBy, feeAmount: terms.fee, feeDueAt: terms.feeDueAt, issuedBy: req?.userId || null,
+        status: answer ? 'issued' : 'accepted', issuedAt: new Date(), respondBy: answer ? terms.respondBy : null, respondedAt: answer ? null : new Date(),
+        responseNote: answer ? '' : 'No answer needed — the school runs no Offer stage',
+        feeAmount: terms.fee, feeDueAt: terms.feeDueAt, issuedBy: req?.userId || null,
         quota: quota || '',
     });
     const { rows: [offer] } = await q(sql, params);
     if (adjusted.note) await events.record(app.school, { application: app._id, by: req, type: 'fee', action: 'quota_fee', message: `Admission fee ${fmt.money(adjusted.fee)} — ${adjusted.note}`, visibility: 'applicant' }, q);
-    const target = flow.enabled('offer') ? 'offer_issued' : 'selected';
+    const target = answer ? 'offer_issued' : 'selected';
     const set = {
-        offerStatus: 'issued', admissionFeeAmount: terms.fee, admissionFeeStatus: terms.fee > 0 ? 'due' : 'not_required',
+        offerStatus: answer ? 'issued' : 'accepted', admissionFeeAmount: terms.fee, admissionFeeStatus: terms.fee > 0 ? 'due' : 'not_required',
         ...(list ? { selection: { list: String(list._id), listName: list.name, listNo: list.listNo, decision: 'selected' } } : {}),
     };
     // A school with no Offer stage may already have this applicant as Selected.
-    const appRow = app.status === target
+    const apps = require('./applications');
+    let appRow = app.status === target
         ? await patch(AdmissionApplication, app._id, set, { q })
-        : await require('./applications').move(req, app, target, { system: true, q, after, quiet: true, set });
+        : await apps.move(req, app, target, { system: true, q, after, quiet: true, set });
+    if (!answer && flow.enabled('fee_payment') && terms.fee > 0) {
+        appRow = await apps.move(req, appRow, 'payment_pending', { system: true, q, after, quiet: true });
+    }
     return { offer, app: appRow };
 }
 
@@ -551,16 +584,22 @@ async function publish(req, list, { at = null } = {}) {
 
 async function publishNow(req, list) {
     const settings = await settingsSvc.getSettings(list.school);
-    // Claim the list first: a scheduled publication and a click cannot both run it.
-    const claimed = await patch(AdmissionList, list._id, { status: 'published', publishedAt: new Date() }, { where: { status: 'approved' } });
-    if (!claimed) refuse('This list has already been published', 409);
-    const { rows: lines } = await pool.query(
-        `SELECT e.*, a."status" AS "appStatus" FROM ${TE} e JOIN ${TA} a ON a."_id" = e."application"
-          WHERE e."list" = $1 ORDER BY e."rank"`, [String(list._id)]);
+    if (list.staleReason) refuse(`${list.staleReason} Send the list back to draft and rebuild it.`, 409, { code: 'LIST_STALE' });
     const out = { offered: 0, waitlisted: 0, noSeat: 0, skipped: 0 };
     const after = [];
-    try {
+    // The list's status and every offer it makes commit together (Nov 2026).
+    // The status used to be written first, on its own: a server stopped in
+    // between left a list that read "published" with no offers, and that could
+    // not be published again. The claim is still what makes a scheduled
+    // publication and a click unable to both run it — it just lives inside.
     await seats.withSeat(list.round, list.class, async (q, st) => {
+        const { rows: [claimed] } = await q(
+            `UPDATE "admissionlists" SET "status" = 'published', "publishedAt" = now(), "publishAt" = NULL, "updatedAt" = now()
+              WHERE "_id" = $1 AND "status" = 'approved' RETURNING "_id"`, [String(list._id)]);
+        if (!claimed) refuse('This list has already been published', 409);
+        const { rows: lines } = await q(
+            `SELECT e.*, a."status" AS "appStatus" FROM ${TE} e JOIN ${TA} a ON a."_id" = e."application"
+              WHERE e."list" = $1 ORDER BY e."rank"`, [String(list._id)]);
         let available = st.available;
         for (const line of lines.filter((l) => l.decision === 'selected')) {
             const { rows: [app] } = await q(`SELECT * FROM ${TA} WHERE "_id" = $1 FOR UPDATE`, [line.application]);
@@ -596,12 +635,8 @@ async function publishNow(req, list) {
             after.push(() => notify.toApplicant(app, 'waiting_list', { list_name: list.name, selection_list: list.name, waitlist_position: String(p), rank: String(line.rank) }));
         }
     }, { quota: list.quota || '' });
-    } catch (e) {
-        // Nothing of it was committed — the list goes back to approved, to be published again.
-        await patch(AdmissionList, list._id, { status: 'approved', publishedAt: null }, { where: { status: 'published' } }).catch(() => {});
-        throw e;
-    }
-    for (const fn of after) await fn();
+    // What follows the commit (emails, seats handed on) can no longer undo it.
+    for (const fn of after) { try { await fn(); } catch (e) { console.error('[admission] after publishing:', e.message); } }
     events.recordQuietly(list.school, { by: req, type: 'list', action: 'published', message: `${list.name} published — ${out.offered} offered, ${out.waitlisted} waitlisted${out.noSeat ? `, ${out.noSeat} moved to the waiting list for want of seats` : ''}` });
     return { published: true, ...out };
 }
@@ -691,6 +726,12 @@ async function respond(req, app, accept, note = '', { byApplicant = false } = {}
     });
     for (const fn of after) await fn();
     events.recordQuietly(app.school, { application: app._id, by: req, type: 'offer', action: accept ? 'accepted' : 'declined', message: `Offer ${offer.offerNumber} ${accept ? 'accepted' : 'declined'}${note ? ` — ${str(note, 300)}` : ''}`, visibility: 'applicant' });
+    if (byApplicant) {
+        require('./staffAlerts').aboutApplication(app, {
+            title: `Offer ${accept ? 'accepted' : 'declined'}: ${app.studentName || app.applicationNumber}`,
+            body: accept ? `${app.applicationNumber} accepted offer ${offer.offerNumber}.` : `${app.applicationNumber} declined offer ${offer.offerNumber}${note ? ` — ${str(note, 200)}` : ''}. The seat is free.`,
+        });
+    }
     if (!accept) await promote(app.round, app.class, { reason: `${app.applicationNumber} declined` });
     return updated;
 }
@@ -704,7 +745,7 @@ async function closeOffer(offer, status, { req = null, reason = '', moveApp = tr
         if (!o) return null;
         if (moveApp) {
             const { rows: [app] } = await q(`SELECT * FROM ${TA} WHERE "_id" = $1 FOR UPDATE`, [String(offer.application)]);
-            if (app && ['offer_issued', 'accepted', 'payment_pending'].includes(app.status)) {
+            if (app && (['offer_issued', 'accepted', 'payment_pending'].includes(app.status) || (app.status === 'selected' && ['issued', 'accepted'].includes(app.offerStatus)))) {
                 await require('./applications').move(req, app, 'offer_expired', { system: true, q, after, quiet: true, reason, set: { offerStatus: status } });
             } else if (app) {
                 await patch(AdmissionApplication, app._id, { offerStatus: status }, { q });
@@ -733,7 +774,19 @@ async function extendOffer(req, app, respondBy) {
     if (!offer || !['issued', 'accepted'].includes(offer.status)) refuse('There is no open offer to extend', 409);
     const by = date(respondBy);
     if (!by || by < new Date()) refuse('Choose a date in the future');
-    const set = offer.status === 'issued' ? { respondBy: by, remindedAt: null } : { feeDueAt: by, remindedAt: null };
+    // The dates that hang off the one being moved go with it, by the same
+    // number of days: the fee date follows the response date, and every
+    // instalment follows the fee date (they used to stay where they were — an
+    // offer extended a fortnight still asked for its second instalment on the old day).
+    const from = offer.status === 'issued' ? offer.respondBy : offer.feeDueAt;
+    const delta = from ? by.getTime() - new Date(from).getTime() : 0;
+    const shift = (d) => (d ? new Date(new Date(d).getTime() + delta) : d);
+    const schedule = Array.isArray(offer.schedule) && delta
+        ? offer.schedule.map((x) => ({ ...x, dueAt: shift(x.dueAt), remindedAt: null, overdueAt: null }))
+        : offer.schedule;
+    const set = offer.status === 'issued'
+        ? { respondBy: by, feeDueAt: delta ? shift(offer.feeDueAt) : offer.feeDueAt, schedule, remindedAt: null, lapseWarnedAt: null }
+        : { feeDueAt: by, schedule, remindedAt: null, lapseWarnedAt: null };
     await patch(AdmissionOffer, offer._id, set);
     events.recordQuietly(app.school, { application: app._id, by: req, type: 'offer', action: 'extended', message: `${offer.status === 'issued' ? 'Response' : 'Fee payment'} deadline moved to ${fmt.fmtDate(by)}`, visibility: 'applicant' });
     return { ok: true };
@@ -745,6 +798,7 @@ async function releaseFor(app, { req = null, reason = '' } = {}) {
     if (offer) await closeOffer(offer, app.status === 'withdrawn' ? 'withdrawn' : 'cancelled', { req, reason, moveApp: false });
     await patch(AdmissionApplication, app._id, { offerStatus: offer ? (app.status === 'withdrawn' ? 'withdrawn' : 'cancelled') : app.offerStatus }, { touch: false }).catch(() => {});
     if (offer || ['confirmed'].includes(app.status)) await promote(app.round, app.class, { reason: `${app.applicationNumber || 'An application'} left` });
+    if (app.selection?.decision === 'waitlisted') await renumberWaiting(app.round, app.class).catch((e) => console.error('[admission] waiting positions:', e.message));
 }
 
 /**
@@ -804,7 +858,93 @@ async function promoteNow(roundId, classId, { reason = '' } = {}) {
         }, { quota: bucket });
     }
     for (const fn of after) await fn();
+    if (promoted) await renumberWaiting(roundId, classId).catch((e) => console.error('[admission] waiting positions:', e.message));
     return { promoted };
+}
+
+/**
+ * Waiting positions as they stand now: 1, 2, 3 … down each published list,
+ * over the applications still waiting. Someone promoted, withdrawn or
+ * cancelled leaves the line and everyone behind moves up — on the list and on
+ * each application's own page (they used to keep the number they were given
+ * on the day the list was published).
+ */
+async function renumberWaiting(roundId, classId) {
+    const { rows: lists } = await pool.query(`SELECT "_id" FROM "admissionlists" WHERE "round" = $1 AND "class" = $2 AND "status" = 'published'`, [String(roundId), String(classId)]);
+    for (const l of lists) {
+        await inTx(async (q) => {
+            await txLock(q, `admission-waiting:${l._id}`);
+            const { rows } = await q(
+                `SELECT e."_id", e."application", e."waitPosition", (a."status" = 'waitlisted') AS waiting
+                   FROM ${TE} e JOIN ${TA} a ON a."_id" = e."application"
+                  WHERE e."list" = $1 AND e."decision" = 'waitlisted' ORDER BY e."waitPosition" ASC NULLS LAST, e."rank" ASC NULLS LAST`, [l._id]);
+            let pos = 0;
+            for (const r of rows) {
+                const next = r.waiting ? ++pos : null;
+                if (r.waitPosition === next) continue;
+                await q(`UPDATE ${TE} SET "waitPosition" = $2, "updatedAt" = now() WHERE "_id" = $1`, [r._id, next]);
+                if (next != null) {
+                    await q(
+                        `UPDATE ${TA} SET "selection" = jsonb_set("selection", '{waitPosition}', to_jsonb($2::int))
+                          WHERE "_id" = $1 AND "selection"->>'list' = $3 AND "selection"->>'decision' = 'waitlisted'`, [r.application, next, String(l._id)]);
+                }
+            }
+        });
+    }
+}
+
+/**
+ * A result was corrected after lists had been ranked on it. A list not yet
+ * published is marked — it has to be rebuilt before it goes further; one
+ * already published stands (families were told), and the office is told to
+ * look at it. Lotteries do not read results.
+ */
+async function flagListsFor(req, exam, applicationId) {
+    const { rows } = await pool.query(
+        `SELECT l."_id", l."name", l."status", l."school" FROM "admissionlists" l
+          WHERE l."round" = $1 AND COALESCE(l."method", 'merit') = 'merit' AND l."status" IN ('draft', 'pending_approval', 'approved', 'published')
+            AND l."criteria"::text LIKE $3
+            AND (l."status" = 'draft' OR EXISTS (SELECT 1 FROM ${TE} e WHERE e."list" = l."_id" AND e."application" = $2))`,
+        [String(exam.round), String(applicationId), `%exam:${exam._id}%`]);
+    const { rows: [app] } = await pool.query(`SELECT "applicationNumber", "studentName" FROM ${TA} WHERE "_id" = $1`, [String(applicationId)]);
+    const who = app?.applicationNumber || 'an applicant';
+    for (const l of rows) {
+        if (l.status === 'published') {
+            events.recordQuietly(l.school, { application: applicationId, by: req, type: 'list', action: 'result_changed', message: `${exam.name}: result corrected after ${l.name} was published — check whether the list still stands` });
+            require('./staffAlerts').toAdmins(l.school, {
+                title: `A result changed after ${l.name} was published`,
+                body: `${who}'s result in ${exam.name} was corrected. ${l.name} was ranked on that exam and is already published — check whether the decision for this applicant still stands.`,
+                link: { type: 'admission.selection' },
+            });
+            continue;
+        }
+        const why = `${who}'s result in ${exam.name} was corrected after this list was built.`;
+        await pool.query(`UPDATE "admissionlists" SET "staleReason" = $2, "updatedAt" = now() WHERE "_id" = $1 AND "status" IN ('draft', 'pending_approval', 'approved')`, [l._id, why]);
+        events.recordQuietly(l.school, { by: req, type: 'list', action: 'stale', message: `${l.name} needs rebuilding — ${why}`, meta: { list: String(l._id) } });
+    }
+    return rows.length;
+}
+
+/** Offers nobody has answered, about to run out: the family is told once (Settings → Email). */
+async function lapseWarnings(schoolId, settings) {
+    const days = Number(settings.email.reminders?.offerDaysBefore) || 0;
+    if (!days || !settings.selection.allowApplicantResponse) return 0;
+    const { rows } = await pool.query(
+        `SELECT o.* FROM ${TO} o
+          WHERE o."school" = $1 AND o."status" = 'issued' AND o."lapseWarnedAt" IS NULL AND o."respondBy" IS NOT NULL
+            AND o."respondBy" > now() AND o."respondBy" <= now() + make_interval(days => $2)
+            AND o."issuedAt" < now() - interval '12 hours'
+          LIMIT 200`, [String(schoolId), days]);
+    let n = 0;
+    for (const o of rows) {
+        const claimed = await patch(AdmissionOffer, o._id, { lapseWarnedAt: new Date() }, { where: { lapseWarnedAt: null, status: 'issued' }, touch: false });
+        if (!claimed) continue;
+        const { rows: [app] } = await pool.query(`SELECT * FROM ${TA} WHERE "_id" = $1`, [o.application]);
+        if (!app) continue;
+        notify.toApplicant(app, 'offer_reminder', offerValues(o, null, null));
+        n += 1;
+    }
+    return n;
 }
 
 // ── Confirming the admission ─────────────────────────────────────────────────
@@ -826,6 +966,12 @@ async function confirmationBlockers(app, settings) {
     }
     if (settings.conversion.requireAdmissionFeePaid && app.admissionFeeStatus === 'due' && !firstPaid) {
         blockers.push(plan ? `The first instalment of the admission fee (${fmt.money(plan[0].amount)}) is not paid` : 'The admission fee is not paid or waived');
+    }
+    // A cheque is money once the bank has paid it.
+    if (settings.conversion.requireAdmissionFeePaid) {
+        for (const c of await require('./payments').unclearedOn(app._id)) {
+            blockers.push(`${c.mode === 'dd' ? 'Draft' : 'Cheque'} ${c.reference} (${fmt.money(c.amount)}) has not been marked as cleared`);
+        }
     }
     const apps = require('./applications');
     const schema = await apps.schemaOf(app);
@@ -862,7 +1008,7 @@ async function confirm(req, app) {
     if (blockers.length) refuse(`Not ready to confirm: ${blockers.join('; ')}`, 409, { code: 'NOT_READY', errors: blockers.map((m) => ({ path: 'confirm', message: m })) });
     const access = require('./access');
     const stage = workflow.compile(settings.workflow).stage('confirmation');
-    if (stage?.requiresApproval && !(await access.isAdmin(req))) refuse('Confirming an admission needs an admission administrator', 403);
+    if (stage?.requiresApproval && !(req && await access.isAdmin(req))) refuse('Confirming an admission needs an admission administrator', 403);
     const after = [];
     const live = await liveOffer(app._id);
     const confirmPool = live ? (live.quota || '') : (['verified', 'allotted'].includes(app.quotaStatus) ? app.quota : '');
@@ -926,4 +1072,5 @@ module.exports = {
     publish, publishNow, manualOffer, liveOffer, respond, closeOffer, withdrawOffer, extendOffer, releaseFor, promote,
     confirmationBlockers, confirm, publishDue, expireDue, offerValues,
     METHODS, isLottery, drawLottery, verifyDraw, cancelList, publicList, pointsFor,
+    renumberWaiting, assertSecondPerson, flagListsFor, lapseWarnings,
 };

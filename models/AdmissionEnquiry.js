@@ -19,6 +19,10 @@ const AdmissionEnquirySchema = new db.Schema({
     class:      { type: db.Types.UUID, ref: 'Class', default: null },
     message:    { type: String, default: '' },
     source:     { type: String, trim: true, default: '' },
+    // An enquiry left on the portal: when the person agreed to be contacted about
+    // it, and the version of the school's privacy notice they agreed under.
+    consentAt:      { type: Date, default: null },
+    consentVersion: { type: Number, default: null },
     status:     { type: String, enum: ['new', 'contacted', 'registered', 'closed'], default: 'new' },
     notes:      { type: db.Types.JSON, default: () => [] },
     handledBy:  { type: db.Types.UUID, ref: 'User', default: null },

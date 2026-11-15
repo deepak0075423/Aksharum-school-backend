@@ -81,7 +81,9 @@ exports.list = handler(async (req, res) => {
     const page = Math.max(1, Number(req.query.page) || 1);
     const order = SORTS[req.query.sort] || SORTS.submitted;
     const [{ rows }, { rows: [c] }, { rows: facets }] = await Promise.all([
-        pool.query(`SELECT ${LIST_SELECT} ${LIST_FROM} WHERE ${f.where} ORDER BY ${order}, a."_id" LIMIT ${limit} OFFSET ${(page - 1) * limit}`, f.params),
+        // The list shows none of the answers: they are not read for it (every
+        // row's whole form used to be loaded and thrown away). The export reads them.
+        pool.query(`SELECT ${LIST_SELECT.replace('a."formVersion", a."data",', '')} ${LIST_FROM} WHERE ${f.where} ORDER BY ${order}, a."_id" LIMIT ${limit} OFFSET ${(page - 1) * limit}`, f.params),
         pool.query(`SELECT COUNT(*)::int AS n ${LIST_FROM} WHERE ${f.where}`, f.params),
         pool.query(`SELECT a."status", COUNT(*)::int AS n FROM "admissionapplications" a WHERE a."school" = $1 GROUP BY a."status"`, [String(req.schoolId)]),
     ]);
@@ -163,6 +165,36 @@ async function detailFor(req, app, { restricted = false } = {}) {
     const visibleTimeline = restricted ? timeline.filter((t) => t.visibility === 'applicant' || t.type === 'status') : timeline;
     // Aadhaar numbers leave the server masked; an administrator reveals one on purpose (logged).
     const shown = formEngine.maskData(schema, app.data || {});
+    // A member of staff who is not an admission administrator gets what their
+    // part of the work needs, and nothing of the money, the offers, a legal
+    // hold, the quota's notes or the look-alike applications — those used to
+    // ride along in the same answer, only the sensitive answers were held back.
+    if (restricted) {
+        const { feeWaivers, legalHold, flags, conversion, quotaNote, externalRef, retiredData, payLinkEpoch, erasureReason, applicationFeeAmount, admissionFeeAmount, selection: sel, ...mine } = app;
+        void feeWaivers; void legalHold; void flags; void conversion; void quotaNote; void externalRef; void retiredData; void payLinkEpoch; void erasureReason; void applicationFeeAmount; void admissionFeeAmount; void sel;
+        const hidden = new Set(formEngine.allFields(schema).filter((f) => f.sensitive).map((f) => f.key));
+        return {
+            application: {
+                ...mine, data: Object.fromEntries(Object.entries(shown.data).filter(([k]) => !hidden.has(k))), maskedFields: [],
+                statusLabel: workflow.STATUSES[app.status]?.label || app.status, statusTone: workflow.STATUSES[app.status]?.tone || 'gray', ...info,
+            },
+            schema: formEngine.withoutSensitive(schema),
+            answers: formEngine.answerRows(schema, app.data, { includeSensitive: false, scope: { classId: app.class, roundId: app.round } }),
+            documents: {
+                requirements: reqs.filter((r) => !r.type.sensitive).map((r) => ({ key: r.type.key, name: r.type.name, required: r.required, verification: r.type.verification, gate: r.type.gate, rejectionReasons: r.type.rejectionReasons || [], sensitive: false })),
+                files: docs.filter((d) => !types.get(d.docKey)?.sensitive), summary: facts.docs, history: [],
+            },
+            fees: null, timeline: visibleTimeline, offers: [], lists: [], duplicates: [],
+            exams: candidates.map(({ remarks, marks, ...c }) => c),
+            workflow: {
+                moves, stage: flow.stage(app.stage), stages: flow.stages.filter((s) => s.enabled).map((s) => ({ key: s.key, label: s.label })),
+                pending: app.pendingTransition, facts: { docs: facts.docs, exams: facts.exams, results: facts.results },
+            },
+            confirmation: { blockers: [], ready: false },
+            permissions: { isAdmin: false, canSeeSensitive: false, canReveal: false },
+            quotas: [], waivers: [],
+        };
+    }
     return {
         application: {
             ...app, data: restricted ? Object.fromEntries(Object.entries(shown.data).filter(([k]) => !formEngine.allFields(schema).find((f) => f.key === k && f.sensitive))) : shown.data,
@@ -320,6 +352,9 @@ async function reviewDocument(req, doc, body) {
     } else if (app.status === 'documents_rejected' && summary.rejected === 0) {
         await apps.move(req, app, 'under_review', { system: true, quiet: true }).catch(() => {});
     }
+    if (updated.status === 'verified' && app.status === 'enrolled') {
+        await require('../services/admission/conversion').lateDocument(app, updated).catch((e) => console.error('[admission] late document:', e.message));
+    }
     return updated;
 }
 exports._reviewDocument = reviewDocument;
@@ -414,6 +449,82 @@ exports.payments = handler(async (req, res) => {
 }, TAG);
 
 // ── Refunds and payment links (Oct 2026) ─────────────────────────────────────
+
+/** The office asks the gateway about an online payment the family says they made. */
+exports.checkPayment = handler(async (req, res) => {
+    const app = await access.schoolApplication(req, req.params.id);
+    const row = await payments.reconcileLatest(req, app, req.body?.kind || null);
+    res.json({ success: true, data: { receiptNumber: row.receiptNumber, status: row.status, amount: row.amount }, message: `Confirmed with the gateway — receipt ${row.receiptNumber}` });
+}, TAG);
+
+exports.clearPayment = handler(async (req, res) => {
+    const app = await access.schoolApplication(req, req.params.id);
+    const row = await payments.clearPayment(req, app, req.params.paymentId);
+    res.json({ success: true, data: { _id: row._id, clearance: row.clearance, clearedAt: row.clearedAt } });
+}, TAG);
+
+/** Every pay link sent for this application stops working (a link forwarded to the wrong person, a fee that changed). */
+exports.cancelPayLinks = handler(async (req, res) => {
+    const app = await access.schoolApplication(req, req.params.id);
+    await pool.query(`UPDATE "admissionapplications" SET "payLinkEpoch" = COALESCE("payLinkEpoch", 0) + 1 WHERE "_id" = $1`, [String(app._id)]);
+    events.recordQuietly(app.school, { application: app._id, by: req, type: 'payment', action: 'pay_links_cancelled', message: 'Payment links sent so far were cancelled' });
+    res.json({ success: true, message: 'The payment links sent so far no longer work' });
+}, TAG);
+
+/**
+ * Money that wants somebody's attention: more received than was due (to give
+ * back), cheques not yet cleared, online payments started and not finished,
+ * refunds the gateway has not settled, instalments past their date.
+ */
+exports.paymentsAttention = handler(async (req, res) => {
+    const school = String(req.schoolId);
+    const [excess, cheques, open, refunds, overdue] = await Promise.all([
+        pool.query(
+            `SELECT a."_id" AS "applicationId", a."applicationNumber", a."studentName", a."status", k."kind", k.paid, k.refunded, k.fee, k.waived,
+                    ROUND((k.paid - k.refunded - GREATEST(0, k.fee - k.waived))::numeric, 2)::float8 AS excess
+               FROM "admissionapplications" a
+               JOIN LATERAL (
+                    SELECT x.kind,
+                           COALESCE((SELECT SUM(p."amount") FROM "admissionpayments" p WHERE p."application" = a."_id" AND p."kind" = x.kind AND p."status" = 'paid'), 0)::float8 AS paid,
+                           COALESCE((SELECT SUM(r."amount") FROM "admissionrefunds" r WHERE r."application" = a."_id" AND r."kind" = x.kind AND r."status" IN ('pending', 'processed')), 0)::float8 AS refunded,
+                           (CASE WHEN x.kind = 'application_fee' THEN a."applicationFeeAmount" ELSE a."admissionFeeAmount" END)::float8 AS fee,
+                           COALESCE((SELECT SUM((w->>'amount')::numeric) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(a."feeWaivers") = 'array' THEN a."feeWaivers" ELSE '[]'::jsonb END) w WHERE w->>'kind' = x.kind), 0)::float8 AS waived
+                      FROM (VALUES ('application_fee'), ('admission_fee')) x(kind)) k ON true
+              WHERE a."school" = $1 AND k.paid - k.refunded - GREATEST(0, k.fee - k.waived) > 0.004
+              ORDER BY a."updatedAt" DESC LIMIT 200`, [school]),
+        pool.query(
+            `SELECT p."_id", p."kind", p."amount", p."mode", p."reference", p."receiptNumber", p."paidAt", a."_id" AS "applicationId", a."applicationNumber", a."studentName"
+               FROM "admissionpayments" p JOIN "admissionapplications" a ON a."_id" = p."application"
+              WHERE p."school" = $1 AND p."status" = 'paid' AND p."clearance" = 'pending' ORDER BY p."paidAt" ASC LIMIT 200`, [school]),
+        pool.query(
+            `SELECT p."_id", p."kind", p."amount", p."createdAt", p."checkedAt", a."_id" AS "applicationId", a."applicationNumber", a."studentName"
+               FROM "admissionpayments" p JOIN "admissionapplications" a ON a."_id" = p."application"
+              WHERE p."school" = $1 AND p."status" = 'created' AND p."mode" = 'online' AND p."createdAt" > now() - interval '3 days' ORDER BY p."createdAt" DESC LIMIT 200`, [school]),
+        pool.query(
+            `SELECT r."_id", r."amount", r."status", r."error", r."createdAt", p."receiptNumber", a."_id" AS "applicationId", a."applicationNumber", a."studentName"
+               FROM "admissionrefunds" r JOIN "admissionpayments" p ON p."_id" = r."payment" JOIN "admissionapplications" a ON a."_id" = r."application"
+              WHERE r."school" = $1 AND (r."status" = 'pending' OR (r."status" = 'failed' AND r."createdAt" > now() - interval '30 days')) ORDER BY r."createdAt" DESC LIMIT 200`, [school]),
+        pool.query(
+            `SELECT a."_id" AS "applicationId", a."applicationNumber", a."studentName", a."status", s.ord - 1 AS index, s.x->>'label' AS label, (s.x->>'amount')::float8 AS amount, (s.x->>'dueAt')::timestamptz AS "dueAt"
+               FROM "admissionoffers" o JOIN "admissionapplications" a ON a."_id" = o."application" AND a."admissionFeeStatus" = 'due'
+               CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(o."schedule") = 'array' THEN o."schedule" ELSE '[]'::jsonb END) WITH ORDINALITY s(x, ord)
+              WHERE o."school" = $1 AND o."status" IN ('accepted', 'confirmed') AND (s.x->>'overdueAt') IS NOT NULL
+              ORDER BY (s.x->>'dueAt') ASC LIMIT 200`, [school]),
+    ]);
+    // An instalment flagged overdue may have been paid since: keep the ones still owed.
+    const stillOwed = [];
+    const plans = new Map();
+    for (const row of overdue.rows) {
+        const id = String(row.applicationId);
+        if (!plans.has(id)) {
+            const { rows: [full] } = await pool.query(`SELECT * FROM "admissionapplications" WHERE "_id" = $1`, [id]);
+            plans.set(id, full ? await payments.scheduleOf(full).catch(() => null) : null);
+        }
+        const part = (plans.get(id) || []).find((x) => x.index === Number(row.index));
+        if (part && part.owing > 0) stillOwed.push({ ...row, owing: part.owing });
+    }
+    res.json({ success: true, data: { refundsOwed: excess.rows, cheques: cheques.rows, openOrders: open.rows, refunds: refunds.rows, overdue: stillOwed } });
+}, TAG);
 
 exports.refund = handler(async (req, res) => {
     const app = await access.schoolApplication(req, req.params.id);

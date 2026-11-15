@@ -37,7 +37,7 @@ describe('admission — level 2: the office sets admissions up', () => {
         assert.equal(d.bogus, undefined);
         assert.equal(d.selection.offerValidityDays, 60);
         assert.deepEqual(d.selection.tieBreakers, ['score_desc']);
-        assert.deepEqual(d.email.reminders, { examHoursBefore: 0, paymentDaysBefore: 30 });
+        assert.deepEqual(d.email.reminders, { examHoursBefore: 0, paymentDaysBefore: 30, offerDaysBefore: 2, draftDaysBefore: 3, documentsDaysBefore: 3 });
         assert.equal((await put({ bogus: {} })).status, 400, 'nothing known to save');
         await put({ applications: { maxPerApplicant: 3 }, security: { otpResendSeconds: 30, otpMaxAttempts: 3 } });
     });
@@ -162,8 +162,13 @@ describe('admission — level 2: the office sets admissions up', () => {
     it('takes enquiries from the portal, checked, and the office follows them up', async () => {
         await H.clearRateLimits();
         const send = (body) => H.api('POST', `/admission/public/portals/${portal.slug}/enquiries`, { body });
-        const ok = await send({ name: 'Ravi Kumar', email: 'ravi@family.test', phone: '9811122233', class: s.classes[1]._id, message: 'Is there a school bus from Baner?' });
+        const unasked = await send({ name: 'Ravi Kumar', email: 'ravi@family.test', phone: '9811122233', message: 'Is there a school bus from Baner?' });
+        assert.equal(unasked.status, 400, 'the person agrees to be contacted first');
+        assert.equal(unasked.body.code, 'CONSENT_REQUIRED');
+        const ok = await send({ name: 'Ravi Kumar', email: 'ravi@family.test', phone: '9811122233', class: s.classes[1]._id, message: 'Is there a school bus from Baner?', consent: true });
         assert.ok([200, 201].includes(ok.status), JSON.stringify(ok.body));
+        const [kept] = await H.q(`SELECT "consentAt", "consentVersion" FROM "admissionenquiries" WHERE "school" = $1 AND "email" = 'ravi@family.test'`, [s.id]);
+        assert.ok(kept.consentAt && kept.consentVersion >= 1, 'the yes is kept with the enquiry');
         assert.equal((await send({ name: 'Ravi Kumar', phone: '12345' })).status, 400);
         assert.equal((await send({ name: 'Ravi Kumar', email: 'ravi@family.test', message: '<img src=x onerror=alert(1)>' })).status, 400);
         assert.equal((await send({ name: 'R4vi', email: 'ravi@family.test' })).status, 400, 'a name is letters');

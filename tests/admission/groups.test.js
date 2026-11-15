@@ -89,7 +89,16 @@ describe('admission — groups of schools', () => {
         assert.equal((await H.api('POST', `/admission/admin/transfers/${offer.body.data._id}/decide`, { token: A.adminToken, body: { accept: true } })).status, 404, 'only the receiving branch answers');
         const inbox = (await H.api('GET', '/admission/admin/transfers', { token: B.adminToken })).body.data;
         assert.equal(inbox[0].direction, 'in');
-        const ok = await H.api('POST', `/admission/admin/transfers/${offer.body.data._id}/decide`, { token: B.adminToken, body: { accept: true, round: rb._id, class: B.classes[0]._id, answer: 'Welcome to campus B' } });
+        // Nothing of the application reaches branch B before the family says yes.
+        const decide = () => H.api('POST', `/admission/admin/transfers/${offer.body.data._id}/decide`, { token: B.adminToken, body: { accept: true, round: rb._id, class: B.classes[0]._id, answer: 'Welcome to campus B' } });
+        const tooSoon = await decide();
+        assert.equal(tooSoon.status, 409);
+        assert.equal(tooSoon.body.code, 'CONSENT_WAITING');
+        const asked = (await H.api('GET', `/admission/portal/applications/${src._id}`, { token: g2.token })).body.data.transfer;
+        assert.equal(asked.needsAnswer, true);
+        assert.equal((await H.api('POST', `/admission/portal/applications/${src._id}/transfers/${asked._id}/respond`, { token: ga.token, body: { agree: true } })).status, 404, 'only the family whose application it is');
+        assert.equal((await H.api('POST', `/admission/portal/applications/${src._id}/transfers/${asked._id}/respond`, { token: g2.token, body: { agree: true } })).status, 200);
+        const ok = await decide();
         assert.equal(ok.status, 200, JSON.stringify(ok.body));
         const draftId = ok.body.data.toApplication;
         const [draft] = await H.q(`SELECT * FROM "admissionapplications" WHERE "_id" = $1`, [draftId]);

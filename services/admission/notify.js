@@ -43,16 +43,41 @@ async function applicationValues(app) {
     };
 }
 
-/** Send `event` about `app` to its applicant, after the response. */
+/**
+ * Send `event` about `app` to its applicant, after the response: the email
+ * (written down and sent through the mailer's queue), and — Nov 2026 — the
+ * same news as a notification on the family's phone or browser, where they
+ * have let the portal or the app show them. The application's own page is
+ * where both lead; its timeline already is the in-app record.
+ */
 function toApplicant(app, event, extra = {}) {
     setImmediate(async () => {
         try {
             const ctx = await applicationValues(app);
-            if (ctx.to) await mailer.send(app.school, event, { to: ctx.to, recipient: ctx.recipient, application: app._id, values: { ...ctx.values, ...extra } });
+            const values = { ...ctx.values, ...extra };
+            if (ctx.to) await mailer.enqueue(app.school, event, { to: ctx.to, recipient: ctx.recipient, application: app._id, values });
+            await pushToApplicant(app, event, values);
         } catch (e) {
             console.error(`[admission notify] ${event}:`, e.message);
         }
     });
+}
+
+/** The device notification: the email's own subject line, and where a tap goes. */
+async function pushToApplicant(app, event, values) {
+    try {
+        if (!app.applicant) return;
+        const tpl = await mailer.templateFor(app.school, event);
+        if (!tpl.enabled) return;
+        const base = await mailer.commonValues(app.school);
+        const title = require('./richText').renderSubject(tpl.subject, { ...base.values, ...values });
+        const about = [values.student_name, values.application_number && values.application_number !== 'not yet numbered' ? values.application_number : ''].filter(Boolean).join(' · ');
+        await require('../pushService').send([{
+            user: app.applicant, title, body: about ? `${about} — open your application to see the details.` : 'Open your application to see the details.',
+            link: { web: `/${base.settings.slug}/applications/${app._id}`, mobile: `/modules/applicant-application?id=${app._id}` },
+            kind: 'notification', tag: `adm:${app._id}:${event}`,
+        }]);
+    } catch (e) { console.error(`[admission push] ${event}:`, e.message); }
 }
 
 /** Send `event` to an applicant about their account rather than one application (privacy requests). */
@@ -61,7 +86,7 @@ function toApplicantUser(schoolId, userId, event, extra = {}) {
         try {
             const { rows: [u] } = await pool.query(`SELECT "name", "email" FROM "users" WHERE "_id" = $1`, [String(userId)]);
             if (!u?.email || /^erased\+/.test(u.email)) return;
-            await mailer.send(schoolId, event, { to: u.email, recipient: userId, values: { applicant_name: u.name || 'Applicant', ...extra } });
+            await mailer.enqueue(schoolId, event, { to: u.email, recipient: userId, values: { applicant_name: u.name || 'Applicant', ...extra } });
         } catch (e) {
             console.error(`[admission notify] ${event}:`, e.message);
         }

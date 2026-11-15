@@ -85,7 +85,7 @@ async function guestPortal(req, res, next) {
 
 // An exam in progress, and money already paid, are never held up by a changed notice.
 const CONSENT_FREE = [/^\/portal\/consent$/, /^\/portal\/privacy\//, /\/withdraw$/, /\/exams\/[^/]+\/start$/, /\/attempts\/[^/]+\/(answers|submit|violation|next-section)$/,
-    /\/pay\/verify$/, /\/payments\/[^/]+\/reconcile$/];
+    /\/pay\/verify$/, /\/payments\/[^/]+\/reconcile$/, /\/pay\/check$/];
 
 /** Middleware for public routes: the portal named in the address. */
 async function publicPortal(req, res, next) {

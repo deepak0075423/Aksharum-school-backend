@@ -29,9 +29,13 @@ const TAG = 'admission portal';
 /** The application as its family sees it — none of the office's own fields. */
 function familyView(app) {
     const meta = workflow.STATUSES[app.status] || {};
+    // "Admission fee due" is not what a family that has paid should read: the
+    // fee is in, and the school has the next step.
+    const feeIn = app.status === 'payment_pending' && ['paid', 'waived', 'not_required'].includes(app.admissionFeeStatus);
     return {
-        _id: app._id, applicationNumber: app.applicationNumber, status: app.status, statusLabel: meta.label || app.status,
-        statusText: meta.applicant || meta.label || app.status, statusTone: meta.tone || 'gray', stage: app.stage,
+        _id: app._id, applicationNumber: app.applicationNumber, status: app.status, statusLabel: feeIn ? 'Fee received' : meta.label || app.status,
+        statusText: feeIn ? 'Admission fee received — the school will confirm your admission' : meta.applicant || meta.label || app.status,
+        statusTone: feeIn ? 'green' : meta.tone || 'gray', stage: app.stage,
         round: app.round, class: app.class, academicYear: app.academicYear, formVersionNo: app.formVersionNo,
         data: app.data || {}, studentName: app.studentName, submittedAt: app.submittedAt, createdAt: app.createdAt, updatedAt: app.updatedAt,
         applicationFeeAmount: app.applicationFeeAmount, applicationFeeStatus: app.applicationFeeStatus,
@@ -112,6 +116,8 @@ exports.detail = handler(async (req, res) => {
     ]);
     const reqs = documents.requirements(app, schema, types);
     const docSummary = documents.summarize(reqs, docs);
+    // When each document is due — the type's own days after submission, else the round's date.
+    const dueBy = documents.dueDates(app, reqs, round);
 
     // Exams the applicant is scheduled for, with what they may do now.
     const { rows: cands } = await pool.query(
@@ -162,10 +168,13 @@ exports.detail = handler(async (req, res) => {
             round: round ? { _id: round._id, name: round.name, closesAt: round.closesAt, documentDeadline: round.documentDeadline } : null,
             editable: apps.EDITABLE.includes(app.status),
             canWithdraw: settings.applications.allowWithdraw && !workflow.isClosed(app.status) && app.status !== 'enrolled',
-            canDelete: app.status === 'draft' && !app.submittedAt,
+            // A draft with a fee paid on it stays, with its receipt — it is withdrawn, not deleted.
+            canDelete: app.status === 'draft' && !app.submittedAt && !fees.payments.some((p) => ['paid', 'refunded', 'void'].includes(p.status)),
             feeBeforeSubmit: settings.applications.applicationFeeTiming === 'before_submit',
             documents: {
-                requirements: reqs.map((r) => ({ key: r.type.key, name: r.type.name, description: r.type.description, required: r.required, fromForm: r.fromForm, fieldKey: r.fieldKey, accept: r.type.accept, maxSizeMB: r.type.maxSizeMB })),
+                requirements: reqs.map((r) => ({ key: r.type.key, name: r.type.name, description: r.type.description, required: r.required, fromForm: r.fromForm, fieldKey: r.fieldKey, accept: r.type.accept, maxSizeMB: r.type.maxSizeMB, gate: r.type.gate || 'none', dueAt: dueBy.get(r.type.key) || null })),
+                // Papers can still be sent after the seat is confirmed (a transfer certificate that arrives later).
+                open: documents.OPEN_FOR_DOCUMENTS.includes(app.status),
                 files: docs.map((d) => ({ _id: d._id, docKey: d.docKey, originalName: d.originalName, size: d.size, mime: d.mime, status: d.status, version: d.version, rejectionReason: d.rejectionReason, createdAt: d.createdAt, reviewedAt: d.reviewedAt })),
                 summary: docSummary,
             },
@@ -182,8 +191,28 @@ exports.detail = handler(async (req, res) => {
                 canRespond: offer.status === 'issued' && settings.selection.allowApplicantResponse && (!offer.respondBy || new Date(offer.respondBy) > new Date()),
             } : null,
             declaration: settings.portal.declaration,
+            // A move to another branch the family is asked to agree to (services/admission/groups.js).
+            transfer: await require('../services/admission/groups').familyTransfer(app).catch(() => null),
         },
     });
+}, TAG);
+
+// ── The applicant's own account ──────────────────────────────────────────────
+
+exports.updateProfile = handler(async (req, res) => {
+    const u = await require('../services/admission/guestAuth').updateProfile(req, req.body || {});
+    res.json({ success: true, data: { _id: u._id, name: u.name, email: u.email, phone: u.phone }, message: 'Saved' });
+}, TAG);
+
+exports.changePassword = handler(async (req, res) => {
+    await require('../services/admission/guestAuth').changePassword(req, req.body || {});
+    res.json({ success: true, message: 'Password changed' });
+}, TAG);
+
+/** The family answers a proposed move to another branch. */
+exports.answerTransfer = handler(async (req, res) => {
+    const app = await access.ownApplication(req, req.params.id);
+    res.json({ success: true, data: await require('../services/admission/groups').answerTransfer(req, app, req.params.transferId, req.body?.agree === true) });
 }, TAG);
 
 exports.save = handler(async (req, res) => {
@@ -225,6 +254,13 @@ exports.upload = handler(async (req, res) => {
         }
     }
     await documents.refresh({ ...app }, schema);
+    // Somebody at the school is waiting for this one: a copy sent again after a rejection, or a paper that arrives after submission.
+    if (r.resubmitted || !['draft', 'incomplete'].includes(app.status)) {
+        require('../services/admission/staffAlerts').aboutApplication(app, {
+            title: `${r.type.name} ${r.resubmitted ? 'uploaded again' : 'uploaded'}: ${app.studentName || app.applicationNumber}`,
+            body: `${app.applicationNumber || 'An application'} — ${r.type.name} is waiting to be checked.`,
+        });
+    }
     res.status(201).json({ success: true, data: { _id: r.row._id, docKey: r.row.docKey, status: r.row.status, originalName: r.row.originalName, version: r.row.version } });
 }, TAG);
 
@@ -260,6 +296,7 @@ exports.payLink = handler(async (req, res) => {
     const app = await access.ownApplication(req, req.params.id);
     const kind = req.body?.kind;
     payments.payableKind(app, kind);
+    await payments.assertPayable(app, kind);
     const b = await payments.balance(app, kind);
     if (b.due <= 0) refuse('Nothing is due', 409, { code: 'NOTHING_DUE' });
     const resolved = await require('../services/paymentGateway').resolveGateway(app.school, 'admission');
@@ -281,6 +318,13 @@ exports.payReconcile = handler(async (req, res) => {
     const app = await access.ownApplication(req, req.params.id);
     const row = await payments.reconcile(req, app, req.params.paymentId);
     res.json({ success: true, data: { receiptNumber: row.receiptNumber, status: row.status } });
+}, TAG);
+
+/** "I paid, but the page did not say so" — the gateway is asked about the latest open order. */
+exports.payCheck = handler(async (req, res) => {
+    const app = await access.ownApplication(req, req.params.id);
+    const row = await payments.reconcileLatest(req, app, req.body?.kind || null);
+    res.json({ success: true, data: { receiptNumber: row.receiptNumber, status: row.status, amount: row.amount } });
 }, TAG);
 
 exports.receipt = handler(async (req, res) => {
@@ -427,6 +471,8 @@ exports.attempt = handler(async (req, res) => {
     let att = await ownAttempt(req, app, req.params.attemptId);
     const exam = await AdmissionExam.findById(att.exam).lean();
     att = await exams.finishIfDue(req, exam, att);
+    // This page now holds the sitting (one page at a time — exams.claimSession).
+    att = await exams.claimSession(att, req.query.session);
     res.json({ success: true, data: await exams.attemptView(exam, att) });
 }, TAG);
 
@@ -434,6 +480,7 @@ exports.saveAnswers = handler(async (req, res) => {
     const app = await access.ownApplication(req, req.params.id);
     const att = await ownAttempt(req, app, req.params.attemptId);
     const exam = await AdmissionExam.findById(att.exam).lean();
+    exams.assertSession(att, req.body?.session);
     res.json({ success: true, data: await exams.saveAnswers(req, exam, att, { answers: req.body?.answers, seq: req.body?.seq }) });
 }, TAG);
 
@@ -441,6 +488,7 @@ exports.submitExam = handler(async (req, res) => {
     const app = await access.ownApplication(req, req.params.id);
     const att = await ownAttempt(req, app, req.params.attemptId);
     const exam = await AdmissionExam.findById(att.exam).lean();
+    exams.assertSession(att, req.body?.session);
     const row = await exams.submitAttempt(req, exam, att, { answers: req.body?.answers, seq: req.body?.seq });
     res.json({ success: true, data: await exams.attemptView(exam, row) });
 }, TAG);
@@ -450,6 +498,7 @@ exports.nextSection = handler(async (req, res) => {
     const app = await access.ownApplication(req, req.params.id);
     const att = await ownAttempt(req, app, req.params.attemptId);
     const exam = await AdmissionExam.findById(att.exam).lean();
+    exams.assertSession(att, req.body?.session);
     const row = await exams.nextSection(req, exam, att);
     res.json({ success: true, data: await exams.attemptView(exam, row) });
 }, TAG);

@@ -20,6 +20,11 @@ const AdmissionTransferSchema = new db.Schema({
     reason:          { type: String, default: '' },
     status:          { type: String, enum: ['pending', 'accepted', 'declined', 'cancelled', 'completed'], default: 'pending' },
     answer:          { type: String, default: '' },
+    // The family's own say (Nov 2026): 'asked' when the move is offered, then
+    // 'given' or 'refused'. Nothing of the application reaches the other branch
+    // before it is 'given'. '' on moves offered before consent was recorded.
+    consent:         { type: String, default: '' },
+    consentAt:       { type: Date, default: null },
     requestedBy:     { type: db.Types.UUID, ref: 'User', default: null },
     decidedBy:       { type: db.Types.UUID, ref: 'User', default: null },
     decidedAt:       { type: Date, default: null },

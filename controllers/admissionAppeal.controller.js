@@ -43,3 +43,22 @@ exports.assign = handler(async (req, res) => {
 exports.decide = handler(async (req, res) => {
     res.json({ success: true, data: await appeals.decide(req, req.params.id, req.body || {}) });
 }, TAG);
+
+// ── Files attached to an appeal ──────────────────────────────────────────────
+
+exports.attach = handler(async (req, res) => {
+    let app;
+    try { app = await access.ownApplication(req, req.params.id); } catch (e) { if (req.file?.path) require('fs').promises.unlink(req.file.path).catch(() => {}); throw e; }
+    res.status(201).json({ success: true, data: await appeals.attach(req, app, req.params.appealId, req.file) });
+}, TAG);
+
+const sendFile = (res, f, download) => require('../services/admission/documents').send(res, { file: f.file, originalName: f.name, mime: f.mime, docKey: 'appeal' }, { download });
+
+exports.familyFile = handler(async (req, res) => {
+    const app = await access.ownApplication(req, req.params.id);
+    sendFile(res, await appeals.fileOf(app.school, req.params.appealId, req.params.fileId, { applicationId: app._id }), req.query.download === '1');
+}, TAG);
+
+exports.officeFile = handler(async (req, res) => {
+    sendFile(res, await appeals.fileOf(req.schoolId, req.params.id, req.params.fileId), req.query.download === '1');
+}, TAG);

@@ -67,6 +67,13 @@ const StudentProfileSchema = new db.Schema({
         trim: true,
         trgm: true,   // searched by substring from the library issue counter
     },
+    // From the admission application (services/admission/conversion.js): the day
+    // the student was enrolled, the quota the seat came from ('' = general) and
+    // whether it is a free seat under the RTE Act — which the Fees office must know.
+    admissionDate: { type: Date, default: null },
+    admissionQuota: { type: String, default: '' },
+    admissionQuotaName: { type: String, default: '' },
+    isRteSeat: { type: Boolean, default: false },
     dob: {
         type: Date,
         default: null,

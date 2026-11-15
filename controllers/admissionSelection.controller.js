@@ -52,7 +52,7 @@ exports.create = handler(async (req, res) => {
 exports.detail = handler(async (req, res) => {
     const list = await listOf(req, req.params.id);
     const [lines, seat, cls, round] = await Promise.all([
-        linesOf(list._id), seats.state(list.round, list.class),
+        linesOf(list._id), seats.state(list.round, list.class, null, { quota: list.quota || '' }),   // the list's own pool: a quota's list shows the quota's seats
         pool.query(`SELECT "className", "classNumber" FROM "classes" WHERE "_id" = $1`, [String(list.class)]).then((r) => r.rows[0]),
         pool.query(`SELECT "name" FROM "admissionrounds" WHERE "_id" = $1`, [String(list.round)]).then((r) => r.rows[0]),
     ]);

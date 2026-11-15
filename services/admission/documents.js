@@ -41,8 +41,93 @@ function sniff(buf) {
 }
 
 const EDITABLE_BEFORE_SUBMIT = ['draft', 'incomplete'];
+// Confirmed and enrolled too (Nov 2026): a transfer certificate, a medical
+// form, a caste certificate often arrive after the seat is confirmed — there
+// was nowhere to put one.
 const OPEN_FOR_DOCUMENTS = ['draft', 'incomplete', 'submitted', 'under_review', 'documents_pending', 'documents_rejected', 'verified', 'eligible',
-    'exam_scheduled', 'exam_completed', 'interview_scheduled', 'interview_completed', 'evaluated', 'selected', 'waitlisted', 'offer_issued', 'accepted', 'payment_pending'];
+    'exam_scheduled', 'exam_completed', 'interview_scheduled', 'interview_completed', 'evaluated', 'selected', 'waitlisted', 'offer_issued', 'accepted', 'payment_pending',
+    'offer_expired', 'confirmed', 'enrolled'];
+
+// ── What a photo says about where it was taken ───────────────────────────────
+
+const TIFF_SIZE = [0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8];
+
+/**
+ * A JPEG with the place it was taken removed: the GPS block of its EXIF data
+ * is blanked (the entries and the coordinates they point at), and any XMP
+ * packet — which repeats the same facts — is dropped. Everything else stays,
+ * the orientation above all, so the picture still shows the right way up.
+ * A phone photo of a birth certificate otherwise carries the family's home
+ * coordinates to everyone who opens it. Returns the same buffer when there is
+ * nothing to remove, or when the file is not shaped as expected (left alone).
+ */
+function stripLocation(buf) {
+    try {
+        if (!buf || buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return buf;
+        const keep = [buf.slice(0, 2)];
+        let changed = false;
+        let i = 2;
+        while (i + 4 <= buf.length) {
+            if (buf[i] !== 0xff) return changed ? Buffer.concat([...keep, buf.slice(i)]) : buf;
+            const marker = buf[i + 1];
+            if (marker === 0xda || marker === 0xd9) break;             // image data from here on
+            if (marker >= 0xd0 && marker <= 0xd7) { keep.push(buf.slice(i, i + 2)); i += 2; continue; }
+            const len = buf.readUInt16BE(i + 2);
+            if (len < 2 || i + 2 + len > buf.length) return buf;
+            let seg = buf.slice(i, i + 2 + len);
+            if (marker === 0xe1) {
+                const head = seg.slice(4, 33).toString('latin1');
+                if (head.startsWith('http://ns.adobe.com/xap/1.0/') || head.startsWith('http://ns.adobe.com/xmp/extension/')) { changed = true; i += 2 + len; continue; }
+                if (head.startsWith('Exif\0\0')) {
+                    const copy = Buffer.from(seg);
+                    if (blankGps(copy.subarray(10))) { seg = copy; changed = true; }
+                }
+            }
+            keep.push(seg);
+            i += 2 + len;
+        }
+        return changed ? Buffer.concat([...keep, buf.slice(i)]) : buf;
+    } catch { return buf; }
+}
+
+/** Blank the GPS IFD of a TIFF block in place. True when something was blanked. */
+function blankGps(tiff) {
+    if (tiff.length < 8) return false;
+    const order = tiff.slice(0, 2).toString('latin1');
+    if (order !== 'II' && order !== 'MM') return false;
+    const le = order === 'II';
+    const u16 = (o) => (le ? tiff.readUInt16LE(o) : tiff.readUInt16BE(o));
+    const u32 = (o) => (le ? tiff.readUInt32LE(o) : tiff.readUInt32BE(o));
+    const ifd0 = u32(4);
+    if (ifd0 + 2 > tiff.length) return false;
+    const n = u16(ifd0);
+    let done = false;
+    for (let k = 0; k < n; k++) {
+        const e = ifd0 + 2 + k * 12;
+        if (e + 12 > tiff.length) break;
+        if (u16(e) !== 0x8825) continue;
+        const gps = u32(e + 8);
+        if (gps + 2 > tiff.length) break;
+        const count = u16(gps);
+        for (let j = 0; j < count; j++) {
+            const g = gps + 2 + j * 12;
+            if (g + 12 > tiff.length) break;
+            const size = (TIFF_SIZE[u16(g + 2)] || 0) * u32(g + 4);
+            if (size > 4) { const at = u32(g + 8); if (at + size <= tiff.length) tiff.fill(0, at, at + size); }
+            tiff.fill(0, g, g + 12);
+        }
+        tiff.fill(0, gps, gps + 2);     // an empty GPS block
+        done = true;
+    }
+    return done;
+}
+
+async function stripLocationOfFile(filePath) {
+    const before = await fs.promises.readFile(filePath);
+    const after = stripLocation(before);
+    if (after !== before) await fs.promises.writeFile(filePath, after);
+    return after !== before;
+}
 
 // ── Which documents an application needs ─────────────────────────────────────
 
@@ -177,6 +262,8 @@ async function upload(app, docKey, file, { req, applicant = false, schema }) {
             refuse('Files cannot be checked for viruses just now — please try again in a few minutes', 503, { code: 'SCANNER_UNAVAILABLE' });
         }
 
+        // A photo taken on a phone says where: that part is removed before the file is kept.
+        if (EXT_KINDS[ext] === 'jpeg' && await stripLocationOfFile(file.path).catch(() => false)) file.size = (await fs.promises.stat(file.path)).size;
         const sha256 = crypto.createHash('sha256').update(await fs.promises.readFile(file.path)).digest('hex');
         const stored = `${crypto.randomUUID()}.${ext}`;
         const key = `${app.school}/${stored}`;
@@ -186,8 +273,13 @@ async function upload(app, docKey, file, { req, applicant = false, schema }) {
         // From here the file is in place; if the row cannot be written, it goes.
         const original = file;
         file = { key };
+        // A copy replaced on a draft nobody at the school has seen is not a version
+        // worth keeping: it goes, file and all (it used to stay for good).
+        const dropPrevious = !!previous && app.status === 'draft' && !app.submittedAt;
         const row = await withTransaction(async (q) => {
-            if (previous) {
+            if (previous && dropPrevious) {
+                await q(`DELETE FROM "${AdmissionDocument.tableName}" WHERE "_id" = $1`, [previous._id]);
+            } else if (previous) {
                 await q(`UPDATE "${AdmissionDocument.tableName}" SET "current" = false, "status" = CASE WHEN "status" IN ('uploaded', 'under_review') THEN 'replaced' ELSE "status" END, "updatedAt" = now() WHERE "_id" = $1`, [previous._id]);
             }
             const { sql, params } = buildInsert(AdmissionDocument, {
@@ -206,6 +298,7 @@ async function upload(app, docKey, file, { req, applicant = false, schema }) {
             }, q);
             return rows[0];
         });
+        if (dropPrevious && previous.file) fileStore.remove(previous.file);
         return { row, type, resubmitted: !!isResubmission };
     } catch (e) {
         discard(file);
@@ -246,6 +339,115 @@ async function review(doc, { decision, reason = '', note = '' }, req) {
     return updated;
 }
 
+// ── Gates and deadlines ──────────────────────────────────────────────────────
+
+/**
+ * The required documents of `gate` this application is still short of — a
+ * type's "must be in by" point: 'submission' (uploaded before the form can be
+ * submitted), 'before_exam' (verified before an exam is scheduled),
+ * 'before_confirmation' (verified before the seat is confirmed). Returns
+ * [{ name, problem }]. The first two used to be stored and never checked.
+ */
+async function gateProblems(app, gate, { schema = null, types = null, docs = null } = {}) {
+    const all = types || await typesOf(app.school);
+    if (![...all.values()].some((t) => t.gate === gate)) return [];
+    const sch = schema || await require('./applications').schemaOf(app);
+    const have = new Map((docs || await currentDocs(app._id)).map((d) => [d.docKey, d]));
+    const out = [];
+    for (const r of requirements(app, sch, all)) {
+        if (r.type.gate !== gate || !r.required) continue;
+        const d = have.get(r.type.key);
+        if (!d) out.push({ name: r.type.name, problem: 'not uploaded' });
+        else if (gate !== 'submission' && r.type.verification && d.status !== 'verified') out.push({ name: r.type.name, problem: 'not verified' });
+    }
+    return out;
+}
+
+/**
+ * When each document still owed is due: a type's own "days after submission",
+ * else the round's document date. Map(docKey → Date|null).
+ */
+function dueDates(app, reqs, round) {
+    const out = new Map();
+    for (const r of reqs) {
+        const days = Number(r.type.deadlineDays) || 0;
+        const base = app.submittedAt ? new Date(app.submittedAt) : null;
+        out.set(r.type.key, days && base ? new Date(base.getTime() + days * 86400000) : (round?.documentDeadline ? new Date(round.documentDeadline) : null));
+    }
+    return out;
+}
+
+// ── Files that are not one of the application's documents ────────────────────
+
+/**
+ * Keep a supporting file (an appeal's attachment): PDF or a picture, at most
+ * 5 MB, really what its name says, virus-scanned like any document. Returns
+ * { file, name, size, mime }.
+ */
+async function keepLooseFile(app, file, { folder = 'files' } = {}) {
+    const ext = path.extname(file.originalname || '').slice(1).toLowerCase();
+    if (!['pdf', 'jpg', 'jpeg', 'png'].includes(ext)) refuse('Attach a PDF, JPG or PNG', 400, { field: 'file' });
+    if (file.size > 5 * 1024 * 1024) refuse('The file must be at most 5 MB', 400, { field: 'file' });
+    const fd = await fs.promises.open(file.path, 'r');
+    const head = Buffer.alloc(16);
+    await fd.read(head, 0, 16, 0);
+    await fd.close();
+    if (sniff(head) !== EXT_KINDS[ext]) refuse(`The file is not a real ${ext.toUpperCase()} — it may be damaged or renamed`, 400, { field: 'file' });
+    const scan = await require('./virusScan').scanFile(file.path);
+    if (scan.status === 'infected') refuse('The virus scanner found something harmful in this file, so it was not kept', 422, { code: 'FILE_INFECTED', field: 'file' });
+    if (scan.status === 'unavailable' && require('./virusScan').config().required) refuse('Files cannot be checked for viruses just now — please try again in a few minutes', 503, { code: 'SCANNER_UNAVAILABLE' });
+    if (EXT_KINDS[ext] === 'jpeg') await stripLocationOfFile(file.path).catch(() => false);
+    const size = (await fs.promises.stat(file.path)).size;
+    const key = `${app.school}/${folder}/${crypto.randomUUID()}.${ext}`;
+    await fileStore.save(file.path, key, MIME[ext]);
+    return { file: key, name: String(file.originalname || `file.${ext}`).slice(0, 200), size, mime: MIME[ext] };
+}
+
+// ── Files the scanner could not check ────────────────────────────────────────
+
+/**
+ * Documents kept while the virus scanner was unreachable are scanned once it
+ * answers again (they used to stay "not scanned" for good). One found harmful
+ * is taken out of use: marked rejected so the family uploads a clean copy,
+ * and the office is told.
+ */
+async function rescanPending(limit = 25) {
+    const scanner = require('./virusScan');
+    if (!scanner.config().enabled) return 0;
+    const { rows } = await pool.query(
+        `SELECT * FROM "${AdmissionDocument.tableName}" WHERE "scanStatus" = 'unavailable' AND "current" ORDER BY "createdAt" ASC LIMIT $1`, [limit]);
+    if (!rows.length) return 0;
+    const os = require('os');
+    let n = 0;
+    for (const d of rows) {
+        const tmp = path.join(os.tmpdir(), `adm-rescan-${crypto.randomUUID()}`);
+        try {
+            await fileStore.copyToFile(d.file, tmp);
+            const scan = await scanner.scanFile(tmp);
+            if (scan.status === 'unavailable') break;           // still down — try again next time
+            if (scan.status === 'clean') {
+                await pool.query(`UPDATE "${AdmissionDocument.tableName}" SET "scanStatus" = 'clean', "scannedAt" = now() WHERE "_id" = $1`, [d._id]);
+            } else if (scan.status === 'infected') {
+                const why = 'The virus scanner found something harmful in this file. Please upload a clean copy.';
+                await pool.query(
+                    `UPDATE "${AdmissionDocument.tableName}" SET "scanStatus" = 'infected', "scannedAt" = now(), "status" = 'rejected', "rejectionReason" = $2, "reviewedAt" = now(), "updatedAt" = now() WHERE "_id" = $1`, [d._id, why]);
+                await fileStore.remove(d.file);
+                events.recordQuietly(d.school, { application: d.application, type: 'document', action: 'infected', message: `${d.originalName || d.docKey}: the virus scanner found ${scan.signature} — the file was removed`, visibility: 'internal' });
+                const { rows: [app] } = await pool.query(`SELECT * FROM "${AdmissionApplication.tableName}" WHERE "_id" = $1`, [d.application]);
+                if (app) {
+                    await refresh(app, await require('./applications').schemaOf(app)).catch(() => {});
+                    require('./staffAlerts').aboutApplication(app, { title: 'A harmful file was removed', body: `${app.applicationNumber || 'An application'}: ${d.originalName || d.docKey} failed the virus scan and was removed. The family needs to upload it again.` });
+                    require('./notify').toApplicant(app, 'document_rejected', { document_name: d.originalName || d.docKey, rejection_reason: why, remarks: why });
+                }
+            }
+            n += 1;
+        } catch (e) {
+            console.error('[admission] rescan:', e.message);
+        } finally { fs.promises.unlink(tmp).catch(() => {}); }
+    }
+    return n;
+}
+
 // ── Opening a file ───────────────────────────────────────────────────────────
 
 function send(res, doc, { download = false } = {}) {
@@ -259,4 +461,7 @@ function send(res, doc, { download = false } = {}) {
     return fileStore.pipeTo(res, doc.file);
 }
 
-module.exports = { ROOT, sniff, typesOf, requirements, currentDocs, summarize, refresh, upload, remove, review, send, appliesTo, OPEN_FOR_DOCUMENTS };
+module.exports = {
+    ROOT, sniff, typesOf, requirements, currentDocs, summarize, refresh, upload, remove, review, send, appliesTo, OPEN_FOR_DOCUMENTS,
+    stripLocation, gateProblems, dueDates, keepLooseFile, rescanPending,
+};

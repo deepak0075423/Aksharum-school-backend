@@ -227,6 +227,7 @@ async function importAllotments(req, roundId, { class: classId, quota: key, rows
         if (have) { out.skipped += 1; continue; }
         const { user, created } = await accountFor(req.schoolId, { name: r.parentName, email: r.parentEmail, phone: r.parentPhone });
         if (created) out.accounts += 1;
+        let imported = null;
         const rel = RELATIONS[r.relation];
         const data = { studentName: r.studentName, studentDob: r.studentDob, ...(r.studentGender ? { studentGender: r.studentGender } : {}), [`${rel}Name`]: r.parentName, [`${rel}Phone`]: r.parentPhone };
         await withTransaction(async (q) => {
@@ -243,8 +244,11 @@ async function importAllotments(req, roundId, { class: classId, quota: key, rows
             });
             const { rows: [app] } = await q(sql, params);
             await events.record(req.schoolId, { application: app._id, by: req, type: 'quota', action: 'allotted', message: `Allotted a seat under the RTE Act (s.12(1)(c)) by the state — reference ${r.externalRef}`, visibility: 'applicant' }, q);
+            imported = app;
         });
         out.imported += 1;
+        // The family hears that the school has their allotment (nothing was sent before).
+        if (imported && r.parentEmail) { require('./notify').toApplicant(imported, 'rte_allotted', { external_ref: r.externalRef }); out.told = (out.told || 0) + 1; }
     }
     events.recordQuietly(req.schoolId, { by: req, type: 'quota', action: 'rte_import', message: `RTE allotment imported for ${classDoc?.className || 'a class'}: ${out.imported} new, ${out.skipped} already in` });
     return out;

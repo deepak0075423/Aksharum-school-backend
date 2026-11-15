@@ -542,6 +542,21 @@ const ROUTES = {
         school_admin: { web: '/admin/admissions/enquiries', mobile: '/(tabs)/notifications' },
         teacher:      { web: '/admin/admissions/enquiries', mobile: '/(tabs)/notifications' },
     },
+    // One application (Nov 2026): an approval waiting, a payment, an offer answered,
+    // a document sent again. A teacher who is not an admission administrator is
+    // told only about an application assigned to them — their duties page opens it.
+    'admission.application': {
+        school_admin: { web: '/admin/admissions/applications/{id}', mobile: '/modules/admin/admission-application?id={id}' },
+        teacher:      { web: '/teacher/admissions/applications/{id}', mobile: '/modules/admission-duty-application?id={id}' },
+    },
+    'admission.appeals': {
+        school_admin: { web: '/admin/admissions/appeals', mobile: '/modules/admin/admission-appeals' },
+        teacher:      { web: '/admin/admissions/appeals', mobile: '/modules/admin/admission-appeals' },
+    },
+    'admission.payments': {
+        school_admin: { web: '/admin/admissions/payments', mobile: '/modules/admin/admission-payments' },
+        teacher:      { web: '/admin/admissions/payments', mobile: '/modules/admin/admission-payments' },
+    },
 };
 
 // Where a role's plain notification list lives. This is the universal fallback:

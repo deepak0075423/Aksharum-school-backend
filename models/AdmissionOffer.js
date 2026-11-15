@@ -27,10 +27,12 @@ const AdmissionOfferSchema = new db.Schema({
     closedBy:     { type: db.Types.UUID, ref: 'User', default: null },
     reason:       { type: String, default: '' },
     remindedAt:   { type: Date, default: null },
+    // The family was told once that an unanswered offer is about to lapse.
+    lapseWarnedAt: { type: Date, default: null },
     // The seat pool the offer holds: a quota's key, or '' for the general seats.
     quota:        { type: String, default: '' },
     // The admission fee in instalments (the round's plan), fixed when the offer
-    // is made: [{ label, amount, dueAt, remindedAt }]. null: one payment.
+    // is made: [{ label, amount, dueAt, remindedAt, overdueAt }]. null: one payment.
     schedule:     { type: db.Types.JSON, default: null },
 }, { timestamps: true });
 

@@ -19,6 +19,9 @@ const AdmissionResultSchema = new db.Schema({
     application:  { type: db.Types.UUID, ref: 'AdmissionApplication', required: true },
     candidate:    { type: db.Types.UUID, ref: 'AdmissionCandidate', default: null },
     marks:        { type: db.Types.JSON, default: () => ({}) },
+    // An interview panel of two or more: each member's own sheet, by user id —
+    // { marks, absent, remarks, name, at }. `marks` above is then their average.
+    panelMarks:   { type: db.Types.JSON, default: () => ({}) },
     autoScore:    { type: Number, default: null },
     manualScore:  { type: Number, default: null },
     total:        { type: Number, default: null },

@@ -137,7 +137,26 @@ async function nextAdmissionNumber(school, classDoc = null) {
     return candidate;
 }
 
+/**
+ * One admission number at a time per school. The next number is read from the
+ * numbers already given, so two students admitted at the same moment — one
+ * from the Students screen, one from an admission application — could both
+ * be handed the same one. Everything that gives a number does it holding this
+ * lock: the admission module inside its own transaction (lockKey), the
+ * Students screen through withLock.
+ */
+const lockKey = (schoolId) => `admission-number:${schoolId}`;
+
+async function withLock(schoolId, fn) {
+    const { withTransaction, lock } = require('../services/dbTx');
+    return withTransaction(async (q) => {
+        await lock(q, lockKey(schoolId));
+        return fn();
+    });
+}
+
 module.exports = {
+    lockKey, withLock,
     DEFAULT_FORMAT, initialsOf, validateFormat, parseFormat,
     previewAdmissionNumber, nextAdmissionNumber, resolveYear,
 };

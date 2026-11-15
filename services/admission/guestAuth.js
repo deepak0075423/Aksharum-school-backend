@@ -244,16 +244,81 @@ async function forgot(portal, body, { ip = '' } = {}) {
     const email = str(body.email, 200).toLowerCase();
     if (!isEmail(email)) refuse('Enter a valid email address', 400, { field: 'email' });
     const answer = genericSent(email, security);
-    const rows = await identity.membershipsByEmail(email);
-    const here = guestRowHere(rows, schoolId);
-    if (!here || !here.isActive) return answer;
-    const issued = await otp.issue(schoolId, email, 'reset', { security, ip });
-    // Waiting is not announced either: it would say the address has an account.
-    if (issued.blocked) return answer;
-    await mailer.send(schoolId, 'password_reset', {
-        to: email, recipient: here._id, values: { applicant_name: here.name, otp: issued.code, otp_expiry_minutes: String(security.otpExpiryMinutes) },
+    // The answer goes back at once, the same for every address; the code is
+    // made and mailed afterwards. Waiting for the mail server here made the
+    // page slower for an address that has an account than for one that has
+    // none — which told anyone with a stopwatch which addresses are registered.
+    setImmediate(async () => {
+        try {
+            const rows = await identity.membershipsByEmail(email);
+            const here = guestRowHere(rows, schoolId);
+            if (!here || !here.isActive) return;
+            const issued = await otp.issue(schoolId, email, 'reset', { security, ip });
+            // Waiting is not announced either: it would say the address has an account.
+            if (issued.blocked) return;
+            await mailer.send(schoolId, 'password_reset', {
+                to: email, recipient: here._id, values: { applicant_name: here.name, otp: issued.code, otp_expiry_minutes: String(security.otpExpiryMinutes) },
+            });
+        } catch (e) { console.error('[admission] reset code:', e.message); }
     });
     return answer;
+}
+
+// ── The signed-in applicant's own account ────────────────────────────────────
+
+/** Name and mobile, changed by the applicant (the email is the sign-in and stays). */
+async function updateProfile(req, body = {}) {
+    const { nameProblem } = require('../../utils/textRules');
+    const { isPhone, normalizePhone } = require('../../utils/validators');
+    const set = {};
+    if (body.name !== undefined) {
+        const name = str(body.name, 100).replace(/\s+/g, ' ');
+        if (name.length < 2) refuse('Enter your full name', 400, { field: 'name' });
+        const bad = nameProblem(name, 'Your name'); if (bad) refuse(bad, 400, { field: 'name' });
+        set.name = name;
+    }
+    if (body.phone !== undefined) {
+        const phone = normalizePhone(str(body.phone, 20));
+        if (phone && !isPhone(phone)) refuse('Enter a valid 10-digit mobile number', 400, { field: 'phone' });
+        set.phone = phone;
+    }
+    if (!Object.keys(set).length) refuse('Nothing was changed');
+    const cols = Object.keys(set);
+    const { rows: [u] } = await pool.query(
+        `UPDATE "users" SET ${cols.map((c, i) => `"${c}" = $${i + 2}`).join(', ')} WHERE "_id" = $1 AND "role" = 'guest' RETURNING "_id", "name", "email", "phone"`,
+        [String(req.userId), ...cols.map((c) => set[c])]);
+    if (!u) refuse('Account not found', 404);
+    if (set.phone !== undefined) await AdmissionApplicant.updateOne({ user: req.userId }, { $set: { phone: set.phone } }).catch(() => {});
+    await authCache.invalidate(String(req.userId)).catch(() => {});
+    events.recordQuietly(req.schoolId, { by: { _id: u._id, name: u.name, role: 'guest' }, type: 'account', action: 'profile_updated', message: `${u.name} updated their ${cols.join(' and ')}` });
+    return u;
+}
+
+/**
+ * A new password, with the present one. It is the address's password — every
+ * Aksharum sign-in on this email changes with it, as with a reset.
+ */
+async function changePassword(req, body = {}) {
+    const current = String(body.currentPassword ?? '');
+    if (!current) refuse('Enter your present password', 400, { field: 'currentPassword' });
+    const pwBad = passwordError(body.password);
+    if (pwBad) refuse(pwBad, 400, { field: 'password' });
+    const { rows: [u] } = await pool.query(`SELECT "_id", "name", "email", "password" FROM "users" WHERE "_id" = $1 AND "role" = 'guest'`, [String(req.userId)]);
+    if (!u) refuse('Account not found', 404);
+    // Counted like a sign-in: five wrong tries lock the address's password (services/loginLockout).
+    const { opened, refusal } = await lockout.checkPassword(u.email, current);
+    if (refusal) {
+        // A wrong guess says so here (the person is signed in); a lock keeps its own wording and time.
+        const { message, ...rest } = refusal.body || {};
+        const wrong = refusal.status === 401;
+        refuse(wrong ? `Your present password is not right${rest.attempts?.left != null ? ` — ${rest.attempts.left} more ${rest.attempts.left === 1 ? 'try' : 'tries'} before it is locked` : ''}` : message, wrong ? 400 : refusal.status, { ...rest, field: 'currentPassword' });
+    }
+    if (!opened?.length) refuse('Your present password is not right', 400, { field: 'currentPassword' });
+    if (String(body.password) === current) refuse('Choose a password different from the present one', 400, { field: 'password' });
+    const hash = await bcrypt.hash(String(body.password), 12);
+    await identity.setCredentials(u.email, { passwordHash: hash, isFirstLogin: false, extra: { resetToken: null, resetTokenExpiry: null } });
+    events.recordQuietly(req.schoolId, { by: { _id: u._id, name: u.name, role: 'guest' }, type: 'account', action: 'password_changed', message: `${u.name} changed their password` });
+    return { ok: true };
 }
 
 /**
@@ -279,4 +344,4 @@ async function reset(portal, body) {
     return { ...here, password: hash };
 }
 
-module.exports = { register, resendRegistration, verifyRegistration, login, forgot, reset, portalOpenFor, guestRowHere };
+module.exports = { register, resendRegistration, verifyRegistration, login, forgot, reset, portalOpenFor, guestRowHere, updateProfile, changePassword };

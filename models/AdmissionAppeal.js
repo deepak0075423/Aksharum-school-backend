@@ -23,6 +23,8 @@ const AdmissionAppealSchema = new db.Schema({
     exam:         { type: db.Types.UUID, ref: 'AdmissionExam', default: null },
     aboutStatus:  { type: String, default: '' },
     reason:       { type: String, default: '' },
+    // What the family attached: [{ id, file, name, size, mime, at }] — `file` never leaves the server.
+    files:        { type: db.Types.JSON, default: () => [] },
     status:       { type: String, enum: ['open', 'in_review', 'upheld', 'not_upheld', 'withdrawn'], default: 'open' },
     dueAt:        { type: Date, default: null },
     assignedTo:   { type: db.Types.UUID, ref: 'User', default: null },

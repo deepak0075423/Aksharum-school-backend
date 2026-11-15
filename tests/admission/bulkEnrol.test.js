@@ -41,7 +41,9 @@ describe('admission — bulk enrolment and the offers forecast', () => {
         const counts = plan.rows.reduce((m, x) => ({ ...m, [name(x.section)]: (m[name(x.section)] || 0) + 1 }), {});
         assert.deepEqual(counts, { A: 2, B: 1 });
         assert.equal(plan.rows[0].parent.name, 'Amit Sharma', 'the parent from the form');
-        assert.equal(plan.rows[0].studentEmail, '', 'the form did not ask for the student\'s email');
+        // The form did not ask for the student's email: the parent's address with the child's name after a "+" is suggested.
+        assert.match(plan.rows[0].studentEmail, /^[^@+]+\+[a-z]+@family\.test$/, plan.rows[0].studentEmail);
+        assert.equal(plan.rows[0].emailSuggested, true);
     });
 
     it('enrols each row as on its own — a row missing its email says so, the rest go on', async () => {

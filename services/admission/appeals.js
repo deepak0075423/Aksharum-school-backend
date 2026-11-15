@@ -1,9 +1,10 @@
 'use strict';
 /**
  * Asking the school to look again (Oct 2026) — a re-check of a published exam
- * result, or an appeal against a decision that closed the application (not
- * eligible, not selected). The school sets the windows and how fast it
- * answers; an admission administrator decides, in writing.
+ * result, or an appeal against a decision that ended the application (not
+ * eligible, not selected, cancelled by the school, an offer that lapsed). The
+ * school sets the windows and how fast it answers; an admission administrator
+ * decides, in writing. A family can attach files to what it writes.
  *
  *   upheld, re-check   the corrected marks are recorded on the result (with the
  *                      appeal's number as the reason) and published again
@@ -26,7 +27,7 @@ const { refuse, isId, str } = require('./util');
 const { textProblem } = require('../../utils/textRules');
 
 const OPEN = ['open', 'in_review'];
-const DECISION_STATUSES = ['rejected', 'ineligible'];
+const DECISION_STATUSES = ['rejected', 'ineligible', 'cancelled', 'offer_expired'];
 const KIND_LABEL = { recheck: 'Re-check of a result', decision: 'Appeal against a decision' };
 const DAY = 86400000;
 
@@ -104,6 +105,11 @@ async function file(req, app, input = {}) {
         message: `${KIND_LABEL[kind]}${examName ? ` (${examName})` : ''} asked for — ${appeal.number}. The school answers by ${fmt.fmtDate(appeal.dueAt)}.`,
     });
     notify.toApplicant(app, 'appeal_received', { appeal_number: appeal.number, appeal_kind: KIND_LABEL[kind].toLowerCase(), due_date: fmt.fmtDate(appeal.dueAt), exam_name: examName || '' });
+    require('./staffAlerts').toAdmins(app.school, {
+        title: `New appeal ${appeal.number}`,
+        body: `${app.studentName || app.applicationNumber}: ${KIND_LABEL[kind].toLowerCase()}${examName ? ` (${examName})` : ''}. To be answered by ${fmt.fmtDate(appeal.dueAt)}.`,
+        link: { type: 'admission.appeals' },
+    });
     return appeal;
 }
 
@@ -119,9 +125,9 @@ async function withdraw(req, app, appealId) {
 /** The family's appeals — never the staff note. */
 async function forFamily(app) {
     const { rows } = await pool.query(
-        `SELECT a."_id", a."number", a."kind", a."status", a."reason", a."decision", a."dueAt", a."createdAt", a."decidedAt", e."name" AS "examName"
+        `SELECT a."_id", a."number", a."kind", a."status", a."reason", a."decision", a."dueAt", a."createdAt", a."decidedAt", a."files", e."name" AS "examName"
            FROM "admissionappeals" a LEFT JOIN "admissionexams" e ON e."_id" = a."exam" WHERE a."application" = $1 ORDER BY a."createdAt" DESC`, [String(app._id)]);
-    return rows;
+    return rows.map((r) => ({ ...r, files: publicFiles(r.files) }));
 }
 
 // ── The office ───────────────────────────────────────────────────────────────
@@ -155,6 +161,67 @@ async function appealOf(schoolId, id, q = null) {
     return a;
 }
 
+/**
+ * Where an upheld appeal can send the application, as the workflow allows it.
+ * A closed application reopens to Under Review and may go on from there in
+ * the same step; one whose offer lapsed is not closed, and goes where a
+ * lapsed offer may (the waiting list). The screen used to offer every status
+ * and the workflow refused all but one.
+ */
+async function reopenChoices(app) {
+    const settings = await settingsSvc.getSettings(app.school);
+    const flow = workflow.compile(settings.workflow);
+    const label = (k) => ({ key: k, label: workflow.STATUSES[k].label });
+    const open = (k) => !workflow.STATUSES[k].closed && !workflow.STATUSES[k].system && k !== 'draft';
+    if (!workflow.isClosed(app.status)) {
+        return workflow.STATUS_KEYS.filter(open).filter((k) => workflow.canMove(app, k, { flow, isAdmin: true }).ok).map(label);
+    }
+    if (!workflow.canMove(app, 'under_review', { flow, isAdmin: true, reopen: true }).ok) return [];
+    const facts = await require('./applications').factsFor(app).catch(() => null);
+    const from = { ...app, status: 'under_review' };
+    return [label('under_review'), ...workflow.STATUS_KEYS.filter((k) => k !== 'under_review' && open(k))
+        .filter((k) => workflow.canMove(from, k, { flow, isAdmin: true, facts: facts ? { ...facts, app: from } : null }).ok).map(label)];
+}
+
+/** An appeal's files as they leave the server — never where they are kept. */
+const publicFiles = (files) => (Array.isArray(files) ? files : []).map((f) => ({ id: f.id, name: f.name, size: f.size, mime: f.mime, at: f.at }));
+
+const MAX_FILES = 3;
+
+/** The family attaches a file to an appeal the school has not answered yet. */
+async function attach(req, app, appealId, file) {
+    const fs = require('fs').promises;
+    const drop = () => (file?.path ? fs.unlink(file.path).catch(() => {}) : null);
+    try {
+        if (!isId(String(appealId || ''))) refuse('Appeal not found', 404);
+        if (!file) refuse('Choose a file', 400);
+        const store = require('./fileStore');
+        const docs = require('./documents');
+        return await withTransaction(async (q) => {
+            const { rows: [a] } = await q(`SELECT * FROM "admissionappeals" WHERE "_id" = $1 AND "application" = $2 FOR UPDATE`, [String(appealId), String(app._id)]);
+            if (!a) refuse('Appeal not found', 404);
+            if (!OPEN.includes(a.status)) refuse('This appeal has been answered — nothing more can be added to it', 409);
+            const files = Array.isArray(a.files) ? a.files : [];
+            if (files.length >= MAX_FILES) refuse(`An appeal can carry at most ${MAX_FILES} files`, 409);
+            const saved = await docs.keepLooseFile(app, file, { folder: 'appeals' });
+            const entry = { id: require('crypto').randomUUID(), file: saved.file, name: saved.name, size: saved.size, mime: saved.mime, at: new Date() };
+            await q(`UPDATE "admissionappeals" SET "files" = $2::jsonb, "updatedAt" = now() WHERE "_id" = $1`, [a._id, JSON.stringify([...files, entry])]);
+            void store;
+            return publicFiles([entry])[0];
+        });
+    } finally { await drop(); }
+}
+
+async function fileOf(schoolId, appealId, fileId, { applicationId = null } = {}) {
+    if (!isId(String(appealId || ''))) refuse('File not found', 404);
+    const { rows: [a] } = await pool.query(
+        `SELECT "files", "application" FROM "admissionappeals" WHERE "_id" = $1 AND "school" = $2`, [String(appealId), String(schoolId)]);
+    if (!a || (applicationId && String(a.application) !== String(applicationId))) refuse('File not found', 404);
+    const f = (Array.isArray(a.files) ? a.files : []).find((x) => x.id === String(fileId));
+    if (!f) refuse('File not found', 404);
+    return f;
+}
+
 /** Everything the decider needs: the appeal, the application, and for a re-check the marks as they stand. */
 async function detail(schoolId, id) {
     const a = await appealOf(schoolId, id);
@@ -162,12 +229,11 @@ async function detail(schoolId, id) {
     let exam = null; let result = null;
     if (a.exam) {
         exam = await AdmissionExam.findById(a.exam).select('name mode subjects maxMarks passMarks resultsStatus').lean();
-        result = (await pool.query(`SELECT "_id", "marks", "total", "percentage", "grade", "passed", "absent", "corrections", "remarks", "published" FROM "admissionresults" WHERE "exam" = $1 AND "application" = $2`, [a.exam, a.application])).rows[0] || null;
+        result = (await pool.query(`SELECT "_id", "marks", "autoScore", "manualScore", "total", "percentage", "grade", "passed", "absent", "corrections", "remarks", "published" FROM "admissionresults" WHERE "exam" = $1 AND "application" = $2`, [a.exam, a.application])).rows[0] || null;
     }
-    const reopenTo = a.kind === 'decision'
-        ? Object.entries(workflow.STATUSES).filter(([k, s]) => !s.closed && !s.system && k !== 'draft').map(([k, s]) => ({ key: k, label: s.label }))
-        : [];
-    return { appeal: a, application: app, exam, result, reopenTo };
+    const full = a.kind === 'decision' ? (await pool.query(`SELECT * FROM "admissionapplications" WHERE "_id" = $1`, [a.application])).rows[0] : null;
+    const reopenTo = full && DECISION_STATUSES.includes(full.status) ? await reopenChoices(full) : [];
+    return { appeal: { ...a, files: publicFiles(a.files) }, application: app, exam, result, reopenTo };
 }
 
 async function assign(req, id, userId) {
@@ -204,9 +270,32 @@ async function decide(req, id, input = {}) {
         const exam = await AdmissionExam.findById(a.exam).lean();
         const { rows: [res] } = await pool.query(`SELECT * FROM "admissionresults" WHERE "exam" = $1 AND "application" = $2`, [a.exam, a.application]);
         if (!exam || !res) refuse('The result is no longer there', 409);
-        if (!input.marks || typeof input.marks !== 'object') refuse('Enter the corrected marks — an upheld re-check changes them', 400, { field: 'marks' });
         const exams = require('./exams');
-        const row = await exams.correctResult(req, exam, res, { marks: input.marks, reason: `Re-check ${a.number}: ${decision.slice(0, 200)}` });
+        const why = `Re-check ${a.number}: ${decision.slice(0, 200)}`;
+        let change;
+        if (exam.mode === 'online') {
+            // An online result is its auto-marked score plus the evaluator's marks — there
+            // are no subject marks to correct. (Only subject marks were passed on before,
+            // so an upheld re-check of an online exam changed nothing.)
+            const given = (v) => v !== undefined && v !== null && v !== '' && Number.isFinite(Number(v));
+            if (!given(input.autoScore) && !given(input.manualScore)) refuse('Enter the corrected score — an upheld re-check changes it', 400, { field: 'autoScore' });
+            change = {
+                ...(given(input.autoScore) ? { autoScore: Number(input.autoScore) } : {}),
+                ...(given(input.manualScore) ? { manualScore: Number(input.manualScore) } : {}),
+            };
+            const same = (k) => change[k] === undefined || Number(change[k]) === (Number(res[k]) || 0);
+            if (same('autoScore') && same('manualScore')) refuse('The score entered is the same as before — an upheld re-check changes it. If nothing changes, answer "not upheld".', 400, { field: 'autoScore' });
+        } else {
+            if (!input.marks || typeof input.marks !== 'object') refuse('Enter the corrected marks — an upheld re-check changes them', 400, { field: 'marks' });
+            const differs = (exam.subjects || []).some((sub) => {
+                const now = input.marks[sub.key];
+                const was = res.marks?.[sub.key];
+                return (now === '' || now == null ? null : Number(now)) !== (was == null ? null : Number(was));
+            });
+            if (!differs) refuse('The marks entered are the same as before — an upheld re-check changes them. If nothing changes, answer "not upheld".', 400, { field: 'marks' });
+            change = { marks: input.marks };
+        }
+        const row = await exams.correctResult(req, exam, res, { ...change, reason: why });
         if (exam.resultsStatus === 'published') await exams.publishResultsNow(req, exam);
         result.outcome = { before: { marks: res.marks, total: res.total, grade: res.grade, passed: res.passed }, after: { marks: row.marks, total: row.total, grade: row.grade, passed: row.passed } };
     } else if (outcome === 'upheld' && a.kind === 'decision') {
@@ -214,7 +303,17 @@ async function decide(req, id, input = {}) {
         const target = workflow.STATUSES[to];
         if (!target || target.closed || target.system || to === 'draft') refuse('Choose the stage the application goes back to', 400, { field: 'reopenTo' });
         if (!DECISION_STATUSES.includes(app.status)) refuse('The application is no longer closed — it has moved on since the appeal', 409);
-        await require('./applications').move(req, app, to, { reopen: true, remarks: decision, note: `Appeal ${a.number} upheld${internalNote ? ` — ${internalNote}` : ''}`, quiet: true });
+        const choices = await reopenChoices(app);
+        if (!choices.some((c) => c.key === to)) refuse(`The application cannot go to ${target.label} from here — choose one of: ${choices.map((c) => c.label).join(', ') || 'nothing is open'}`, 409, { field: 'reopenTo' });
+        const apps = require('./applications');
+        const note = `Appeal ${a.number} upheld${internalNote ? ` — ${internalNote}` : ''}`;
+        // A closed application reopens to Under Review — the one door the workflow
+        // has — and goes on from there. Two moves, each its own: the second one's
+        // checks read (and may refresh) the row, which a shared transaction would
+        // still be holding. The choice was checked above, so the second succeeds.
+        let row = app;
+        if (workflow.isClosed(app.status)) row = await apps.move(req, app, 'under_review', { reopen: true, remarks: to === 'under_review' ? decision : '', note, quiet: true });
+        if (row.status !== to) await apps.move(req, row, to, { remarks: decision, note: workflow.isClosed(app.status) ? '' : note, quiet: true });
         result.outcome = { reopenedTo: to, from: app.status };
     }
     const { rows: [row] } = await pool.query(
@@ -231,4 +330,4 @@ async function decide(req, id, input = {}) {
     return row;
 }
 
-module.exports = { options, file, withdraw, forFamily, list, detail, assign, decide, KIND_LABEL };
+module.exports = { options, file, withdraw, forFamily, list, detail, assign, decide, attach, fileOf, reopenChoices, KIND_LABEL, DECISION_STATUSES };

@@ -62,7 +62,10 @@ async function loadSessionUser(userId) {
 // session endpoints every signed-in person needs — and nothing else. Deny by
 // default: a route added later is out of an applicant's reach whether or not
 // its author remembered a role guard.
-const GUEST_ALLOWED = /^\/api\/(auth\/(me|logout|accounts|switch|reset-password)|admission\/portal)(\/|\?|$)/;
+// (Nov 2026) …and their own profile and password, and letting this device
+// show their notifications — an applicant could change neither name, phone
+// nor password while signed in, and a phone could not register for a push.
+const GUEST_ALLOWED = /^\/api\/(auth\/(me|logout|accounts|switch|reset-password)|admission\/portal|notifications\/push\/(config|devices|devices\/remove))(\/|\?|$)/;
 
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];

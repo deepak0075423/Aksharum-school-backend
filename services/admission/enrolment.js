@@ -73,7 +73,8 @@ async function bulkPlan(req, { classId, roundId }) {
     const { bySection, after } = suggestSections(sections, live.map((x) => ({ id: String(x.app._id), gender: x.p.student.gender || 'Unknown' })));
     const rows = live.map(({ app, p }) => ({
         applicationId: app._id, applicationNumber: app.applicationNumber, studentName: p.student.name, gender: p.student.gender,
-        section: bySection[String(app._id)], studentEmail: p.student.email || '', canUseApplicantAccount: p.student.canUseApplicantAccount, applicantEmail: p.student.applicantEmail,
+        // A child with no address of their own: the parent's with the child's name after a "+" (conversion.suggestStudentEmail) — 50 rows used to be typed by hand.
+        section: bySection[String(app._id)], studentEmail: p.student.email || p.student.suggestedEmail || '', emailSuggested: !p.student.email && !!p.student.suggestedEmail, canUseApplicantAccount: p.student.canUseApplicantAccount, applicantEmail: p.student.applicantEmail,
         parent: { relation: p.parent.relation, name: p.parent.name, email: p.parent.email, phone: p.parent.phone, existing: p.parent.existing },
         blockers: p.blockers, warnings: p.warnings,
         hostelRequested: !!p.options?.hostel?.requested,

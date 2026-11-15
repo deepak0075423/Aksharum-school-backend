@@ -99,7 +99,9 @@ describe('admission — quotas, RTE allotments and the reimbursement register', 
         assert.equal((await imp({ rows: [{ ...rows[0], parentPhone: '12345' }] })).status, 400);
         const r = await imp({ rows });
         assert.equal(r.status, 201, JSON.stringify(r.body));
-        assert.deepEqual(r.body.data, { imported: 4, skipped: 0, accounts: 4 });
+        assert.equal(r.body.data.imported, 4);
+        assert.equal(r.body.data.skipped, 0);
+        assert.equal(r.body.data.accounts, 4);
         assert.equal((await imp({ rows })).body.data.skipped, 4, 'loading it again adds nothing');
         const allotted = await H.q(`SELECT * FROM "admissionapplications" WHERE "round" = $1 AND "quotaStatus" = 'allotted' ORDER BY "externalRef"`, [round._id]);
         assert.equal(allotted.length, 4);

@@ -20,7 +20,7 @@
  */
 const pool = require('../../db/pool');
 const { patch } = require('../../db/patch');
-const { withTransaction, buildInsert } = require('../dbTx');
+const { withTransaction, buildInsert, lock } = require('../dbTx');
 const AdmissionApplication = require('../../models/AdmissionApplication');
 const AdmissionRound = require('../../models/AdmissionRound');
 const AdmissionForm = require('../../models/AdmissionForm');
@@ -80,6 +80,40 @@ const feeOf = (round, classId, kind) => {
     return Math.max(0, Number(own ?? base) || 0);
 };
 
+/**
+ * The class's age rule, checked against the child's date of birth (Nov 2026 —
+ * it used to be shown on the landing page and checked nowhere). Returns what
+ * is wrong, in words for the family, or null. `ageOn` missing: age is counted
+ * on the first day of the academic year.
+ */
+function ageProblem(round, classId, dob, { yearStart = null } = {}) {
+    const e = (round?.classes || []).find((c) => String(c.class) === String(classId))?.eligibility;
+    if (!e || !dob) return null;
+    const born = new Date(dob);
+    if (Number.isNaN(born.getTime())) return null;
+    const day = (d) => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const key = (d) => new Date(d).toISOString().slice(0, 10);
+    if (e.dobFrom && key(born) < key(e.dobFrom)) return `This class is for children born on or after ${day(e.dobFrom)}`;
+    if (e.dobTo && key(born) > key(e.dobTo)) return `This class is for children born on or before ${day(e.dobTo)}`;
+    if (e.minAgeYears == null && e.maxAgeYears == null) return null;
+    const on = new Date(e.ageOn || yearStart || Date.now());
+    // Age in years with the months as a fraction, so "5.5 years" can be asked for.
+    let months = (on.getUTCFullYear() - born.getUTCFullYear()) * 12 + (on.getUTCMonth() - born.getUTCMonth());
+    if (on.getUTCDate() < born.getUTCDate()) months -= 1;
+    const age = months / 12;
+    const said = `${Math.floor(months / 12)} year${Math.floor(months / 12) === 1 ? '' : 's'}${months % 12 ? ` ${months % 12} month${months % 12 === 1 ? '' : 's'}` : ''}`;
+    if (e.minAgeYears != null && age < Number(e.minAgeYears)) return `The child must be at least ${e.minAgeYears} years old on ${day(on)} for this class (${said} on that day)`;
+    if (e.maxAgeYears != null && age > Number(e.maxAgeYears)) return `The child must be at most ${e.maxAgeYears} years old on ${day(on)} for this class (${said} on that day)`;
+    return null;
+}
+
+async function ageProblemFor(app, round, dob) {
+    const settings = await settingsSvc.getSettings(app.school);
+    if (settings.applications.enforceAge === false) return null;
+    const year = await AcademicYear.findById(app.academicYear).select('startDate').lean();
+    return ageProblem(round, app.class, dob, { yearStart: year?.startDate || null });
+}
+
 // ── The applicant's side ─────────────────────────────────────────────────────
 
 async function createDraft(req, portal, { roundId, classId, source = '' }) {
@@ -94,15 +128,6 @@ async function createDraft(req, portal, { roundId, classId, source = '' }) {
 
     const settings = portal.settings;
     const limit = Number(round.maxApplicationsPerApplicant) || settings.applications.maxPerApplicant;
-    const { rows: mine } = await pool.query(
-        `SELECT "status", "class" FROM ${T} WHERE "school" = $1 AND "applicant" = $2 AND "round" = $3`,
-        [String(schoolId), String(req.userId), String(roundId)]);
-    const live = mine.filter((a) => !['withdrawn', 'cancelled'].includes(a.status));
-    if (live.length >= limit) refuse(`You can make at most ${limit} application${limit === 1 ? '' : 's'} in this round`, 409, { code: 'APPLICATION_LIMIT' });
-    if (!settings.applications.allowReapplyAfterRejection
-        && mine.some((a) => String(a.class) === String(classId) && ['rejected', 'ineligible'].includes(a.status))) {
-        refuse('An application for this class in this round was not successful, and the school does not accept a second one', 409, { code: 'NO_REAPPLY' });
-    }
 
     const schema = found.version.schema;
     const defaults = {};
@@ -118,7 +143,21 @@ async function createDraft(req, portal, { roundId, classId, source = '' }) {
         data: defaults, applicationFeeAmount: appFee, applicationFeeStatus: appFee > 0 ? 'due' : 'not_required',
         source: str(from, 60), createdBy: req.userId,
     });
-    const { rows: [app] } = await pool.query(sql, params);
+    // The count and the insert under one lock per family and round: two
+    // "start an application" requests at the same moment cannot both pass the limit.
+    const app = await withTransaction(async (q) => {
+        await lock(q, `admission-apply:${req.userId}:${roundId}`);
+        const { rows: mine } = await q(
+            `SELECT "status", "class" FROM ${T} WHERE "school" = $1 AND "applicant" = $2 AND "round" = $3`,
+            [String(schoolId), String(req.userId), String(roundId)]);
+        const live = mine.filter((a) => !['withdrawn', 'cancelled'].includes(a.status));
+        if (live.length >= limit) refuse(`You can make at most ${limit} application${limit === 1 ? '' : 's'} in this round`, 409, { code: 'APPLICATION_LIMIT' });
+        if (!settings.applications.allowReapplyAfterRejection
+            && mine.some((a) => String(a.class) === String(classId) && ['rejected', 'ineligible'].includes(a.status))) {
+            refuse('An application for this class in this round was not successful, and the school does not accept a second one', 409, { code: 'NO_REAPPLY' });
+        }
+        return (await q(sql, params)).rows[0];
+    });
     events.recordQuietly(schoolId, { application: app._id, by: req, type: 'status', action: 'created', to: 'draft', message: 'Application started', visibility: 'applicant' });
     return app;
 }
@@ -172,7 +211,15 @@ async function saveDraft(req, app, input) {
     const updated = await patch(AdmissionApplication, app._id, { data, ...summary, lastActivityAt: new Date() }, { where: { status: app.status } });
     if (!updated) refuse('This application changed while you were editing — refresh to continue', 409);
     await documents.refresh(updated, schema);
-    return { app: updated, errors: r.errors };
+    // The class's age rule, said as soon as the date of birth is in — not after the fee is paid.
+    const errors = { ...r.errors };
+    if (updated.status === 'draft' && summary.studentDob) {
+        const dobKey = formEngine.mappedKey ? formEngine.mappedKey(schema, 'student.dob') : null;
+        const round = await AdmissionRound.findById(app.round).lean();
+        const bad = await ageProblemFor(updated, round, summary.studentDob).catch(() => null);
+        if (bad) errors[dobKey || 'student.dob'] = bad;
+    }
+    return { app: updated, errors };
 }
 
 /** The application's duplicates: same child (name + date of birth), or same family contact and date of birth, this year. */
@@ -210,12 +257,18 @@ async function submit(req, app) {
         classId: app.class, roundId: app.round, partial: false,
         docs: requireDocs ? have : new Proxy({}, { get: () => true }),
     });
-    if (requireDocs) {
-        for (const req2 of documents.requirements({ ...app, data: r.data }, schema, types)) {
-            if (req2.required && !have[req2.type.key] && !req2.fromForm) {
-                r.errors[`doc:${req2.type.key}`] = `${req2.type.name} — upload the document`;
-            }
-        }
+    for (const req2 of documents.requirements({ ...app, data: r.data }, schema, types)) {
+        // Asked for at submission by the school's setting — or by the document
+        // type itself ("must be in at submission"), whatever the setting says.
+        const now = requireDocs ? !req2.fromForm : req2.type.gate === 'submission';
+        if (now && req2.required && !have[req2.type.key]) r.errors[`doc:${req2.type.key}`] = `${req2.type.name} — upload the document`;
+    }
+    // The class's age rule — on a first submission; one the office sent back as
+    // incomplete was already let in.
+    if (app.status === 'draft') {
+        const dob = formEngine.summaryOf(schema, r.data).studentDob;
+        const bad = dob ? await ageProblemFor(app, round, dob) : null;
+        if (bad) r.errors[(formEngine.mappedKey && formEngine.mappedKey(schema, 'student.dob')) || 'student.dob'] = bad;
     }
     const errorKeys = Object.keys(r.errors);
     if (errorKeys.length) refuse(r.errors[errorKeys[0]], 400, { code: 'FORM_INVALID', errors: errorKeys.map((k) => ({ path: k, message: r.errors[k] })) });
@@ -265,6 +318,13 @@ async function submit(req, app) {
     // Moved here from another branch of the group: submitting it finishes the move (services/admission/groups.js).
     if (updated.transferFrom) await require('./groups').completeTransfer(req, updated).catch((e) => console.error('[admission] transfer:', e.message));
     notify.toApplicant(updated, 'application_submitted');
+    // Sent back as incomplete and now returned: whoever asked for it is told.
+    // (New applications are counted in the office's daily summary instead — one note each would bury the bell.)
+    if (!first) {
+        require('./staffAlerts').aboutApplication(updated, {
+            title: `Resubmitted: ${updated.studentName || updated.applicationNumber}`, body: `${updated.applicationNumber} was sent back as incomplete and has been submitted again.`,
+        });
+    }
     return updated;
 }
 
@@ -280,12 +340,32 @@ async function withdraw(req, app, reason = '') {
 /** Throw away a draft that was never submitted, with its files. */
 async function discardDraft(req, app) {
     if (app.status !== 'draft' || app.submittedAt) refuse('Only a draft that was never submitted can be deleted', 409);
+    const money = await moneyOn(app._id);
+    if (money.kept) refuse('A fee has been paid on this draft, so it is kept with its receipt — withdraw it instead, and ask the school about a refund', 409, { code: 'DRAFT_HAS_PAYMENT' });
+    if (money.open) refuse('A payment on this draft is still being confirmed — try again in a few minutes', 409, { code: 'PAYMENT_OPEN' });
     const docs = await documents.currentDocs(app._id);
     const { rows } = await pool.query(`SELECT "file" FROM "admissiondocuments" WHERE "application" = $1`, [String(app._id)]);
-    const del = await pool.query(`DELETE FROM ${T} WHERE "_id" = $1 AND "status" = 'draft' AND "submittedAt" IS NULL AND "applicant" = $2`, [String(app._id), String(req.userId)]);
-    if (!del.rowCount) refuse('This draft could not be deleted', 409);
+    await withTransaction(async (q) => {
+        // Orders that were opened and never paid go with the draft (the payments table refuses the delete otherwise).
+        await q(`DELETE FROM "admissionpayments" WHERE "application" = $1 AND "status" IN ('created', 'failed', 'cancelled') AND COALESCE("paymentId", '') = ''`, [String(app._id)]);
+        const del = await q(`DELETE FROM ${T} WHERE "_id" = $1 AND "status" = 'draft' AND "submittedAt" IS NULL AND "applicant" = $2`, [String(app._id), String(req.userId)]);
+        if (!del.rowCount) refuse('This draft could not be deleted', 409);
+    });
     for (const r of rows) require('./fileStore').remove(r.file);
     return { deleted: true, files: docs.length };
+}
+
+/**
+ * Money on an application, as far as deleting it goes: `kept` — a payment was
+ * received (paid, refunded, voided: each has a receipt that stays on record);
+ * `open` — an online order opened in the last half hour that may still be paid.
+ */
+async function moneyOn(applicationId) {
+    const { rows: [m] } = await pool.query(
+        `SELECT COUNT(*) FILTER (WHERE "status" IN ('paid', 'refunded', 'void') OR COALESCE("paymentId", '') <> '')::int AS kept,
+                COUNT(*) FILTER (WHERE "status" = 'created' AND "createdAt" > now() - interval '30 minutes')::int AS open
+           FROM "admissionpayments" WHERE "application" = $1`, [String(applicationId)]);
+    return { kept: m.kept > 0, open: m.open > 0 };
 }
 
 // ── Facts the workflow judges by ─────────────────────────────────────────────
@@ -297,9 +377,24 @@ async function factsFor(app, schema = null) {
                 COUNT(*) FILTER (WHERE c."status" = 'scheduled')::int AS pending,
                 COUNT(*) FILTER (WHERE c."status" <> 'withdrawn' AND (r."_id" IS NULL OR r."status" NOT IN ('approved', 'published')))::int AS unapproved
            FROM "admissioncandidates" c
+           JOIN "admissionexams" x ON x."_id" = c."exam" AND x."status" <> 'cancelled'
            LEFT JOIN "admissionresults" r ON r."exam" = c."exam" AND r."application" = c."application"
           WHERE c."application" = $1`, [String(app._id)]);
     return { app, docs, exams: { scheduled: e.scheduled, pending: e.pending }, results: { unapproved: e.unapproved } };
+}
+
+/**
+ * Where the application stood before it arrived at its present status — read
+ * from its history. What an action that takes its own step back (an exam
+ * cancelled) returns the application to.
+ */
+async function previousStatus(app, q = null) {
+    const run = q || ((s, p) => pool.query(s, p));
+    const { rows: [e] } = await run(
+        `SELECT "from" FROM "admissionevents" WHERE "application" = $1 AND "type" = 'status' AND "to" = $2 AND "from" <> '' ORDER BY "createdAt" DESC LIMIT 1`,
+        [String(app._id), app.status]);
+    const from = e?.from;
+    return from && workflow.STATUSES[from] && !workflow.STATUSES[from].closed && from !== 'draft' ? from : 'under_review';
 }
 
 // ── Moving an application ────────────────────────────────────────────────────
@@ -313,7 +408,8 @@ const REASON_STATUSES = ['rejected', 'ineligible', 'cancelled', 'withdrawn', 'in
  *
  * opts: { remarks (shown to the family), note (internal), reason, reopen,
  *         system, actorIsApplicant, q (a transaction), after [] (post-commit),
- *         set (extra columns), quiet (no email) }
+ *         set (extra columns), quiet (no email), undo (a system action taking
+ *         its own step back — see workflow.canMove) }
  */
 async function move(req, app, to, opts = {}) {
     const settings = await settingsSvc.getSettings(app.school);
@@ -321,7 +417,7 @@ async function move(req, app, to, opts = {}) {
     const access = require('./access');
     const isAdmin = opts.system ? true : await access.isAdmin(req);
     const facts = opts.system ? null : await factsFor(app);
-    const decision = workflow.canMove(app, to, { flow, isAdmin, actorId: req?.userId, facts, system: !!opts.system, reopen: !!opts.reopen });
+    const decision = workflow.canMove(app, to, { flow, isAdmin, actorId: req?.userId, facts, system: !!opts.system, reopen: !!opts.reopen, undo: !!opts.undo });
     if (!decision.ok) refuse(decision.reason, 409, { code: 'TRANSITION_REFUSED' });
     const remarks = str(opts.remarks, 1000);
     const reason = str(opts.reason, 500);
@@ -334,6 +430,11 @@ async function move(req, app, to, opts = {}) {
         const row = await patch(AdmissionApplication, app._id, { pendingTransition: pending }, { where: { status: app.status } });
         if (!row) refuse('The application changed — refresh and try again', 409);
         events.recordQuietly(app.school, { application: app._id, by: req, type: 'approval', action: 'requested', from: app.status, to, message: `Asked to move to ${workflow.STATUSES[to].label}${pending.note ? ` — ${pending.note}` : ''}` });
+        require('./staffAlerts').toAdmins(app.school, {
+            title: `Approval needed: ${app.studentName || app.applicationNumber || 'an application'}`,
+            body: `${req.user?.name || 'A colleague'} asked to move ${app.applicationNumber || 'an application'} to ${workflow.STATUSES[to].label}. It waits for an administrator.`,
+            link: { type: 'admission.application', entityId: String(app._id) }, except: req.userId,
+        });
         return { pending: true, application: row };
     }
 
@@ -351,7 +452,7 @@ async function move(req, app, to, opts = {}) {
         const fromLabel = workflow.STATUSES[app.status]?.label || app.status;
         await events.record(app.school, {
             application: app._id, by: opts.actorIsApplicant ? req : (opts.system && !req ? null : req), type: 'status',
-            action: opts.reopen ? 'reopened' : 'moved', from: app.status, to,
+            action: opts.reopen ? 'reopened' : opts.undo ? 'returned' : 'moved', from: app.status, to,
             message: `${meta.applicant || meta.label}${remarks ? ` — ${remarks}` : ''}`,
             visibility: 'applicant', meta: { fromLabel, note: str(opts.note, 500) || undefined, reason: reason || undefined },
         }, q);
@@ -399,6 +500,13 @@ async function assign(req, app, userId) {
     }
     const row = await patch(AdmissionApplication, app._id, { assignedTo: userId || null });
     events.recordQuietly(app.school, { application: app._id, by: req, type: 'assignment', action: userId ? 'assigned' : 'unassigned', message: userId ? `Assigned to ${name}` : 'Unassigned' });
+    if (userId && String(userId) !== String(req.userId) && String(userId) !== String(app.assignedTo || '')) {
+        require('./staffAlerts').toUsers(app.school, [userId], {
+            title: 'An application was assigned to you',
+            body: `${app.studentName || 'An applicant'}${app.applicationNumber ? ` (${app.applicationNumber})` : ''} is now yours to handle — assigned by ${req.user?.name || 'the admission office'}.`,
+            link: { type: 'admission.application', entityId: String(app._id) }, by: req.userId,
+        });
+    }
     return row;
 }
 
@@ -442,7 +550,7 @@ async function correctAnswers(req, app, input, reason) {
 }
 
 module.exports = {
-    EDITABLE, formFor, schemaOf, roundClosedReason, feeOf,
+    EDITABLE, formFor, schemaOf, roundClosedReason, feeOf, ageProblem, moneyOn, previousStatus,
     createDraft, openForEdit, saveDraft, submit, withdraw, discardDraft, duplicates,
     factsFor, move, decidePending, assign, addNote, correctAnswers,
 };

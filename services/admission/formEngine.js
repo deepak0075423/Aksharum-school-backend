@@ -467,6 +467,11 @@ function mapped(schema, data, target) {
     return f ? data?.[f.key] : undefined;
 }
 
+/** The key of the field mapped to `target`, or null — where a rule about that answer is reported. */
+function mappedKey(schema, target) {
+    return allFields(schema).find((x) => x.mapTo === target)?.key || null;
+}
+
 /**
  * The columns copied onto the application row for search and duplicates:
  * the child, and the family's main contact (guardian, else father, else
@@ -539,6 +544,6 @@ function withoutSensitive(schema) {
 module.exports = {
     FIELD_TYPES, INPUT_TYPES, CHOICE_TYPES, OPS, MAP_TARGETS, ALLOWED_KINDS, ID_KINDS,
     validateSchema, validateAnswers, applicableFields, allFields, fileFields, checkValue, conditionHolds,
-    migrateAnswers, mapped, summaryOf, answerRows, withoutSensitive,
+    migrateAnswers, mapped, mappedKey, summaryOf, answerRows, withoutSensitive,
     isAadhaarField, maskAadhaar, maskData, MASKED,
 };

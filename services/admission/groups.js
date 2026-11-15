@@ -250,11 +250,42 @@ async function offerTransfer(req, app, input = {}) {
     const bad = textProblem(reason, 'Reason'); if (bad) refuse(bad, 400, { field: 'reason' });
     const { rows: [open] } = await pool.query(`SELECT 1 FROM "admissiontransfers" WHERE "fromApplication" = $1 AND "status" IN ('pending', 'accepted')`, [String(app._id)]);
     if (open) refuse('A move of this application is already in progress', 409);
-    const { sql, params } = buildInsert(AdmissionTransfer, { group: g._id, fromSchool: app.school, fromApplication: app._id, toSchool, reason, status: 'pending', requestedBy: req.userId });
+    const { sql, params } = buildInsert(AdmissionTransfer, { group: g._id, fromSchool: app.school, fromApplication: app._id, toSchool, reason, status: 'pending', consent: 'asked', requestedBy: req.userId });
     const { rows: [t] } = await pool.query(sql, params);
     const { rows: [to] } = await pool.query(`SELECT "name" FROM "schools" WHERE "_id" = $1`, [toSchool]);
     events.recordQuietly(app.school, { application: app._id, by: req, type: 'group', action: 'transfer_offered', message: `Offered to ${to?.name || 'another branch'} — ${reason}` });
+    // The family decides whether their answers and documents go to another school.
+    events.recordQuietly(app.school, { application: app._id, by: req, type: 'group', action: 'transfer_consent_asked', visibility: 'applicant', message: `The school proposes moving this application to ${to?.name || 'another branch'}. Your answers and documents would be shared with that school — say yes or no on this page.` });
+    require('./notify').toApplicant(app, 'status_update', { remarks: `We propose moving this application to ${to?.name || 'another branch of our group'}. Nothing is shared with that school until you agree — open your application to say yes or no.` });
     return t;
+}
+
+/** The move the family is being asked about, or already agreed to and waiting on the other branch. */
+async function familyTransfer(app) {
+    const { rows: [t] } = await pool.query(
+        `SELECT t."_id", t."status", t."consent", t."reason", t."createdAt", s."name" AS "toSchoolName" FROM "admissiontransfers" t JOIN "schools" s ON s."_id" = t."toSchool"
+          WHERE t."fromApplication" = $1 AND t."status" = 'pending' ORDER BY t."createdAt" DESC LIMIT 1`, [String(app._id)]);
+    if (!t) return null;
+    return { _id: t._id, toSchoolName: t.toSchoolName, reason: t.reason, askedAt: t.createdAt, needsAnswer: t.consent !== 'given', agreed: t.consent === 'given' };
+}
+
+/** The family agrees to the move — or says no, and the offer is closed. */
+async function answerTransfer(req, app, id, agree) {
+    if (!isId(String(id || ''))) refuse('That move was not found', 404);
+    const { rows: [t] } = await pool.query(
+        `UPDATE "admissiontransfers" SET "consent" = $3, "consentAt" = now(), "status" = CASE WHEN $3 = 'refused' THEN 'cancelled' ELSE "status" END, "updatedAt" = now()
+          WHERE "_id" = $1 AND "fromApplication" = $2 AND "status" = 'pending' AND COALESCE("consent", '') <> 'given' RETURNING *`,
+        [String(id), String(app._id), agree ? 'given' : 'refused']);
+    if (!t) refuse('That move has already been answered', 409);
+    const { rows: [to] } = await pool.query(`SELECT "name" FROM "schools" WHERE "_id" = $1`, [t.toSchool]);
+    events.recordQuietly(app.school, {
+        application: app._id, by: req, type: 'group', action: agree ? 'transfer_consent_given' : 'transfer_consent_refused', visibility: 'applicant',
+        message: agree ? `You agreed to the move to ${to?.name || 'the other branch'} — your answers and documents can now be shared with it` : `You said no to the move to ${to?.name || 'the other branch'} — nothing was shared`,
+    });
+    const alerts = require('./staffAlerts');
+    if (agree) alerts.toAdmins(t.toSchool, { title: 'An application is waiting to move here', body: `${app.studentName || 'A family'} agreed to move their application from another branch. Accept or decline it under Branches.`, link: { type: 'admission.applications' } });
+    alerts.aboutApplication(app, { title: `Move to ${to?.name || 'another branch'}: the family said ${agree ? 'yes' : 'no'}`, body: `${app.applicationNumber || app.studentName}: ${agree ? 'the other branch can now accept it.' : 'the offer has been closed and nothing was shared.'}` });
+    return { agreed: !!agree };
 }
 
 async function transfers(req) {
@@ -285,6 +316,8 @@ async function decideTransfer(req, id, { accept, round, class: classId, answer }
         events.recordQuietly(t0.fromSchool, { application: t0.fromApplication, by: req, type: 'group', action: 'transfer_declined', message: `The other branch declined the move — ${reply}` });
         return t;
     }
+    // Not before the family has agreed: accepting copies their answers and documents to this school.
+    if (t0.consent !== 'given') refuse('The family has not agreed to the move yet — their answers and documents are shared only once they say yes on their application page', 409, { code: 'CONSENT_WAITING' });
     if (!isId(String(round || '')) || !isId(String(classId || ''))) refuse('Choose the round and class it joins', 400, { field: 'round' });
     const { rows: [src] } = await pool.query(`SELECT * FROM "admissionapplications" WHERE "_id" = $1`, [t0.fromApplication]);
     if (!src || !ACTIVE(src.status)) refuse('The application has closed since the move was offered', 409);
@@ -377,5 +410,5 @@ async function completeTransfer(req, app) {
 
 module.exports = {
     normalize, list, save, remove, groupOf, forSchool, setListed, publicView, familyView, setPreferences, withdrawSiblings, officeSiblings,
-    offerTransfer, transfers, decideTransfer, cancelTransfer, completeTransfer,
+    offerTransfer, transfers, decideTransfer, cancelTransfer, completeTransfer, familyTransfer, answerTransfer,
 };

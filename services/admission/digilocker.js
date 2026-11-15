@@ -106,51 +106,78 @@ async function call(url, opts = {}) {
 }
 
 /**
- * DigiLocker sends the family back here with a code (or an error). The code is
- * swapped for a token; the account and the list of issued documents are read.
- * Returns where to send the browser next — the application's page.
+ * DigiLocker sends the family's browser back here with a code (or an error).
+ * Nothing is connected at this point (Nov 2026): the code is handed on to the
+ * application's own page, and only a browser SIGNED IN AS THE APPLICATION'S
+ * OWNER can finish (complete, below). Before, whoever's browser arrived here
+ * with the state connected their locker — so a parent sent a link that
+ * somebody else had started would have attached their own DigiLocker to that
+ * person's application. Returns where to send the browser next.
  */
 async function callback({ code, state, error }) {
-    const c = config();
     const { rows: [s] } = await pool.query(`SELECT * FROM "admissiondigilockersessions" WHERE "state" = $1`, [String(state || '')]);
-    const back = async (ok) => {
-        if (!s) return `${String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '')}/`;
-        // Started in the phone app: back into it. The scheme is the server's own, never the request's.
-        if (s.client === 'app') return `${appScheme()}://modules/applicant-application?id=${s.application}&digilocker=${ok ? 'connected' : 'failed'}`;
-        const st = await settingsSvc.getSettings(s.school);
-        return `${String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '')}/${st.slug}/applications/${s.application}?digilocker=${ok ? 'connected' : 'failed'}`;
-    };
-    if (!s || s.status !== 'started' || new Date(s.expiresAt) < new Date()) return back(false);
+    const front = String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    if (!s) return `${front}/`;
+    const live = s.status === 'started' && new Date(s.expiresAt) >= new Date();
+    const ok = live && !error && !!code;
+    if (live && !ok) {
+        await pool.query(`UPDATE "admissiondigilockersessions" SET "status" = 'failed', "error" = $2, "codeVerifier" = '', "updatedAt" = now() WHERE "_id" = $1 AND "status" = 'started'`, [s._id, String(error || 'No code came back').slice(0, 300)]);
+    }
+    const q = ok
+        ? new URLSearchParams({ digilocker: 'return', dl_state: String(state), dl_code: String(code).slice(0, 600) })
+        : new URLSearchParams({ digilocker: 'failed' });
+    // Started in the phone app: back into it. The scheme is the server's own, never the request's.
+    if (s.client === 'app') return `${appScheme()}://modules/applicant-application?id=${s.application}&${q}`;
+    const st = await settingsSvc.getSettings(s.school);
+    return `${front}/${st.slug}/applications/${s.application}?${q}`;
+}
+
+/**
+ * Finish connecting: the signed-in owner of the application presents the
+ * state and the code their browser came back with. The code is swapped for a
+ * token; the account and the list of issued documents are read.
+ */
+async function complete(req, app, { state, code }) {
+    const c = config();
+    const { rows: [s] } = await pool.query(
+        `SELECT * FROM "admissiondigilockersessions" WHERE "state" = $1 AND "application" = $2 AND "applicant" = $3`, [String(state || ''), String(app._id), String(req.userId)]);
+    if (!s) refuse('This DigiLocker connection was not started from your account — start it again from this page', 409, { code: 'DIGILOCKER_NOT_YOURS' });
+    if (s.status === 'connected') return { connected: true };
+    if (s.status !== 'started' || new Date(s.expiresAt) < new Date()) refuse('The DigiLocker connection has expired — start it again', 409, { code: 'DIGILOCKER_EXPIRED' });
+    if (!code) refuse('DigiLocker did not send a code back — start it again', 400);
+    // One browser finishes it, once.
+    const { rowCount } = await pool.query(`UPDATE "admissiondigilockersessions" SET "status" = 'finishing', "updatedAt" = now() WHERE "_id" = $1 AND "status" = 'started'`, [s._id]);
+    if (!rowCount) refuse('The DigiLocker connection is already being finished', 409);
     const fail = async (why) => {
         await pool.query(`UPDATE "admissiondigilockersessions" SET "status" = 'failed', "error" = $2, "codeVerifier" = '', "updatedAt" = now() WHERE "_id" = $1`, [s._id, String(why).slice(0, 300)]);
-        return back(false);
+        refuse('DigiLocker could not be connected — try again', 502, { code: 'DIGILOCKER_FAILED' });
     };
-    if (error || !code) return fail(error || 'No code came back');
+    let tok; let user; let list;
     try {
-        const tok = await (await call(`${c.base}/1/token`, {
+        tok = await (await call(`${c.base}/1/token`, {
             method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({ grant_type: 'authorization_code', code: String(code), client_id: c.clientId, client_secret: c.secret, redirect_uri: c.redirectUri, code_verifier: s.codeVerifier }),
         })).json();
-        if (!tok.access_token) return fail('No access token');
+        if (!tok.access_token) throw new Error('No access token');
         const auth = { Authorization: `Bearer ${tok.access_token}` };
-        const user = tok.name ? tok : await (await call(`${c.base}/1/user`, { headers: auth })).json().catch(() => ({}));
-        const list = await (await call(`${c.base}/2/files/issued`, { headers: auth })).json();
-        const files = (Array.isArray(list?.items) ? list.items : []).filter((f) => f && f.uri && f.type !== 'dir').slice(0, 100).map((f) => ({
-            uri: String(f.uri).slice(0, 300), name: String(f.name || f.description || f.doctype || 'Document').slice(0, 160), doctype: String(f.doctype || '').slice(0, 40),
-            issuer: String(f.issuer || '').slice(0, 160), date: String(f.date || '').slice(0, 30), mime: Array.isArray(f.mime) ? f.mime.join(',') : String(f.mime || ''), size: Number(f.size) || 0,
-        }));
-        const account = {
-            name: String(user.name || '').slice(0, 120), dob: isoDob(user.dob), gender: String(user.gender || '').slice(0, 10),
-            idHash: user.digilockerid ? crypto.createHash('sha256').update(String(user.digilockerid)).digest('hex').slice(0, 32) : '',
-        };
-        await pool.query(
-            `UPDATE "admissiondigilockersessions" SET "status" = 'connected', "token" = $2, "account" = $3::jsonb, "files" = $4::jsonb, "codeVerifier" = '', "updatedAt" = now() WHERE "_id" = $1`,
-            [s._id, seal(tok.access_token), JSON.stringify(account), JSON.stringify(files)]);
-        events.recordQuietly(s.school, { application: s.application, by: { _id: s.applicant, role: 'guest' }, type: 'document', action: 'digilocker_connected', message: `DigiLocker connected — ${files.length} issued document(s) found`, visibility: 'applicant' });
-        return back(true);
+        user = tok.name ? tok : await (await call(`${c.base}/1/user`, { headers: auth })).json().catch(() => ({}));
+        list = await (await call(`${c.base}/2/files/issued`, { headers: auth })).json();
     } catch (e) {
-        return fail(e.message);
+        await fail(e.message);
     }
+    const files = (Array.isArray(list?.items) ? list.items : []).filter((f) => f && f.uri && f.type !== 'dir').slice(0, 100).map((f) => ({
+        uri: String(f.uri).slice(0, 300), name: String(f.name || f.description || f.doctype || 'Document').slice(0, 160), doctype: String(f.doctype || '').slice(0, 40),
+        issuer: String(f.issuer || '').slice(0, 160), date: String(f.date || '').slice(0, 30), mime: Array.isArray(f.mime) ? f.mime.join(',') : String(f.mime || ''), size: Number(f.size) || 0,
+    }));
+    const account = {
+        name: String(user.name || '').slice(0, 120), dob: isoDob(user.dob), gender: String(user.gender || '').slice(0, 10),
+        idHash: user.digilockerid ? crypto.createHash('sha256').update(String(user.digilockerid)).digest('hex').slice(0, 32) : '',
+    };
+    await pool.query(
+        `UPDATE "admissiondigilockersessions" SET "status" = 'connected', "token" = $2, "account" = $3::jsonb, "files" = $4::jsonb, "codeVerifier" = '', "updatedAt" = now() WHERE "_id" = $1`,
+        [s._id, seal(tok.access_token), JSON.stringify(account), JSON.stringify(files)]);
+    events.recordQuietly(s.school, { application: s.application, by: { _id: s.applicant, role: 'guest' }, type: 'document', action: 'digilocker_connected', message: `DigiLocker connected — ${files.length} issued document(s) found`, visibility: 'applicant' });
+    return { connected: true, files: files.length };
 }
 
 /** The live session of an application, if any (an expired one is ended on the way). */
@@ -221,4 +248,4 @@ async function expire() {
     return rowCount;
 }
 
-module.exports = { config, available, start, callback, view, importFile, expire, isoDob, seal, open };
+module.exports = { config, available, start, callback, complete, view, importFile, expire, isoDob, seal, open };

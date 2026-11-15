@@ -122,6 +122,11 @@ describe('admission — selection, offers, confirmation and enrolment', () => {
         assert.equal(cheque.status, 400, 'a cheque needs its number');
         const paid = await H.api('POST', `/admission/admin/applications/${apps[0]._id}/payments`, { token: s.adminToken, body: { kind: 'admission_fee', amount: 1000, mode: 'cheque', reference: '000123' } });
         assert.equal(paid.status, 201);
+        // A cheque is money once the bank has paid it: the seat is not confirmed on one still to clear.
+        const uncleared = await H.api('POST', `/admission/admin/applications/${apps[0]._id}/confirm`, { token: s.adminToken });
+        assert.equal(uncleared.status, 409);
+        assert.ok(uncleared.body.errors.some((e) => /000123.*not been marked as cleared/.test(e.message)), JSON.stringify(uncleared.body));
+        assert.equal((await H.api('POST', `/admission/admin/applications/${apps[0]._id}/payments/${paid.body.data._id}/clear`, { token: s.adminToken })).status, 200);
         const ok = await H.api('POST', `/admission/admin/applications/${apps[0]._id}/confirm`, { token: s.adminToken });
         assert.equal(ok.status, 200, JSON.stringify(ok.body));
         assert.equal(await status(apps[0]._id), 'confirmed');
