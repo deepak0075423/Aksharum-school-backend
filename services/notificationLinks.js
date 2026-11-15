@@ -373,7 +373,10 @@ const ROUTES = {
     // the document's page (Nov 2026).
     'documents.item': {
         school_admin: { web: '/admin/documents/{id}',            mobile: '/modules/document-detail?id={id}' },
-        teacher:      { web: '/teacher/documents?focus={id}',    mobile: '/modules/document-detail?id={id}' },
+        // A teacher lands on the document's own page: their list opens on
+        // "Shared with me", where a notice about their OWN document (work
+        // handed in, a question asked) flagged nothing at all.
+        teacher:      { web: '/teacher/documents/{id}',          mobile: '/modules/document-detail?id={id}' },
         student:      { web: '/student/documents?focus={id}',    mobile: '/modules/document-detail?id={id}' },
         parent:       { web: '/parent/documents?focus={id}',     mobile: '/modules/document-detail?id={id}' },
     },

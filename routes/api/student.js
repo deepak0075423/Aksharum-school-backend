@@ -8,6 +8,7 @@ const examCtrl       = require('../../controllers/aptitudeExam.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const docViewer      = require('../../controllers/documentViewer.controller');
 const docDetail      = require('../../controllers/documentDetail.controller');
+const { checkUploads } = require('../../services/documentAccess');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const formalExamCtrl = require('../../controllers/formalExam.controller');
 const classTestCtrl  = require('../../controllers/classTest.controller');
@@ -71,7 +72,7 @@ router.get('/exams/:id/result',          examGuard, examCtrl.getStudentResult);
 // Documents
 router.get('/documents',              docGuard, docViewer.studentGetDocuments);
 router.get('/documents/:id',          docGuard, docCtrl.studentGetDocument);
-router.post('/documents/:id/submit',  docGuard, uploadDocument.array('files', 5), docCtrl.studentSubmitAssignment);
+router.post('/documents/:id/submit',  docGuard, uploadDocument.array('files', 5), checkUploads, docCtrl.studentSubmitAssignment);
 router.post('/documents/read',        docGuard, docViewer.markRead);
 router.post('/documents/:id/read',    docGuard, docViewer.markRead);
 // The discussion under a document — only what is marked for everyone, and only

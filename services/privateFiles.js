@@ -31,8 +31,9 @@
  *                    designations the leave type's policy lets approve
  *   attendance-docs  school admins, attendance admins, the student and their
  *                    parents, the section's class and vice class teacher
- *   documents        anyone signed in at the school the file belongs to (the
- *                    Documents module decides who is shown the link); a Video
+ *   documents        whoever the document, comment or submission the file
+ *                    hangs off is open to (services/documentAccess), and only
+ *                    while the school's Documents module is on; a Video
  *                    Learning asset, anyone signed in
  */
 const crypto = require('crypto');
@@ -261,20 +262,32 @@ const RULES = {
         return false;
     },
 
+    /**
+     * The Documents module's files — each judged by what it hangs off
+     * (services/documentAccess.fileAccess): a document's own file by who the
+     * document reaches, a comment's attachment the same (staff only when the
+     * comment is), a student's submitted work by the student, their parents
+     * and the staff who mark it. "Anyone signed in at the school" let one
+     * student open another's homework with nothing but the address. Nothing
+     * is served while the school's Documents module is switched off.
+     */
     async documents(v, name) {
         const pat = `%${name.replace(/[%_\\]/g, (m) => `\\${m}`)}%`;
-        const rows = await q(
-            `SELECT "school"::text AS school FROM "documents" WHERE "files"::text LIKE $1
-             UNION ALL SELECT "school"::text FROM "documentversions" WHERE "files"::text LIKE $1
-             UNION ALL SELECT "school"::text FROM "documentcomments" WHERE "files"::text LIKE $1
-             UNION ALL SELECT "school"::text FROM "assignmentsubmissions" WHERE "files"::text LIKE $1
-             UNION ALL SELECT '*' FROM "videoassets" WHERE "fileUrl" LIKE $1`,
-            [pat],
-        ).catch(() => []);
-        return rows.some((r) => r.school === '*' || (r.school && r.school === v.sid));
+        // A Video Learning asset kept in this folder: anyone signed in.
+        const video = await q(`SELECT 1 FROM "videoassets" WHERE "fileUrl" LIKE $1 LIMIT 1`, [pat]).catch(() => []);
+        if (video.length) return true;
+        const access = require('./documentAccess');
+        if (!(await access.moduleOn(v.sid))) return false;
+        const found = await access.fileAccess(v, name);
+        if (found.originalName) {
+            if (documentNames.size > 20000) documentNames.clear();
+            documentNames.set(name, found.originalName);
+        }
+        return found.ok;
     },
 };
 
+const documentNames = new Map();   // stored name → the name it was uploaded under
 const decisionCache = new Map();   // uid|folder/name → { ok, until }
 async function canRead(viewer, folder, name) {
     if (!viewer) return false;
@@ -319,6 +332,16 @@ async function serve(req, res, folder, name) {
     }
     res.set('Cache-Control', 'private, no-store');
     res.set('X-Robots-Tag', 'noindex');
+    // A shared document goes out under the name it was uploaded with, not the
+    // one it is stored under ("1794323118661-668451442.pdf"); `?dl=1` saves it
+    // rather than showing it. The `download` attribute on a link cannot do
+    // either when the API is on another host.
+    const original = folder === 'documents' ? documentNames.get(name) : '';
+    if (original) {
+        const plain = original.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+        res.set('Content-Disposition',
+            `${req.query?.dl ? 'attachment' : 'inline'}; filename="${plain}"; filename*=UTF-8''${encodeURIComponent(original)}`);
+    }
     res.sendFile(abs, { dotfiles: 'deny' }, (err) => {
         if (err && !res.headersSent) res.status(err.statusCode === 404 || err.code === 'ENOENT' ? 404 : 500).json({ success: false, message: 'File not found' });
     });

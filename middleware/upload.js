@@ -32,6 +32,16 @@ const docFilter = (req, file, cb) => {
     cb(ok ? null : new Error('Unsupported file type'), ok);
 };
 
+// The Documents module: what a school shares and what students hand in. A
+// phone photographs homework as HEIC or WebP as often as JPEG, so those are
+// taken too. What a file really is gets checked after the upload
+// (services/documentAccess.checkUploads) — this reads the name alone.
+const DOCUMENT_TYPES = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'];
+const sharedDocFilter = (req, file, cb) => {
+    const ok = new RegExp(`\\.(${DOCUMENT_TYPES.join('|')})$`, 'i').test(file.originalname);
+    cb(ok ? null : new Error(`${file.originalname} cannot be attached — use a PDF, a Word, Excel or PowerPoint file, a text file or a photo`), ok);
+};
+
 const excelFilter = (req, file, cb) => {
     const ok = /\.(xlsx|xls|csv)$/i.test(file.originalname);
     cb(ok ? null : new Error('Only Excel/CSV files allowed'), ok);
@@ -51,7 +61,7 @@ const videoFilter = (req, file, cb) => {
 };
 
 const uploadProfile  = multer({ storage: diskStorage('profiles'),  fileFilter: imageFilter, limits: { fileSize: 5 * 1024 * 1024 } });
-const uploadDocument = multer({ storage: diskStorage('documents'), fileFilter: docFilter,   limits: { fileSize: 10 * 1024 * 1024 } });
+const uploadDocument = multer({ storage: diskStorage('documents'), fileFilter: sharedDocFilter, limits: { fileSize: 10 * 1024 * 1024 } });
 const uploadExcel    = multer({ storage: multer.memoryStorage(),   fileFilter: excelFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 const uploadImage    = multer({ storage: diskStorage('images'),    fileFilter: imageFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 const uploadLeaveDoc = multer({ storage: diskStorage('leave-docs'), fileFilter: docFilter,  limits: { fileSize: 5 * 1024 * 1024 } });
@@ -120,13 +130,39 @@ const uploadLmsRequestDoc = multer({ storage: diskStorage('lms-requests'), fileF
  * error — some handlers run these by hand and wait on next() — and takes the
  * files it brought with it.
  */
+/**
+ * A file the upload would not take is the sender's to fix, not a server
+ * fault: it used to go out as a 500 with multer's own words ("File too
+ * large"), which every screen showed as an error in the app.
+ */
+const UPLOAD_WORDS = {
+    LIMIT_FILE_SIZE: 'One of the files is too large to attach',
+    LIMIT_FILE_COUNT: 'Too many files were attached',
+    LIMIT_UNEXPECTED_FILE: 'Too many files were attached',
+    LIMIT_PART_COUNT: 'Too much was attached',
+    LIMIT_FIELD_VALUE: 'One of the fields is too long',
+};
+function uploadRefusal(err) {
+    if (!err || err.status) return err;
+    if (err instanceof multer.MulterError) {
+        err.message = UPLOAD_WORDS[err.code] || err.message;
+        err.status = 400;
+        err.code = err.code || 'UPLOAD_REFUSED';
+    } else if (/unsupported file type|cannot be attached|only .* (allowed|files)|upload a |attach a /i.test(err.message || '')) {
+        // The file filters above refuse with a plain Error.
+        err.status = 400;
+        err.code = 'UNSUPPORTED_FILE';
+    }
+    return err;
+}
+
 const withPhoneCheck = (instance) => {
     for (const kind of ['single', 'array', 'fields', 'none', 'any']) {
         const make = instance[kind].bind(instance);
         instance[kind] = (...args) => {
             const read = make(...args);
             return (req, res, next) => read(req, res, (err) => {
-                if (err) return next(err);
+                if (err) return next(uploadRefusal(err));
                 const phoneBad = checkPhoneFields(req.body);
                 const textBad = phoneBad ? null : (textExempt(req) ? null : checkText(req.body, textOptionsFor(req)));
                 const bad = phoneBad || textBad;
@@ -145,4 +181,4 @@ const withPhoneCheck = (instance) => {
 [uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo,
     uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc, uploadAdmissionDoc, uploadLmsImage, uploadLmsRequestDoc].forEach(withPhoneCheck);
 
-module.exports = { uploadLmsImage, uploadLmsRequestDoc, uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
+module.exports = { DOCUMENT_TYPES, uploadLmsImage, uploadLmsRequestDoc, uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

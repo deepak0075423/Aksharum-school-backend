@@ -28,6 +28,8 @@ const User               = require('../models/User');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const pool               = require('../db/pool');
 const { yearOrderSql } = require('../utils/listOrder');
+const access             = require('../services/documentAccess');
+const { isUuid, placeCte, REACH } = access;
 
 const qt = (Model) => `"${Model.tableName}"`;
 const ids = (list) => (list || []).map(String).filter(Boolean);
@@ -35,48 +37,31 @@ const ids = (list) => (list || []).map(String).filter(Boolean);
 // ── Where one student sits ───────────────────────────────────────────────────
 
 /**
- * The classes and sections a document may be addressed to for this student to
- * see it.
+ * Where a student sits today, in words — "Class 9 - A" under the page title.
  *
- * Expanded across academic years on (class number, section name) rather than
- * matched on the stored ids: a class row exists once per year, so a document
- * filed against last year's "Class 9 - A" is still this year's Class 9 - A to
- * everyone reading it. This is the same rule the admin roster uses, so the two
- * always agree about who a document reached.
+ * Only the label. Whether a document reaches a student is decided by where
+ * they sat in THAT DOCUMENT'S academic year (services/documentAccess), which
+ * this pointer cannot answer once a year has rolled over.
  */
-async function reachOf(studentUserId, schoolId) {
+async function reachOf(studentUserId) {
     const profile = await StudentProfile.findOne({ user: studentUserId }).lean();
-    const empty = { classes: [], sections: [], label: '', sectionId: null };
-    if (!profile?.currentSection) return empty;
-
+    if (!profile?.currentSection) return { label: '', sectionId: null };
     const { rows } = await pool.query(
-        `WITH me AS (
-           SELECT c."classNumber", s."sectionName", c."className"
-             FROM ${qt(ClassSection)} s
-             JOIN ${qt(Class)} c ON c."_id" = s."class"
-            WHERE s."_id" = $1
-         )
-         SELECT
-           (SELECT array_agg(c2."_id")
-              FROM ${qt(Class)} c2, me
-             WHERE c2."school" = $2 AND c2."classNumber" = me."classNumber")        AS "classes",
-           (SELECT array_agg(s2."_id")
-              FROM ${qt(ClassSection)} s2
-              JOIN ${qt(Class)} c3 ON c3."_id" = s2."class", me
-             WHERE s2."school" = $2
-               AND c3."classNumber" = me."classNumber"
-               AND s2."sectionName" = me."sectionName")                             AS "sections",
-           (SELECT me."className" || ' - ' || me."sectionName" FROM me)             AS "label"`,
-        [String(profile.currentSection), String(schoolId)],
+        `SELECT c."className" || ' - ' || s."sectionName" AS "label"
+           FROM ${qt(ClassSection)} s JOIN ${qt(Class)} c ON c."_id" = s."class"
+          WHERE s."_id" = $1`,
+        [String(profile.currentSection)],
     );
-    const r = rows[0] || {};
-    return {
-        classes:  ids(r.classes),
-        sections: ids(r.sections),
-        label:    r.label || '',
-        sectionId: String(profile.currentSection),
-    };
+    return { label: rows[0]?.label || '', sectionId: String(profile.currentSection) };
 }
+
+/**
+ * The lateral join that says which of the students in `place` a row reaches,
+ * as `reach.ids`. Goes after SELECT(…), which names the document `d` and its
+ * year `ay`.
+ */
+const REACH_JOIN = `
+    LEFT JOIN LATERAL (SELECT ${REACH} AS ids) reach ON true`;
 
 // ── Reading the shelf ────────────────────────────────────────────────────────
 
@@ -88,7 +73,7 @@ const SELECT = (extra = '', reader = null) => `
   SELECT d."_id", d."title", d."description", d."category", d."docType", d."subject",
          d."targetType", d."targetClasses", d."targetSections", d."targetUsers",
          d."isAssignment", d."assignmentType", d."dueDate", d."allowSubmission",
-         d."totalMarks", d."files", d."createdAt", d."updatedAt", d."academicYear",
+         d."totalMarks", d."files", d."createdAt", d."updatedAt", d."academicYear", d."isArchived",
          u."_id" AS "uploaderId", u."name" AS "uploaderName",
          u."role" AS "uploaderRole", u."profileImage" AS "uploaderPhoto",
          ay."yearName" AS "academicYearName",
@@ -123,7 +108,7 @@ function sharedWith(r) {
 }
 
 function shapeDoc(r) {
-    const files = Array.isArray(r.files) ? r.files : [];
+    const files = access.publicFiles(r.files);
     return {
         _id: r._id,
         title: r.title,
@@ -148,6 +133,7 @@ function shapeDoc(r) {
         fileSize: files.reduce((n, f) => n + (Number(f.fileSize) || 0), 0),
         // Opened by whoever is asking. Their own upload is never "unread".
         isRead: !!r.readAt,
+        isArchived: !!r.isArchived,
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
         academicYear: r.academicYear,
@@ -167,12 +153,24 @@ function shapeDoc(r) {
  */
 function stateOf(doc, submission) {
     if (!doc.isAssignment) return null;
-    if (submission?.status === 'submitted' || submission?.status === 'late') {
-        return submission.marks != null ? 'marked' : submission.status;
-    }
+    // Marked, whether or not anything was handed in through the app — work
+    // done on paper can be marked too.
+    if (submission?.marks != null) return 'marked';
+    if (submission?.status === 'submitted' || submission?.status === 'late') return submission.status;
+    // Nothing handed in and nothing can be: not "to do" and not "missed",
+    // neither of which the student could act on.
+    if (!doc.allowSubmission) return 'closed';
     if (doc.dueDate && Date.now() > new Date(doc.dueDate).getTime()) return 'missed';
     return 'pending';
 }
+
+/** A submission as its owner (or their parent) reads it. */
+const shapeSub = (sub, withFiles = true) => (sub ? {
+    _id: sub._id, status: sub.status, submittedAt: sub.submittedAt,
+    marks: sub.marks ?? null, feedback: sub.feedback || '', reviewedAt: sub.reviewedAt || null,
+    questionScores: Array.isArray(sub.questionScores) ? sub.questionScores : [],
+    ...(withFiles ? { files: access.publicFiles(sub.files) } : {}),
+} : null);
 
 /** The school's filing labels, for the category dropdown. */
 async function categoriesOf(schoolId) {
@@ -203,7 +201,7 @@ async function yearsOf(schoolId) {
 function yearClause(req, years, params) {
     if (req.query.year === 'all') return '';
     const wanted = req.query.year
-        ? years.find((y) => String(y._id) === String(req.query.year))
+        ? (isUuid(req.query.year) ? years.find((y) => String(y._id) === String(req.query.year)) : null)
         : years.find((y) => y.status === 'active');
     if (!wanted) return '';
     params.push(String(wanted._id));
@@ -218,18 +216,18 @@ exports.studentGetDocuments = async (req, res) => {
     try {
         const school = String(req.schoolId);
         const [reach, years, categories] = await Promise.all([
-            reachOf(req.userId, school), yearsOf(school), categoriesOf(school),
+            reachOf(req.userId), yearsOf(school), categoriesOf(school),
         ]);
 
-        const params = [school, reach.classes, reach.sections, String(req.userId)];
+        const params = [school, [String(req.userId)], String(req.userId)];
         const year   = yearClause(req, years, params);
 
         const { rows } = await pool.query(
-            `${SELECT('', '$4::uuid')}
+            `WITH ${placeCte('$2')}
+             ${SELECT('', '$3::uuid')}
+             ${REACH_JOIN}
               WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
-                AND ( d."targetType" = 'whole_school'
-                   OR (d."targetType" = 'class'          AND d."targetClasses"  ?| $2::text[])
-                   OR (d."targetType" = 'class_sections' AND d."targetSections" ?| $3::text[]) )
+                AND cardinality(reach.ids) > 0
               ORDER BY d."createdAt" DESC`,
             params,
         );
@@ -243,15 +241,7 @@ exports.studentGetDocuments = async (req, res) => {
 
         const data = docs.map((d) => {
             const sub = byDoc[String(d._id)] || null;
-            return {
-                ...d,
-                mySubmission: sub && {
-                    _id: sub._id, status: sub.status, submittedAt: sub.submittedAt,
-                    marks: sub.marks, feedback: sub.feedback,
-                    files: sub.files || [], reviewedAt: sub.reviewedAt,
-                },
-                state: stateOf(d, sub),
-            };
+            return { ...d, mySubmission: shapeSub(sub), state: stateOf(d, sub) };
         });
 
         res.json({
@@ -293,9 +283,11 @@ function countsOf(docs, pick = (d) => d) {
  */
 exports.parentGetDocuments = async (req, res) => {
     try {
-        const school  = String(req.schoolId);
-        const parent  = await ParentProfile.findOne({ user: req.userId }).lean();
-        const childIds = ids(parent?.children?.length ? parent.children : [parent?.student]);
+        const school   = String(req.schoolId);
+        // Both links a parent can be joined to a child by, re-read as students
+        // of this school (services/parentChildren) — the profile's own list
+        // alone missed a child linked from the student's side.
+        const childIds = await access.childIds(req.userId, school);
 
         const [years, categories] = await Promise.all([yearsOf(school), categoriesOf(school)]);
 
@@ -312,45 +304,37 @@ exports.parentGetDocuments = async (req, res) => {
             });
         }
 
-        // Who they are, and where each one sits.
-        const [people, reaches] = await Promise.all([
-            pool.query(
-                `SELECT u."_id", u."name", u."profileImage",
-                        c."className" || ' - ' || s."sectionName" AS "className",
-                        sp."rollNumber"
-                   FROM ${qt(User)} u
-                   LEFT JOIN ${qt(StudentProfile)} sp ON sp."user" = u."_id"
-                   LEFT JOIN ${qt(ClassSection)} s    ON s."_id"   = sp."currentSection"
-                   LEFT JOIN ${qt(Class)} c           ON c."_id"   = s."class"
-                  WHERE u."_id" = ANY($1::uuid[])
-                  ORDER BY u."name"`,
-                [childIds],
-            ),
-            Promise.all(childIds.map((id) => reachOf(id, school))),
-        ]);
-
-        const reachOfChild = Object.fromEntries(childIds.map((id, i) => [id, reaches[i]]));
+        // Who they are, and where each one sits today.
+        const people = await pool.query(
+            `SELECT u."_id", u."name", u."profileImage",
+                    c."className" || ' - ' || s."sectionName" AS "className",
+                    sp."rollNumber"
+               FROM ${qt(User)} u
+               LEFT JOIN ${qt(StudentProfile)} sp ON sp."user" = u."_id"
+               LEFT JOIN ${qt(ClassSection)} s    ON s."_id"   = sp."currentSection"
+               LEFT JOIN ${qt(Class)} c           ON c."_id"   = s."class"
+              WHERE u."_id" = ANY($1::uuid[])
+              ORDER BY u."name"`,
+            [childIds],
+        );
         const children = people.rows.map((r) => ({
             _id: r._id,
             name: r.name,
             photo: r.profileImage || '',
-            className: r.className || reachOfChild[String(r._id)]?.label || '',
+            className: r.className || '',
             rollNumber: r.rollNumber || '',
         }));
 
-        // The union of every child's reach — one query rather than one per child.
-        const allClasses  = [...new Set(reaches.flatMap((r) => r.classes))];
-        const allSections = [...new Set(reaches.flatMap((r) => r.sections))];
-
-        const params = [school, allClasses, allSections, String(req.userId)];
+        const params = [school, childIds, String(req.userId)];
         const year   = yearClause(req, years, params);
 
+        // One read for all of them: each row says which children it reaches.
         const { rows } = await pool.query(
-            `${SELECT('', '$4::uuid')}
+            `WITH ${placeCte('$2')}
+             ${SELECT(', reach.ids AS "reaches"', '$3::uuid')}
+             ${REACH_JOIN}
               WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
-                AND ( d."targetType" = 'whole_school'
-                   OR (d."targetType" = 'class'          AND d."targetClasses"  ?| $2::text[])
-                   OR (d."targetType" = 'class_sections' AND d."targetSections" ?| $3::text[]) )
+                AND cardinality(reach.ids) > 0
               ORDER BY d."createdAt" DESC`,
             params,
         );
@@ -365,15 +349,8 @@ exports.parentGetDocuments = async (req, res) => {
         const subFor = {};
         for (const s of subs) (subFor[String(s.document)] ||= {})[String(s.student)] = s;
 
-        const reaches_ = (raw, reach) => {
-            if (raw.targetType === 'whole_school') return true;
-            if (raw.targetType === 'class')          return ids(raw.targetClasses).some((c) => reach.classes.includes(c));
-            if (raw.targetType === 'class_sections') return ids(raw.targetSections).some((s) => reach.sections.includes(s));
-            return false;
-        };
-
         const data = docs.map(({ raw, doc }) => {
-            const forChildren = childIds.filter((id) => reaches_(raw, reachOfChild[id]));
+            const forChildren = childIds.filter((id) => (raw.reaches || []).includes(id));
             // One entry per child the document actually reaches, so the page can
             // say "Aarav submitted, Diya has not" without asking again.
             const perChild = Object.fromEntries(forChildren.map((id) => {
@@ -410,7 +387,7 @@ exports.parentGetDocuments = async (req, res) => {
 };
 
 /** The most urgent thing any child still owes on one document. */
-const STATE_RANK = { missed: 4, pending: 3, submitted: 2, late: 2, marked: 1 };
+const STATE_RANK = { missed: 5, pending: 4, submitted: 3, late: 3, marked: 2, closed: 1 };
 
 function worstState(perChild) {
     let best = null;
@@ -423,58 +400,9 @@ function worstState(perChild) {
 
 // ── Teacher ──────────────────────────────────────────────────────────────────
 
-/**
- * The sections a teacher stands in front of.
- *
- * Two different answers come out of this, and conflating them is a bug either
- * way:
- *
- *   • `sections` / `classes` — everything, across every year on record. This is
- *     what decides whether a teacher may READ a document, and a document filed
- *     under last year is still theirs to open.
- *   • `postable` / `list` — only this year's, one row per section. A class row
- *     exists once per academic year, so a teacher of "Class 9 - A" holds four
- *     of them; offering all four in a picker asks them to choose between four
- *     chips with the same name, and sharing to a closed year reaches nobody.
- *
- * With no year marked active the two collapse — a school still setting itself
- * up must not be locked out of sharing.
- */
-async function teacherReach(teacherId, schoolId) {
-    const { rows } = await pool.query(
-        `SELECT DISTINCT s."_id" AS "section", s."class",
-                c."className" || ' - ' || s."sectionName" AS "label",
-                c."classNumber", s."sectionName",
-                (ay."status" = 'active') AS "current"
-           FROM ${qt(ClassSection)} s
-           JOIN ${qt(Class)} c            ON c."_id"  = s."class"
-           LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = c."academicYear"
-          WHERE s."school" = $1
-            AND ( s."classTeacher" = $2
-               OR s."substituteTeacher" = $2
-               OR s."_id" IN (SELECT "section" FROM ${qt(SectionSubjectTeacher)} WHERE "teacher" = $2) )
-          ORDER BY c."classNumber", "label"`,
-        [String(schoolId), String(teacherId)],
-    );
-
-    const current = rows.filter((r) => r.current);
-    // One chip per section name even so: two rows of the same year would be a
-    // data fault, and a duplicate chip is unpickable either way.
-    const pick = [];
-    const seen = new Set();
-    for (const r of (current.length ? current : rows)) {
-        if (seen.has(r.label)) continue;
-        seen.add(r.label);
-        pick.push(r);
-    }
-
-    return {
-        sections: ids(rows.map((r) => r.section)),
-        classes:  [...new Set(ids(rows.map((r) => r.class)))],
-        postable: ids(pick.map((r) => r.section)),
-        list:     pick.map((r) => ({ _id: r.section, label: r.label })),
-    };
-}
+// The sections a teacher stands in front of — services/documentAccess, where
+// the route guards and the file rule read the same answer.
+const teacherReach = access.teacherReach;
 
 exports.teacherReach = teacherReach;
 
@@ -498,12 +426,20 @@ exports.teacherGetDocuments = async (req, res) => {
          COALESCE(sub."n", 0)::int   AS "submissionCount",
          COALESCE(sub."marked", 0)::int AS "markedCount"`, '$2::uuid')}
              LEFT JOIN LATERAL (
-               SELECT count(*)::int AS "n",
-                      count(*) FILTER (WHERE a."marks" IS NOT NULL)::int AS "marked"
+               -- Handed in, and of those the ones that have been looked at:
+               -- given marks, or — where the assignment has no marks to give
+               -- — given feedback. Counting marks alone left every unmarked
+               -- kind of work "to mark" for ever.
+               SELECT count(*) FILTER (WHERE a."status" IN ('submitted', 'late'))::int AS "n",
+                      count(*) FILTER (WHERE a."status" IN ('submitted', 'late')
+                                         AND (a."marks" IS NOT NULL OR a."reviewedAt" IS NOT NULL))::int AS "marked"
                  FROM ${qt(AssignmentSubmission)} a
                 WHERE a."document" = d."_id"
              ) sub ON true
-              WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
+              -- Their own stay on their shelf when the office puts them away,
+              -- marked as archived; everyone else's leave it.
+              WHERE d."school" = $1
+                AND (NOT COALESCE(d."isArchived", false) OR d."uploadedBy" = $2::uuid)${year}
                 AND ( d."uploadedBy" = $2::uuid
                    OR d."targetType" IN ('all_teachers', 'whole_school')
                    OR (d."targetType" = 'specific_teachers' AND d."targetUsers"    ? $5)
@@ -588,15 +524,10 @@ exports.markRead = async (req, res) => {
  */
 exports.studentDocumentAccess = async (req, res, next) => {
     try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!doc || doc.isArchived) return res.status(404).json({ success: false, message: 'Document not found' });
-
-        if (doc.targetType === 'whole_school') return next();
-        const reach = await reachOf(req.userId, req.schoolId);
-        const hit = (list, mine) => ids(list).some((x) => mine.includes(x));
-        if (doc.targetType === 'class'          && hit(doc.targetClasses,  reach.classes))  return next();
-        if (doc.targetType === 'class_sections' && hit(doc.targetSections, reach.sections)) return next();
-
+        if ((await access.studentsReached(doc._id, [req.userId])).length) return next();
         return res.status(403).json({ success: false, message: 'This document was not shared with you' });
     } catch (e) { return res.status(500).json({ success: false, message: e.message }); }
 };

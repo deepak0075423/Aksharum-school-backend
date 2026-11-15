@@ -24,8 +24,16 @@ const AcademicYear       = require('../models/AcademicYear');
 const StudentProfile     = require('../models/StudentProfile');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const User               = require('../models/User');
+const DocumentRead       = require('../models/DocumentRead');
+const StudentEnrollment  = require('../models/StudentEnrollment');
 const pool               = require('../db/pool');
-const { notify }         = require('../services/notifyService');
+const { notify, withParents } = require('../services/notifyService');
+const access             = require('../services/documentAccess');
+const { isUuid }         = access;
+
+/** The marking form's own line for what the named questions leave over. */
+const OTHER_MARKS = 'Other marks';
+const like = (term) => `%${String(term).trim().replace(/[%_\\]/g, (m) => `\\${m}`)}%`;
 
 const qt = (Model) => `"${Model.tableName}"`;
 
@@ -94,50 +102,70 @@ async function audienceSections(doc) {
  * there is one and a derived `state` when there is not. `state` is the whole
  * point: "pending" and "not submitted" are the same absence of a row, and only
  * the due date tells them apart.
+ *
+ * WHO IS ON IT is read from where each student sat in the document's own
+ * academic year (StudentEnrollment) — `place` below. It used to be the
+ * profile's current-section pointer, which moves when the year rolls over: the
+ * day a school promoted its students, every class assignment of the year
+ * before showed nobody, and the marks with them. A student with no enrolment
+ * row for that year is placed by the pointer when the pointer rests in it; a
+ * document filed under no year is judged by the pointer alone.
+ *
+ * Anyone who handed work in stays, wherever they are placed now — labelled
+ * with their own year when it is not the document's.
+ *
+ * `only` narrows it to some sections: what a teacher who did not set the work
+ * may see of it is their own classes, not the whole school's submissions.
  */
-function rosterCte({ docId, school, sections, dueDate, year = null }) {
+function rosterCte({ docId, school, sections, dueDate, year = null, only = null }) {
     const params = [docId, school];
-    // The year a student's section belongs to, when it is NOT the document's
-    // own year — "2025-26" for someone not yet moved up. Such a student is
-    // kept only if they already handed work in; their section is never one of
-    // the section filter's choices, and their label carries the year.
-    let otherYear = 'NULL::text';
-    let yearParam = null;
-    if (year) {
-        params.push(String(year));
-        yearParam = `$${params.length}::uuid`;
-        otherYear = `CASE WHEN c."_id" IS NOT NULL AND c."academicYear" IS DISTINCT FROM ${yearParam} THEN ay."yearName" END`;
-    }
+    const add = (v) => { params.push(v); return `$${params.length}`; };
+    const Y = year ? `${add(String(year))}::uuid` : null;
+
+    const place = Y ? `
+      place AS (
+        SELECT e."student", e."section", e."class", e."rollNumber"
+          FROM ${qt(StudentEnrollment)} e
+         WHERE e."school" = $2::uuid AND e."academicYear" = ${Y}
+        UNION ALL
+        SELECT sp."user", sp."currentSection", s0."class", sp."rollNumber"
+          FROM ${qt(StudentProfile)} sp
+          JOIN ${qt(ClassSection)} s0 ON s0."_id" = sp."currentSection"
+          JOIN ${qt(Class)} c0        ON c0."_id" = s0."class"
+         WHERE sp."school" = $2::uuid AND c0."academicYear" = ${Y}
+           AND NOT EXISTS (SELECT 1 FROM ${qt(StudentEnrollment)} e
+                            WHERE e."student" = sp."user" AND e."academicYear" = ${Y})
+      )` : `
+      place AS (
+        SELECT sp."user" AS "student", sp."currentSection" AS "section", s0."class", sp."rollNumber"
+          FROM ${qt(StudentProfile)} sp
+          LEFT JOIN ${qt(ClassSection)} s0 ON s0."_id" = sp."currentSection"
+         WHERE sp."school" = $2::uuid
+      )`;
+
     let scope;
     if (sections === null) {
-        // The whole school — as it stands in the document's own academic year.
-        // A student still placed in an earlier year's section (not yet moved
-        // up, or gone) is not part of a year they are not in; without this the
-        // section filter listed "Class 6 - A" once per year. Anyone who has
-        // already handed work in stays, wherever they are placed.
-        scope = yearParam
-            ? `u."role" = 'student' AND (c."academicYear" = ${yearParam} OR sub."_id" IS NOT NULL)`
-            : `u."role" = 'student'`;
+        // The whole school — as it stood in the document's own academic year.
+        scope = 'pl."student" IS NOT NULL';
     } else if (!sections.length) {
         // Nobody — a teacher-only document, or a target with nothing selected.
         scope = 'false';
     } else {
-        params.push(sections);
-        scope = `sp."currentSection" = ANY($${params.length}::uuid[])`;
+        scope = `pl."section" = ANY(${add(sections)}::uuid[])`;
     }
-    params.push(dueDate || null);
-    const dueParam = `$${params.length}::timestamptz`;
+    const mine = only ? ` AND COALESCE(pl."section", sp."currentSection")::text = ANY(${add(only)}::text[])` : '';
+    const dueParam = `${add(dueDate || null)}::timestamptz`;
 
-    const sql = `
+    const sql = `${place},
       roster AS (
         SELECT u."_id"            AS "studentId",
                u."name",
                u."profileImage",
-               sp."rollNumber",
-               sp."currentSection",
+               COALESCE(NULLIF(pl."rollNumber", ''), sp."rollNumber") AS "rollNumber",
+               COALESCE(pl."section", sp."currentSection")            AS "currentSection",
                c."className",
                s."sectionName",
-               ${otherYear}        AS "otherYear",
+               ${Y ? `CASE WHEN pl."student" IS NULL AND c."_id" IS NOT NULL THEN ay."yearName" END` : 'NULL::text'} AS "otherYear",
                sub."_id"           AS "submissionId",
                sub."submittedAt",
                sub."marks",
@@ -145,19 +173,24 @@ function rosterCte({ docId, school, sections, dueDate, year = null }) {
                sub."files"         AS "submissionFiles",
                sub."questionScores",
                sub."reviewedAt",
+               rd."readAt",
                CASE
                  WHEN sub."status" IN ('submitted', 'late') THEN sub."status"
                  WHEN ${dueParam} IS NOT NULL AND now() > ${dueParam} THEN 'missed'
                  ELSE 'pending'
                END AS "state"
           FROM ${qt(StudentProfile)} sp
-          JOIN ${qt(User)} u ON u."_id" = sp."user" AND COALESCE(u."isActive", true)
-          LEFT JOIN ${qt(ClassSection)} s ON s."_id" = sp."currentSection"
-          LEFT JOIN ${qt(Class)} c        ON c."_id" = s."class"
-          LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = c."academicYear"
+          JOIN ${qt(User)} u ON u."_id" = sp."user" AND u."role" = 'student'
+          LEFT JOIN place pl                ON pl."student" = u."_id"
+          LEFT JOIN ${qt(ClassSection)} s   ON s."_id" = COALESCE(pl."section", sp."currentSection")
+          LEFT JOIN ${qt(Class)} c          ON c."_id" = COALESCE(pl."class", s."class")
+          LEFT JOIN ${qt(AcademicYear)} ay  ON ay."_id" = c."academicYear"
           LEFT JOIN ${qt(AssignmentSubmission)} sub
                  ON sub."document" = $1::uuid AND sub."student" = u."_id"
-         WHERE sp."school" = $2::uuid AND ${scope}
+          LEFT JOIN ${qt(DocumentRead)} rd
+                 ON rd."document" = $1::uuid AND rd."user" = u."_id"
+         WHERE sp."school" = $2::uuid
+           AND (((${scope}) AND COALESCE(u."isActive", true)) OR sub."_id" IS NOT NULL)${mine}
       )`;
     return { sql, params };
 }
@@ -171,7 +204,9 @@ const SECTION_LABEL = (empty) => `coalesce("className" || ' - ' || "sectionName"
 // ── Loading the document ─────────────────────────────────────────────────────
 
 async function loadDoc(req, res) {
-    const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+    const doc = isUuid(req.params.id)
+        ? await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean()
+        : null;
     if (!doc) {
         res.status(404).json({ success: false, message: 'Document not found' });
         return null;
@@ -187,12 +222,18 @@ async function loadDoc(req, res) {
  * the ones they set. Marking someone else's assignment, reminding someone
  * else's class or deleting someone else's copy are all the owner's to do.
  *
+ * Reading someone else's assignment shows the students of the teacher's own
+ * sections and nobody else's work (`req.rosterOnly`): a school-wide assignment
+ * used to hand every teacher every student's submission, marks and feedback.
+ *
  * Mounted as route middleware rather than folded into loadDoc, so the admin
  * routes are untouched and a teacher route can never forget the check.
  */
 exports.teacherDocumentAccess = (mode = 'read') => async (req, res, next) => {
     try {
-        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        const doc = isUuid(req.params.id)
+            ? await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean()
+            : null;
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
 
         if (String(doc.uploadedBy) === String(req.userId)) return next();
@@ -202,33 +243,17 @@ exports.teacherDocumentAccess = (mode = 'read') => async (req, res, next) => {
                 message: 'Only the teacher who set this can do that',
             });
         }
-
-        if (['all_teachers', 'whole_school'].includes(doc.targetType)) return next();
-        if (doc.targetType === 'specific_teachers'
-            && (doc.targetUsers || []).map(String).includes(String(req.userId))) return next();
-
-        const mine = await SectionSubjectTeacher.find({ teacher: req.userId }).distinct('section');
-        const asClassTeacher = await ClassSection.find({
-            school: req.schoolId,
-            $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
-        }).distinct('_id');
-        const sections = [...mine, ...asClassTeacher].map(String);
-
-        if (doc.targetType === 'class_sections'
-            && (doc.targetSections || []).map(String).some((s) => sections.includes(s))) return next();
-
-        if (doc.targetType === 'class' && sections.length) {
-            const classes = (await ClassSection.find({ _id: { $in: sections } }).distinct('class')).map(String);
-            if ((doc.targetClasses || []).map(String).some((c) => classes.includes(c))) return next();
+        if (!(await access.teacherCanRead(doc, req.userId, req.schoolId))) {
+            return res.status(403).json({ success: false, message: 'This document was not shared with you' });
         }
-
-        return res.status(403).json({ success: false, message: 'This document was not shared with you' });
+        req.rosterOnly = (await access.teacherReach(req.userId, req.schoolId)).sections;
+        return next();
     } catch (e) { return res.status(500).json({ success: false, message: e.message }); }
 };
 
 /** The header strip: what this document is, in one object both tabs read. */
 async function header(doc, req) {
-    const [uploader, sections, classes, year, people] = await Promise.all([
+    const [uploader, sections, classes, year, people, readers] = await Promise.all([
         doc.uploadedBy ? User.findById(doc.uploadedBy).select('name role profileImage').lean() : null,
         (doc.targetSections || []).length
             ? pool.query(
@@ -255,6 +280,11 @@ async function header(doc, req) {
                 [(doc.targetUsers || []).map(String)],
             ).then((r) => r.rows.map((x) => x.label))
             : [],
+        // How many people have opened it — the sharer's own opening left out.
+        pool.query(
+            `SELECT count(*)::int AS n FROM ${qt(DocumentRead)} WHERE "document" = $1 AND "user" <> $2`,
+            [String(doc._id), String(doc.uploadedBy)],
+        ).then((r) => r.rows[0]?.n || 0).catch(() => 0),
     ]);
 
     const where = doc.targetType === 'whole_school' ? ['Whole School']
@@ -291,33 +321,56 @@ async function header(doc, req) {
         targetType: doc.targetType,
         sharedWith: where,
         academicYearName: year,
-        files: doc.files || [],
+        files: access.publicFiles(doc.files),
         currentVersion: doc.currentVersion || 1,
         isArchived: !!doc.isArchived,
         status,
+        readCount: readers,
+        lastReminderAt: doc.lastReminderAt || null,
         // Whether the reader may change this. An admin always may; a teacher
         // only their own — the routes enforce it, and the page needs to know so
         // it does not offer buttons that will be refused.
-        canManage: req?.userRole === 'school_admin' || String(doc.uploadedBy) === String(req?.userId),
+        // "Admin" is the route as much as the role: a teacher whose designation
+        // administers Documents arrives on /api/admin and may do all of it.
+        canManage: (req ? isAdmin(req) : false) || String(doc.uploadedBy) === String(req?.userId),
         uploadedBy: uploader
             ? { _id: uploader._id, name: uploader.name, role: uploader.role, photo: uploader.profileImage }
             : null,
     };
 }
 
-/** Five equal bands across the total, the way a mark sheet is read. */
+/**
+ * Five equal bands across the total, the way a mark sheet is read.
+ *
+ * The bands are continuous — each takes everything above the one before it up
+ * to its own top — so no mark can fall between two of them. They used to be
+ * whole-number ranges ("0–10", "11–20"): a 10.5 was counted in neither, and a
+ * paper out of 3 produced bands that read "2–1". Anything above the total
+ * (marks recorded before a total was lowered) lands in the last band rather
+ * than nowhere.
+ */
 function scoreBands(totalMarks) {
     const total = Number(totalMarks) > 0 ? Number(totalMarks) : 100;
     const step  = total / 5;
+    const whole = Number.isInteger(step);
+    const fmt   = (n) => String(Math.round(n * 10) / 10);
     return Array.from({ length: 5 }, (_, i) => {
-        const lo = Math.round(i * step);
-        const hi = Math.round((i + 1) * step);
-        return { lo: i === 0 ? 0 : lo + 1, hi, label: `${i === 0 ? 0 : lo + 1}–${hi}` };
+        const lo = +(i * step).toFixed(6);
+        const hi = +((i + 1) * step).toFixed(6);
+        return {
+            lo, hi, first: i === 0, last: i === 4,
+            // Whole steps keep the familiar "11–20"; a fractional step says
+            // where each band starts and ends.
+            label: i === 0 ? `0–${fmt(hi)}` : whole ? `${lo + 1}–${hi}` : `${fmt(lo)}–${fmt(hi)}`,
+        };
     });
 }
 
 const bandCaseSql = (bands) => bands
-    .map((b, i) => `count(*) FILTER (WHERE "marks" IS NOT NULL AND "marks" >= ${b.lo} AND "marks" <= ${b.hi})::int AS "b${i}"`)
+    .map((b, i) => {
+        const range = b.first ? `"marks" <= ${b.hi}` : b.last ? `"marks" > ${b.lo}` : `"marks" > ${b.lo} AND "marks" <= ${b.hi}`;
+        return `count(*) FILTER (WHERE "marks" IS NOT NULL AND ${range})::int AS "b${i}"`;
+    })
     .join(',\n               ');
 
 // ── Tab 1 & 2: the assignment ────────────────────────────────────────────────
@@ -347,7 +400,7 @@ exports.getAssignment = async (req, res) => {
         const sections = await audienceSections(doc);
         const { sql: cte, params: base } = rosterCte({
             docId: String(doc._id), school: String(doc.school), sections, dueDate: doc.dueDate,
-            year: doc.academicYear || null,
+            year: doc.academicYear || null, only: req.rosterOnly || null,
         });
 
         const bands = scoreBands(doc.totalMarks);
@@ -365,9 +418,9 @@ exports.getAssignment = async (req, res) => {
         else if (q.status === 'graded')  where.push('"marks" IS NOT NULL');
         else if (q.status === 'ungraded') where.push(`${HANDED_IN} AND "marks" IS NULL`);
 
-        if (q.section) { rowParams.push(String(q.section)); where.push(`"currentSection" = $${rowParams.length}::uuid`); }
-        if (q.search) {
-            rowParams.push(`%${String(q.search).trim()}%`);
+        if (isUuid(q.section)) { rowParams.push(String(q.section)); where.push(`"currentSection" = $${rowParams.length}::uuid`); }
+        if (String(q.search || '').trim()) {
+            rowParams.push(like(q.search));
             where.push(`("name" ILIKE $${rowParams.length} OR "rollNumber" ILIKE $${rowParams.length})`);
         }
         const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -469,7 +522,7 @@ exports.getAssignment = async (req, res) => {
 };
 
 function shapeStudent(r) {
-    const files = Array.isArray(r.submissionFiles) ? r.submissionFiles : [];
+    const files = access.publicFiles(r.submissionFiles);
     return {
         _id: r.studentId,
         name: r.name,
@@ -485,6 +538,8 @@ function shapeStudent(r) {
         feedback: r.feedback || '',
         questionScores: Array.isArray(r.questionScores) ? r.questionScores : [],
         reviewedAt: r.reviewedAt,
+        // When they opened the assignment, if they have.
+        readAt: r.readAt || null,
         files,
         fileCount: files.length,
     };
@@ -503,7 +558,7 @@ exports.getAssignmentAnalytics = async (req, res) => {
         const sections = await audienceSections(doc);
         const { sql: cte, params: base } = rosterCte({
             docId: String(doc._id), school: String(doc.school), sections, dueDate: doc.dueDate,
-            year: doc.academicYear || null,
+            year: doc.academicYear || null, only: req.rosterOnly || null,
         });
         const outOf = Number(doc.totalMarks) > 0 ? Number(doc.totalMarks) : null;
 
@@ -552,9 +607,11 @@ exports.getAssignmentAnalytics = async (req, res) => {
                    FROM roster`,
                 base,
             ),
-            // The assignment before this one, for the "vs last assignment" line.
-            // Matched on the same target so the comparison is between two pieces
-            // of work set to roughly the same people.
+            // The assignment before this one, for the "vs last assignment" line:
+            // set by the same person to exactly the same classes or sections.
+            // It used to be any earlier assignment in the school with the same
+            // KIND of audience, so a teacher's page compared their class with
+            // another teacher's — and named that work and its average.
             pool.query(
                 `SELECT d."_id", d."title", d."totalMarks",
                         avg(sub."marks")::float AS "average"
@@ -562,12 +619,18 @@ exports.getAssignmentAnalytics = async (req, res) => {
                    JOIN ${qt(AssignmentSubmission)} sub ON sub."document" = d."_id" AND sub."marks" IS NOT NULL
                   WHERE d."school" = $1 AND d."_id" <> $2
                     AND COALESCE(d."isAssignment", false)
+                    AND NOT COALESCE(d."isArchived", false)
                     AND d."targetType" = $3
                     AND d."createdAt" < $4
-                  GROUP BY d."_id", d."title", d."totalMarks"
+                    AND d."uploadedBy" = $5
+                    AND ${access.ARR('d."targetClasses"')}  @> $6::jsonb AND ${access.ARR('d."targetClasses"')}  <@ $6::jsonb
+                    AND ${access.ARR('d."targetSections"')} @> $7::jsonb AND ${access.ARR('d."targetSections"')} <@ $7::jsonb
+                  GROUP BY d."_id", d."title", d."totalMarks", d."createdAt"
                   ORDER BY d."createdAt" DESC
                   LIMIT 1`,
-                [String(doc.school), String(doc._id), doc.targetType, doc.createdAt],
+                [String(doc.school), String(doc._id), doc.targetType, doc.createdAt, String(doc.uploadedBy),
+                    JSON.stringify((doc.targetClasses || []).map(String)),
+                    JSON.stringify((doc.targetSections || []).map(String))],
             ),
         ]);
 
@@ -642,14 +705,27 @@ exports.getAssignmentAnalytics = async (req, res) => {
 
 // ── Marking ──────────────────────────────────────────────────────────────────
 
+const round2 = (n) => Math.round(n * 100) / 100;
+
 /**
- * Award marks and write feedback against one student's submission.
+ * Award marks and write feedback against one student.
  *
  * Addressed by student rather than by submission id: the admin is marking a
  * name on a roster, and half the roster has no submission row at all. When the
  * assignment defines questions the total is computed from the per-question
  * scores rather than typed twice — two numbers that must agree are one number
  * with extra chances to be wrong.
+ *
+ * What the numbers may be:
+ *   • never below zero, never above the question's own maximum, and never more
+ *     in all than the assignment is out of — a refusal, not a silent trim;
+ *   • when every question has a maximum and they add up to less than the
+ *     total, the rest can be awarded as "Other marks" (presentation, neatness)
+ *     — there used to be no way to give those marks at all.
+ *
+ * A student who handed nothing in through the app can still be marked — work
+ * done on paper, or a zero for work never done. That writes a row with no
+ * files and no hand-in time; the roster still says they did not submit.
  */
 exports.reviewSubmission = async (req, res) => {
     try {
@@ -658,64 +734,141 @@ exports.reviewSubmission = async (req, res) => {
         if (!doc.isAssignment) {
             return res.status(400).json({ success: false, message: 'This document is not an assignment' });
         }
+        const bad = (message, status = 400) => res.status(status).json({ success: false, message });
 
         const studentId = req.params.studentId;
+        if (!isUuid(studentId)) return bad('That student could not be found', 404);
         const sub = await AssignmentSubmission.findOne({ document: doc._id, student: studentId });
-        if (!sub) {
-            return res.status(404).json({ success: false, message: 'This student has not submitted anything to mark' });
+        if (!sub && !(await access.studentsReached(doc._id, [studentId])).length) {
+            return bad('This student is not on this assignment', 404);
         }
 
-        const { feedback } = req.body;
+        const before = {
+            marks: sub?.marks ?? null,
+            feedback: sub?.feedback || '',
+        };
+        const next = { marks: before.marks, feedback: before.feedback, questionScores: sub?.questionScores || [] };
+
+        const total  = Number(doc.totalMarks) > 0 ? Number(doc.totalMarks) : null;
+        const num    = (raw) => (raw === '' || raw == null ? null : Number(raw));
         const scores = Array.isArray(req.body.questionScores) ? req.body.questionScores : null;
+        const questions = doc.questions || [];
 
-        if (scores && (doc.questions || []).length) {
-            const byLabel = Object.fromEntries(scores.map((q) => [q.label, q.score]));
-            sub.questionScores = doc.questions.map((q) => {
-                const raw = byLabel[q.label];
-                const n   = raw === '' || raw == null ? null : Number(raw);
+        if (scores && questions.length) {
+            const byLabel = Object.fromEntries(scores.map((q) => [String(q?.label ?? ''), q?.score]));
+            const out = [];
+            for (const q of questions) {
+                const n   = num(byLabel[q.label]);
                 const max = Number(q.maxMarks) > 0 ? Number(q.maxMarks) : null;
-                return {
-                    label: q.label,
-                    score: n == null || Number.isNaN(n) ? null : (max ? Math.min(n, max) : n),
-                };
-            });
-            const awarded = sub.questionScores.filter((q) => q.score != null);
-            sub.marks = awarded.length ? awarded.reduce((n, q) => n + q.score, 0) : null;
+                if (n != null && (Number.isNaN(n) || n < 0)) return bad(`${q.label}: marks must be zero or more`);
+                if (n != null && max != null && n > max)     return bad(`${q.label} is out of ${max}`);
+                out.push({ label: q.label, score: n });
+            }
+
+            // What the named questions leave over, when they say how much each
+            // is worth and that comes to less than the paper is out of.
+            const named = questions.reduce((a, q) => a + (Number(q.maxMarks) > 0 ? Number(q.maxMarks) : 0), 0);
+            const room  = total != null && questions.every((q) => Number(q.maxMarks) > 0) ? round2(total - named) : 0;
+            const other = num(byLabel[OTHER_MARKS]);
+            if (other != null) {
+                if (Number.isNaN(other) || other < 0) return bad(`${OTHER_MARKS} must be zero or more`);
+                if (!(room > 0))                      return bad(`The questions already add up to the total — there are no ${OTHER_MARKS.toLowerCase()} to give`);
+                if (other > room)                     return bad(`${OTHER_MARKS} is out of ${room}`);
+                out.push({ label: OTHER_MARKS, score: other });
+            }
+
+            const awarded = out.filter((q) => q.score != null);
+            const sum = awarded.length ? round2(awarded.reduce((n, q) => n + q.score, 0)) : null;
+            if (sum != null && total != null && sum > total) {
+                return bad(`These add up to ${sum}, more than the total of ${total}`);
+            }
+            next.questionScores = out;
+            next.marks = sum;
         } else if (req.body.marks !== undefined) {
-            const n = req.body.marks === '' || req.body.marks === null ? null : Number(req.body.marks);
-            if (n != null && Number.isNaN(n)) {
-                return res.status(400).json({ success: false, message: 'Marks must be a number' });
-            }
-            if (n != null && doc.totalMarks && n > doc.totalMarks) {
-                return res.status(400).json({ success: false, message: `Marks cannot exceed ${doc.totalMarks}` });
-            }
-            sub.marks = n;
+            const n = num(req.body.marks);
+            if (n != null && (Number.isNaN(n) || n < 0)) return bad('Marks must be a number, zero or more');
+            if (n != null && total != null && n > total) return bad(`Marks cannot exceed ${total}`);
+            next.marks = n;
+            next.questionScores = [];
+        }
+        if (req.body.feedback !== undefined) next.feedback = String(req.body.feedback).trim().slice(0, 2000);
+
+        const reviewed = next.marks != null || !!next.feedback;
+        if (!sub && !reviewed) return bad('Enter marks or feedback to record');
+
+        let saved;
+        if (sub) {
+            sub.marks = next.marks;
+            sub.feedback = next.feedback;
+            sub.questionScores = next.questionScores;
+            // Cleared again: nothing has been marked, so nothing says it was.
+            sub.reviewedBy = reviewed ? req.userId : null;
+            sub.reviewedAt = reviewed ? new Date() : null;
+            await sub.save();
+            saved = sub;
+        } else {
+            saved = await AssignmentSubmission.create({
+                document: doc._id, school: doc.school, student: studentId,
+                files: [], status: 'pending', submittedAt: null,
+                marks: next.marks, feedback: next.feedback, questionScores: next.questionScores,
+                reviewedBy: req.userId, reviewedAt: new Date(),
+            });
         }
 
-        if (feedback !== undefined) sub.feedback = String(feedback);
-        sub.reviewedBy = req.userId;
-        sub.reviewedAt = new Date();
-        await sub.save();
+        // Told only when there is something new to read: taking a mark back
+        // off, or saving the form unchanged, is not news. The student's
+        // parents hear it too, under that child.
+        const changed = next.marks !== before.marks || next.feedback !== before.feedback;
+        if (reviewed && changed) {
+            const score = next.marks != null ? ` — ${next.marks}${total ? `/${total}` : ''}` : '';
+            notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: next.marks != null ? '📝 Assignment marked' : '💬 Feedback on an assignment',
+                body: next.marks != null
+                    ? `"${doc.title}" has been marked${score}.`
+                    : `There is feedback on "${doc.title}".`,
+                recipients: await withParents([studentId]),
+                about: [studentId],
+                link: { type: 'documents.item', entityId: doc._id },
+            });
+        }
 
-        notify({
-            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-            title: '📝 Your assignment has been marked',
-            body: `"${doc.title}" has been marked${sub.marks != null ? ` — ${sub.marks}${doc.totalMarks ? `/${doc.totalMarks}` : ''}` : ''}.`,
-            recipients: [studentId],
-            link: { type: 'documents.item', entityId: doc._id },
-        });
-
-        res.json({ success: true, data: sub });
+        const out = typeof saved.toObject === 'function' ? saved.toObject() : saved;
+        res.json({ success: true, data: { ...out, files: access.publicFiles(out.files) } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-/** Nudge everyone the assignment is still waiting on. */
+// One student can be nudged again after ten minutes; the map only ever holds
+// the last few minutes of presses.
+const REMIND_ALL_EVERY = 60 * 60 * 1000;
+const REMIND_ONE_EVERY = 10 * 60 * 1000;
+const lastNudge = new Map();   // `${doc}|${student}` → time
+
+/** Nudge everyone the assignment is still waiting on — and their parents. */
 exports.remindPending = async (req, res) => {
     try {
         const doc = await loadDoc(req, res);
         if (!doc) return;
-        if (!doc.isAssignment) {
-            return res.status(400).json({ success: false, message: 'This document is not an assignment' });
+        const bad = (message, status = 400, code) => res.status(status).json({ success: false, message, ...(code ? { code } : {}) });
+        if (!doc.isAssignment)    return bad('This document is not an assignment');
+        // A reminder asks for something. Neither of these can be answered.
+        if (doc.isArchived)       return bad('This assignment is archived — restore it before sending a reminder');
+        if (!doc.allowSubmission) return bad('Submissions are closed on this assignment, so there is nothing a reminder could ask for');
+
+        // A named few, or everyone still outstanding.
+        const named = Array.isArray(req.body?.studentIds) ? req.body.studentIds.map(String).filter(isUuid) : [];
+        const only  = named.length ? named : null;
+        if (Array.isArray(req.body?.studentIds) && req.body.studentIds.length && !only) {
+            return bad('Those students could not be found');
+        }
+
+        const now = Date.now();
+        if (!only && doc.lastReminderAt && now - new Date(doc.lastReminderAt).getTime() < REMIND_ALL_EVERY) {
+            const again = new Date(new Date(doc.lastReminderAt).getTime() + REMIND_ALL_EVERY);
+            return bad(
+                `A reminder already went to everyone at ${new Date(doc.lastReminderAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })}. `
+                + `The next one can go after ${again.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })}.`,
+                429, 'REMINDED_RECENTLY');
         }
 
         const sections = await audienceSections(doc);
@@ -723,60 +876,157 @@ exports.remindPending = async (req, res) => {
             docId: String(doc._id), school: String(doc.school), sections, dueDate: doc.dueDate,
             year: doc.academicYear || null,
         });
-
-        // A named few, or everyone still outstanding.
-        const only = Array.isArray(req.body?.studentIds) && req.body.studentIds.length
-            ? req.body.studentIds.map(String)
-            : null;
         const extra = only ? [only] : [];
         const pick  = only ? ` AND "studentId" = ANY($${params.length + 1}::uuid[])` : '';
 
+        // Still owed: nothing handed in, and nothing marked on paper either.
         const { rows } = await pool.query(
-            `WITH ${cte} SELECT "studentId" FROM roster WHERE NOT (${HANDED_IN})${pick}`,
+            `WITH ${cte} SELECT "studentId" FROM roster WHERE NOT (${HANDED_IN}) AND "marks" IS NULL${pick}`,
             [...params, ...extra],
         );
-        if (!rows.length) {
+        let students = rows.map((r) => String(r.studentId));
+        if (only) {
+            for (const [k, t] of lastNudge) if (now - t > REMIND_ONE_EVERY) lastNudge.delete(k);
+            const fresh = students.filter((id) => !lastNudge.has(`${doc._id}|${id}`));
+            if (students.length && !fresh.length) {
+                return bad('A reminder was sent a few minutes ago — give it a little time', 429, 'REMINDED_RECENTLY');
+            }
+            students = fresh;
+        }
+        if (!students.length) {
             return res.json({ success: true, sent: 0, message: 'Everyone has already submitted' });
         }
 
-        const due = doc.dueDate ? new Date(doc.dueDate) : null;
+        const due  = doc.dueDate ? new Date(doc.dueDate) : null;
+        const day  = due ? due.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+        // "It was due" only once it has been — this said so about next week.
+        const when = !due ? '.' : due.getTime() < now ? ` — it was due ${day}.` : ` — it is due ${day}.`;
         await notify({
             school: req.schoolId, sender: req.userId, senderRole: req.userRole,
             title: '⏰ Assignment still to submit',
-            body: `"${doc.title}" is still waiting on your submission`
-                + (due ? ` — it was due ${due.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}.` : '.'),
-            recipients: rows.map((r) => r.studentId),
+            body: `"${doc.title}" has not been handed in yet${when}`,
+            recipients: await withParents(students),
+            about: students,
             link: { type: 'documents.item', entityId: doc._id },
         });
 
-        res.json({ success: true, sent: rows.length });
+        if (only) for (const id of students) lastNudge.set(`${doc._id}|${id}`, now);
+        else await Document.updateOne({ _id: doc._id }, { lastReminderAt: new Date(now) });
+
+        res.json({ success: true, sent: students.length });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 /**
  * A second copy of a document, ready to be edited into next week's.
  *
- * The file metadata is copied, not the files: both rows point at the same bytes
- * on disk, which is safe because deleting a document has never unlinked them.
- * The copy starts unarchived, at version 1, with no submissions and no due date
- * — a date carried over from the original would be in the past on arrival.
+ * The file metadata is copied, not the files: both rows point at the same
+ * bytes on disk, and a file is only removed once nothing names it. The copy
+ * starts unarchived, at version 1, with no submissions and no due date — a
+ * date carried over from the original would be in the past on arrival.
+ *
+ * It is filed under THIS year and aimed at this year's rows of the same
+ * classes and sections. It used to keep the original's year and ids, so a copy
+ * made after a rollover sat in last year, out of every default view, with a
+ * roster of nobody.
  */
 exports.duplicate = async (req, res) => {
     try {
         const doc = await loadDoc(req, res);
         if (!doc) return;
 
-        const { _id, createdAt, updatedAt, ...rest } = doc;
+        const yearId = await access.currentYearId(req.schoolId);
+        let classes  = (doc.targetClasses  || []).map(String);
+        let sections = (doc.targetSections || []).map(String);
+
+        if (yearId) {
+            if (classes.length) {
+                classes = (await pool.query(
+                    `SELECT DISTINCT c2."_id"
+                       FROM ${qt(Class)} c1
+                       JOIN ${qt(Class)} c2 ON c2."school" = c1."school" AND c2."classNumber" = c1."classNumber"
+                                           AND c2."academicYear" = $2
+                      WHERE c1."_id"::text = ANY($1::text[]) AND c1."school" = $3`,
+                    [classes, String(yearId), String(req.schoolId)],
+                )).rows.map((r) => String(r._id));
+            }
+            if (sections.length) {
+                sections = (await pool.query(
+                    `SELECT DISTINCT s2."_id"
+                       FROM ${qt(ClassSection)} s1
+                       JOIN ${qt(Class)} c1        ON c1."_id" = s1."class"
+                       JOIN ${qt(Class)} c2        ON c2."school" = c1."school" AND c2."classNumber" = c1."classNumber"
+                                                  AND c2."academicYear" = $2
+                       JOIN ${qt(ClassSection)} s2 ON s2."class" = c2."_id" AND s2."sectionName" = s1."sectionName"
+                      WHERE s1."_id"::text = ANY($1::text[]) AND s1."school" = $3`,
+                    [sections, String(yearId), String(req.schoolId)],
+                )).rows.map((r) => String(r._id));
+            }
+        }
+        // A teacher's copy goes only where they may share this year.
+        if (!isAdmin(req) && doc.targetType === 'class_sections') {
+            const mine = (await access.teacherReach(req.userId, req.schoolId)).postable;
+            sections = sections.filter((id) => mine.includes(id));
+        }
+        if ((doc.targetType === 'class' && !classes.length) || (doc.targetType === 'class_sections' && !sections.length)) {
+            return res.status(400).json({
+                success: false,
+                message: 'None of the classes this was shared with exist in the current academic year — share it again as a new document instead',
+            });
+        }
+
+        const { _id, createdAt, updatedAt, lastReminderAt, ...rest } = doc;
         const copy = await Document.create({
             ...rest,
-            title: `${doc.title} (copy)`.slice(0, 200),
+            title: `${doc.title} (copy)`.slice(0, 160),
             uploadedBy: req.userId,
             uploaderRole: req.userRole === 'teacher' ? 'teacher' : 'school_admin',
+            academicYear: yearId,
+            targetClasses: classes,
+            targetSections: sections,
             currentVersion: 1,
             isArchived: false,
             dueDate: null,
         });
-        res.status(201).json({ success: true, data: copy });
+        const out = typeof copy.toObject === 'function' ? copy.toObject() : copy;
+        res.status(201).json({ success: true, data: { ...out, files: access.publicFiles(out.files) } });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+/**
+ * Who has opened it — for the person who shared it.
+ *
+ * The read marks have been kept since Nov 2026 and only ever told a reader
+ * what THEY had not opened; the sharer could not see whether a notice had
+ * been read by anyone.
+ */
+exports.getReaders = async (req, res) => {
+    try {
+        const doc = await loadDoc(req, res);
+        if (!doc) return;
+        const { rows } = await pool.query(
+            `SELECT u."_id", u."name", u."role", u."profileImage", r."readAt",
+                    c."className" || ' - ' || s."sectionName" AS "section"
+               FROM ${qt(DocumentRead)} r
+               JOIN ${qt(User)} u ON u."_id" = r."user"
+               LEFT JOIN ${qt(StudentProfile)} sp ON sp."user" = u."_id" AND u."role" = 'student'
+               LEFT JOIN ${qt(ClassSection)} s    ON s."_id" = sp."currentSection"
+               LEFT JOIN ${qt(Class)} c           ON c."_id" = s."class"
+              WHERE r."document" = $1 AND r."user" <> $2
+              ORDER BY r."readAt" DESC
+              LIMIT 1000`,
+            [String(doc._id), String(doc.uploadedBy)],
+        );
+        res.json({
+            success: true,
+            data: {
+                total: rows.length,
+                readers: rows.map((r) => ({
+                    _id: r._id, name: r.name, role: r.role, photo: r.profileImage || '',
+                    section: r.section || '', readAt: r.readAt,
+                })),
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -802,13 +1052,9 @@ const isAdmin = (req) => req.userRole === 'school_admin'
 const canPinOn = (req, doc) => isAdmin(req)
     || (doc && String(doc.uploadedBy) === String(req.userId));
 
-const buildFiles = (files) => (files || []).map((f) => ({
-    originalName: f.originalname,
-    storedName:   f.filename,
-    filePath:     f.path,
-    mimeType:     f.mimetype,
-    fileSize:     f.size,
-}));
+const buildFiles = access.storedFiles;
+const STAFF_ROLES = ['school_admin', 'teacher'];
+const MAX_COMMENT = 2000;
 
 /**
  * The thread, assembled.
@@ -834,8 +1080,8 @@ exports.listComments = async (req, res) => {
         if (req.query.author === 'students') where.push(`c."authorRole" IN ('student', 'parent')`);
         if (req.query.author === 'staff')    where.push(`c."authorRole" IN ('school_admin', 'teacher')`);
         if (req.query.author === 'pinned')   where.push('COALESCE(c."isPinned", false)');
-        if (req.query.search) {
-            params.push(`%${String(req.query.search).trim()}%`);
+        if (String(req.query.search || '').trim()) {
+            params.push(like(req.query.search));
             where.push(`c."body" ILIKE $${params.length}`);
         }
         // Under a filter a deleted comment matches nothing of its own; the
@@ -871,7 +1117,7 @@ exports.listComments = async (req, res) => {
             return {
                 _id: r._id,
                 body: r.body || '',
-                files: Array.isArray(r.files) ? r.files : [],
+                files: access.publicFiles(r.files),
                 parent: r.parent,
                 isPinned: !!r.isPinned,
                 visibility: r.visibility || 'all',
@@ -887,6 +1133,10 @@ exports.listComments = async (req, res) => {
                 canEdit: mine,
                 canDelete: mine || admin,
                 canPin: pins && !r.parent,
+                // Staff-only is the author's call, or an admin's, and only on
+                // what staff wrote — a student's own comment is never hidden
+                // from the student who wrote it.
+                canHide: !r.parent && STAFF_ROLES.includes(r.authorRole) && (mine || admin),
                 author: r.authorId
                     ? { _id: r.authorId, name: r.authorName, role: r.authorRole, photo: r.authorPhoto }
                     : { _id: null, name: 'Removed account', role: r.authorRole, photo: '' },
@@ -935,24 +1185,41 @@ exports.listComments = async (req, res) => {
 };
 
 exports.addComment = async (req, res) => {
+    const bad = (message, status = 400) => {
+        // A refused comment takes its attachments with it.
+        access.discardUploads(req);
+        return res.status(status).json({ success: false, message });
+    };
     try {
         const doc = await loadDoc(req, res);
-        if (!doc) return;
+        if (!doc) { access.discardUploads(req); return; }
 
         const body  = String(req.body.body || '').trim();
         const files = buildFiles(req.files);
-        if (!body && !files.length) {
-            return res.status(400).json({ success: false, message: 'Write something, or attach a file' });
+        if (!body && !files.length) return bad('Write something, or attach a file');
+        if (body.length > MAX_COMMENT) return bad(`A comment can be up to ${MAX_COMMENT.toLocaleString('en-IN')} characters`);
+
+        // `answered` is the comment actually being replied to; `root` is the
+        // thread it sits in. Only one level: a reply to a reply joins the same
+        // thread rather than starting a third tier nobody can read on a phone.
+        let answered = null;
+        let root = null;
+        if (req.body.parent) {
+            answered = isUuid(req.body.parent)
+                ? await DocumentComment.findOne({ _id: req.body.parent, document: doc._id }).lean() : null;
+            if (!answered || (!isStaff(req) && answered.visibility === 'staff')) {
+                return bad('The comment being replied to is gone', 404);
+            }
+            root = answered.parent ? await DocumentComment.findById(answered.parent).lean() : answered;
+            if (!root) return bad('The comment being replied to is gone', 404);
         }
 
-        let parent = null;
-        if (req.body.parent) {
-            const p = await DocumentComment.findOne({ _id: req.body.parent, document: doc._id }).lean();
-            if (!p || (!isStaff(req) && p.visibility === 'staff')) return res.status(404).json({ success: false, message: 'The comment being replied to is gone' });
-            // Only one level: a reply to a reply joins the same thread rather
-            // than starting a third tier nobody can read on a phone.
-            parent = p.parent || p._id;
-        }
+        // A reply lives where its thread lives: inside a staff-only thread it
+        // is staff-only whatever the composer was left on. It used to take the
+        // composer's default — "Visible to All" — and reach the class as a
+        // comment with no beginning.
+        const visibility = root?.visibility === 'staff' ? 'staff'
+            : (isStaff(req) && req.body.visibility === 'staff' ? 'staff' : 'all');
 
         const comment = await DocumentComment.create({
             document:   doc._id,
@@ -961,65 +1228,112 @@ exports.addComment = async (req, res) => {
             authorRole: req.userRole,
             body,
             files,
-            parent,
-            // Only staff can keep a comment among staff.
-            visibility: isStaff(req) && req.body.visibility === 'staff' ? 'staff' : 'all',
+            parent: root ? root._id : null,
+            visibility,
         });
 
-        // Only the person actually being answered is told. A comment on a
-        // document shared with the whole school is not an event 900 people need
-        // in their inbox.
-        if (parent) {
-            const p = await DocumentComment.findById(parent).lean();
-            if (p && !p.isDeleted && String(p.author) !== String(req.userId)) {
+        const link = { type: 'documents.item', entityId: doc._id };
+        const from = { school: req.schoolId, sender: req.userId, senderRole: req.userRole };
+
+        if (root) {
+            // The person answered, and whoever started the thread — never a
+            // comment on a school-wide document to its 900 readers. Someone
+            // who cannot see a staff-only reply is not told there is one.
+            const told = [answered, root]
+                .filter((c) => c && !c.isDeleted && String(c.author) !== String(req.userId))
+                .filter((c) => visibility !== 'staff' || STAFF_ROLES.includes(c.authorRole))
+                .map((c) => String(c.author));
+            if (told.length) {
                 notify({
-                    school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-                    title: '💬 Reply on an assignment',
+                    ...from,
+                    title: '💬 Reply to your comment',
                     body: `Your comment on "${doc.title}" has a reply.`,
-                    recipients: [p.author],
-                    link: { type: 'documents.item', entityId: doc._id },
+                    recipients: [...new Set(told)],
+                    link,
                 });
             }
+        } else if (!isStaff(req) && doc.uploadedBy) {
+            // A question from a student reaches the person who shared the
+            // document — nobody used to hear it had been asked.
+            notify({
+                ...from,
+                title: '❓ Question on a document',
+                body: `A ${req.userRole === 'parent' ? 'parent' : 'student'} has asked something on "${doc.title}".`,
+                recipients: [doc.uploadedBy],
+                link,
+            });
         }
 
-        res.status(201).json({ success: true, data: comment });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+        const out = typeof comment.toObject === 'function' ? comment.toObject() : comment;
+        res.status(201).json({ success: true, data: { ...out, files: access.publicFiles(out.files) } });
+    } catch (e) {
+        access.discardUploads(req);
+        res.status(500).json({ success: false, message: e.message });
+    }
 };
 
-/** Edit your own words; pin a comment if you are an admin or shared the document. */
+/**
+ * Edit your own words; pin a comment if you are an admin or shared the
+ * document; keep a staff comment among staff if it is yours or you are an
+ * admin.
+ */
 exports.updateComment = async (req, res) => {
     try {
-        const c = await DocumentComment.findOne({ _id: req.params.commentId, school: req.schoolId });
+        const c = isUuid(req.params.commentId)
+            ? await DocumentComment.findOne({ _id: req.params.commentId, school: req.schoolId }) : null;
         if (!c || c.isDeleted) return res.status(404).json({ success: false, message: 'This comment was deleted' });
-        if (req.body.isPinned !== undefined || req.body.visibility !== undefined) {
+        const bad = (message, status = 403) => res.status(status).json({ success: false, message });
+
+        if (req.body.isPinned !== undefined) {
             const doc = await Document.findOne({ _id: c.document, school: req.schoolId }).select('uploadedBy').lean();
-            if (!canPinOn(req, doc)) {
-                return res.status(403).json({ success: false, message: 'Only the school office or the teacher who shared this document can do that' });
+            if (!canPinOn(req, doc)) return bad('Only the school office or the teacher who shared this document can do that');
+            if (c.parent) return bad('Only the first comment of a thread can be pinned', 400);
+        }
+        if (req.body.visibility !== undefined) {
+            // The sharing teacher could flip ANY comment to staff-only — a
+            // student's question vanished from the student who asked it.
+            if (!STAFF_ROLES.includes(c.authorRole)) {
+                return bad('A student’s comment cannot be hidden from them — delete it if it should not be there');
             }
+            if (!isAdmin(req) && String(c.author) !== String(req.userId)) {
+                return bad('Only the person who wrote this, or the school office, can change who sees it');
+            }
+            if (c.parent) return bad('A reply is seen by whoever sees the comment it answers', 400);
         }
 
         if (req.body.body !== undefined) {
-            if (String(c.author) !== String(req.userId)) {
-                return res.status(403).json({ success: false, message: 'You can only edit your own comment' });
-            }
+            if (String(c.author) !== String(req.userId)) return bad('You can only edit your own comment');
             const body = String(req.body.body).trim();
-            if (!body && !c.files?.length) {
-                return res.status(400).json({ success: false, message: 'A comment cannot be emptied — delete it instead' });
-            }
+            if (!body && !c.files?.length) return bad('A comment cannot be emptied — delete it instead', 400);
+            if (body.length > MAX_COMMENT) return bad(`A comment can be up to ${MAX_COMMENT.toLocaleString('en-IN')} characters`, 400);
             c.body = body;
             c.isEdited = true;
         }
-        if (req.body.isPinned   !== undefined) c.isPinned   = !!req.body.isPinned;
-        if (req.body.visibility !== undefined) c.visibility = req.body.visibility === 'staff' ? 'staff' : 'all';
+        if (req.body.isPinned !== undefined) c.isPinned = !!req.body.isPinned;
+        let moved = false;
+        if (req.body.visibility !== undefined) {
+            const to = req.body.visibility === 'staff' ? 'staff' : 'all';
+            moved = to !== c.visibility;
+            c.visibility = to;
+        }
 
         await c.save();
-        res.json({ success: true, data: c });
+        // The replies go where their thread goes.
+        if (moved) {
+            await pool.query(
+                `UPDATE ${qt(DocumentComment)} SET "visibility" = $2, "updatedAt" = now() WHERE "parent" = $1`,
+                [String(c._id), c.visibility],
+            );
+        }
+        const out = typeof c.toObject === 'function' ? c.toObject() : c;
+        res.json({ success: true, data: { ...out, files: access.publicFiles(out.files) } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.deleteComment = async (req, res) => {
     try {
-        const c = await DocumentComment.findOne({ _id: req.params.commentId, school: req.schoolId }).lean();
+        const c = isUuid(req.params.commentId)
+            ? await DocumentComment.findOne({ _id: req.params.commentId, school: req.schoolId }).lean() : null;
         const admin = isAdmin(req);
         if (!c || (c.isDeleted && !admin)) return res.status(404).json({ success: false, message: 'This comment was already deleted' });
         const mine = String(c.author) === String(req.userId);
@@ -1028,6 +1342,8 @@ exports.deleteComment = async (req, res) => {
         }
 
         const T = qt(DocumentComment);
+        // Attachments leave the disk with the words they were attached to.
+        const gone = access.namesOf(c.files);
         let kept = false;
         let deletedReplies = 0;
         if (!admin && !c.parent) {
@@ -1054,9 +1370,11 @@ exports.deleteComment = async (req, res) => {
             // Replies go with the comment they answer — left behind they read
             // as answers to nothing. (For anyone but an admin they are all the
             // author's own by now: other people's replies kept the row above.)
-            ({ rowCount: deletedReplies } = await pool.query(
-                `DELETE FROM ${T} WHERE "parent" = $1`, [String(c._id)],
-            ));
+            const { rows } = await pool.query(
+                `DELETE FROM ${T} WHERE "parent" = $1 RETURNING "files"`, [String(c._id)],
+            );
+            deletedReplies = rows.length;
+            for (const r of rows) gone.push(...access.namesOf(r.files));
         }
         // The last reply under a deleted comment takes the empty shell with it.
         if (c.parent) {
@@ -1067,12 +1385,14 @@ exports.deleteComment = async (req, res) => {
                 [String(c.parent)],
             );
         }
+        access.removeUnreferenced(gone);
         res.json({ success: true, deletedReplies, kept });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.toggleLike = async (req, res) => {
     try {
+        if (!isUuid(req.params.commentId)) return res.status(404).json({ success: false, message: 'Comment not found' });
         // One statement, so two people liking at once cannot each overwrite the
         // other's array with a copy read a moment earlier.
         const { rows } = await pool.query(

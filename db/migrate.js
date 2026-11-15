@@ -306,6 +306,18 @@ const ONCE = [
                 + `${r.rostersRewritten} rosters corrected, ${r.pointersMoved} profile pointers moved`;
         },
     },
+    {
+        // Shared documents (Nov 2026): a due date was stored at 5:30 AM on its
+        // day, so work was late from the early morning; and every file carried
+        // the server's own disk path out to its readers. See
+        // services/documentBackfill.js.
+        name: 'documents: due at the end of the day, files by address (Nov 2026)',
+        run: async () => {
+            const r = await require('../services/documentBackfill').run();
+            return `${r.due} due dates moved to the end of their day, ${r.late} submissions no longer late, `
+                + `${r.paths} rows of file paths rewritten`;
+        },
+    },
 ];
 
 async function runOnce() {

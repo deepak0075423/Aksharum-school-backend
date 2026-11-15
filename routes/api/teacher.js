@@ -19,6 +19,7 @@ const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const docViewer      = require('../../controllers/documentViewer.controller');
 const docDetail      = require('../../controllers/documentDetail.controller');
+const { checkUploads } = require('../../services/documentAccess');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
@@ -162,14 +163,14 @@ router.get('/document-categories', docGuard, async (req, res) => {
 
 // ── Documents ─────────────────────────────────────────────────────────────────
 router.get('/documents',                             docGuard, docViewer.teacherGetDocuments);
-router.post('/documents',                            docGuard, uploadDocument.array('files', 10), docCtrl.teacherUpload);
+router.post('/documents',                            docGuard, uploadDocument.array('files', 10), checkUploads, docCtrl.teacherUpload);
 router.post('/documents/read',                       docGuard, docViewer.markRead);
 router.post('/documents/:id/read',                   docGuard, docViewer.markRead);
-router.get('/documents/:id',                         docGuard, docCtrl.teacherGetDocument);
-router.put('/documents/:id',                         docGuard, uploadDocument.array('files', 10), docCtrl.teacherEditDocument);
+router.put('/documents/:id',                         docGuard, uploadDocument.array('files', 10), checkUploads, docCtrl.teacherEditDocument);
 router.delete('/documents/:id',                      docGuard, docCtrl.teacherDeleteDocument);
-router.get('/documents/:id/submissions',             docGuard, docCtrl.teacherGetSubmissions);
-router.post('/documents/submissions/:submissionId/review', docGuard, docCtrl.teacherReviewSubmission);
+// The two old submission routes are gone: the review one let any teacher mark
+// any submission in the school by its id. Marking is
+// /documents/:id/submissions/:studentId/review below, behind the owner check.
 
 // ── One document, opened ──────────────────────────────────────────────────────
 // The same four tabs the admin gets, behind an access check: a teacher reads
@@ -177,14 +178,23 @@ router.post('/documents/submissions/:submissionId/review', docGuard, docCtrl.tea
 const canRead = docDetail.teacherDocumentAccess('read');
 const canOwn  = docDetail.teacherDocumentAccess('own');
 
+// One document by id — only one that reaches this teacher. It used to answer
+// for any document in the school.
+router.get('/documents/:id',                      docGuard, canRead, docCtrl.teacherGetDocument);
 router.get('/documents/:id/assignment',           docGuard, canRead, docDetail.getAssignment);
 router.get('/documents/:id/assignment/analytics', docGuard, canRead, docDetail.getAssignmentAnalytics);
 router.get('/documents/:id/comments',             docGuard, canRead, docDetail.listComments);
-router.post('/documents/:id/comments',            docGuard, canRead, uploadDocument.array('files', 4), docDetail.addComment);
+router.post('/documents/:id/comments',            docGuard, canRead, uploadDocument.array('files', 4), checkUploads, docDetail.addComment);
 
 router.post('/documents/:id/submissions/:studentId/review', docGuard, canOwn, docDetail.reviewSubmission);
 router.post('/documents/:id/remind',              docGuard, canOwn, docDetail.remindPending);
 router.post('/documents/:id/duplicate',           docGuard, canOwn, docDetail.duplicate);
+// Their own to put away and take back out, to see who has opened, and to roll
+// back to an earlier set of files.
+router.post('/documents/:id/archive',             docGuard, docCtrl.teacherArchiveDocument);
+router.get('/documents/:id/readers',              docGuard, canOwn, docDetail.getReaders);
+router.get('/documents/:id/versions',             docGuard, canOwn, docCtrl.getVersions);
+router.post('/documents/:id/versions/:versionId/restore', docGuard, canOwn, docCtrl.restoreVersion);
 
 // Editing and deleting a comment are guarded by authorship inside the handler,
 // so they need no document-level check of their own.

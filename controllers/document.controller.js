@@ -14,56 +14,25 @@ const DocumentRead         = require('../models/DocumentRead');
 const TeacherProfile       = require('../models/TeacherProfile');
 const Subject              = require('../models/Subject');
 const User                 = require('../models/User');
+const DocumentVersion      = require('../models/DocumentVersion');
 const pool                 = require('../db/pool');
 const { yearOrderSql } = require('../utils/listOrder');
+const access               = require('../services/documentAccess');
+const { notify }           = require('../services/notifyService');
+const { isUuid }           = access;
 
 /** Table name, quoted — the raw-SQL reads below take their names from the models. */
 const qt = (Model) => `"${Model.tableName}"`;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function buildFileObjects(files) {
-    return (files || []).map(f => ({
-        originalName: f.originalname,
-        storedName:   f.filename,
-        filePath:     f.path,
-        mimeType:     f.mimetype,
-        fileSize:     f.size,
-    }));
-}
+// What is stored for an upload — the address under the server root, never the
+// machine's own disk path (services/documentAccess).
+const buildFileObjects = access.storedFiles;
 
-async function canStudentViewDocument(doc, studentId, schoolId) {
-    const { targetType, targetSections, targetClasses, targetUsers } = doc;
-
-    if (targetType === 'whole_school') return true;
-    if (targetType === 'all_teachers') return false;
-    if (targetType === 'specific_teachers') return false;
-
-    const profile = await StudentProfile.findOne({ user: studentId }).lean();
-    if (!profile?.currentSection) return false;
-
-    const sectionId = profile.currentSection.toString();
-
-    if (targetType === 'class_sections') {
-        const studentSec = await ClassSection.findById(sectionId).lean();
-        if (!studentSec) return false;
-        const studentClass = await Class.findById(studentSec.class).lean();
-        if (!studentClass) return false;
-        const sameClasses = await Class.find({ school: schoolId, classNumber: studentClass.classNumber }).distinct('_id');
-        const sameSections = await ClassSection.find({ class: { $in: sameClasses }, sectionName: studentSec.sectionName, school: schoolId }).distinct('_id');
-        const sameSectionStrs = sameSections.map(id => id.toString());
-        return (targetSections || []).some(id => sameSectionStrs.includes(id.toString()));
-    }
-    if (targetType === 'class') {
-        const section = await ClassSection.findById(sectionId).lean();
-        if (!section?.class) return false;
-        const classDoc = await Class.findById(section.class).lean();
-        if (!classDoc) return false;
-        const allClassIds = await Class.find({ school: classDoc.school, classNumber: classDoc.classNumber }).distinct('_id');
-        const allClassStrs = allClassIds.map(id => id.toString());
-        return (targetClasses || []).some(id => allClassStrs.includes(id.toString()));
-    }
-    return false;
+/** Is this document on this student's shelf — judged by where they sat in its year. */
+async function canStudentViewDocument(doc, studentId) {
+    return (await access.studentsReached(doc._id, [studentId])).length > 0;
 }
 
 // ── Admin: Documents ──────────────────────────────────────────────────────────
@@ -115,7 +84,6 @@ const LIST_SORTS = {
 
 /** The tab strip: a fixed taxonomy, so the same tabs mean the same thing everywhere. */
 const TAB_TYPES = {
-    assignments: ['assignment'],
     notices:     ['notice', 'circular'],
     study:       ['study_material'],
 };
@@ -139,10 +107,17 @@ function listWhere(req) {
 
     const types = TAB_TYPES[q.tab];
     if (types) { params.push(types); where.push(`d."docType" = ANY($${params.length}::text[])`); }
+    // Assignments is the flag, not the type: study material students hand work
+    // in against is an assignment to whoever has to mark it — and the tile
+    // above this tab counts the flag, so the two now agree.
+    if (q.tab === 'assignments') where.push('COALESCE(d."isAssignment", false) = true');
 
     if (q.category)     { params.push(String(q.category));     where.push(`d."category" = $${params.length}`); }
     if (q.docType)      { params.push(String(q.docType));      where.push(`d."docType" = $${params.length}`); }
-    if (q.academicYear) { params.push(String(q.academicYear)); where.push(`d."academicYear" = $${params.length}::uuid`); }
+    // 'none' is the documents filed under no year at all. Anything that is not
+    // an id is ignored rather than handed to Postgres to choke on.
+    if (q.academicYear === 'none') where.push('d."academicYear" IS NULL');
+    else if (isUuid(q.academicYear)) { params.push(String(q.academicYear)); where.push(`d."academicYear" = $${params.length}::uuid`); }
 
     if (q.target === 'classes') {
         params.push(CLASS_TARGETS);   where.push(`d."targetType" = ANY($${params.length}::text[])`);
@@ -157,7 +132,8 @@ function listWhere(req) {
 
     const search = String(q.search || '').trim();
     if (search) {
-        params.push(`%${search}%`);
+        // A typed % or _ is a character to find, not a wildcard.
+        params.push(`%${search.replace(/[%_\\]/g, (m) => `\\${m}`)}%`);
         // Title, the line under it and the school's own filing label — the three
         // things visible in the row someone is trying to find again.
         where.push(`(d."title" ILIKE $${params.length}
@@ -252,7 +228,7 @@ function shapeRow(r) {
         }
     })();
 
-    const files = Array.isArray(r.files) ? r.files : [];
+    const files = access.publicFiles(r.files);
     return {
         _id: r._id,
         title: r.title,
@@ -404,7 +380,7 @@ exports.adminGetDocumentOverview = async (req, res) => {
                 },
                 counts: {
                     all:         live.n,
-                    assignments: sum((r) => TAB_TYPES.assignments.includes(r.docType)).n,
+                    assignments: sum((r) => r.isAssignment).n,
                     notices:     sum((r) => TAB_TYPES.notices.includes(r.docType)).n,
                     study:       sum((r) => TAB_TYPES.study.includes(r.docType)).n,
                     archived:    archived.n,
@@ -419,24 +395,8 @@ exports.adminGetDocumentOverview = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-/**
- * The year a document is filed under.
- *
- * The school's active year, or — when none is marked active — the year whose
- * window the upload date falls inside. Returns null rather than guessing when
- * neither answers, so an unfiled document stays visibly unfiled instead of
- * being quietly parked in the wrong year.
- */
-async function currentAcademicYearId(schoolId, at = new Date()) {
-    const active = await AcademicYear.findOne({ school: schoolId, status: 'active' }).lean();
-    if (active) return active._id;
-    const covering = await AcademicYear.findOne({
-        school: schoolId,
-        startDate: { $lte: at },
-        endDate:   { $gte: at },
-    }).lean();
-    return covering?._id || null;
-}
+// The year a document is filed under — services/documentAccess.
+const currentAcademicYearId = access.currentYearId;
 
 const ASSIGNMENT_TYPES = ['homework', 'classwork', 'project', 'practice', 'lab', 'reading'];
 
@@ -447,6 +407,7 @@ const ASSIGNMENT_TYPES = ['homework', 'classwork', 'project', 'practice', 'lab',
  * later stored against: two questions both called "Q1" would have one set of
  * scores between them.
  */
+const OTHER_MARKS = 'Other marks';
 function parseQuestions(raw) {
     let list;
     try { list = JSON.parse(raw || '[]'); } catch { return []; }
@@ -458,6 +419,9 @@ function parseQuestions(raw) {
             maxMarks: q?.maxMarks === '' || q?.maxMarks == null ? null : Number(q.maxMarks),
         }))
         .filter((q) => {
+            // "Other marks" is the marking form's own line for what the named
+            // questions leave over; a question cannot take its name.
+            if (q.label.toLowerCase() === OTHER_MARKS.toLowerCase()) return false;
             if (!q.label || seen.has(q.label.toLowerCase())) return false;
             seen.add(q.label.toLowerCase());
             return true;
@@ -579,303 +543,511 @@ exports.adminDocumentTeachers = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-exports.adminUpload = async (req, res) => {
-    try {
-        const { title, description, category, docType, subject, assignmentType,
-                questions, targetType, targetClasses, targetSections,
-                targetUsers, isAssignment, dueDate, allowSubmission, marksEnabled, totalMarks, tags } = req.body;
+// ── What both sharing forms post ─────────────────────────────────────────────
 
-        if (!title?.trim())  return res.status(400).json({ success: false, message: 'Title is required' });
-        if (!category)       return res.status(400).json({ success: false, message: 'Category is required' });
-        if (!targetType)     return res.status(400).json({ success: false, message: 'Target type is required' });
+const TARGET_TYPES  = ['whole_school', 'all_teachers', 'specific_teachers', 'class', 'class_sections'];
+const STAFF_TARGETS = ['all_teachers', 'specific_teachers'];
+const STAFF_ONLY    = 'Only students hand work in — an assignment cannot be shared with teachers alone';
+
+/** A refusal takes the files the request brought with it: multer has already written them. */
+const refuse = (req, res, message, status = 400, code = null) => {
+    access.discardUploads(req);
+    return res.status(status).json({ success: false, message, ...(code ? { code } : {}) });
+};
+
+/** A form posts every value as text, so 'false' is false. */
+const flag = (v) => v === true || v === 'true' || v === 1 || v === '1';
+
+/**
+ * When work is due.
+ *
+ * The form sends a day. `new Date('2026-11-20')` is midnight UTC — 5:30 in the
+ * morning here — so work handed in at ten on the due day came out "late" and
+ * everything unsubmitted was "missed" before school had opened. A day means
+ * the whole day: it is due at the end of it. `undefined` is a value that is
+ * not a date at all.
+ */
+function dueAt(value) {
+    if (value == null || value === '') return null;
+    const s = String(value);
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    const d = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999) : new Date(s);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+}
+
+const fmtDay = (d) => new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+
+/** A JSON list of ids from a form field; null when it is not a list. */
+function idList(raw) {
+    let list;
+    try { list = Array.isArray(raw) ? raw : JSON.parse(raw || '[]'); } catch { return null; }
+    if (!Array.isArray(list)) return null;
+    return [...new Set(list.map((x) => String(x?._id || x || '')).filter(Boolean))];
+}
+
+function tagList(raw) {
+    const list = idList(raw);
+    return (list || []).map((t) => t.trim()).filter(Boolean).slice(0, 20);
+}
+
+/**
+ * The classes or sections a document is aimed at — every one a row of this
+ * school. An id from somewhere else used to be stored as it came, reaching
+ * nobody; so did "whole classes" with no class ticked.
+ */
+async function classTargets(req, targetType, rawClasses, rawSections) {
+    const none = { ok: true, classes: [], sections: [] };
+    if (targetType === 'class') {
+        const want = idList(rawClasses);
+        if (!want?.length) return { ok: false, message: 'Pick at least one class' };
+        const found = want.every(isUuid)
+            ? await Class.find({ _id: { $in: want }, school: req.schoolId }).distinct('_id') : [];
+        if (found.length !== want.length) return { ok: false, message: 'Some of the chosen classes are not in this school' };
+        return { ...none, classes: want };
+    }
+    if (targetType === 'class_sections') {
+        const want = idList(rawSections);
+        if (!want?.length) return { ok: false, message: 'Pick at least one section' };
+        const found = want.every(isUuid)
+            ? await ClassSection.find({ _id: { $in: want }, school: req.schoolId }).distinct('_id') : [];
+        if (found.length !== want.length) return { ok: false, message: 'Some of the chosen sections are not in this school' };
+        return { ...none, sections: want };
+    }
+    return none;
+}
+
+/** A document as a client reads it: its files by address, not by disk path. */
+function clean(doc) {
+    const o = doc && typeof doc.toObject === 'function' ? doc.toObject() : { ...(doc || {}) };
+    o.files = access.publicFiles(o.files);
+    return o;
+}
+
+const plainFiles = (files) => (Array.isArray(files) ? files : []).map((f) => ({
+    originalName: f.originalName, storedName: f.storedName, filePath: f.filePath,
+    mimeType: f.mimeType, fileSize: f.fileSize,
+}));
+
+/**
+ * Tell the people a document was shared with that it is there.
+ *
+ * Nothing used to: a notice went onto the shelf and waited to be found. Run
+ * after the answer has gone back — a school-wide notice writes a receipt per
+ * reader, and the person sharing it should not wait on that.
+ */
+function announce(doc, req) {
+    setImmediate(async () => {
+        try {
+            const { recipients, about } = await access.audience(doc);
+            if (!recipients.length) return;
+            const kind = doc.isAssignment ? 'assignment'
+                : ({ notice: 'notice', circular: 'circular', study_material: 'study material' }[doc.docType] || 'document');
+            const due = doc.isAssignment && doc.dueDate ? ` Due ${fmtDay(doc.dueDate)}.` : '';
+            notify({
+                school: doc.school, sender: req.userId, senderRole: req.userRole,
+                title: `${doc.isAssignment ? '📝' : '📄'} New ${kind}: ${doc.title}`.slice(0, 140),
+                body: `${doc.description ? String(doc.description).trim() : `A new ${kind} has been shared with you.`}${due}`,
+                recipients,
+                about: about || undefined,
+                link: { type: 'documents.item', entityId: doc._id },
+            });
+        } catch (e) { console.error('[documents] announce:', e.message); }
+    });
+}
+
+/**
+ * The assignment half of an edit. Returns what is wrong, or null.
+ *
+ * `allowSubmission` is read here now. Both edit forms have always sent it and
+ * neither endpoint looked, so "Accept submissions" could not be switched off —
+ * and a notice later turned into an assignment kept the `false` it was created
+ * with, so it said "Submissions are closed" for good.
+ */
+function applyAssignment(doc, b) {
+    const was = !!doc.isAssignment;
+    if (b.isAssignment !== undefined) doc.isAssignment = flag(b.isAssignment);
+
+    if (!doc.isAssignment) {
+        if (was) {
+            doc.dueDate = null;
+            doc.allowSubmission = false;
+            // Nothing left to grade or to break into questions.
+            doc.questions = [];
+            doc.marksEnabled = false;
+            doc.totalMarks = null;
+        }
+    } else {
+        if (STAFF_TARGETS.includes(doc.targetType)) return STAFF_ONLY;
+        if (b.allowSubmission !== undefined) doc.allowSubmission = flag(b.allowSubmission);
+        else if (!was) doc.allowSubmission = true;
+        if (b.dueDate !== undefined) {
+            const due = dueAt(b.dueDate);
+            if (due === undefined) return 'That due date is not a date';
+            doc.dueDate = due;
+        }
+        if (b.totalMarks !== undefined) {
+            doc.totalMarks   = Number(b.totalMarks) > 0 ? Number(b.totalMarks) : null;
+            doc.marksEnabled = doc.totalMarks != null;
+        }
+        if (b.assignmentType !== undefined && ASSIGNMENT_TYPES.includes(b.assignmentType)) {
+            doc.assignmentType = b.assignmentType;
+        }
+        if (b.questions !== undefined) doc.questions = parseQuestions(b.questions);
+    }
+    // Read after the flag, so "not an assignment any more" cannot keep the type.
+    if (b.docType !== undefined || b.isAssignment !== undefined) {
+        doc.docType = normalizeDocType(b.docType !== undefined ? b.docType : doc.docType, doc.isAssignment);
+    }
+    return null;
+}
+
+/**
+ * Save an edited document, keeping what its files were.
+ *
+ * When the files change the set that was there is filed as a version — the
+ * counter used to go up with nothing behind it — and the read marks are
+ * cleared: a notice whose attachment was swapped is a notice people have not
+ * read. Replaced files stay on disk for as long as a version holds them.
+ */
+async function saveEdited(doc, req, had, changed) {
+    await doc.save();
+    if (!changed) return;
+    await Promise.all([
+        DocumentVersion.create({
+            document: doc._id, school: doc.school,
+            versionNumber: (doc.currentVersion || 2) - 1,
+            files: had, uploadedBy: req.userId,
+        }),
+        DocumentRead.deleteMany({ document: doc._id, user: { $ne: req.userId } }),
+    ]).catch((e) => console.error('[documents] version:', e.message));
+}
+
+/** Everything hanging off these documents — nothing cascades in this database. */
+async function wipe(docs) {
+    const docIds = docs.map((d) => d._id);
+    if (!docIds.length) return;
+    const [versions, comments, subs] = await Promise.all([
+        DocumentVersion.find({ document: { $in: docIds } }).select('files').lean(),
+        DocumentComment.find({ document: { $in: docIds } }).select('files').lean(),
+        AssignmentSubmission.find({ document: { $in: docIds } }).select('files').lean(),
+    ]);
+    const names = [...docs, ...versions, ...comments, ...subs].flatMap((r) => access.namesOf(r.files));
+    await Promise.all([
+        AssignmentSubmission.deleteMany({ document: { $in: docIds } }),
+        DocumentComment.deleteMany({ document: { $in: docIds } }),
+        DocumentRead.deleteMany({ document: { $in: docIds } }),
+        DocumentVersion.deleteMany({ document: { $in: docIds } }),
+    ]);
+    // The files go once no other document shares them (a duplicate does).
+    access.removeUnreferenced(names);
+}
+
+// ── Admin: share, edit, put away, delete ─────────────────────────────────────
+
+exports.adminUpload = async (req, res) => {
+    let created = false;
+    try {
+        const b = req.body;
+        if (!b.title?.trim())                      return refuse(req, res, 'Title is required');
+        if (!b.category)                           return refuse(req, res, 'Category is required');
+        if (!TARGET_TYPES.includes(b.targetType))  return refuse(req, res, 'Choose who this is shared with');
 
         const files    = buildFileObjects(req.files);
-        const assigned = !!isAssignment && isAssignment !== 'false';
-        if (assigned && !files.length) return res.status(400).json({ success: false, message: NEEDS_FILE });
+        const assigned = flag(b.isAssignment);
+        if (assigned && !files.length)                      return refuse(req, res, NEEDS_FILE, 400, 'NEEDS_FILE');
+        if (assigned && STAFF_TARGETS.includes(b.targetType)) return refuse(req, res, STAFF_ONLY);
+        const due = assigned ? dueAt(b.dueDate) : null;
+        if (due === undefined)                              return refuse(req, res, 'That due date is not a date');
 
-        const people = await teacherTargets(req, targetType, targetUsers);
-        if (!people.ok) return res.status(400).json({ success: false, message: people.message });
+        const where = await classTargets(req, b.targetType, b.targetClasses, b.targetSections);
+        if (!where.ok) return refuse(req, res, where.message);
+        const people = await teacherTargets(req, b.targetType, b.targetUsers);
+        if (!people.ok) return refuse(req, res, people.message);
 
+        const total = Number(b.totalMarks) > 0 ? Number(b.totalMarks) : null;
         const doc = await Document.create({
             school: req.schoolId,
-            title:  title.trim(),
-            description: description || '',
-            category,
-            docType: normalizeDocType(docType, assigned),
+            title:  b.title.trim(),
+            description: b.description || '',
+            category: b.category,
+            docType: normalizeDocType(b.docType, assigned),
             files,
             uploadedBy:   req.userId,
-            uploaderRole: 'school_admin',
-            targetType,
-            targetClasses:  JSON.parse(targetClasses  || '[]'),
-            targetSections: JSON.parse(targetSections || '[]'),
+            // Stamped from the account, not the route: a teacher who administers
+            // Documents shares through this endpoint too.
+            uploaderRole: req.userRole === 'teacher' ? 'teacher' : 'school_admin',
+            targetType: b.targetType,
+            targetClasses:  where.classes,
+            targetSections: where.sections,
             targetUsers:    people.users,
-            tags: JSON.parse(tags || '[]'),
-            subject: subject || '',
+            tags: tagList(b.tags),
+            subject: b.subject || '',
             academicYear:    await currentAcademicYearId(req.schoolId),
             isAssignment:    assigned,
-            assignmentType:  assigned && ASSIGNMENT_TYPES.includes(assignmentType) ? assignmentType : 'homework',
-            questions:       assigned ? parseQuestions(questions) : [],
-            dueDate:         dueDate ? new Date(dueDate) : null,
-            allowSubmission: assigned ? allowSubmission !== false : false,
+            assignmentType:  assigned && ASSIGNMENT_TYPES.includes(b.assignmentType) ? b.assignmentType : 'homework',
+            questions:       assigned ? parseQuestions(b.questions) : [],
+            dueDate:         due,
+            // Open unless the form says otherwise. This compared the text
+            // 'false' with the boolean, so it was always open.
+            allowSubmission: assigned ? (b.allowSubmission === undefined ? true : flag(b.allowSubmission)) : false,
             // Marks are what makes an assignment gradeable, so a total given
             // without the flag still counts — the form has one field, not two.
-            marksEnabled:    assigned && (marksEnabled === 'true' || marksEnabled === true || Number(totalMarks) > 0),
-            totalMarks:      Number(totalMarks) > 0 ? Number(totalMarks) : null,
+            marksEnabled:    assigned && total != null,
+            totalMarks:      assigned ? total : null,
         });
-        res.status(201).json({ success: true, data: doc });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+        created = true;
+        announce(doc, req);
+        res.status(201).json({ success: true, data: clean(doc) });
+    } catch (e) {
+        if (!created) access.discardUploads(req);
+        res.status(500).json({ success: false, message: e.message });
+    }
 };
 
 exports.adminGetDocument = async (req, res) => {
     try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId })
             .populate('uploadedBy', 'name')
             .lean();
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        res.json({ success: true, data: doc });
+        res.json({ success: true, data: clean(doc) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.adminEditDocument = async (req, res) => {
     try {
+        if (!isUuid(req.params.id)) return refuse(req, res, 'Document not found', 404);
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId });
-        if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
+        if (!doc) return refuse(req, res, 'Document not found', 404);
 
-        const { title, description, category, docType, subject, assignmentType, questions,
-                targetType, targetClasses, targetSections,
-                targetUsers, isAssignment, dueDate, marksEnabled, totalMarks, tags, academicYear } = req.body;
+        const b = req.body;
+        if (b.title !== undefined) {
+            if (!String(b.title).trim()) return refuse(req, res, 'Title is required');
+            doc.title = String(b.title).trim();
+        }
+        if (b.description !== undefined) doc.description = b.description;
+        if (b.category !== undefined) {
+            if (!b.category) return refuse(req, res, 'Category is required');
+            doc.category = b.category;
+        }
+        if (b.subject !== undefined) doc.subject = b.subject;
+        if (b.tags !== undefined)    doc.tags    = tagList(b.tags);
 
-        if (title !== undefined)      doc.title       = title.trim();
-        if (description !== undefined)doc.description = description;
-        if (category !== undefined)   doc.category    = category;
-        if (targetType !== undefined) doc.targetType  = targetType;
-        if (targetClasses  !== undefined) doc.targetClasses  = JSON.parse(targetClasses);
-        if (targetSections !== undefined) doc.targetSections = JSON.parse(targetSections);
-        if (targetUsers !== undefined || targetType !== undefined) {
+        if (b.targetType !== undefined) {
+            if (!TARGET_TYPES.includes(b.targetType)) return refuse(req, res, 'Choose who this is shared with');
+            doc.targetType = b.targetType;
+        }
+        if (b.targetType !== undefined || b.targetClasses !== undefined || b.targetSections !== undefined) {
+            const where = await classTargets(
+                req, doc.targetType,
+                b.targetClasses  !== undefined ? b.targetClasses  : (doc.targetClasses  || []).map(String),
+                b.targetSections !== undefined ? b.targetSections : (doc.targetSections || []).map(String),
+            );
+            if (!where.ok) return refuse(req, res, where.message);
+            doc.targetClasses  = where.classes;
+            doc.targetSections = where.sections;
+        }
+        if (b.targetUsers !== undefined || b.targetType !== undefined) {
             const people = await teacherTargets(
                 req, doc.targetType,
-                targetUsers !== undefined ? targetUsers : (doc.targetUsers || []).map(String),
+                b.targetUsers !== undefined ? b.targetUsers : (doc.targetUsers || []).map(String),
             );
-            if (!people.ok) return res.status(400).json({ success: false, message: people.message });
+            if (!people.ok) return refuse(req, res, people.message);
             doc.targetUsers = people.users;
         }
-        if (tags !== undefined) doc.tags = JSON.parse(tags);
-        if (dueDate !== undefined)    doc.dueDate     = dueDate ? new Date(dueDate) : null;
-        if (subject !== undefined)    doc.subject     = subject;
-        if (totalMarks !== undefined) {
-            doc.totalMarks   = Number(totalMarks) > 0 ? Number(totalMarks) : null;
-            doc.marksEnabled = doc.totalMarks != null;
-        }
-        if (assignmentType !== undefined && ASSIGNMENT_TYPES.includes(assignmentType)) {
-            doc.assignmentType = assignmentType;
-        }
-        if (questions !== undefined) doc.questions = parseQuestions(questions);
-        if (academicYear !== undefined) doc.academicYear = academicYear || null;
-        if (isAssignment !== undefined) {
-            doc.isAssignment = !!isAssignment && isAssignment !== 'false';
-            if (!doc.isAssignment) {
-                doc.dueDate = null;
-                doc.allowSubmission = false;
-                // Nothing left to grade or to break into questions.
-                doc.questions = [];
-                doc.marksEnabled = false;
-                doc.totalMarks = null;
+        if (b.academicYear !== undefined) {
+            if (b.academicYear && !(isUuid(b.academicYear)
+                && await AcademicYear.findOne({ _id: b.academicYear, school: req.schoolId }).lean())) {
+                return refuse(req, res, 'That academic year is not one of this school\'s');
             }
-        }
-        // Read after the flag above, so "not an assignment any more" cannot be
-        // left holding docType 'assignment'.
-        if (docType !== undefined || isAssignment !== undefined) {
-            doc.docType = normalizeDocType(
-                docType !== undefined ? docType : doc.docType,
-                doc.isAssignment,
-            );
+            doc.academicYear = b.academicYear || null;
         }
 
+        const wrong = applyAssignment(doc, b);
+        if (wrong) return refuse(req, res, wrong);
+
+        const had   = plainFiles(doc.files);
         const after = filesAfterEdit(doc, req);
-        if (!after.ok) return res.status(400).json({ success: false, message: after.message });
+        if (!after.ok) return refuse(req, res, after.message);
         if (after.changed) {
             doc.files = after.files;
             doc.currentVersion = (doc.currentVersion || 1) + 1;
         }
-        if (doc.isAssignment && !doc.files?.length) {
-            return res.status(400).json({ success: false, message: NEEDS_FILE });
-        }
-        await doc.save();
-        res.json({ success: true, data: doc });
+        if (doc.isAssignment && !doc.files?.length) return refuse(req, res, NEEDS_FILE, 400, 'NEEDS_FILE');
+
+        await saveEdited(doc, req, had, after.changed);
+        res.json({ success: true, data: clean(doc) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.adminDeleteDocument = async (req, res) => {
     try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
         const doc = await Document.findOneAndDelete({ _id: req.params.id, school: req.schoolId });
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        // Nothing cascades in the database, so everything hanging off the
-        // document goes here — the submissions against it and the discussion
-        // about it. Orphaned rows are invisible until somebody counts them.
-        await Promise.all([
-            AssignmentSubmission.deleteMany({ document: doc._id }),
-            DocumentComment.deleteMany({ document: doc._id }),
-            DocumentRead.deleteMany({ document: doc._id }),
-        ]);
+        await wipe([doc]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-exports.adminArchiveDocument = async (req, res) => {
+/**
+ * Put a document away, or take it back out — `{ archived: bool }`, and leaving
+ * it out still means archive. The office may do it to anything; a teacher (on
+ * their own route) only to what they shared.
+ */
+const archiveBy = (own) => async (req, res) => {
     try {
-        // The one endpoint puts a document away and takes it back out — an
-        // archived document with no route back is a deleted one with extra steps.
-        const archive = req.body?.archived === undefined ? true : !!req.body.archived;
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
+        const archive = req.body?.archived === undefined ? true : flag(req.body.archived);
         const doc = await Document.findOneAndUpdate(
-            { _id: req.params.id, school: req.schoolId },
+            { _id: req.params.id, school: req.schoolId, ...(own ? { uploadedBy: req.userId } : {}) },
             { isArchived: archive },
-            { new: true }
+            { new: true },
         ).lean();
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        res.json({ success: true, data: doc });
+        res.json({ success: true, data: clean(doc) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
+exports.adminArchiveDocument   = archiveBy(false);
+exports.teacherArchiveDocument = archiveBy(true);
 
 exports.adminBulkArchive = async (req, res) => {
     try {
-        const { ids } = req.body;
-        if (!ids?.length) return res.status(400).json({ success: false, message: 'ids are required' });
-        const archive = req.body.archived === undefined ? true : !!req.body.archived;
-        await Document.updateMany({ _id: { $in: ids }, school: req.schoolId }, { isArchived: archive });
+        const wanted = (Array.isArray(req.body?.ids) ? req.body.ids : []).map(String).filter(isUuid);
+        if (!wanted.length) return res.status(400).json({ success: false, message: 'ids are required' });
+        const archive = req.body.archived === undefined ? true : flag(req.body.archived);
+        await Document.updateMany({ _id: { $in: wanted }, school: req.schoolId }, { isArchived: archive });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.adminBulkDelete = async (req, res) => {
     try {
-        const { ids } = req.body;
-        if (!ids?.length) return res.status(400).json({ success: false, message: 'ids are required' });
-        await Document.deleteMany({ _id: { $in: ids }, school: req.schoolId });
-        await Promise.all([
-            AssignmentSubmission.deleteMany({ document: { $in: ids } }),
-            DocumentComment.deleteMany({ document: { $in: ids } }),
-            DocumentRead.deleteMany({ document: { $in: ids } }),
-        ]);
-        res.json({ success: true });
+        const wanted = (Array.isArray(req.body?.ids) ? req.body.ids : []).map(String).filter(isUuid);
+        if (!wanted.length) return res.status(400).json({ success: false, message: 'ids are required' });
+        // Only what is this school's. The submissions, comments and read marks
+        // used to be deleted by the ids as posted — another school's with them.
+        const docs = await Document.find({ _id: { $in: wanted }, school: req.schoolId }).select('files').lean();
+        await Document.deleteMany({ _id: { $in: docs.map((d) => d._id) }, school: req.schoolId });
+        await wipe(docs);
+        res.json({ success: true, deleted: docs.length });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-exports.adminGetAuditLog = async (req, res) => {
-    try {
-        const { page = 1, limit = 20 } = req.query;
-        const [docs, total] = await Promise.all([
-            Document.find({ school: req.schoolId })
-                .populate('uploadedBy', 'name email')
-                .sort({ updatedAt: -1 })
-                .skip((+page - 1) * +limit)
-                .limit(+limit)
-                .lean(),
-            Document.countDocuments({ school: req.schoolId }),
-        ]);
-        res.json({ success: true, data: docs, total, page: +page, pages: Math.ceil(total / +limit) });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
+// ── Versions ─────────────────────────────────────────────────────────────────
 
-exports.adminRestoreVersion = async (req, res) => {
-    // Version history not tracked separately; return document as-is
+/** A document's earlier sets of files, newest first, under what it holds now. */
+exports.getVersions = async (req, res) => {
     try {
-        const doc = await Document.findOne({ _id: req.params.docId, school: req.schoolId }).lean();
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
+        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        res.json({ success: true, data: doc });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-// ── Teacher: Documents ────────────────────────────────────────────────────────
-
-exports.teacherGetDocuments = async (req, res) => {
-    try {
-        const { category, isArchived, page = 1, limit = 20 } = req.query;
-
-        // Teacher sees: documents they uploaded OR targeted at them / their section
-        const mySections = await SectionSubjectTeacher.find({ teacher: req.userId }).distinct('section');
-
-        const filter = {
-            school: req.schoolId,
-            isArchived: isArchived === 'true' ? true : false,
-            $or: [
-                { uploadedBy: req.userId },
-                { targetType: 'all_teachers' },
-                { targetType: 'whole_school' },
-                { targetType: 'specific_teachers', targetUsers: req.userId },
-                { targetType: 'class_sections', targetSections: { $in: mySections } },
-            ],
-        };
-        if (category) filter.category = category;
-
-        const [docs, total] = await Promise.all([
-            Document.find(filter)
-                .populate('uploadedBy', 'name')
-                .sort({ createdAt: -1 })
-                .skip((+page - 1) * +limit)
-                .limit(+limit)
-                .lean(),
-            Document.countDocuments(filter),
-        ]);
-        res.json({ success: true, data: docs, total, page: +page, pages: Math.ceil(total / +limit) });
+        const { rows } = await pool.query(
+            `SELECT v."_id", v."versionNumber", v."files", v."createdAt", u."name" AS "by"
+               FROM ${qt(DocumentVersion)} v
+               LEFT JOIN ${qt(User)} u ON u."_id" = v."uploadedBy"
+              WHERE v."document" = $1
+              ORDER BY v."versionNumber" DESC, v."createdAt" DESC`,
+            [String(doc._id)],
+        );
+        res.json({
+            success: true,
+            data: {
+                current: { versionNumber: doc.currentVersion || 1, files: access.publicFiles(doc.files), at: doc.updatedAt },
+                versions: rows.map((r) => ({
+                    _id: r._id, versionNumber: r.versionNumber, files: access.publicFiles(r.files),
+                    // When it stopped being the current one, and who replaced it.
+                    replacedAt: r.createdAt, replacedBy: r.by || '',
+                })),
+            },
+        });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 /**
- * The sections a teacher may actually share to, checked against the ones they
- * stand in front of.
- *
- * This used to be taken on trust: whatever `sectionId` the form posted was
- * written straight onto the document, so any teacher could put a notice in
- * front of any class in the school by editing one field in the request. The
- * only sections that count are the ones they are class teacher, substitute or
- * subject teacher for.
+ * Put an earlier set of files back. What is there now is filed as a version
+ * first, so restoring is itself something that can be undone.
  */
-async function ownSections(req, raw) {
+exports.restoreVersion = async (req, res) => {
+    try {
+        if (!isUuid(req.params.id) || !isUuid(req.params.versionId)) {
+            return res.status(404).json({ success: false, message: 'That version could not be found' });
+        }
+        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId });
+        if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
+        const version = await DocumentVersion.findOne({ _id: req.params.versionId, document: doc._id }).lean();
+        if (!version) return res.status(404).json({ success: false, message: 'That version could not be found' });
+        if (doc.isAssignment && !(version.files || []).length) {
+            return res.status(400).json({ success: false, message: NEEDS_FILE });
+        }
+
+        const had = plainFiles(doc.files);
+        doc.files = plainFiles(version.files);
+        doc.currentVersion = (doc.currentVersion || 1) + 1;
+        await saveEdited(doc, req, had, true);
+        res.json({ success: true, data: clean(doc) });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+
+// ── Teacher: share, edit, delete ─────────────────────────────────────────────
+
+/**
+ * The sections a teacher may actually share to, checked against the ones they
+ * stand in front of this year.
+ *
+ * `keep` is what an edit must not lose: sections already on the document that
+ * are not this teacher's to pick any more — an earlier year's, or a class they
+ * have stopped teaching. The form cannot offer those, and saving used to write
+ * only what it offered, so editing a title quietly un-shared the document from
+ * them (and a document with nothing left to offer could not be saved at all).
+ */
+async function ownSections(req, raw, existing = null) {
     let wanted;
     try {
         wanted = Array.isArray(raw) ? raw : JSON.parse(raw || '[]');
     } catch { wanted = raw ? [String(raw)] : []; }
     wanted = [...new Set((Array.isArray(wanted) ? wanted : [wanted]).map(String).filter(Boolean))];
-    if (!wanted.length) return { ok: false, message: 'Choose at least one section' };
 
-    const { teacherReach } = require('./documentViewer.controller');
     // `postable`, not `sections`: reading reaches back across years, sharing
     // only ever goes to this year's rows — the ones the picker offered.
-    const mine = new Set((await teacherReach(req.userId, req.schoolId)).postable.map(String));
-    const bad  = wanted.filter((id) => !mine.has(id));
-    if (bad.length) {
+    const mine = new Set((await access.teacherReach(req.userId, req.schoolId)).postable.map(String));
+    const keep = (existing || []).map(String).filter((id) => !mine.has(id));
+    if (!wanted.length && !keep.length) return { ok: false, message: 'Choose at least one section' };
+    if (wanted.some((id) => !mine.has(id))) {
         return { ok: false, message: 'You can only share with sections you teach' };
     }
-    return { ok: true, sections: wanted };
+    return { ok: true, sections: [...keep, ...wanted] };
 }
 
 exports.teacherUpload = async (req, res) => {
+    let created = false;
     try {
-        const { title, description, category, docType, subject, assignmentType, questions,
-                sectionId, sectionIds, isAssignment, dueDate,
-                allowSubmission, marksEnabled, totalMarks, tags } = req.body;
-
-        if (!title?.trim())  return res.status(400).json({ success: false, message: 'Title is required' });
-        if (!category)       return res.status(400).json({ success: false, message: 'Category is required' });
+        const b = req.body;
+        if (!b.title?.trim()) return refuse(req, res, 'Title is required');
+        if (!b.category)      return refuse(req, res, 'Category is required');
 
         // `sectionIds` is the array the form posts; `sectionId` is the single
         // value older callers send, and still works.
-        const target = await ownSections(req, sectionIds !== undefined ? sectionIds : sectionId);
-        if (!target.ok) return res.status(400).json({ success: false, message: target.message });
+        const target = await ownSections(req, b.sectionIds !== undefined ? b.sectionIds : b.sectionId);
+        if (!target.ok) return refuse(req, res, target.message);
 
         const files    = buildFileObjects(req.files);
-        const assigned = !!isAssignment && isAssignment !== 'false';
-        if (assigned && !files.length) return res.status(400).json({ success: false, message: NEEDS_FILE });
+        const assigned = flag(b.isAssignment);
+        if (assigned && !files.length) return refuse(req, res, NEEDS_FILE, 400, 'NEEDS_FILE');
+        const due = assigned ? dueAt(b.dueDate) : null;
+        if (due === undefined) return refuse(req, res, 'That due date is not a date');
 
+        const total = Number(b.totalMarks) > 0 ? Number(b.totalMarks) : null;
         const doc = await Document.create({
             school: req.schoolId,
-            title:  title.trim(),
-            description: description || '',
-            category,
+            title:  b.title.trim(),
+            description: b.description || '',
+            category: b.category,
             // Stamped here too, so a teacher's upload lands on the admin's tabs
             // and year filter alongside everything else.
-            docType: normalizeDocType(docType, assigned),
-            subject: subject || '',
+            docType: normalizeDocType(b.docType, assigned),
+            subject: b.subject || '',
             files,
             uploadedBy:   req.userId,
             uploaderRole: 'teacher',
@@ -884,263 +1056,213 @@ exports.teacherUpload = async (req, res) => {
             // and marks it in one place.
             targetType:   'class_sections',
             targetSections: target.sections,
-            tags: JSON.parse(tags || '[]'),
+            tags: tagList(b.tags),
             academicYear:    await currentAcademicYearId(req.schoolId),
             isAssignment:    assigned,
-            assignmentType:  assigned && ASSIGNMENT_TYPES.includes(assignmentType) ? assignmentType : 'homework',
-            questions:       assigned ? parseQuestions(questions) : [],
-            dueDate:         dueDate ? new Date(dueDate) : null,
-            allowSubmission: assigned ? allowSubmission !== 'false' : false,
-            marksEnabled:    assigned && (marksEnabled === 'true' || marksEnabled === true || Number(totalMarks) > 0),
-            totalMarks:      Number(totalMarks) > 0 ? Number(totalMarks) : null,
+            assignmentType:  assigned && ASSIGNMENT_TYPES.includes(b.assignmentType) ? b.assignmentType : 'homework',
+            questions:       assigned ? parseQuestions(b.questions) : [],
+            dueDate:         due,
+            allowSubmission: assigned ? (b.allowSubmission === undefined ? true : flag(b.allowSubmission)) : false,
+            marksEnabled:    assigned && total != null,
+            totalMarks:      assigned ? total : null,
         });
-        res.status(201).json({ success: true, data: doc });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+        created = true;
+        announce(doc, req);
+        res.status(201).json({ success: true, data: clean(doc) });
+    } catch (e) {
+        if (!created) access.discardUploads(req);
+        res.status(500).json({ success: false, message: e.message });
+    }
 };
 
+/** One document, for a reader the route has already let through. */
 exports.teacherGetDocument = async (req, res) => {
     try {
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId })
             .populate('uploadedBy', 'name')
             .lean();
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        res.json({ success: true, data: doc });
+        res.json({ success: true, data: clean(doc) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.teacherEditDocument = async (req, res) => {
     try {
+        if (!isUuid(req.params.id)) return refuse(req, res, 'Document not found', 404);
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId, uploadedBy: req.userId });
-        if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
+        if (!doc) return refuse(req, res, 'Document not found', 404);
 
-        const { title, description, category, docType, subject, assignmentType, questions,
-                sectionIds, isAssignment, dueDate, marksEnabled, totalMarks } = req.body;
+        const b = req.body;
+        if (b.title !== undefined) {
+            if (!String(b.title).trim()) return refuse(req, res, 'Title is required');
+            doc.title = String(b.title).trim();
+        }
+        if (b.description !== undefined) doc.description = b.description;
+        if (b.category !== undefined) {
+            if (!b.category) return refuse(req, res, 'Category is required');
+            doc.category = b.category;
+        }
+        if (b.subject !== undefined) doc.subject = b.subject;
 
-        if (title !== undefined)       doc.title       = title.trim();
-        if (description !== undefined) doc.description = description;
-        if (category !== undefined)    doc.category    = category;
-        if (subject !== undefined)     doc.subject     = subject;
-
-        if (sectionIds !== undefined) {
-            const target = await ownSections(req, sectionIds);
-            if (!target.ok) return res.status(400).json({ success: false, message: target.message });
+        // Only a document shared by section is the teacher's to re-aim; one the
+        // office set up for them some other way keeps its audience.
+        if (b.sectionIds !== undefined && doc.targetType === 'class_sections') {
+            const target = await ownSections(req, b.sectionIds, doc.targetSections);
+            if (!target.ok) return refuse(req, res, target.message);
             doc.targetSections = target.sections;
         }
 
-        if (isAssignment !== undefined) {
-            doc.isAssignment = !!isAssignment && isAssignment !== 'false';
-            if (!doc.isAssignment) {
-                doc.dueDate = null;
-                doc.allowSubmission = false;
-                doc.questions = [];
-                doc.marksEnabled = false;
-                doc.totalMarks = null;
-            }
-        }
-        // After the flag, so "not an assignment any more" cannot keep the type.
-        if (docType !== undefined || isAssignment !== undefined) {
-            doc.docType = normalizeDocType(docType !== undefined ? docType : doc.docType, doc.isAssignment);
-        }
-        if (assignmentType !== undefined && ASSIGNMENT_TYPES.includes(assignmentType)) {
-            doc.assignmentType = assignmentType;
-        }
-        if (questions !== undefined && doc.isAssignment) doc.questions = parseQuestions(questions);
+        const wrong = applyAssignment(doc, b);
+        if (wrong) return refuse(req, res, wrong);
 
-        if (dueDate !== undefined && doc.isAssignment) doc.dueDate = dueDate ? new Date(dueDate) : null;
-        if (totalMarks !== undefined && doc.isAssignment) {
-            doc.totalMarks   = Number(totalMarks) > 0 ? Number(totalMarks) : null;
-            doc.marksEnabled = doc.totalMarks != null;
-        }
-
+        const had   = plainFiles(doc.files);
         const after = filesAfterEdit(doc, req);
-        if (!after.ok) return res.status(400).json({ success: false, message: after.message });
+        if (!after.ok) return refuse(req, res, after.message);
         if (after.changed) {
             doc.files = after.files;
             doc.currentVersion = (doc.currentVersion || 1) + 1;
         }
-        if (doc.isAssignment && !doc.files?.length) {
-            return res.status(400).json({ success: false, message: NEEDS_FILE });
-        }
-        await doc.save();
-        res.json({ success: true, data: doc });
+        if (doc.isAssignment && !doc.files?.length) return refuse(req, res, NEEDS_FILE, 400, 'NEEDS_FILE');
+
+        await saveEdited(doc, req, had, after.changed);
+        res.json({ success: true, data: clean(doc) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
 exports.teacherDeleteDocument = async (req, res) => {
     try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
         const doc = await Document.findOneAndDelete({ _id: req.params.id, school: req.schoolId, uploadedBy: req.userId });
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        await Promise.all([
-            AssignmentSubmission.deleteMany({ document: doc._id }),
-            DocumentRead.deleteMany({ document: doc._id }),
-        ]);
+        // The discussion goes too — it used to be left behind, its attachments
+        // still openable under a document that no longer existed.
+        await wipe([doc]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-exports.teacherGetSubmissions = async (req, res) => {
-    try {
-        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId, uploadedBy: req.userId }).lean();
-        if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
+// ── Student: one document, and handing work in ───────────────────────────────
 
-        const submissions = await AssignmentSubmission.find({ document: doc._id })
-            .populate('student', 'name rollNumber email')
-            .sort({ submittedAt: -1 })
-            .lean();
-        res.json({ success: true, data: submissions });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-exports.teacherReviewSubmission = async (req, res) => {
-    try {
-        const { marks, feedback } = req.body;
-        const sub = await AssignmentSubmission.findOne({ _id: req.params.submissionId, school: req.schoolId });
-        if (!sub) return res.status(404).json({ success: false, message: 'Submission not found' });
-
-        sub.marks      = marks !== undefined ? Number(marks) : sub.marks;
-        sub.feedback   = feedback || sub.feedback;
-        sub.reviewedBy = req.userId;
-        sub.reviewedAt = new Date();
-        await sub.save();
-        res.json({ success: true, data: sub });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
-
-// ── Student: Documents ────────────────────────────────────────────────────────
-
-exports.studentGetDocuments = async (req, res) => {
-    try {
-        const { category } = req.query;
-        const profile = await StudentProfile.findOne({ user: req.userId }).lean();
-        if (!profile?.currentSection) return res.json({ success: true, data: [], _debug: 'no currentSection' });
-
-        const section = await ClassSection.findById(profile.currentSection).lean();
-
-        const orConditions = [{ targetType: 'whole_school' }];
-
-        if (section) {
-            const classDoc = await Class.findById(section.class).lean();
-            if (classDoc) {
-                const sameClasses = await Class.find({ school: req.schoolId, classNumber: classDoc.classNumber }).distinct('_id');
-                orConditions.push({ targetType: 'class', targetClasses: { $in: sameClasses } });
-
-                const sameSections = await ClassSection.find({ class: { $in: sameClasses }, sectionName: section.sectionName, school: req.schoolId }).distinct('_id');
-                orConditions.push({ targetType: 'class_sections', targetSections: { $in: sameSections } });
-            }
-        }
-
-        const filter = { school: req.schoolId, isArchived: false, $or: orConditions };
-        if (category) filter.category = category;
-
-        const docs = await Document.find(filter)
-            .populate('uploadedBy', 'name')
-            .populate('targetClasses', 'classNumber className')
-            .populate('targetSections', 'sectionName')
-            .sort({ createdAt: -1 })
-            .lean();
-
-        // Attach submission status for assignments
-        const assignmentIds = docs.filter(d => d.isAssignment).map(d => d._id);
-        const submissions   = await AssignmentSubmission.find({ student: req.userId, document: { $in: assignmentIds } }).lean();
-        const subMap        = Object.fromEntries(submissions.map(s => [s.document.toString(), s]));
-
-        const data = docs.map(d => ({
-            ...d,
-            mySubmission: d.isAssignment ? (subMap[d._id.toString()] || null) : undefined,
-        }));
-        res.json({ success: true, data });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
+const shapeSubmission = (s) => (s ? {
+    _id: s._id, status: s.status, submittedAt: s.submittedAt, marks: s.marks ?? null,
+    feedback: s.feedback || '', reviewedAt: s.reviewedAt || null,
+    questionScores: Array.isArray(s.questionScores) ? s.questionScores : [],
+    files: access.publicFiles(s.files),
+} : null);
 
 exports.studentGetDocument = async (req, res) => {
     try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId, isArchived: false })
             .populate('uploadedBy', 'name')
             .lean();
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-
-        const canView = await canStudentViewDocument(doc, req.userId, req.schoolId);
-        if (!canView) return res.status(403).json({ success: false, message: 'Access denied' });
-
-        let mySubmission = null;
-        if (doc.isAssignment) {
-            mySubmission = await AssignmentSubmission.findOne({ document: doc._id, student: req.userId }).lean();
+        if (!(await canStudentViewDocument(doc, req.userId))) {
+            return res.status(403).json({ success: false, message: 'This document was not shared with you' });
         }
-        res.json({ success: true, data: { ...doc, mySubmission } });
+
+        const mySubmission = doc.isAssignment
+            ? shapeSubmission(await AssignmentSubmission.findOne({ document: doc._id, student: req.userId }).lean())
+            : null;
+        res.json({ success: true, data: { ...clean(doc), mySubmission } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
+/**
+ * Hand work in, or replace what was handed in.
+ *
+ *   • Only against an assignment that is on this student's shelf and still
+ *     open — the id alone used to be enough, shared with them or not.
+ *   • At least one file.
+ *   • Not once it has been marked: the marks and feedback describe the work
+ *     that was read, and swapping the files under them made them describe
+ *     something else.
+ *   • After the due date it is late, including a replacement — the form says
+ *     so before the student presses the button.
+ */
 exports.studentSubmitAssignment = async (req, res) => {
     try {
-        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId, isAssignment: true, allowSubmission: true }).lean();
-        if (!doc) return res.status(404).json({ success: false, message: 'Assignment not found or submissions not allowed' });
+        if (!isUuid(req.params.id)) return refuse(req, res, 'Assignment not found', 404);
+        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId, isAssignment: true }).lean();
+        if (!doc || doc.isArchived) return refuse(req, res, 'Assignment not found', 404);
+        if (!(await canStudentViewDocument(doc, req.userId))) {
+            return refuse(req, res, 'This assignment was not shared with you', 403);
+        }
+        if (!doc.allowSubmission) return refuse(req, res, 'Submissions are closed for this assignment', 400, 'CLOSED');
 
-        if (doc.dueDate && new Date() > new Date(doc.dueDate)) {
-            const files = buildFileObjects(req.files);
-            const profile = await StudentProfile.findOne({ user: req.userId }).lean();
-            const sub = await AssignmentSubmission.findOneAndUpdate(
-                { document: doc._id, student: req.userId },
-                { $set: { files, status: 'late', submittedAt: new Date(), section: profile?.currentSection || null, school: req.schoolId } },
-                { upsert: true, new: true }
-            ).lean();
-            return res.json({ success: true, data: sub, message: 'Submitted late' });
+        const files = buildFileObjects(req.files);
+        if (!files.length) return refuse(req, res, 'Attach at least one file');
+
+        const before = await AssignmentSubmission.findOne({ document: doc._id, student: req.userId }).lean();
+        if (before && (before.marks != null || before.reviewedAt)) {
+            return refuse(req, res,
+                'This has already been marked, so it can no longer be replaced. Ask your teacher if you need to hand it in again.',
+                409, 'ALREADY_MARKED');
         }
 
-        const files   = buildFileObjects(req.files);
+        const late    = !!doc.dueDate && Date.now() > new Date(doc.dueDate).getTime();
         const profile = await StudentProfile.findOne({ user: req.userId }).lean();
         const sub     = await AssignmentSubmission.findOneAndUpdate(
             { document: doc._id, student: req.userId },
-            { $set: { files, status: 'submitted', submittedAt: new Date(), section: profile?.currentSection || null, school: req.schoolId } },
-            { upsert: true, new: true }
+            { $set: {
+                files, status: late ? 'late' : 'submitted', submittedAt: new Date(),
+                section: profile?.currentSection || null, school: req.schoolId,
+            } },
+            { upsert: true, new: true },
         ).lean();
-        res.json({ success: true, data: sub });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
 
-// ── Parent: documents visible to child ───────────────────────────────────────
-exports.parentGetDocuments = async (req, res) => {
-    try {
-        const parent  = await ParentProfile.findOne({ user: req.userId }).lean();
-        const childId = parent?.children?.[0] || parent?.student;
-        if (!childId) return res.json({ success: true, data: [] });
+        const first = !before || !['submitted', 'late'].includes(before.status);
+        if (before) access.removeUnreferenced(access.namesOf(before.files));
 
-        const profile = await StudentProfile.findOne({ user: childId }).lean();
-        if (!profile?.currentSection) return res.json({ success: true, data: [] });
-
-        const section = await ClassSection.findById(profile.currentSection).lean();
-
-        const parentOrConds = [{ targetType: 'whole_school' }];
-
-        if (section) {
-            const classDoc = await Class.findById(section.class).lean();
-            if (classDoc) {
-                const sameClasses = await Class.find({ school: req.schoolId, classNumber: classDoc.classNumber }).distinct('_id');
-                parentOrConds.push({ targetType: 'class', targetClasses: { $in: sameClasses } });
-
-                const sameSections = await ClassSection.find({ class: { $in: sameClasses }, sectionName: section.sectionName, school: req.schoolId }).distinct('_id');
-                parentOrConds.push({ targetType: 'class_sections', targetSections: { $in: sameSections } });
-            }
+        // The person who set it hears that something has come in — once, not
+        // again for every replacement.
+        if (first && doc.uploadedBy) {
+            const me = await User.findById(req.userId).select('name').lean();
+            notify({
+                school: req.schoolId, sender: req.userId, senderRole: 'student',
+                title: '📥 Work handed in',
+                body: `${me?.name || 'A student'} handed in "${doc.title}"${late ? ' — after the due date' : ''}.`,
+                recipients: [doc.uploadedBy],
+                link: { type: 'documents.item', entityId: doc._id },
+            });
         }
 
-        const docs = await Document.find({
-            school: req.schoolId,
-            isArchived: false,
-            $or: parentOrConds,
-        })
-            .populate('uploadedBy', 'name')
-            .sort({ createdAt: -1 })
-            .lean();
-
-        res.json({ success: true, data: docs });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+        res.json({ success: true, data: shapeSubmission(sub), ...(late ? { message: 'Submitted late' } : {}) });
+    } catch (e) {
+        access.discardUploads(req);
+        res.status(500).json({ success: false, message: e.message });
+    }
 };
+
+// ── Parent: one document, with where each child stands on it ─────────────────
 
 exports.parentGetDocument = async (req, res) => {
     try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
         const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId, isArchived: false })
             .populate('uploadedBy', 'name')
             .lean();
         if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
-        res.json({ success: true, data: doc });
+
+        // Only what reaches one of their own children. This returned any
+        // document in the school to any parent — staff notices included.
+        const kids    = await require('../services/parentChildren').childrenOf(req.userId, req.schoolId, 'name');
+        const reached = await access.studentsReached(doc._id, kids.map((k) => String(k._id)));
+        if (!reached.length) return res.status(403).json({ success: false, message: 'This document was not shared with your child' });
+
+        const subs = doc.isAssignment
+            ? await AssignmentSubmission.find({ document: doc._id, student: { $in: reached } }).lean()
+            : [];
+        const children = kids.filter((k) => reached.includes(String(k._id))).map((k) => {
+            const sub = subs.find((s) => String(s.student) === String(k._id)) || null;
+            const s = shapeSubmission(sub);
+            // A parent reads how it went, not the work itself.
+            if (s) delete s.files;
+            return { _id: k._id, name: k.name, submission: s };
+        });
+        res.json({ success: true, data: { ...clean(doc), forChildren: reached, children } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
+
+exports.dueAt = dueAt;
+exports.OTHER_MARKS = OTHER_MARKS;

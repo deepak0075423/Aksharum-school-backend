@@ -157,6 +157,16 @@ const DocumentSchema = new db.Schema({
         type: Boolean,
         default: false,
     },
+
+    /**
+     * When "remind everyone still outstanding" was last sent. One press reaches
+     * a whole class and their parents, so it is held to once an hour — there
+     * was nothing to stop it being pressed ten times in a row.
+     */
+    lastReminderAt: {
+        type: Date,
+        default: null,
+    },
 }, { timestamps: true });
 
 DocumentSchema.index({ school: 1, createdAt: -1 });

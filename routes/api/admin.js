@@ -18,6 +18,7 @@ const resultAdmin    = require('../../controllers/resultAdmin.controller');
 const leaveCtrl      = require('../../controllers/leave.controller');
 const compOffCtrl    = require('../../controllers/compOff.controller');
 const docCtrl        = require('../../controllers/document.controller');
+const { checkUploads } = require('../../services/documentAccess');
 const docDetail      = require('../../controllers/documentDetail.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
@@ -551,6 +552,12 @@ router.post('/document-categories', docGuard, async (req, res) => {
     try {
         const { name } = req.body;
         if (!name?.trim()) return res.status(400).json({ success: false, message: 'Name is required' });
+        // "Notice" and "notice" are one label to everyone who reads the list;
+        // the unique index only ever caught the exact same spelling.
+        const wanted = name.trim().toLowerCase();
+        const taken = (await DocumentCategory.find({ school: req.schoolId }).select('name').lean())
+            .some((c) => String(c.name || '').trim().toLowerCase() === wanted);
+        if (taken) return res.status(409).json({ success: false, message: 'Category already exists' });
         const cat = await DocumentCategory.create({ school: req.schoolId, name: name.trim() });
         res.status(201).json({ success: true, data: cat });
     } catch (e) {
@@ -567,19 +574,26 @@ router.delete('/document-categories/:id', docGuard, async (req, res) => {
 
 // ── Documents ─────────────────────────────────────────────────────────────────
 router.get('/documents',                              docGuard, docCtrl.adminGetDocuments);
-router.post('/documents',                             docGuard, uploadDocument.array('files', 10), docCtrl.adminUpload);
-router.get('/documents/audit',                        docGuard, docCtrl.adminGetAuditLog);
+router.post('/documents',                             docGuard, uploadDocument.array('files', 10), checkUploads, docCtrl.adminUpload);
 // Before '/documents/:id' — Express matches in order, and 'overview' would
 // otherwise be read as a document id and 404.
 router.get('/documents/overview',                     docGuard, docCtrl.adminGetDocumentOverview);
 router.get('/documents/teachers',                     docGuard, docCtrl.adminDocumentTeachers);
+// The share form's class → section picker, behind the module's own guard: a
+// teacher whose designation administers Documents is refused the
+// school-admin-only /classes-with-sections, and got an empty picker.
+router.get('/documents/classes',                      docGuard, classesWithSections);
 router.post('/documents/bulk-archive',                docGuard, docCtrl.adminBulkArchive);
 router.delete('/documents/bulk-delete',               docGuard, docCtrl.adminBulkDelete);
 router.get('/documents/:id',                          docGuard, docCtrl.adminGetDocument);
-router.put('/documents/:id',                          docGuard, uploadDocument.array('files', 10), docCtrl.adminEditDocument);
+router.put('/documents/:id',                          docGuard, uploadDocument.array('files', 10), checkUploads, docCtrl.adminEditDocument);
 router.delete('/documents/:id',                       docGuard, docCtrl.adminDeleteDocument);
 router.post('/documents/:id/archive',                 docGuard, docCtrl.adminArchiveDocument);
-router.post('/documents/:docId/versions/:versionId/restore', docGuard, docCtrl.adminRestoreVersion);
+// Earlier sets of files, and putting one back.
+router.get('/documents/:id/versions',                 docGuard, docCtrl.getVersions);
+router.post('/documents/:id/versions/:versionId/restore', docGuard, docCtrl.restoreVersion);
+// Who has opened it.
+router.get('/documents/:id/readers',                  docGuard, docDetail.getReaders);
 
 // ── One document, opened ──────────────────────────────────────────────────────
 // The four tabs of the detail page. Registered after the collection routes above
@@ -592,7 +606,7 @@ router.post('/documents/:id/remind',               docGuard, docDetail.remindPen
 router.post('/documents/:id/duplicate',            docGuard, docDetail.duplicate);
 
 router.get('/documents/:id/comments',              docGuard, docDetail.listComments);
-router.post('/documents/:id/comments',             docGuard, uploadDocument.array('files', 4), docDetail.addComment);
+router.post('/documents/:id/comments',             docGuard, uploadDocument.array('files', 4), checkUploads, docDetail.addComment);
 router.patch('/documents/comments/:commentId',     docGuard, docDetail.updateComment);
 router.delete('/documents/comments/:commentId',    docGuard, docDetail.deleteComment);
 router.post('/documents/comments/:commentId/like', docGuard, docDetail.toggleLike);
