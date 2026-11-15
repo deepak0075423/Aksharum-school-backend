@@ -319,6 +319,11 @@ async function header(doc, req) {
         assignedOn: doc.createdAt,
         updatedAt: doc.updatedAt,
         targetType: doc.targetType,
+        // The ids as well as the names: the phone's edit form opens from this
+        // payload, and a field it is not given is a field it would blank.
+        targetClasses:  (doc.targetClasses  || []).map(String),
+        targetSections: (doc.targetSections || []).map(String),
+        targetUsers:    (doc.targetUsers    || []).map(String),
         sharedWith: where,
         academicYearName: year,
         files: access.publicFiles(doc.files),

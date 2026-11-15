@@ -210,45 +210,166 @@ function yearClause(req, years, params) {
     return ` AND (d."academicYear" = $${params.length}::uuid OR d."academicYear" IS NULL)`;
 }
 
+// ── One shelf, a page at a time ──────────────────────────────────────────────
+//
+// A reader's shelf used to travel whole: every document of the year, each with
+// its files and the class names behind its audience, and the browser did the
+// tabs, the search and the counting. Now it is read in two steps.
+//
+//   1. THE WHOLE SHELF, LIGHT — one narrow row per document (LIGHT below): what
+//      the tabs, the search, the sort and the figures are worked out from. The
+//      figures describe the whole shelf, so this step cannot be paged away.
+//   2. THE PAGE, IN FULL — only the rows being shown are read with their files
+//      and audience labels (fullByIds).
+//
+// `page` / `limit` ask for a page. A caller that sends neither — a phone app
+// installed before this — still gets the whole shelf, as it always did.
+
+const LIGHT = (extra = '', reader = null) => `
+  SELECT d."_id", d."title", d."description", d."category", d."docType",
+         d."isAssignment", d."dueDate", d."allowSubmission", d."createdAt",
+         d."uploadedBy" AS "uploaderId", u."name" AS "uploaderName",
+         ${reader ? 'rd."readAt"' : 'NULL::timestamptz'} AS "readAt"${extra}
+    FROM ${qt(Document)} d
+    LEFT JOIN ${qt(User)} u          ON u."_id"  = d."uploadedBy"
+    ${reader ? `LEFT JOIN ${qt(DocumentRead)} rd ON rd."document" = d."_id" AND rd."user" = ${reader}` : ''}
+    LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = d."academicYear"`;
+
+/** The rows of one page, in full, keyed by id. */
+async function fullByIds(docIds, readerId, schoolId) {
+    if (!docIds.length) return {};
+    const { rows } = await pool.query(
+        `${SELECT('', '$2::uuid')} WHERE d."_id" = ANY($1::uuid[]) AND d."school" = $3`,
+        [docIds.map(String), String(readerId), String(schoolId)],
+    );
+    return Object.fromEntries(rows.map((r) => [String(r._id), r]));
+}
+
+const TAB_TYPES = { notices: ['notice', 'circular'], study: ['study_material'] };
+
+/**
+ * The filter bar, applied to light rows — the same rules the pages used to
+ * apply in the browser. The assignments tab is the flag rather than the type:
+ * study material students still hand in is an assignment to whoever must do it.
+ */
+function narrow(list, q, stateOf_ = (d) => d.state) {
+    const term = String(q.search || '').trim().toLowerCase();
+    return list.filter((d) => {
+        if (q.tab === 'assignments' && !d.isAssignment) return false;
+        if (TAB_TYPES[q.tab] && !TAB_TYPES[q.tab].includes(d.docType)) return false;
+        if (q.category && d.category !== q.category) return false;
+        if (q.state && stateOf_(d) !== q.state) return false;
+        if (term && !`${d.title} ${d.description || ''} ${d.category || ''} ${d.uploaderName || ''}`
+            .toLowerCase().includes(term)) return false;
+        return true;
+    });
+}
+
+function order(list, sort) {
+    const byDate = (a, b) => new Date(b.createdAt) - new Date(a.createdAt);
+    return [...list].sort((a, b) => {
+        switch (sort) {
+            case 'oldest': return -byDate(a, b);
+            case 'title':  return String(a.title).localeCompare(String(b.title), undefined, { sensitivity: 'base' });
+            // No due date sorts last — a notice is not "due immediately".
+            case 'due': {
+                const av = a.dueDate ? new Date(a.dueDate).getTime() : Infinity;
+                const bv = b.dueDate ? new Date(b.dueDate).getTime() : Infinity;
+                return (av === bv ? 0 : av < bv ? -1 : 1) || byDate(a, b);
+            }
+            default: return byDate(a, b);
+        }
+    });
+}
+
+/** The page asked for — or everything, for a caller that asked for no page. */
+function pageOf(list, q) {
+    const paged = q.page !== undefined || q.limit !== undefined;
+    if (!paged) return { rows: list, meta: { total: list.length, page: 1, pages: 1, limit: list.length } };
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(q.limit) || 30)));
+    const pages = Math.max(1, Math.ceil(list.length / limit));
+    const page  = Math.min(pages, Math.max(1, Math.floor(Number(q.page) || 1)));
+    return { rows: list.slice((page - 1) * limit, page * limit), meta: { total: list.length, page, pages, limit } };
+}
+
+const tabCountsOf = (list) => ({
+    all:         list.length,
+    assignments: list.filter((d) => d.isAssignment).length,
+    notices:     list.filter((d) => TAB_TYPES.notices.includes(d.docType)).length,
+    study:       list.filter((d) => TAB_TYPES.study.includes(d.docType)).length,
+});
+
+/** What "mark all as read" acts on: everything unread under the filters, not one page of it. */
+const unreadIdsOf = (list) => list.filter((d) => !d.isRead).map((d) => d._id).slice(0, 2000);
+
+const lightRow = (r) => ({
+    _id: r._id, title: r.title, description: r.description || '', category: r.category || '',
+    docType: r.docType || 'other', isAssignment: !!r.isAssignment, dueDate: r.dueDate,
+    allowSubmission: !!r.allowSubmission, createdAt: r.createdAt,
+    uploaderId: r.uploaderId, uploaderName: r.uploaderName || '', isRead: !!r.readAt,
+});
+
 // ── Student ──────────────────────────────────────────────────────────────────
 
 exports.studentGetDocuments = async (req, res) => {
     try {
         const school = String(req.schoolId);
+        const me     = String(req.userId);
         const [reach, years, categories] = await Promise.all([
-            reachOf(req.userId), yearsOf(school), categoriesOf(school),
+            reachOf(me), yearsOf(school), categoriesOf(school),
         ]);
 
-        const params = [school, [String(req.userId)], String(req.userId)];
+        const params = [school, [me], me];
         const year   = yearClause(req, years, params);
-
         const { rows } = await pool.query(
             `WITH ${placeCte('$2')}
-             ${SELECT('', '$3::uuid')}
+             ${LIGHT('', '$3::uuid')}
              ${REACH_JOIN}
               WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
-                AND cardinality(reach.ids) > 0
-              ORDER BY d."createdAt" DESC`,
+                AND cardinality(reach.ids) > 0`,
             params,
         );
 
-        const docs = rows.map(shapeDoc);
-        const subs = await AssignmentSubmission.find({
-            student: req.userId,
-            document: { $in: docs.filter((d) => d.isAssignment).map((d) => d._id) },
-        }).lean();
-        const byDoc = Object.fromEntries(subs.map((s) => [String(s.document), s]));
+        const withState = async (list) => {
+            const subs = await AssignmentSubmission.find({
+                student: me, document: { $in: list.filter((d) => d.isAssignment).map((d) => d._id) },
+            }).lean();
+            const byDoc = Object.fromEntries(subs.map((s) => [String(s.document), s]));
+            return list.map((d) => {
+                const sub = byDoc[String(d._id)] || null;
+                return { ...d, sub, state: stateOf(d, sub) };
+            });
+        };
+        const shelf = await withState(rows.map(lightRow));
+        const shape = (full) => (i) => ({ ...shapeDoc(full[String(i._id)]), mySubmission: shapeSub(i.sub), state: i.state });
 
-        const data = docs.map((d) => {
-            const sub = byDoc[String(d._id)] || null;
-            return { ...d, mySubmission: shapeSub(sub), state: stateOf(d, sub) };
-        });
+        const filtered = order(narrow(shelf, req.query), req.query.sort);
+        const { rows: slice, meta } = pageOf(filtered, req.query);
+        const full = await fullByIds(slice.map((i) => i._id), me, school);
+
+        // One document asked for by name — a notification's — whatever year it
+        // is filed under and whatever the filters are showing.
+        let focused = null;
+        if (isUuid(req.query.focus)) {
+            let item = shelf.find((i) => String(i._id) === req.query.focus);
+            if (!item) {
+                const f = await fullByIds([req.query.focus], me, school);
+                const r = f[req.query.focus];
+                if (r && !r.isArchived && (await access.studentsReached(r._id, [me])).length) {
+                    [item] = await withState([{ ...lightRow(r), isAssignment: !!r.isAssignment }]);
+                }
+            }
+            if (item) focused = shape(await fullByIds([item._id], me, school))(item);
+        }
 
         res.json({
             success: true,
-            data,
+            data: slice.map(shape(full)),
+            ...meta,
+            focused,
             who: { label: reach.label },
-            counts: countsOf(data),
+            counts: countsOf(shelf),
+            unreadIds: unreadIdsOf(filtered),
             categories,
             years,
             year: req.query.year || null,
@@ -277,30 +398,26 @@ function countsOf(docs, pick = (d) => d) {
 /**
  * Every child's documents, in one read, each tagged with whose it is.
  *
- * The alternative — one request per child — makes the switch at the top of the
- * page a network round trip, and a parent comparing two children's homework
- * flips between them constantly.
+ * `child` narrows the list to one of them; the figures for each child travel
+ * with every answer, so the switch at the top of the page carries its numbers
+ * without asking again.
  */
 exports.parentGetDocuments = async (req, res) => {
     try {
         const school   = String(req.schoolId);
+        const me       = String(req.userId);
         // Both links a parent can be joined to a child by, re-read as students
         // of this school (services/parentChildren) — the profile's own list
         // alone missed a child linked from the student's side.
-        const childIds = await access.childIds(req.userId, school);
+        const childIds = await access.childIds(me, school);
 
         const [years, categories] = await Promise.all([yearsOf(school), categoriesOf(school)]);
 
         if (!childIds.length) {
             return res.json({
-                success: true,
-                data: [],
-                children: [],
-                counts: countsOf([]),
-                perChild: {},
-                categories,
-                years,
-                year: req.query.year || null,
+                success: true, data: [], total: 0, page: 1, pages: 1, limit: 0, focused: null,
+                children: [], counts: countsOf([]), perChild: {}, unreadIds: [],
+                categories, years, year: req.query.year || null,
             });
         }
 
@@ -325,60 +442,83 @@ exports.parentGetDocuments = async (req, res) => {
             rollNumber: r.rollNumber || '',
         }));
 
-        const params = [school, childIds, String(req.userId)];
+        const params = [school, childIds, me];
         const year   = yearClause(req, years, params);
 
         // One read for all of them: each row says which children it reaches.
         const { rows } = await pool.query(
             `WITH ${placeCte('$2')}
-             ${SELECT(', reach.ids AS "reaches"', '$3::uuid')}
+             ${LIGHT(', reach.ids AS "reaches"', '$3::uuid')}
              ${REACH_JOIN}
               WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
-                AND cardinality(reach.ids) > 0
-              ORDER BY d."createdAt" DESC`,
+                AND cardinality(reach.ids) > 0`,
             params,
         );
 
-        const docs = rows.map((r) => ({ raw: r, doc: shapeDoc(r) }));
+        // Every child's standing on every assignment on the shelf.
+        const perChildOf = async (list) => {
+            const subs = await AssignmentSubmission.find({
+                student: { $in: childIds },
+                document: { $in: list.filter((d) => d.isAssignment).map((d) => d._id) },
+            }).lean();
+            const subFor = {};
+            for (const s of subs) (subFor[String(s.document)] ||= {})[String(s.student)] = s;
+            return list.map((d) => {
+                const forChildren = childIds.filter((id) => (d.reaches || []).includes(id));
+                // One entry per child the document actually reaches, so the page
+                // can say "Aarav submitted, Diya has not" without asking again.
+                const perChild = Object.fromEntries(forChildren.map((id) => {
+                    const sub = subFor[String(d._id)]?.[id] || null;
+                    return [id, {
+                        state: stateOf(d, sub),
+                        submittedAt: sub?.submittedAt || null,
+                        marks: sub?.marks ?? null,
+                        feedback: sub?.feedback || '',
+                    }];
+                }));
+                return { ...d, forChildren, perChild };
+            });
+        };
+        const shelf = await perChildOf(rows.map((r) => ({ ...lightRow(r), reaches: r.reaches || [] })));
+        const shape = (full) => (i) => ({ ...shapeDoc(full[String(i._id)]), forChildren: i.forChildren, perChild: i.perChild });
 
-        // Every child's submission against every assignment on the shelf.
-        const subs = await AssignmentSubmission.find({
-            student: { $in: childIds },
-            document: { $in: docs.filter((d) => d.doc.isAssignment).map((d) => d.doc._id) },
-        }).lean();
-        const subFor = {};
-        for (const s of subs) (subFor[String(s.document)] ||= {})[String(s.student)] = s;
+        // One child's shelf, or everyone's. Across all of them there is no
+        // single state, so a document stands where its most urgent child does —
+        // which is what a parent pressing "Still to do" is asking.
+        const child  = childIds.includes(String(req.query.child || '')) ? String(req.query.child) : '';
+        const scoped = child ? shelf.filter((d) => d.forChildren.includes(child)) : shelf;
+        const stand  = (d) => (child ? d.perChild[child]?.state : worstState(d.perChild));
 
-        const data = docs.map(({ raw, doc }) => {
-            const forChildren = childIds.filter((id) => (raw.reaches || []).includes(id));
-            // One entry per child the document actually reaches, so the page can
-            // say "Aarav submitted, Diya has not" without asking again.
-            const perChild = Object.fromEntries(forChildren.map((id) => {
-                const sub = subFor[String(doc._id)]?.[id] || null;
-                return [id, {
-                    state: stateOf(doc, sub),
-                    submittedAt: sub?.submittedAt || null,
-                    marks: sub?.marks ?? null,
-                    feedback: sub?.feedback || '',
-                }];
-            }));
-            return { ...doc, forChildren, perChild };
-        });
+        const filtered = order(narrow(scoped, req.query, stand), req.query.sort);
+        const { rows: slice, meta } = pageOf(filtered, req.query);
+        const full = await fullByIds(slice.map((i) => i._id), me, school);
+
+        let focused = null;
+        if (isUuid(req.query.focus)) {
+            let item = shelf.find((i) => String(i._id) === req.query.focus);
+            if (!item) {
+                const f = await fullByIds([req.query.focus], me, school);
+                const r = f[req.query.focus];
+                const reached = r && !r.isArchived ? await access.studentsReached(r._id, childIds) : [];
+                if (reached.length) [item] = await perChildOf([{ ...lightRow(r), reaches: reached }]);
+            }
+            if (item) focused = shape(await fullByIds([item._id], me, school))(item);
+        }
 
         res.json({
             success: true,
-            data,
+            data: slice.map(shape(full)),
+            ...meta,
+            focused,
             children,
-            // Across all the children at once there is no single state, so a
-            // document counts as still-to-do if ANY of them still owes it —
-            // which is what a parent scanning the tile is asking.
-            counts: countsOf(data, (d) => ({ state: worstState(d.perChild) })),
+            counts: countsOf(shelf, (d) => ({ state: worstState(d.perChild) })),
             // Per child, so the switch can carry a number without the page
             // recounting the whole shelf on every render.
             perChild: Object.fromEntries(children.map((c) => {
-                const mine = data.filter((d) => d.forChildren.includes(String(c._id)));
+                const mine = shelf.filter((d) => d.forChildren.includes(String(c._id)));
                 return [c._id, countsOf(mine, (d) => d.perChild[String(c._id)])];
             })),
+            unreadIds: unreadIdsOf(filtered),
             categories,
             years,
             year: req.query.year || null,
@@ -406,6 +546,11 @@ const teacherReach = access.teacherReach;
 
 exports.teacherReach = teacherReach;
 
+/**
+ * Two halves of one shelf: `scope=shared` is what reached this teacher,
+ * `scope=mine` what they shared. Without it both come back together, as they
+ * always did.
+ */
 exports.teacherGetDocuments = async (req, res) => {
     try {
         const school = String(req.schoolId);
@@ -421,10 +566,7 @@ exports.teacherGetDocuments = async (req, res) => {
         const params = [school, me, reach.sections, reach.classes, me];
         const year   = yearClause(req, years, params);
 
-        const { rows } = await pool.query(
-            `${SELECT(`,
-         COALESCE(sub."n", 0)::int   AS "submissionCount",
-         COALESCE(sub."marked", 0)::int AS "markedCount"`, '$2::uuid')}
+        const SUBS = `
              LEFT JOIN LATERAL (
                -- Handed in, and of those the ones that have been looked at:
                -- given marks, or — where the assignment has no marks to give
@@ -435,7 +577,14 @@ exports.teacherGetDocuments = async (req, res) => {
                                          AND (a."marks" IS NOT NULL OR a."reviewedAt" IS NOT NULL))::int AS "marked"
                  FROM ${qt(AssignmentSubmission)} a
                 WHERE a."document" = d."_id"
-             ) sub ON true
+             ) sub ON true`;
+
+        const { rows } = await pool.query(
+            `${LIGHT(`,
+         COALESCE(d."isArchived", false) AS "isArchived",
+         COALESCE(sub."n", 0)::int      AS "submissionCount",
+         COALESCE(sub."marked", 0)::int AS "markedCount"`, '$2::uuid')}
+             ${SUBS}
               -- Their own stay on their shelf when the office puts them away,
               -- marked as archived; everyone else's leave it.
               WHERE d."school" = $1
@@ -446,33 +595,73 @@ exports.teacherGetDocuments = async (req, res) => {
                    OR (d."targetType" = 'class_sections'    AND d."targetSections" ?| $3::text[])
                    -- A document set for a whole class is also for the people who
                    -- teach it; the old filter left that case out entirely.
-                   OR (d."targetType" = 'class'             AND d."targetClasses"  ?| $4::text[]) )
-              ORDER BY d."createdAt" DESC`,
+                   OR (d."targetType" = 'class'             AND d."targetClasses"  ?| $4::text[]) )`,
             params,
         );
 
-        const data = rows.map((r) => ({
-            ...shapeDoc(r),
-            mine: String(r.uploaderId) === me,
-            isRead: !!r.readAt || String(r.uploaderId) === me,
-            submissionCount: r.submissionCount || 0,
-            markedCount: r.markedCount || 0,
-        }));
+        const shelf = rows.map((r) => {
+            const mine = String(r.uploaderId) === me;
+            return {
+                ...lightRow(r),
+                mine,
+                // Their own upload is never "unread".
+                isRead: !!r.readAt || mine,
+                submissionCount: r.submissionCount || 0,
+                markedCount: r.markedCount || 0,
+            };
+        });
+        const shape = (full) => (i) => ({
+            ...shapeDoc(full[String(i._id)]),
+            mine: i.mine, isRead: i.isRead,
+            submissionCount: i.submissionCount, markedCount: i.markedCount,
+        });
 
-        const mine = data.filter((d) => d.mine);
+        const scope  = ['mine', 'shared'].includes(req.query.scope) ? req.query.scope : '';
+        const scoped = scope ? shelf.filter((d) => (scope === 'mine' ? d.mine : !d.mine)) : shelf;
+        const filtered = order(narrow(scoped, req.query), req.query.sort);
+        const { rows: slice, meta } = pageOf(filtered, req.query);
+        const full = await fullByIds(slice.map((i) => i._id), me, school);
+
+        // One document by name — "edit this one" from its own page — whatever
+        // year it is filed under. Only ever one of their own, or one on the shelf.
+        let focused = null;
+        if (isUuid(req.query.focus)) {
+            let item = shelf.find((i) => String(i._id) === req.query.focus);
+            if (!item) {
+                const hit = await pool.query(
+                    `${LIGHT(`,
+         COALESCE(d."isArchived", false) AS "isArchived",
+         COALESCE(sub."n", 0)::int      AS "submissionCount",
+         COALESCE(sub."marked", 0)::int AS "markedCount"`, '$2::uuid')}
+                     ${SUBS}
+                      WHERE d."school" = $1 AND d."_id" = $3::uuid AND d."uploadedBy" = $2::uuid`,
+                    [school, me, req.query.focus],
+                );
+                const r = hit.rows[0];
+                if (r) item = { ...lightRow(r), mine: true, isRead: true, submissionCount: r.submissionCount || 0, markedCount: r.markedCount || 0 };
+            }
+            if (item) focused = shape(await fullByIds([item._id], me, school))(item);
+        }
+
+        const mineAll = shelf.filter((d) => d.mine);
         res.json({
             success: true,
-            data,
+            data: slice.map(shape(full)),
+            ...meta,
+            focused,
             sections: reach.list,
             counts: {
-                ...countsOf(data),
-                mine: mine.length,
-                shared: data.length - mine.length,
-                unread: data.filter((d) => !d.isRead).length,
+                ...countsOf(shelf),
+                mine: mineAll.length,
+                shared: shelf.length - mineAll.length,
+                unread: shelf.filter((d) => !d.isRead).length,
                 // Work waiting on this teacher: their own assignments with
-                // something handed in that nobody has marked.
-                toMark: mine.reduce((n, d) => n + Math.max(0, d.submissionCount - d.markedCount), 0),
+                // something handed in that nobody has looked at.
+                toMark: mineAll.reduce((n, d) => n + Math.max(0, d.submissionCount - d.markedCount), 0),
             },
+            // The tab strip follows the half of the shelf on screen.
+            tabCounts: tabCountsOf(scoped),
+            unreadIds: unreadIdsOf(filtered),
             categories,
             years,
             year: req.query.year || null,

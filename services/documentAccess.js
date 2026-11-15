@@ -128,6 +128,7 @@ const KIND_OF_EXT = {
  * The filter in middleware/upload.js reads the extension alone, so a page of
  * script renamed "notes.pdf" went straight onto the shelf. Text files have no
  * signature to check; they are refused only when they are not text at all.
+ * Each file is then put through the virus scanner, where one is set up.
  */
 async function checkUploads(req, res, next) {
     try {
@@ -146,6 +147,28 @@ async function checkUploads(req, res, next) {
             if (bad) {
                 discardUploads(req);
                 return res.status(400).json({ success: false, code: 'BAD_FILE', message: bad });
+            }
+
+            // The same ClamAV daemon admission uploads go through
+            // (services/admission/virusScan.js): on once CLAMAV_HOST is set.
+            // A file is refused when clamd names a virus in it — and, with
+            // CLAMAV_REQUIRED, when clamd cannot be asked at all.
+            const virus = require('./admission/virusScan');
+            const scan = await virus.scanFile(f.path);
+            if (scan.status === 'infected') {
+                console.warn(`[documents] upload refused — ${scan.signature} in ${f.originalname} (user ${req.userId})`);
+                discardUploads(req);
+                return res.status(400).json({
+                    success: false, code: 'INFECTED_FILE',
+                    message: `${f.originalname} was not attached — the virus check found ${scan.signature} in it`,
+                });
+            }
+            if (scan.status === 'unavailable' && virus.config().required) {
+                discardUploads(req);
+                return res.status(503).json({
+                    success: false, code: 'SCAN_UNAVAILABLE',
+                    message: 'Files cannot be checked for viruses just now — try again in a few minutes',
+                });
             }
         }
         return next();
