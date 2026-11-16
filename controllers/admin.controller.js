@@ -2201,6 +2201,21 @@ exports.updateTeacherFull = async (req, res) => {
             { $set: built, $setOnInsert: { user: user._id, school: req.schoolId } },
             { upsert: true },
         );
+        // A section the office signed off was signed off for the values and
+        // scans that were there. Whatever changed here puts its section back to
+        // pending (Employee Directory → Verification), and a replaced scan is
+        // not kept on disk. Never allowed to fail the save itself.
+        try {
+            const employeeDocs = require('../services/employeeDocuments');
+            const afterProfile = { ...(existing || {}), ...built };
+            await employeeDocs.reopenForChanges(req.schoolId, String(user._id),
+                { user: { name: user.name, email: user.email, phone: user.phone }, profile: existing || {} },
+                { user: { name: user.name, email: user.email, phone: user.phone, ...userUpdate }, profile: afterProfile },
+                req.userId);
+            for (const key of TEACHER_FILE_FIELDS) {
+                if (existing?.[key] && existing[key] !== afterProfile[key]) employeeDocs.removeIfUnused(existing[key], afterProfile);
+            }
+        } catch (e) { console.error('[updateTeacher] verification follow-up:', e.message); }
         // The designation decides which modules this teacher reaches.
         if (built.designation !== (existing?.designation || '')) {
             await designationSvc.invalidateUser(user._id);
@@ -2388,7 +2403,14 @@ exports.deleteUser = async (req, res) => {
         await StudentProfile.deleteOne({ user: userId });
         // A deleted teacher used to leave their profile row behind, which held on
         // to the employee ID and kept it out of circulation for good.
-        if (target.role === 'teacher') await TeacherProfile.deleteOne({ user: userId });
+        // …and so does everything the Employee Directory kept about them: the
+        // sign-offs, document decisions, reminders and the scans themselves.
+        // Read before the profile row goes — the file names live on it.
+        if (target.role === 'teacher') {
+            try { await require('../services/employeeDocuments').purgeEmployee(req.schoolId, userId); }
+            catch (e) { console.error('[deleteUser] directory clean-up:', e.message); }
+            await TeacherProfile.deleteOne({ user: userId });
+        }
         // Emptied before the row goes, not after: anything still pointing at the
         // user has to let go first, and once the row is gone there is no id left
         // to find those periods by.

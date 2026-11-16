@@ -399,6 +399,11 @@ const ROUTES = {
         school_admin: { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification?tab=documents&employee={id}' },
         teacher:      { web: '/admin/employee-directory/verification?tab=documents&employee={id}', mobile: '/modules/employee-verification?tab=documents&employee={id}' },
     },
+    // A member of staff asked for their record to be corrected.
+    'directory.requests': {
+        school_admin: { web: '/admin/employee-directory/verification?tab=requests', mobile: '/modules/employee-verification?tab=requests' },
+        teacher:      { web: '/admin/employee-directory/verification?tab=requests', mobile: '/modules/employee-verification?tab=requests' },
+    },
 
     // ── ID cards ─────────────────────────────────────────────────────────────
     // A card issued for the reader (or, for a parent, for their child).
@@ -764,7 +769,7 @@ const HIGH_TYPES = [
     'fees.mine', 'library.myfines', 'library.manage.fines', 'library.fines',
     'substitutions',
     'documents.item',
-    'directory.mydocs', 'directory.review',
+    'directory.mydocs', 'directory.review', 'directory.requests',
     'medical.desk', 'medical.changes', 'medical.round',
 ];
 

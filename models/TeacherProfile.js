@@ -120,6 +120,31 @@ const TeacherProfileSchema = new db.Schema({
     experienceCertificateFile: { type: String, default: '' },
     resignationLetterFile:     { type: String, default: '' },
     joiningLetterFile:         { type: String, default: '' },
+    // More paperwork the office may keep (Employee Directory, Nov 2026). All
+    // optional; each is reviewed like the ones above (services/employeeDocuments).
+    degreeCertificateFile:         { type: String, default: '' },
+    teachingDegreeCertificateFile: { type: String, default: '' },
+    appointmentLetterFile:         { type: String, default: '' },
+    policeVerificationFile:        { type: String, default: '' },
+    medicalFitnessFile:            { type: String, default: '' },
+    addressProofFile:              { type: String, default: '' },
+    cancelledChequeFile:           { type: String, default: '' },
+    // Qualifications beyond the highest one and the teaching degree:
+    // [{ qualification, specialization, institution, passingYear, grade }].
+    qualifications: { type: Array, default: [] },
+
+    // ── Where the employment stands ─────────────────────────────────────────
+    // Not the account switch (User.isActive): a person serving notice still
+    // signs in. '' = not stated.
+    employmentStage: {
+        type: String,
+        enum: ['', 'probation', 'confirmed', 'notice', 'resigned', 'terminated', 'retired'],
+        default: '',
+    },
+    probationEndDate: { type: Date, default: null },
+    confirmationDate: { type: Date, default: null },
+    exitDate:         { type: Date, default: null },
+    exitReason:       { type: String, default: '', trim: true },
 
     // ── Bank ────────────────────────────────────────────────────────────────
     bankAccountHolder: { type: String, default: '', trim: true },

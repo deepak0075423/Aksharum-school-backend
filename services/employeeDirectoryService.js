@@ -56,6 +56,9 @@ const LeaveType             = require('../models/LeaveType');
 const EmployeeSalaryAssignment = require('../models/EmployeeSalaryAssignment');
 const EmployeeResponsibility   = require('../models/EmployeeResponsibility');
 const EmployeeVerification     = require('../models/EmployeeVerification');
+const EmployeeDepartment       = require('../models/EmployeeDepartment');
+const EmployeeChangeRequest    = require('../models/EmployeeChangeRequest');
+const SubstituteAssignment     = require('../models/SubstituteAssignment');
 const Document              = require('../models/Document');
 const designations          = require('./designationService');
 
@@ -155,11 +158,20 @@ function visibilityFor(viewer, employeeId) {
         leave:         admin || self,
         documents:     admin || self,
         governmentId:  admin || self,
-        bank:          (admin && viewer.payrollAdmin) || self,
+        // Bank details: the school administrator always — whether or not the
+        // school runs the Payroll module (they typed the account number in on
+        // the teacher form, and they are who verifies it). A teacher who
+        // administers the directory needs administrative access to Payroll as
+        // well, as before; an employee always sees their own.
+        bank:          (admin && (viewer.role === 'school_admin' || viewer.payrollAdmin)) || self,
         payroll:       viewer.payrollAdmin || self,
         completion:    admin || self,
-        // Only an administrator may unmask, and only for someone else's record
-        // through the audited endpoint; an employee's own values are theirs.
+        // The account state, last sign-in and the office's sign-offs are
+        // administrative facts — a colleague looking someone up is not sent them.
+        status:        admin || self,
+        verification:  admin || self,
+        // An administrator may unmask through the audited endpoint; an employee
+        // may read their own values the same way (the endpoint allows both).
         canReveal:     admin || self,
     };
 }
@@ -197,6 +209,11 @@ const COMPLETION_FIELDS = [
     { key: 'bankBranch',            label: 'Bank branch' },
     { key: 'joiningDate',           label: 'Date of joining' },
     { key: 'employeeId',            label: 'Employee ID' },
+    // Not demanded by the intake form, but a record with neither is not one the
+    // directory can place: it has no department to list under and no
+    // designation to take its module access from.
+    { key: 'designation',           label: 'Designation' },
+    { key: 'department',            label: 'Department' },
 ];
 
 // Only demanded of an experienced hire, exactly as the intake validator does.
@@ -207,7 +224,12 @@ const EXPERIENCED_ONLY = [
     { key: 'resignationLetterFile', label: 'Resignation letter', doc: true },
 ];
 
-function computeCompletion(user, profile) {
+/**
+ * `rejected` — the document keys the office has turned down. A rejected scan
+ * is on file but is not paperwork the record can count: it reads as missing
+ * here exactly as it does on the reminder desk.
+ */
+function computeCompletion(user, profile, rejected = null) {
     const p = profile || {};
     const required = [...COMPLETION_FIELDS];
     if (p.employmentType === 'experienced') required.push(...EXPERIENCED_ONLY);
@@ -217,7 +239,8 @@ function computeCompletion(user, profile) {
     for (const f of required) {
         const source = f.on === 'user' ? user : p;
         const value  = source?.[f.key];
-        const ok = value instanceof Date ? !Number.isNaN(value.getTime()) : !!trim(value);
+        const ok = (value instanceof Date ? !Number.isNaN(value.getTime()) : !!trim(value))
+            && !(f.doc && rejected && rejected.has(f.key));
         const label = f.key === 'fatherOrHusbandName' ? fatherOrHusbandLabel(p.gender, 'sentence') : f.label;
         if (ok) filled += 1; else missing.push({ key: f.key, label, isDocument: !!f.doc });
     }
@@ -240,10 +263,60 @@ const DOCUMENT_DEFS = [
     { key: 'aadhaarFrontFile',          category: 'identity',   label: 'Aadhaar — Front',        sensitive: true,  verification: 'government_id' },
     { key: 'aadhaarBackFile',           category: 'identity',   label: 'Aadhaar — Back',         sensitive: true,  verification: 'government_id' },
     { key: 'panCardFile',               category: 'identity',   label: 'PAN Card',               sensitive: true,  verification: 'government_id' },
+    { key: 'addressProofFile',          category: 'identity',   label: 'Address Proof',          sensitive: true,  verification: 'contact' },
+    { key: 'degreeCertificateFile',         category: 'education', label: 'Highest Qualification Certificate', sensitive: false, verification: 'education' },
+    { key: 'teachingDegreeCertificateFile', category: 'education', label: 'Teaching Degree Certificate',      sensitive: false, verification: 'education' },
     { key: 'resignationLetterFile',     category: 'employment', label: 'Resignation Letter',     sensitive: false, verification: 'employment_documents' },
     { key: 'experienceCertificateFile', category: 'employment', label: 'Experience Certificate', sensitive: false, verification: 'employment_documents' },
     { key: 'joiningLetterFile',         category: 'employment', label: 'Joining Letter',         sensitive: false, verification: 'employment_documents' },
+    { key: 'appointmentLetterFile',     category: 'employment', label: 'Appointment Letter',     sensitive: false, verification: 'employment_documents' },
+    { key: 'policeVerificationFile',    category: 'compliance', label: 'Police Verification',    sensitive: true,  verification: 'employment_documents' },
+    { key: 'medicalFitnessFile',        category: 'compliance', label: 'Medical Fitness Certificate', sensitive: true, verification: 'employment_documents' },
+    { key: 'cancelledChequeFile',       category: 'bank',       label: 'Cancelled Cheque / Passbook', sensitive: true, verification: 'bank', gate: 'bank' },
 ];
+
+// Every upload is stored as "<time in ms>-<random>.<ext>" (middleware/upload),
+// so the file's own name says when it arrived — the profile row has no column
+// for it, and its createdAt is when the RECORD was made, not the scan.
+function uploadedAtOf(fileName) {
+    const ms = Number(String(fileName || '').split('-')[0]);
+    return Number.isFinite(ms) && ms > 1e12 && ms < 1e14 ? new Date(ms) : null;
+}
+
+// The values each verification section is made of. A section with none of its
+// key values on file has nothing to have checked (see setVerification); the
+// full list is what a later edit is compared against, so a sign-off does not
+// outlive the value it was given for.
+const SECTION_FIELDS = {
+    personal: {
+        key: [['dob', 'Date of birth'], ['gender', 'Gender']],
+        all: ['name', 'dob', 'gender', 'bloodGroup', 'fatherOrHusbandName', 'emergencyContactName', 'emergencyContactPhone'],
+    },
+    contact: {
+        key: [['phone', 'Mobile number'], ['currentAddress', 'Current address']],
+        all: ['phone', 'email', 'alternatePhone', 'currentAddress', 'currentCity', 'currentState', 'currentPincode', 'currentCountry',
+            'permanentAddress', 'permanentCity', 'permanentState', 'permanentPincode', 'permanentCountry', 'addressProofFile'],
+    },
+    government_id: {
+        key: [['aadhaarNumber', 'Aadhaar number'], ['panNumber', 'PAN number']],
+        all: ['aadhaarNumber', 'panNumber', 'uanNumber', 'aadhaarFrontFile', 'aadhaarBackFile', 'panCardFile'],
+    },
+    education: {
+        key: [['qualification', 'Highest qualification']],
+        all: ['qualification', 'teachingDegree', 'qualifications', 'degreeCertificateFile', 'teachingDegreeCertificateFile'],
+    },
+    employment_documents: {
+        key: [['joiningDate', 'Date of joining'], ['employeeId', 'Employee ID']],
+        all: ['employeeId', 'joiningDate', 'employmentType', 'totalExperience', 'previousSchool', 'lastDesignation',
+            'resignationLetterFile', 'experienceCertificateFile', 'joiningLetterFile', 'appointmentLetterFile',
+            'policeVerificationFile', 'medicalFitnessFile'],
+    },
+    bank: {
+        key: [['bankAccountNumber', 'Bank account number'], ['bankIfsc', 'IFSC code']],
+        all: ['bankAccountHolder', 'bankAccountNumber', 'bankIfsc', 'bankBranch', 'cancelledChequeFile'],
+    },
+};
+const USER_FIELDS = new Set(['name', 'email', 'phone']);
 
 function buildDocuments(profile, verificationBySection) {
     const p = profile || {};
@@ -258,11 +331,11 @@ function buildDocuments(profile, verificationBySection) {
                 fileName: p[d.key],
                 url: `${STAFF_DOC_BASE}/${p[d.key]}`,
                 sensitive: d.sensitive,
-                uploadedAt: p.createdAt || null,
+                gate: d.gate || 'governmentId',
+                uploadedAt: uploadedAtOf(p[d.key]),
                 verificationStatus: v?.status || 'pending',
                 verifiedAt: v?.verifiedAt || null,
                 verifiedBy: v?.verifiedByName || '',
-                expiresAt: v?.expiresAt || null,
             };
         });
 }
@@ -273,11 +346,12 @@ module.exports = {
     REVEALABLE,
     resolveViewer, visibilityFor,
     computeCompletion, COMPLETION_FIELDS, EXPERIENCED_ONLY,
-    buildDocuments, DOCUMENT_DEFS, STAFF_DOC_BASE,
+    buildDocuments, DOCUMENT_DEFS, STAFF_DOC_BASE, uploadedAtOf, SECTION_FIELDS, USER_FIELDS,
     models: {
         User, TeacherProfile, ClassSection, Class, Subject, SectionSubjectTeacher,
         AcademicYear, Timetable, TimetableEntry, Room, TeacherAttendance,
         LeaveApplication, LeaveBalance, LeaveType, EmployeeSalaryAssignment,
-        EmployeeResponsibility, EmployeeVerification, Document,
+        EmployeeResponsibility, EmployeeVerification, EmployeeDepartment, EmployeeChangeRequest,
+        SubstituteAssignment, Document,
     },
 };
