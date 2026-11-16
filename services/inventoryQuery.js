@@ -20,9 +20,13 @@
  * screens did not change.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 
-/** `"tablename"`, quoted, from a model. */
-const T = (Model) => `"${Model.tableName}"`;
+// A table as a list or board should read it: for a model whose rows belong to
+// an academic year (services/yearRules.js) that is the year in view's rows;
+// for every other model, and wherever one record is opened or anything is
+// written, it is the table itself (services/yearScope.js `table`).
+const T = (Model) => yearScope.table(Model);
 
 /** Positional parameters, accumulated as the SQL is built. */
 function params() {

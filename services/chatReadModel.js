@@ -17,6 +17,7 @@
  * — not in the thread, not as a reply quote, not as a list preview.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const { getCacheRedis } = require('../config/cacheRedis');
 const { childCards } = require('./parentChildren');
 
@@ -284,7 +285,7 @@ async function teacherContext(teacherId, schoolId) {
     const { rows } = await pool.query(
         `WITH yr AS (
             SELECT "_id" FROM "academicyears"
-             WHERE "school" = $2::uuid AND "status" = 'active'
+             WHERE "school" = $2::uuid AND ${yearScope.yearStatus()} = 'active'
              ORDER BY "startDate" DESC NULLS LAST LIMIT 1
          ),
          links AS (
@@ -641,7 +642,7 @@ async function contactLines(userIds, schoolId) {
     const { rows } = await pool.query(
         `WITH yr AS (
             SELECT "_id" FROM "academicyears"
-             WHERE "school" = $2::uuid AND "status" = 'active'
+             WHERE "school" = $2::uuid AND ${yearScope.yearStatus()} = 'active'
              ORDER BY "startDate" DESC NULLS LAST LIMIT 1
          )
          SELECT u."_id"::text AS "id", u."role",

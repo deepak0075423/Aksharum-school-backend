@@ -1,5 +1,6 @@
 'use strict';
 const Notification        = require('../models/Notification');
+const yearScope = require('../services/yearScope');
 const NotificationReceipt = require('../models/NotificationReceipt');
 const User                = require('../models/User');
 const StudentProfile      = require('../models/StudentProfile');
@@ -479,12 +480,14 @@ async function childScope(req) {
  * where `clause` is '' when the choice is "all" or the school has no years.
  */
 async function yearWindow(req) {
-    const wanted = String(req.query?.year || req.body?.year || '');
+    // Nothing asked, but the year switcher in the header is on a year: that
+    // year's mailbox (the switcher's year reads as the active one).
+    const wanted = String(req.query?.year || req.body?.year || (yearScope.picked() ? 'current' : ''));
     if (!wanted || !req.schoolId) return null;
     const { query } = require('../db/pool');
     const { yearOrderSql } = require('../utils/listOrder');
     const { rows } = await query(
-        `SELECT "_id", "yearName", "status", "startDate" FROM "academicyears"
+        `SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate" FROM "academicyears"
           WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
         [String(req.schoolId)],
     );

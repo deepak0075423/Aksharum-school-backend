@@ -12,6 +12,7 @@
 //  so a report cannot disagree with the screen it summarises.
 // ─────────────────────────────────────────────────────────────────────────────
 const pool = require('../db/pool');
+const yearScope = require('../services/yearScope');
 const { dayRange } = require('../services/hostelService');
 const { T, TBL, params, inScope, eq, between, studentJoin, monthStart, share } = require('../services/hostelQuery');
 const { BED_STATE, bedCounts, hostelsInScope } = require('../services/hostelOverview');
@@ -707,7 +708,7 @@ async function tiles(ctx) {
     const { PAYMENTS, PAID_AT, PAID_AMOUNT, maintState } = S();
     const p = params(); const f = params(); const m = params();
     const { rows: [yr] } = await pool.query(
-        `SELECT "startDate", "yearName" FROM ${T(AcademicYear)} WHERE "school" = $1 AND "status" = 'active' ORDER BY "startDate" DESC NULLS LAST LIMIT 1`, [String(school)]);
+        `SELECT "startDate", "yearName" FROM ${T(AcademicYear)} WHERE "school" = $1 AND ${yearScope.yearStatus()} = 'active' ORDER BY "startDate" DESC NULLS LAST LIMIT 1`, [String(school)]);
     const yearStart = yr?.startDate && new Date(yr.startDate) <= new Date() ? new Date(yr.startDate) : monthStart(11);
     const STATE = maintState(m.$(dayRange().start));
     const [beds, { rows: [res] }, { rows: [fee] }, { rows: [wo] }] = await Promise.all([

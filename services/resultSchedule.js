@@ -24,6 +24,7 @@
  * the school's day (config/timezone), so the two are compared as days.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const TZ = require('../config/timezone');
 const { isUuid } = require('../db/schema');
 const FormalExam = require('../models/FormalExam');
@@ -171,7 +172,7 @@ async function studentSchedule(schoolId, studentId) {
  */
 async function teacherSchedule(schoolId, teacherId) {
     const { rows: sections } = await pool.query(`
-        SELECT s."_id", s."sectionName", c."className", c."classNumber", y."yearName", (y."status" = 'active') AS "current",
+        SELECT s."_id", s."sectionName", c."className", c."classNumber", y."yearName", (${yearScope.yearStatus('y')} = 'active') AS "current",
                (s."classTeacher" = $1::uuid OR s."substituteTeacher" = $1::uuid) AS "myClass",
                COALESCE((SELECT jsonb_agg(sub."subjectName" ORDER BY sub."subjectName")
                            FROM ${T.sst} st JOIN ${T.subjects} sub ON sub."_id" = st."subject"
@@ -182,7 +183,7 @@ async function teacherSchedule(schoolId, teacherId) {
          WHERE s."school" = $2::uuid AND COALESCE(s."status", 'active') <> 'archived'
            AND (s."classTeacher" = $1::uuid OR s."substituteTeacher" = $1::uuid
                 OR EXISTS (SELECT 1 FROM ${T.sst} st WHERE st."section" = s."_id" AND st."teacher" = $1::uuid))
-         ORDER BY (y."status" = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName"`, [String(teacherId), String(schoolId)]);
+         ORDER BY (${yearScope.yearStatus('y')} = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName"`, [String(teacherId), String(schoolId)]);
     const exams = await examsFor(schoolId, sections.map((x) => x._id), { teacherId });
     return {
         sections: sections.map((x) => ({
@@ -205,13 +206,13 @@ async function teacherSchedule(schoolId, teacherId) {
  */
 async function officeSchedule(schoolId) {
     const { rows: sections } = await pool.query(`
-        SELECT s."_id", s."sectionName", c."className", c."classNumber", y."yearName", (y."status" = 'active') AS "current"
+        SELECT s."_id", s."sectionName", c."className", c."classNumber", y."yearName", (${yearScope.yearStatus('y')} = 'active') AS "current"
           FROM ${T.sections} s
           LEFT JOIN ${T.classes} c ON c."_id" = s."class"
           LEFT JOIN ${T.years} y ON y."_id" = s."academicYear"
          WHERE s."school" = $1::uuid AND COALESCE(s."status", 'active') <> 'archived'
            AND EXISTS (SELECT 1 FROM ${T.exams} e WHERE e."section" = s."_id" AND e."archivedAt" IS NULL)
-         ORDER BY (y."status" = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName"`, [String(schoolId)]);
+         ORDER BY (${yearScope.yearStatus('y')} = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName"`, [String(schoolId)]);
     const exams = await examsFor(schoolId, sections.map((x) => x._id));
     // Papers of one section, on one day, at overlapping times, in different exams.
     const bySection = new Map();

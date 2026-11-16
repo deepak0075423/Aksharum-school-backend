@@ -1,5 +1,6 @@
 'use strict';
 const Attendance       = require('../models/Attendance');
+const yearScope = require('../services/yearScope');
 const AttendanceRecord = require('../models/AttendanceRecord');
 const TeacherAttendance = require('../models/TeacherAttendance');
 const TeacherAttendanceRegularization = require('../models/TeacherAttendanceRegularization');
@@ -45,8 +46,12 @@ function maybeGenerateCompOff(record, actorId) {
     });
 }
 
-const teacherSection = (req) => ClassSection.findOne({
+// The section this teacher runs THIS year. Without the year this found the
+// first section they had ever run — last year's class, with last year's
+// students and registers, on this year's dashboard.
+const teacherSection = async (req) => ClassSection.findOne({
     school: req.schoolId,
+    ...(await yearScope.thisYear(req.schoolId)),
     $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
 }).lean();
 

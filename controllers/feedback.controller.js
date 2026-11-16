@@ -514,7 +514,7 @@ exports.getCampaigns = async (req, res) => {
         const filter = { school: req.schoolId };
         if (req.query.status)       filter.status = str(req.query.status, 20);
         else if (!bool(req.query.includeArchived)) filter.status = { $ne: 'archived' };
-        if (req.query.academicYear) filter.academicYear = str(req.query.academicYear, 40);
+        if (req.query.academicYear && req.query.academicYear !== 'all') filter.academicYear = str(req.query.academicYear, 40);
         if (req.query.search)       filter.name = new RegExp(String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
 
         const { page, limit, skip } = paginate(req);
@@ -1352,7 +1352,7 @@ exports.getTeacherAnalytics = async (req, res) => {
         const profile = await TeacherProfile.findOne({ user: teacherId }).select('department designation employeeId').lean();
 
         const campaignFilter = { school: req.schoolId, status: { $in: ['active', 'closed', 'archived'] } };
-        if (req.query.academicYear) campaignFilter.academicYear = str(req.query.academicYear, 40);
+        if (req.query.academicYear && req.query.academicYear !== 'all') campaignFilter.academicYear = str(req.query.academicYear, 40);
         const campaigns = await FeedbackCampaign.find(campaignFilter)
             .select('name term startDate status minimumResponses').sort({ startDate: -1 }).lean();
         if (!campaigns.length) return ok(res, { teacher, profile, campaigns: [], summary: null, categories: [], trend: [] });
@@ -1444,7 +1444,7 @@ async function buildReport(req) {
 
     const campaignFilter = { school };
     if (req.query.campaign)     campaignFilter._id = str(req.query.campaign, 40);
-    if (req.query.academicYear) campaignFilter.academicYear = str(req.query.academicYear, 40);
+    if (req.query.academicYear && req.query.academicYear !== 'all') campaignFilter.academicYear = str(req.query.academicYear, 40);
     if (req.query.term)         campaignFilter.term = str(req.query.term, 60);
     if (req.query.dateFrom || req.query.dateTo) {
         campaignFilter.startDate = {};

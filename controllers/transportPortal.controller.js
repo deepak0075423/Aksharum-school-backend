@@ -114,7 +114,8 @@ exports.parentChildren = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 async function guardParentChild(req, res) {
-    const studentId = req.query.studentId || req.body.studentId;
+    // A GET carries no body at all: reading it unguarded answered 500, not "studentId is required".
+    const studentId = req.query.studentId || req.body?.studentId;
     if (!studentId) { bad(res, 'studentId is required'); return null; }
     const ids = await childIdsOf(req.userId);
     if (!ids.includes(String(studentId))) { bad(res, 'Not your child', 403); return null; }

@@ -1,6 +1,7 @@
 'use strict';
 
 const Document             = require('../models/Document');
+const yearScope = require('../services/yearScope');
 const AssignmentSubmission = require('../models/AssignmentSubmission');
 const StudentProfile       = require('../models/StudentProfile');
 const ParentProfile        = require('../models/ParentProfile');
@@ -119,6 +120,13 @@ function listWhere(req) {
     // an id is ignored rather than handed to Postgres to choke on.
     if (q.academicYear === 'none') where.push('d."academicYear" IS NULL');
     else if (isUuid(q.academicYear)) { params.push(String(q.academicYear)); where.push(`d."academicYear" = $${params.length}::uuid`); }
+    // Nothing asked: the academic year in view (the switcher's, else the
+    // school's active year), with the documents filed under no year, as every
+    // reader's shelf shows them. `all` is every year.
+    else if (q.academicYear !== 'all') {
+        const year = yearScope.now();
+        if (year?.id) { params.push(year.id); where.push(`(d."academicYear" = $${params.length}::uuid OR d."academicYear" IS NULL)`); }
+    }
 
     if (q.target === 'classes') {
         params.push(CLASS_TARGETS);   where.push(`d."targetType" = ANY($${params.length}::text[])`);
@@ -331,7 +339,7 @@ exports.adminGetDocumentOverview = async (req, res) => {
                 [school],
             ),
             pool.query(
-                `SELECT ay."_id", ay."yearName", ay."status", ay."startDate",
+                `SELECT ay."_id", ay."yearName", ${yearScope.yearStatus('ay')} AS "status", ay."startDate",
                         count(d."_id")::int AS "n"
                    FROM ${qt(AcademicYear)} ay
                    LEFT JOIN ${qt(Document)} d
@@ -518,7 +526,7 @@ exports.adminDocumentTeachers = async (req, res) => {
                    JOIN ${qt(Subject)} sb ON sb."_id" = sst."subject"
                    LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = sb."academicYear"
                   WHERE sst."teacher" = u."_id"
-                    AND (ay."_id" IS NULL OR ay."status" = 'active')
+                    AND (ay."_id" IS NULL OR ${yearScope.yearStatus('ay')} = 'active')
                ) t ON true
               WHERE u."school" = $1 AND u."role" = 'teacher' AND COALESCE(u."isActive", true)
               ORDER BY lower(u."name")`,

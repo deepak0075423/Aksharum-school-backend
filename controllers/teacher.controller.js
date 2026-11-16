@@ -1,5 +1,6 @@
 'use strict';
 const User           = require('../models/User');
+const yearScope = require('../services/yearScope');
 const TeacherProfile = require('../models/TeacherProfile');
 const { ownSections, primarySection } = require('../services/teacherOwnSections');
 const { released } = require('../services/resultExams');
@@ -113,9 +114,14 @@ exports.getDashboard = async (req, res) => {
                     $or: [{ classTeacher: req.userId }, { substituteTeacher: req.userId }],
                 }).select('_id').lean(),
             ]);
-            const sectionIds = [...new Set([
-                ...taught.map(String), ...owned.map((s) => String(s._id)),
-            ])];
+            // This year's sections only: the subject links and the sections a
+            // teacher ran are kept for every year, and last year's results do
+            // not belong on this year's dashboard.
+            const ofYear = await ClassSection.find({
+                _id: { $in: [...new Set([...taught.map(String), ...owned.map((s) => String(s._id))])] },
+                school: req.schoolId, ...(await yearScope.thisYear(req.schoolId)),
+            }).select('_id').lean();
+            const sectionIds = ofYear.map((s) => String(s._id));
 
             if (sectionIds.length) {
                 const [sections, exams] = await Promise.all([

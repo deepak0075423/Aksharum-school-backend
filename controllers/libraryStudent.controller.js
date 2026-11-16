@@ -1,5 +1,6 @@
 'use strict';
 const LibraryBook        = require('../models/LibraryBook');
+const yearScope = require('../services/yearScope');
 const LibraryIssuance    = require('../models/LibraryIssuance');
 const LibraryReservation = require('../models/LibraryReservation');
 const LibraryFine        = require('../models/LibraryFine');
@@ -11,6 +12,12 @@ const {
     notifyLibraryStaff, attachFineSummary,
 } = require('../services/libraryRules');
 const { notify } = require('../services/notifyService');
+
+// A dated library table as a list, tile or report should read it: the academic
+// year in view's rows (services/yearRules.js — an issue still out, a fine still
+// unpaid and a reservation still waiting stay in view until they are closed).
+// Opening one record, and every write, reads the table itself.
+const Y = (Model) => yearScope.table(Model);
 
 // ── Student / Teacher shared endpoints ────────────────────────────────────────
 
@@ -146,7 +153,7 @@ exports.search = async (req, res) => {
                            AND "status" = 'available')                                                 AS "availableCopies",
                         (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}"  WHERE "school" = $1
                            AND "status" = 'issued')                                                    AS "issuedCopies",
-                        (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+                        (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
                            AND "status" = ANY($2::text[]))                                             AS "reserved"`,
                 [sid, HELD],
             ),

@@ -16,6 +16,7 @@
  * are every student's marks.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const FormalExam = require('../models/FormalExam');
 const ExamMarksSheet = require('../models/ExamMarksSheet');
 const ClassTest = require('../models/ClassTest');
@@ -264,12 +265,12 @@ async function teacherBoard(schoolId, teacherId) {
     // The sections this teacher looks after, so an empty Validation tab can
     // say why it is empty.
     const { rows: own } = await pool.query(`
-        SELECT s."sectionName", c."className", (y."status" = 'active') AS "current"
+        SELECT s."sectionName", c."className", (${yearScope.yearStatus('y')} = 'active') AS "current"
           FROM ${T.sections} s
           LEFT JOIN ${T.classes} c ON c."_id" = s."class"
           LEFT JOIN ${T.years} y ON y."_id" = s."academicYear"
          WHERE s."school" = $2::uuid AND (s."classTeacher" = $1::uuid OR s."substituteTeacher" = $1::uuid)
-         ORDER BY (y."status" = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName"`, p);
+         ORDER BY (${yearScope.yearStatus('y')} = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName"`, p);
     out.classTeacherOf = own.filter((r) => r.current !== false).map((r) => [r.className, r.sectionName].filter(Boolean).join(' – '));
     out.tiles = {
         toEnter: markExams.reduce((n, e) => n + e.owed, 0),
@@ -463,7 +464,7 @@ async function testOptions(schoolId, teacherId) {
           LEFT JOIN ${T.years} y ON y."_id" = s."academicYear"
           JOIN ${T.subjects} sub ON sub."_id" = st."subject"
          WHERE st."teacher" = $1::uuid AND COALESCE(s."status", 'active') <> 'archived'
-         ORDER BY (y."status" = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName", sub."subjectName"`, [String(teacherId), String(schoolId)]);
+         ORDER BY (${yearScope.yearStatus('y')} = 'active') DESC, c."classNumber" NULLS LAST, s."sectionName", sub."subjectName"`, [String(teacherId), String(schoolId)]);
     return rows.map((r) => ({
         sectionId: r.section, subjectId: r.subject, sectionName: r.sectionName, className: r.className || '',
         subjectName: r.subjectName, yearName: r.yearName || '', current: r.yearStatus === 'active',

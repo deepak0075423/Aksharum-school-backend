@@ -1,5 +1,6 @@
 'use strict';
 const ClassSection        = require('../models/ClassSection');
+const yearScope = require('../services/yearScope');
 const ClassAnnouncement   = require('../models/ClassAnnouncement');
 const ClassMonitor        = require('../models/ClassMonitor');
 const StudentProfile      = require('../models/StudentProfile');
@@ -351,7 +352,11 @@ exports.deleteAnnouncement = async (req, res) => {
 };
 exports.assignMonitor = async (req, res) => {
     try {
-        const mySection = await ClassSection.findOne({ classTeacher: req.userId, school: req.schoolId }).lean();
+        // This year's section: a teacher who ran a class last year too would
+        // otherwise have the monitor filed against that one.
+        const mySection = await ClassSection.findOne({
+            classTeacher: req.userId, school: req.schoolId, ...(await yearScope.thisYear(req.schoolId)),
+        }).lean();
         if (!mySection) return err(res, 'You are not the class teacher of any section', 403);
         const mon = await ClassMonitor.create({
             section: mySection._id, assignedBy: req.userId, ...req.body,
@@ -363,7 +368,9 @@ exports.removeMonitor = async (req, res) => {
     try {
         // Same trap as deleteAnnouncement: an undefined section would have left
         // the id matching on its own.
-        const mySection = await ClassSection.findOne({ classTeacher: req.userId, school: req.schoolId }).lean();
+        const mySection = await ClassSection.findOne({
+            classTeacher: req.userId, school: req.schoolId, ...(await yearScope.thisYear(req.schoolId)),
+        }).lean();
         if (!mySection) return err(res, 'You are not the class teacher of any section', 403);
         await ClassMonitor.findOneAndDelete({ _id: req.params.id, section: mySection._id });
         res.json({ success: true });

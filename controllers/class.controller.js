@@ -19,6 +19,7 @@ const { schoolWorksSaturday } = require('../utils/timetableDays');
 const { accessChanged } = require('../services/accessChanged');
 const { notify } = require('../services/notifyService');
 const pool = require('../db/pool');
+const yearScope = require('../services/yearScope');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const err = (res, e, status = 500)    => res.status(status).json({ success: false, message: e.message || e });
@@ -98,9 +99,20 @@ const overlapMessage = (clash) =>
 // Academic Years
 exports.getAcademicYears = async (req, res) => {
     try {
-        const years  = await AcademicYear.find({ school: req.schoolId }).lean();   // A–Z
+        // `status` is the year's status as this request reads it — the year the
+        // switcher in the header is on reads as the active one, so every year
+        // dropdown fed from this list opens on it. `realStatus` is what is
+        // stored: the Academic Years screen, which is ABOUT the years, shows that.
+        const [years, real] = await Promise.all([
+            AcademicYear.find({ school: req.schoolId }).lean(),   // A–Z
+            yearScope.allYears(() => AcademicYear.find({ school: req.schoolId }).select('status').lean()),
+        ]);
+        const realStatus = new Map(real.map((y) => [String(y._id), y.status]));
         const counts = await yearCounts(req.schoolId);
-        ok(res, years.map((y) => ({ ...y, ...(counts.get(String(y._id)) || EMPTY_YEAR_COUNTS) })));
+        ok(res, years.map((y) => ({
+            ...y, realStatus: realStatus.get(String(y._id)) || y.status,
+            ...(counts.get(String(y._id)) || EMPTY_YEAR_COUNTS),
+        })));
     } catch (e) { err(res, e); }
 };
 exports.createAcademicYear = async (req, res) => {
@@ -124,6 +136,7 @@ exports.createAcademicYear = async (req, res) => {
             status: 'inactive',
             school: req.schoolId,
         });
+        yearScope.forget(req.schoolId);
         ok(res, year, 201);
     } catch (e) { err(res, e, 400); }
 };
@@ -152,6 +165,7 @@ exports.updateAcademicYear = async (req, res) => {
         const update = { startDate: newStart, endDate: newEnd };
         if (label) update.yearName = label;
         const year = await AcademicYear.findByIdAndUpdate(req.params.id, update, { new: true });
+        yearScope.forget(req.schoolId);
         ok(res, year);
     } catch (e) { err(res, e, 400); }
 };
@@ -187,6 +201,7 @@ exports.deleteAcademicYear = async (req, res) => {
         }
 
         await AcademicYear.findByIdAndDelete(year._id);
+        yearScope.forget(req.schoolId);
         res.json({ success: true });
     } catch (e) { err(res, e); }
 };
@@ -202,6 +217,7 @@ exports.setActiveAcademicYear = async (req, res) => {
         const year = await AcademicYear.findByIdAndUpdate(
             target._id, { $set: { status: 'active' } }, { new: true }
         );
+        yearScope.forget(req.schoolId);
         // Every student's record follows the active year: their class, section
         // and roll number are now that year's (or, for a student not placed in
         // it yet, their latest earlier year's). The rows of every year are

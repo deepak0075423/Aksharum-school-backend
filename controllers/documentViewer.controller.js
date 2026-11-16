@@ -16,6 +16,7 @@
  */
 
 const Document           = require('../models/Document');
+const yearScope = require('../services/yearScope');
 const AssignmentSubmission = require('../models/AssignmentSubmission');
 const DocumentCategory   = require('../models/DocumentCategory');
 const DocumentRead       = require('../models/DocumentRead');
@@ -196,7 +197,7 @@ async function categoriesOf(schoolId) {
  */
 async function yearsOf(schoolId) {
     const { rows } = await pool.query(
-        `SELECT "_id", "yearName", "status" FROM ${qt(AcademicYear)}
+        `SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status" FROM ${qt(AcademicYear)}
           WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
         [String(schoolId)],
     );

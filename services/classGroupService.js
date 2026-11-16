@@ -27,6 +27,7 @@
  * teacher made.
  */
 const pool       = require('../db/pool');
+const yearScope = require('./yearScope');
 const Chat       = require('../models/Chat');
 const ChatMember = require('../models/ChatMember');
 const broker     = require('./chatBrokerService');
@@ -37,8 +38,10 @@ const isClassGroup = (chat) => !!chat && KINDS.includes(chat.kind) && !!chat.cla
 
 // "Class 9" + "A" → "9A"
 const LABEL = `(regexp_replace(COALESCE(c."className", ''), '^\\s*class\\s*', '', 'i') || COALESCE(cs."sectionName", ''))`;
-const ACTIVE_YEAR = `(NOT EXISTS (SELECT 1 FROM "academicyears" y WHERE y."school" = cs."school" AND y."status" = 'active')
-                     OR cs."academicYear" IN (SELECT y."_id" FROM "academicyears" y WHERE y."school" = cs."school" AND y."status" = 'active'))`;
+// Worked out as each statement is built (not once at load): which year reads
+// as the active one depends on the year the person is looking at.
+const ACTIVE_YEAR = { toString: () => `(NOT EXISTS (SELECT 1 FROM "academicyears" y WHERE y."school" = cs."school" AND ${yearScope.yearStatus('y')} = 'active')
+                     OR cs."academicYear" IN (SELECT y."_id" FROM "academicyears" y WHERE y."school" = cs."school" AND ${yearScope.yearStatus('y')} = 'active'))` };
 
 const id = (v) => (v ? String(v) : null);
 

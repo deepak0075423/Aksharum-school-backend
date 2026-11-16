@@ -44,7 +44,7 @@ const notFound = (res) => res.status(404).json({ success: false, message: 'Exam 
 /* ── Reads ────────────────────────────────────────────────────────────────── */
 
 exports.getOverview = handle(async (req, res) => {
-    res.json({ success: true, data: await board.overview(req.schoolId) });
+    res.json({ success: true, data: await board.overview(req.schoolId, req.query) });
 });
 
 exports.getExams = handle(async (req, res) => {

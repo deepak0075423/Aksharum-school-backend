@@ -1,5 +1,6 @@
 'use strict';
 const { rollInSection } = require('../utils/yearRoll');
+const yearScope = require('../services/yearScope');
 /**
  * Admin → Attendance.
  *
@@ -65,21 +66,27 @@ const schoolYears = (schoolId) => AcademicYear.find({ school: schoolId })
     .select('yearName startDate endDate status').lean();   // A–Z, for the picker
 
 /**
- * The year a question is about: the one asked for by id; otherwise the one that
- * holds `day` (the running year first, since two rows can overlap); otherwise
- * the running year; otherwise the newest.
+ * The year a question is about: the one asked for by id; otherwise, for a day
+ * in the past, the year that holds it (the running year first, since two rows
+ * can overlap); otherwise the running year; otherwise the newest.
+ *
+ * "Today" is the running year's day even when the calendar has not reached that
+ * year's start date: the registers teachers mark today are the running year's
+ * sections, so that is the year today's figures are read from. ("Running" is
+ * as this request reads it — the year the switcher is on stands in for it.)
  */
 function pickYear(years, { id, day } = {}) {
     if (id) {
         const hit = years.find((y) => String(y._id) === String(id));
         if (hit) return hit;
     }
-    if (day) {
+    const running = years.find((y) => y.status === 'active');
+    if (day && (day !== localToday() || !running)) {
         const holding = years.filter((y) => dateKey(y.startDate) <= day && day <= dateKey(y.endDate));
         const hit = holding.find((y) => y.status === 'active') || newestYear(holding);
         if (hit) return hit;
     }
-    return years.find((y) => y.status === 'active') || newestYear(years);
+    return running || newestYear(years);
 }
 
 const yearOut = (y) => (y ? {
@@ -617,13 +624,16 @@ exports.activity = async (req, res) => {
         const since30 = keyDate(addDays(today, -30));
         const since60 = keyDate(addDays(today, -60));
         const recent  = keyDate(addDays(today, -7));
+        // The academic year in view's activity: registers of that year's
+        // sections, and staff corrections dated in it.
+        const ofYear = yearScope.isYear('cs."academicYear"');
 
         const [marked, updated, requests, streaks, fixes] = await Promise.all([
             pool.query(
                 `WITH recent AS (
                     SELECT a.* FROM ${T(Attendance)} a
                       JOIN ${T(ClassSection)} cs ON cs."_id" = a."section"
-                     WHERE cs."school" = $1 AND a."date" >= $3
+                     WHERE cs."school" = $1 AND a."date" >= $3${ofYear}
                      ORDER BY a."createdAt" DESC LIMIT $2
                  )
                  SELECT a."_id", a."section", a."date", a."createdAt" AS "at", cs."sectionName", c."className", u."name" AS "by",
@@ -647,7 +657,7 @@ exports.activity = async (req, res) => {
                    JOIN ${T(ClassSection)} cs ON cs."_id" = a."section"
                    JOIN ${T(Class)} c ON c."_id" = cs."class"
                    LEFT JOIN ${T(User)} mb ON mb."_id" = r."markedBy"
-                  WHERE cs."school" = $1 AND a."date" >= $3
+                  WHERE cs."school" = $1 AND a."date" >= $3${ofYear}
                     AND r."markedAt" > a."createdAt" + interval '10 minutes'
                   GROUP BY a."_id", a."section", a."date", cs."sectionName", c."className", mb."name", date_trunc('minute', r."markedAt")
                   ORDER BY "at" DESC LIMIT $2`,
@@ -655,7 +665,7 @@ exports.activity = async (req, res) => {
             ),
             pool.query(
                 `SELECT g."_id", g."date", g."createdAt", g."status", g."reviewedAt", u."name", u."role", rv."name" AS "reviewer"
-                   FROM ${T(TeacherAttendanceRegularization)} g
+                   FROM ${yearScope.table(TeacherAttendanceRegularization)} g
                    JOIN ${T(User)} u ON u."_id" = g."teacher"
                    LEFT JOIN ${T(User)} rv ON rv."_id" = g."reviewedBy"
                   WHERE g."school" = $1
@@ -671,7 +681,7 @@ exports.activity = async (req, res) => {
                       JOIN ${T(Attendance)} a ON a."_id" = r."attendance"
                       JOIN ${T(ClassSection)} cs ON cs."_id" = a."section"
                       JOIN ${T(Class)} c ON c."_id" = cs."class"
-                     WHERE cs."school" = $1 AND a."date" >= $3
+                     WHERE cs."school" = $1 AND a."date" >= $3${ofYear}
                  ),
                  -- One status per student per DAY: a subject-wise school keeps
                  -- several registers a day, and a streak is about days.
@@ -699,7 +709,7 @@ exports.activity = async (req, res) => {
                    FROM ${T(TeacherAttendance)} t
                    JOIN ${T(User)} u ON u."_id" = t."teacher"
                    LEFT JOIN ${T(User)} mb ON mb."_id" = t."markedBy"
-                  WHERE t."school" = $1 AND t."remarks" LIKE 'Regularized by admin%'
+                  WHERE t."school" = $1 AND t."remarks" LIKE 'Regularized by admin%'${yearScope.within('t."date"')}
                   ORDER BY t."updatedAt" DESC LIMIT $2`,
                 [school, limit],
             ),

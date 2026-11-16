@@ -9,6 +9,7 @@
  * the options of the filters.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const ClassTest = require('../models/ClassTest');
 const ClassSection = require('../models/ClassSection');
 const Class = require('../models/Class');
@@ -38,7 +39,9 @@ async function list(schoolId, q = {}) {
     const params = [String(schoolId)];
     const $ = (v) => { params.push(v); return `$${params.length}`; };
     const w = ['ct."school" = $1::uuid'];
-    const year = String(q.academicYear || '');
+    // Nothing asked = the academic year in view; `all` = every year.
+    const asked = String(q.academicYear || '');
+    const year = isUuid(asked) ? asked : asked === 'all' ? '' : (yearScope.now()?.id || '');
     if (isUuid(year)) w.push(`ct."academicYear" = ${$(year)}::uuid`);
     if (q.classNumber !== undefined && q.classNumber !== '' && Number.isFinite(Number(q.classNumber))) w.push(`c."classNumber" = ${$(Number(q.classNumber))}`);
     if (isUuid(String(q.sectionId || ''))) w.push(`ct."section" = ${$(String(q.sectionId))}::uuid`);
@@ -90,7 +93,7 @@ async function list(schoolId, q = {}) {
     const by = Object.fromEntries(counts.map((r) => [r.status, num(r.n)]));
     const sum = (...k) => k.reduce((n, x) => n + (by[x] || 0), 0);
     const [{ rows: years }, { rows: classes }, { rows: subjects }] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]),
+        pool.query(`SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [String(schoolId)]),
         pool.query(`SELECT DISTINCT ON (lower(sub."subjectName")) sub."_id", sub."subjectName" FROM ${T.tests} ct JOIN ${T.subjects} sub ON sub."_id" = ct."subject"
                      WHERE ct."school" = $1::uuid ORDER BY lower(sub."subjectName"), sub."_id"`, [String(schoolId)]),

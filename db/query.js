@@ -68,12 +68,12 @@ class Query {
                 // Only push the projection to SQL when nothing downstream needs the
                 // full row: populate() may need ref columns not in the select list.
                 const select = this._populate.length ? null : this._select;
-                const rows = await m._rawFind(this.filter, { sort: this._sort, limit: this._limit, skip: this._skip, select });
+                const rows = await m._rawFind(m._inYear(this.filter), { sort: this._sort, limit: this._limit, skip: this._skip, select });
                 return this._finishRows(rows);
             }
             case 'findOne': {
                 const select = this._populate.length ? null : this._select;
-                const rows = await m._rawFind(this.filter, { sort: this._sort, limit: 1, skip: this._skip, select });
+                const rows = await m._rawFind(m._inYear(this.filter), { sort: this._sort, limit: 1, skip: this._skip, select });
                 return this._finishRow(rows[0] || null);
             }
             case 'findOneAndUpdate': {
@@ -85,9 +85,9 @@ class Query {
                 return this._finishRow(row);
             }
             case 'count':
-                return m._count(this.filter);
+                return m._count(m._inYear(this.filter));
             case 'distinct':
-                return m._distinct(this.fieldName, this.filter);
+                return m._distinct(this.fieldName, m._inYear(this.filter));
             default:
                 throw new Error(`Unsupported query kind: ${this.kind}`);
         }

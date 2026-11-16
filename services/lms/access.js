@@ -19,6 +19,7 @@
  * cannot disagree about what a student was given.
  */
 const { q, T, forbidden } = require('./common');
+const yearScope = require('../yearScope');
 
 /** A release that is open at this moment (alias r). */
 const LIVE = `r."status" IN ('scheduled', 'active') AND r."releaseAt" <= now() AND (r."expiresAt" IS NULL OR r."expiresAt" > now())`;
@@ -54,7 +55,7 @@ async function studentContext(user) {
     let rows = await q(`
         SELECT ${pick}
           FROM ${T.section} cs
-          JOIN ${T.year} y ON y."_id" = cs."academicYear" AND y."status" = 'active'
+          JOIN ${T.year} y ON y."_id" = cs."academicYear" AND ${yearScope.yearStatus('y')} = 'active'
           JOIN ${T.class} c ON c."_id" = cs."class"
          WHERE cs."school" = $1 AND cs."enrolledStudents" ? $2
          ORDER BY y."startDate" DESC LIMIT 1`, [schoolId, userId]);
@@ -63,7 +64,7 @@ async function studentContext(user) {
             SELECT ${pick}
               FROM ${T.studentProfile} sp
               JOIN ${T.section} cs ON cs."_id" = sp."currentSection" AND cs."school" = $1
-              JOIN ${T.year} y ON y."_id" = cs."academicYear" AND y."status" = 'active'
+              JOIN ${T.year} y ON y."_id" = cs."academicYear" AND ${yearScope.yearStatus('y')} = 'active'
               JOIN ${T.class} c ON c."_id" = cs."class"
              WHERE sp."user" = $2 LIMIT 1`, [schoolId, userId]);
     }
@@ -126,7 +127,7 @@ async function teacherScope(user) {
                COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(cs."enrolledStudents") = 'array' THEN cs."enrolledStudents" ELSE '[]'::jsonb END), 0) AS "studentCount"
           FROM ${T.sectionTeacher} sst
           JOIN ${T.section} cs ON cs."_id" = sst."section" AND cs."school" = $1
-          JOIN ${T.year} y ON y."_id" = cs."academicYear" AND y."status" = 'active'
+          JOIN ${T.year} y ON y."_id" = cs."academicYear" AND ${yearScope.yearStatus('y')} = 'active'
           JOIN ${T.class} c ON c."_id" = cs."class"
           JOIN ${T.schoolSubjectRow} s ON s."_id" = sst."subject"
          WHERE sst."teacher" = $2

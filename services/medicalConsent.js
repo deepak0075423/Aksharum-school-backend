@@ -15,6 +15,7 @@
  *               critical alerts with teachers
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const { patch, insert } = require('../db/patch');
 const MedicalConsent = require('../models/MedicalConsent');
 const settingsSvc = require('./medicalSettings');
@@ -37,7 +38,7 @@ const otcCategories = (settings) => (settings.medicineCategories || []).filter((
 async function currentYear(schoolId) {
     const [y] = await run(
         `SELECT "_id"::text AS "_id", "yearName" FROM "academicyears" WHERE "school" = $1
-          ORDER BY ("status" = 'active') DESC, (now() BETWEEN "startDate" AND "endDate") DESC, "startDate" DESC LIMIT 1`,
+          ORDER BY (${yearScope.yearStatus()} = 'active') DESC, (now() BETWEEN "startDate" AND "endDate") DESC, "startDate" DESC LIMIT 1`,
         [S(schoolId)],
     );
     return y || null;

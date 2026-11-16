@@ -22,6 +22,7 @@
  * and passed in as instants, so nothing depends on the database session zone.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const User = require('../models/User');
 const StudentProfile = require('../models/StudentProfile');
 const TeacherProfile = require('../models/TeacherProfile');
@@ -35,11 +36,16 @@ const HostelBed = require('../models/HostelBed');
 const HostelAllocation = require('../models/HostelAllocation');
 const { dayRange } = require('./hostelService');
 
-const T = (Model) => `"${Model.tableName}"`;
+// A table as a list or board should read it: for a model whose rows belong to
+// an academic year (services/yearRules.js) that is the year in view's rows;
+// for every other model, and wherever one record is opened or anything is
+// written, it is the table itself (services/yearScope.js `table`).
+const PLAIN = (Model) => `"${Model.tableName}"`;
+const T = (Model) => yearScope.table(Model);
 const TBL = {
-    users: T(User), profiles: T(StudentProfile), staffProfiles: T(TeacherProfile), classes: T(Class), sections: T(ClassSection),
-    hostels: T(Hostel), buildings: T(HostelBuilding), floors: T(HostelFloor),
-    rooms: T(HostelRoom), beds: T(HostelBed), allocations: T(HostelAllocation),
+    users: PLAIN(User), profiles: PLAIN(StudentProfile), staffProfiles: PLAIN(TeacherProfile), classes: PLAIN(Class), sections: PLAIN(ClassSection),
+    hostels: PLAIN(Hostel), buildings: PLAIN(HostelBuilding), floors: PLAIN(HostelFloor),
+    rooms: PLAIN(HostelRoom), beds: PLAIN(HostelBed), allocations: PLAIN(HostelAllocation),
 };
 
 const num = (v, d = 0) => (v === '' || v == null || Number.isNaN(Number(v)) ? d : Number(v));

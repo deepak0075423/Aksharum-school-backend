@@ -1,5 +1,6 @@
 'use strict';
 const LibraryBook        = require('../models/LibraryBook');
+const yearScope = require('../services/yearScope');
 const LibraryBookCopy    = require('../models/LibraryBookCopy');
 const LibraryIssuance    = require('../models/LibraryIssuance');
 const LibraryReservation = require('../models/LibraryReservation');
@@ -33,6 +34,12 @@ const {
     outstandingOf, fineStatusFor, ACTIVE_RESERVATION, notifyLibraryStaff,
     attachFineSummary, placeReservation,
 } = require('../services/libraryRules');
+
+// A dated library table as a list, tile or report should read it: the academic
+// year in view's rows (services/yearRules.js — an issue still out, a fine still
+// unpaid and a reservation still waiting stay in view until they are closed).
+// Opening one record, and every write, reads the table itself.
+const Y = (Model) => yearScope.table(Model);
 
 // How a book can come back over the counter.
 const RETURN_CONDITIONS = ['good', 'damaged', 'lost'];
@@ -87,7 +94,10 @@ exports.getDashboard = async (req, res) => {
         // category split and the weekly circulation series, and v4 added the
         // reader counts — a cached older body would keep serving a dashboard
         // missing panels the page now expects to find.
-        const key   = `lib:dash:v4:${req.schoolId}`;
+        // Per academic year in view: the tiles are that year's, and one
+        // person looking at last year must not leave last year's figures in
+        // the cache for everybody else.
+        const key   = `lib:dash:v5:${req.schoolId}:${yearScope.now()?.id || 'all'}`;
         let tiles = null;
         if (redis) {
             try {
@@ -108,33 +118,33 @@ exports.getDashboard = async (req, res) => {
                    (SELECT count(*) FROM "${LibraryBook.tableName}"        WHERE "school" = $1)                                  AS "totalBooks",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1)                                  AS "totalCopies",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1 AND "status" = 'issued')          AS "issuedCopies",
-                   (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1 AND "status" = 'overdue')         AS "overdue",
-                   (SELECT count(*) FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = ANY($2::text[]))    AS "reservations",
-                   (SELECT count(*) FROM "${LibraryFine.tableName}"        WHERE "school" = $1 AND "status" = 'pending')         AS "pendingFines",
+                   (SELECT count(*) FROM ${Y(LibraryIssuance)} lx    WHERE "school" = $1 AND "status" = 'overdue')         AS "overdue",
+                   (SELECT count(*) FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = ANY($2::text[]))    AS "reservations",
+                   (SELECT count(*) FROM ${Y(LibraryFine)} lx        WHERE "school" = $1 AND "status" = 'pending')         AS "pendingFines",
                    (SELECT COALESCE(sum("amount" - COALESCE("waivedAmount", 0) - COALESCE("paidAmount", 0)), 0)
-                      FROM "${LibraryFine.tableName}" WHERE "school" = $1 AND "status" = 'pending')                              AS "pendingFineTotal",
+                      FROM ${Y(LibraryFine)} lx WHERE "school" = $1 AND "status" = 'pending')                              AS "pendingFineTotal",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1 AND "status" = 'available')        AS "availableCopies",
                    -- What has changed, and over what.
                    (SELECT count(*) FROM "${LibraryBook.tableName}"        WHERE "school" = $1
                       AND "createdAt" >= date_trunc('month', now()))                                                             AS "booksThisMonth",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1
                       AND "createdAt" >= date_trunc('month', now()))                                                             AS "copiesThisMonth",
-                   (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1
+                   (SELECT count(*) FROM ${Y(LibraryIssuance)} lx    WHERE "school" = $1
                       AND "issueDate" >= date_trunc('month', now()))                                                             AS "issuedThisMonth",
-                   (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1
+                   (SELECT count(*) FROM ${Y(LibraryIssuance)} lx    WHERE "school" = $1
                       AND "issueDate" >= date_trunc('month', now()) - interval '1 month'
                       AND "issueDate" <  date_trunc('month', now()))                                                             AS "issuedLastMonth",
                    -- Overdue is a live status, so a week ago has to be derived:
                    -- past its due date then, and not yet back at that point.
-                   (SELECT count(*) FROM "${LibraryIssuance.tableName}"    WHERE "school" = $1
+                   (SELECT count(*) FROM ${Y(LibraryIssuance)} lx    WHERE "school" = $1
                       AND "dueDate" < now() - interval '7 days'
                       AND ("returnDate" IS NULL OR "returnDate" > now() - interval '7 days'))                                     AS "overdueLastWeek",
-                   (SELECT count(*) FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+                   (SELECT count(*) FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
                       AND "status" = ANY($2::text[]) AND "createdAt" < now() - interval '7 days')                                 AS "reservationsLastWeek",
                    -- Who actually uses the library, against who could. A reader
                    -- is somebody who has borrowed in the last year, not everyone
                    -- holding a card.
-                   (SELECT count(DISTINCT "issuedTo") FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+                   (SELECT count(DISTINCT "issuedTo") FROM ${Y(LibraryIssuance)} lx WHERE "school" = $1
                       AND "issueDate" >= now() - interval '1 year')                                                              AS "activeReaders",
                    (SELECT count(*) FROM "${User.tableName}" WHERE "school" = $1
                       AND "role" = ANY('{student,teacher}'::text[]) AND "isActive" IS DISTINCT FROM false)                        AS "members"`,
@@ -158,10 +168,10 @@ exports.getDashboard = async (req, res) => {
                             date_trunc('week', now()),
                             interval '1 week') AS "start")
                      SELECT to_char(w."start", 'YYYY-MM-DD') AS "week",
-                       (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" i
+                       (SELECT count(*)::int FROM ${Y(LibraryIssuance)} i
                          WHERE i."school" = $1 AND i."issueDate" >= w."start"
                            AND i."issueDate" < w."start" + interval '1 week')  AS "issued",
-                       (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" i
+                       (SELECT count(*)::int FROM ${Y(LibraryIssuance)} i
                          WHERE i."school" = $1 AND i."returnDate" >= w."start"
                            AND i."returnDate" < w."start" + interval '1 week') AS "returned"
                        FROM w ORDER BY w."start"`,
@@ -185,7 +195,7 @@ exports.getDashboard = async (req, res) => {
                    b."title", b."authors",
                    u."name" AS "borrowerName", u."role" AS "borrowerRole",
                    c."className", cs."sectionName"
-              FROM "${LibraryIssuance.tableName}" i
+              FROM ${Y(LibraryIssuance)} i
               JOIN "${LibraryBook.tableName}" b  ON b."_id" = i."book"
               JOIN "${User.tableName}" u         ON u."_id" = i."issuedTo"
          LEFT JOIN "${StudentProfile.tableName}" sp ON sp."user" = u."_id"
@@ -299,10 +309,10 @@ exports.getBooks = async (req, res) => {
         const fromSql = (resParam) => `
             FROM "${LibraryBook.tableName}" b
             LEFT JOIN LATERAL (
-                SELECT count(*)::int AS "n" FROM "${LibraryIssuance.tableName}" i
+                SELECT count(*)::int AS "n" FROM ${Y(LibraryIssuance)} i
                  WHERE i."book" = b."_id" AND i."status" = 'overdue') ov ON true
             LEFT JOIN LATERAL (
-                SELECT count(*)::int AS "n" FROM "${LibraryReservation.tableName}" r
+                SELECT count(*)::int AS "n" FROM ${Y(LibraryReservation)} r
                  WHERE r."book" = b."_id" AND r."status" = ANY($${resParam}::text[])) rs ON true
             LEFT JOIN LATERAL (
                 SELECT count(*)::int AS "n" FROM "${LibraryBookCopy.tableName}" c
@@ -348,7 +358,7 @@ exports.getBooks = async (req, res) => {
         // Titles with somebody waiting, and titles catalogued this month.
         const extra = await pool.query(
             `SELECT
-               (SELECT count(DISTINCT r."book")::int FROM "${LibraryReservation.tableName}" r
+               (SELECT count(DISTINCT r."book")::int FROM ${Y(LibraryReservation)} r
                  WHERE r."school" = $1 AND r."status" = ANY($2::text[]))              AS "reserved",
                (SELECT count(*)::int FROM "${LibraryBook.tableName}"
                  WHERE "school" = $1 AND "createdAt" >= date_trunc('month', now()))   AS "addedThisMonth"`,
@@ -569,7 +579,7 @@ exports.getBookActivity = async (req, res) => {
                         count(*) FILTER (WHERE "status" = 'overdue')::int AS "overdue",
                         count(DISTINCT "issuedTo")::int AS "readers",
                         max("issueDate") AS "lastIssued"
-                   FROM "${LibraryIssuance.tableName}"
+                   FROM ${Y(LibraryIssuance)} lx
                   WHERE "book" = $1 AND "school" = $2`,
                 [id, school, ACTIVE_ISSUANCE],
             ),
@@ -1095,7 +1105,7 @@ exports.searchCopies = async (req, res) => {
                FROM "${LibraryBookCopy.tableName}" c
                JOIN "${LibraryBook.tableName}" b ON b."_id" = c."book"
                LEFT JOIN LATERAL (
-                   SELECT ii."issuedTo", ii."dueDate" FROM "${LibraryIssuance.tableName}" ii
+                   SELECT ii."issuedTo", ii."dueDate" FROM ${Y(LibraryIssuance)} ii
                     WHERE ii."bookCopy" = c."_id" AND ii."status" = ANY($3::text[]) LIMIT 1
                ) i ON true
                LEFT JOIN "${User.tableName}" u ON u."_id" = i."issuedTo"
@@ -1531,28 +1541,28 @@ async function withBorrowerClass(schoolId, rows, field = 'issuedTo') {
 async function circulationStats(schoolId) {
     const { rows } = await pool.query(
         `SELECT
-           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryIssuance)} lx WHERE "school" = $1
               AND "issueDate" >= date_trunc('week', now()))                                   AS "issued",
-           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryIssuance)} lx WHERE "school" = $1
               AND "issueDate" >= date_trunc('week', now()) - interval '1 week'
               AND "issueDate" <  date_trunc('week', now()))                                   AS "issuedPrev",
-           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryIssuance)} lx WHERE "school" = $1
               AND "returnDate" >= date_trunc('week', now()))                                  AS "returned",
-           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryIssuance)} lx WHERE "school" = $1
               AND "returnDate" >= date_trunc('week', now()) - interval '1 week'
               AND "returnDate" <  date_trunc('week', now()))                                  AS "returnedPrev",
-           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryIssuance)} lx WHERE "school" = $1
               AND "status" = 'overdue')                                                       AS "overdue",
-           (SELECT count(*)::int FROM "${LibraryIssuance.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryIssuance)} lx WHERE "school" = $1
               AND "dueDate" < now() - interval '7 days'
               AND ("returnDate" IS NULL OR "returnDate" > now() - interval '7 days'))          AS "overduePrev",
-           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}" WHERE "school" = $1
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${Y(LibraryFine)} lx WHERE "school" = $1
               AND "paidAt" >= date_trunc('week', now()))                                      AS "collected",
-           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}" WHERE "school" = $1
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${Y(LibraryFine)} lx WHERE "school" = $1
               AND "paidAt" >= date_trunc('week', now()) - interval '1 week'
               AND "paidAt" <  date_trunc('week', now()))                                      AS "collectedPrev",
            (SELECT COALESCE(sum("amount" - COALESCE("waivedAmount", 0) - COALESCE("paidAmount", 0)), 0)::float
-              FROM "${LibraryFine.tableName}" WHERE "school" = $1 AND "status" = 'pending')    AS "outstanding"`,
+              FROM ${Y(LibraryFine)} lx WHERE "school" = $1 AND "status" = 'pending')    AS "outstanding"`,
         [String(schoolId)],
     );
     return rows[0];
@@ -1727,30 +1737,30 @@ exports.renewBook = async (req, res) => {
 async function reservationStats(schoolId) {
     const { rows } = await pool.query(
         `SELECT
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'ready')     AS "ready",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'pending')   AS "waiting",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'collected') AS "collected",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'cancelled') AS "cancelled",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'expired')   AS "expired",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1)                            AS "all",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = 'ready')     AS "ready",
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = 'pending')   AS "waiting",
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = 'collected') AS "collected",
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = 'cancelled') AS "cancelled",
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = 'expired')   AS "expired",
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1)                            AS "all",
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
               AND "status" = 'collected' AND "closedAt" >= date_trunc('month', now()))                                 AS "collectedThisMonth",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
               AND "status" = 'collected' AND "closedAt" >= date_trunc('month', now()) - interval '1 month'
               AND "closedAt" < date_trunc('month', now()))                                                             AS "collectedLastMonth",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
               AND "status" = ANY(ARRAY['cancelled','expired']) AND "closedAt" >= date_trunc('month', now()))           AS "closedThisMonth",
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
               AND "status" = ANY(ARRAY['cancelled','expired'])
               AND "closedAt" >= date_trunc('month', now()) - interval '1 month'
               AND "closedAt" < date_trunc('month', now()))                                                             AS "closedLastMonth",
            -- What is about to fall off the hold shelf: the actionable number.
-           (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
               AND "status" = 'ready' AND "expiresAt" IS NOT NULL
               AND "expiresAt" < now() + interval '2 days')                                                              AS "expiringSoon",
            -- How long the person at the front of the queue has been waiting.
            (SELECT COALESCE(EXTRACT(day FROM now() - min("reservedAt")), 0)::int
-              FROM "${LibraryReservation.tableName}" WHERE "school" = $1 AND "status" = 'pending')                       AS "longestWaitDays"`,
+              FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = 'pending')                       AS "longestWaitDays"`,
         [String(schoolId)],
     );
     return rows[0];
@@ -2027,32 +2037,32 @@ async function fineStats(schoolId) {
     const year = await AcademicYear.findOne({ school: schoolId, status: 'active' }).select('yearName startDate endDate').lean();
     const { rows } = await pool.query(
         `SELECT
-           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}"
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${Y(LibraryFine)} lx
               WHERE "school" = $1 AND COALESCE("paidAmount", 0) > 0
                 AND ($2::timestamptz IS NULL OR "paidAt" >= $2) AND ($3::timestamptz IS NULL OR "paidAt" <= $3))  AS "collectedYear",
-           (SELECT count(*)::int FROM "${LibraryFine.tableName}"
+           (SELECT count(*)::int FROM ${Y(LibraryFine)} lx
               WHERE "school" = $1 AND COALESCE("paidAmount", 0) > 0
                 AND ($2::timestamptz IS NULL OR "paidAt" >= $2) AND ($3::timestamptz IS NULL OR "paidAt" <= $3))  AS "collectedYearCount",
            (SELECT COALESCE(sum("amount" - COALESCE("waivedAmount",0) - COALESCE("paidAmount",0)), 0)::float
-              FROM "${LibraryFine.tableName}" WHERE "school" = $1
+              FROM ${Y(LibraryFine)} lx WHERE "school" = $1
                AND "amount" - COALESCE("waivedAmount",0) - COALESCE("paidAmount",0) > 0)          AS "outstanding",
-           (SELECT count(*)::int FROM "${LibraryFine.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryFine)} lx WHERE "school" = $1
                AND "amount" - COALESCE("waivedAmount",0) - COALESCE("paidAmount",0) > 0)          AS "unpaidCount",
-           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}"
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${Y(LibraryFine)} lx
               WHERE "school" = $1 AND "paidAt" >= date_trunc('month', now()))                     AS "collected",
-           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM "${LibraryFine.tableName}"
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${Y(LibraryFine)} lx
               WHERE "school" = $1 AND "paidAt" >= date_trunc('month', now()) - interval '1 month'
                 AND "paidAt" < date_trunc('month', now()))                                        AS "collectedPrev",
            -- What was owed a week ago: raised by then, and not settled until after.
-           (SELECT count(*)::int FROM "${LibraryFine.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryFine)} lx WHERE "school" = $1
               AND "createdAt" < now() - interval '7 days'
               AND ("paidAt" IS NULL OR "paidAt" > now() - interval '7 days')
               AND ("waivedAt" IS NULL OR "waivedAt" > now() - interval '7 days'))                  AS "unpaidPrev",
-           (SELECT COALESCE(sum("waivedAmount"), 0)::float FROM "${LibraryFine.tableName}"
+           (SELECT COALESCE(sum("waivedAmount"), 0)::float FROM ${Y(LibraryFine)} lx
               WHERE "school" = $1 AND "waivedAt" >= date_trunc('month', now()))                   AS "waived",
-           (SELECT count(*)::int FROM "${LibraryFine.tableName}" WHERE "school" = $1
+           (SELECT count(*)::int FROM ${Y(LibraryFine)} lx WHERE "school" = $1
               AND "waivedAt" >= date_trunc('month', now()))                                       AS "waivedCount",
-           (SELECT COALESCE(sum("waivedAmount"), 0)::float FROM "${LibraryFine.tableName}"
+           (SELECT COALESCE(sum("waivedAmount"), 0)::float FROM ${Y(LibraryFine)} lx
               WHERE "school" = $1 AND "waivedAt" >= date_trunc('month', now()) - interval '1 month'
                 AND "waivedAt" < date_trunc('month', now()))                                      AS "waivedPrev"`,
         [String(schoolId), year?.startDate || null, year?.endDate ? new Date(new Date(year.endDate).getTime() + 86399999) : null],

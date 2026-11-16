@@ -16,6 +16,7 @@
  *   released content not started after N days → those students, once
  */
 const { q, M, T, levelLabel } = require('./common');
+const yearScope = require('../yearScope');
 const { notify, schoolAdminIds } = require('../notifyService');
 const access = require('./access');
 const settings = require('./settings');
@@ -39,7 +40,7 @@ async function bookAdded(book, actor) {
     await M.book.updateOne({ _id: book._id }, { $set: { announcedAt: new Date() } });
     const schools = await q(`
         SELECT DISTINCT c."school" FROM ${T.schoolConfig} c
-          JOIN ${T.year} y ON y."_id" = c."academicYear" AND y."status" = 'active'
+          JOIN ${T.year} y ON y."_id" = c."academicYear" AND ${yearScope.yearStatus('y')} = 'active'
           JOIN ${T.school} s ON s."_id" = c."school" AND s."isActive" IS NOT FALSE AND COALESCE((s."modules"->>'videoLibrary')::boolean, false)
          WHERE c."board" = $1`, [book.board]);
     for (const { school } of schools) {

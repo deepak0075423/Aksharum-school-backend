@@ -15,6 +15,7 @@
  * disagree with what "Reissue" would print.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const IdCard = require('../models/IdCard');
 const IdCardLog = require('../models/IdCardLog');
 const User = require('../models/User');
@@ -385,7 +386,7 @@ async function activity(schoolId, { limit = 20, card = null, includeScans = fals
           LEFT JOIN ${USERS} u ON u."_id" = l."by"
           LEFT JOIN ${CARDS} c ON c."_id" = l."card"
          WHERE l."school" = $1::uuid AND ($2::uuid IS NULL OR l."card" = $2::uuid)
-           AND ($3::boolean OR l."action" <> 'scanned')
+           AND ($3::boolean OR l."action" <> 'scanned')${yearScope.within('l."createdAt"')}
          ORDER BY l."createdAt" DESC LIMIT $4`, [String(schoolId), card ? String(card) : null, !!includeScans, limit]);
     return rows.map((r) => ({ ...r, label: ACTION_LABEL[r.action] || r.action }));
 }

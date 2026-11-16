@@ -26,6 +26,7 @@
  * nothing here depends on the database session's zone.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const { rollInSection, rollInYear, rollOrder } = require('../utils/yearRoll');
 const TZ = require('../config/timezone');
 const { isUuid } = require('../db/schema');
@@ -169,7 +170,20 @@ const columns = (tz) => `
  * The filters a request may carry. `tab` is the lifecycle tab; "all" means
  * every exam that has not been archived, and the archive is its own tab.
  */
-function where(schoolId, q, p, { tab = 'all', status = true } = {}) {
+/**
+ * The academic year an office list is about. Nothing asked = the year in view
+ * (the switcher's, else the school's active year): the Results home used to
+ * open on every year's exams at once, tiles and all. `all` = every year.
+ * Returns an id, 'current' (by status, when no year is in force) or null.
+ */
+function listYear(q) {
+    const v = String(q?.academicYear || q?.academicYearId || '');
+    if (isUuid(v)) return v;
+    if (v === 'all') return null;
+    return yearScope.now()?.id || 'current';
+}
+
+function where(schoolId, q, p, { tab = 'all', status = true, thisYear = false } = {}) {
     const w = [`e."school" = ${p.$(String(schoolId))}::uuid`];
 
     if (tab === 'archived') w.push('e."archivedAt" IS NOT NULL');
@@ -178,9 +192,9 @@ function where(schoolId, q, p, { tab = 'all', status = true } = {}) {
 
     if (status && STATUS_LABELS[q.status]) w.push(`e."status" = ${p.$(q.status)}`);
 
-    const year = String(q.academicYear || q.academicYearId || '');
+    const year = thisYear ? (listYear(q) || '') : String(q.academicYear || q.academicYearId || '');
     if (isUuid(year)) w.push(`e."academicYear" = ${p.$(year)}::uuid`);
-    else if (year === 'current') w.push(`y."status" = 'active'`);
+    else if (year === 'current') w.push(`${yearScope.yearStatus('y')} = 'active'`);
 
     // A class is a row per academic year, so across years it is named by its
     // number — "Class 6" in 2026-27 and in 2027-28 are two rows and one filter.
@@ -338,7 +352,7 @@ async function list(schoolId, q = {}) {
     const rowsSql = `
         SELECT ${columns(tz)}, count(*) OVER ()::int AS "_total"
         ${FROM}${SHEETS}
-         WHERE ${where(schoolId, q, p, { tab })}
+         WHERE ${where(schoolId, q, p, { tab, thisYear: true })}
          ORDER BY e."startDate" DESC NULLS LAST, c."classNumber" NULLS LAST, s."sectionName", e."createdAt" DESC, e."_id"
          LIMIT ${p.$(limit)} OFFSET ${p.$((page - 1) * limit)}`;
 
@@ -346,7 +360,7 @@ async function list(schoolId, q = {}) {
     const countSql = `
         SELECT count(*) FILTER (WHERE x."stage" <> 'archived')::int AS "all",
                ${TABS.slice(1).map((k) => `count(*) FILTER (WHERE x."stage" = ${lit(k)})::int AS ${JSON.stringify(k)}`).join(',\n               ')}
-          FROM (SELECT ${STAGE} AS "stage" ${FROM} WHERE ${where(schoolId, q, cp, { tab: null, status: false })}) x`;
+          FROM (SELECT ${STAGE} AS "stage" ${FROM} WHERE ${where(schoolId, q, cp, { tab: null, status: false, thisYear: true })}) x`;
 
     const [{ rows }, { rows: [tabs] }] = await Promise.all([
         pool.query(rowsSql, p.list), pool.query(countSql, cp.list),
@@ -356,7 +370,7 @@ async function list(schoolId, q = {}) {
     // exams found" while there were pages of them. Answer with the last page.
     if (!rows.length && page > 1) {
         const tp = params();
-        const { rows: [c] } = await pool.query(`SELECT count(*)::int AS "n" ${FROM} WHERE ${where(schoolId, q, tp, { tab })}`, tp.list);
+        const { rows: [c] } = await pool.query(`SELECT count(*)::int AS "n" ${FROM} WHERE ${where(schoolId, q, tp, { tab, thisYear: true })}`, tp.list);
         const last = Math.max(1, Math.ceil(num(c?.n) / limit));
         if (num(c?.n) > 0 && last < page) return list(schoolId, { ...q, page: last });
     }
@@ -369,10 +383,15 @@ async function list(schoolId, q = {}) {
 
 /* ── Overview: tiles and the filter row's options ─────────────────────────── */
 
-async function overview(schoolId) {
+async function overview(schoolId, q = {}) {
     const p = params();
     const tz = p.tz();
     const school = p.$(String(schoolId));
+    // The tiles count the same year the list under them shows.
+    const year = listYear(q);
+    const ofYear = !year ? '' : year === 'current'
+        ? ` AND ${yearScope.yearStatus('y')} = 'active'`
+        : ` AND e."academicYear" = ${p.$(year)}::uuid`;
     const tilesSql = `
         SELECT count(*) FILTER (WHERE x."stage" <> 'archived')::int AS "total",
                count(*) FILTER (WHERE x."stage" = 'published')::int AS "published",
@@ -387,12 +406,12 @@ async function overview(schoolId) {
                count(*) FILTER (WHERE x."attention" = 'validate')::int AS "toValidate",
                count(*) FILTER (WHERE x."attention" = 'open')::int AS "toOpen",
                count(*) FILTER (WHERE x."attention" = 'marks')::int AS "toEnter"
-          FROM (SELECT ${STAGE} AS "stage", ${attention(tz)} AS "attention" ${FROM} WHERE e."school" = ${school}::uuid) x`;
+          FROM (SELECT ${STAGE} AS "stage", ${attention(tz)} AS "attention" ${FROM} WHERE e."school" = ${school}::uuid${ofYear}) x`;
 
     const [{ rows: [tiles] }, { rows: years }, { rows: classes }, conf, { rows: [rc] }] = await Promise.all([
         pool.query(tilesSql, p.list),
         pool.query(`
-            SELECT y."_id", y."yearName", y."status",
+            SELECT y."_id", y."yearName", ${yearScope.yearStatus('y')} AS "status",
                    (SELECT count(*)::int FROM ${T.exams} e WHERE e."academicYear" = y."_id" AND e."archivedAt" IS NULL) AS "exams"
               FROM ${T.years} y WHERE y."school" = $1::uuid
              ORDER BY ${yearOrderSql('y')}`, [String(schoolId)]),
@@ -408,6 +427,8 @@ async function overview(schoolId) {
 
     return {
         tiles: { ...tiles, publishedPct: share(tiles.published, tiles.total) },
+        // The year the tiles are for: an id, or null for every year.
+        year: year === 'current' ? (years.find((y) => y.status === 'active')?._id || null) : year,
         rechecksOpen: num(rc?.n),
         years: years.map((y) => ({ _id: y._id, yearName: y.yearName, current: y.status === 'active', exams: num(y.exams) })),
         classes: classes.map((c) => ({ classNumber: num(c.classNumber), className: c.className })),
@@ -834,7 +855,7 @@ async function results(schoolId, id) {
 async function formMeta(schoolId) {
     const id = String(schoolId);
     const [{ rows: years }, { rows: sections }] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid
+        pool.query(`SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status" FROM ${T.years} WHERE "school" = $1::uuid
                      ORDER BY ${yearOrderSql()}`, [id]),
         pool.query(`
             SELECT s."_id", s."sectionName", s."academicYear", s."class" AS "classId", c."className", c."classNumber",
@@ -934,7 +955,7 @@ async function subjectsFor(schoolId, sectionIds) {
 async function overall(schoolId, q = {}) {
     const id = String(schoolId);
     const [{ rows: years }, { rows: classList }] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status", "startDate" FROM ${T.years} WHERE "school" = $1::uuid
+        pool.query(`SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate" FROM ${T.years} WHERE "school" = $1::uuid
                      ORDER BY ${yearOrderSql()}`, [id]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c
                      WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [id]),
@@ -1056,7 +1077,7 @@ async function analytics(schoolId, q = {}) {
           LEFT JOIN ${T.classes} c  ON c."_id" = s."class"
          WHERE ${where(schoolId, {
         academicYear: q.academicYear, classNumber: q.classNumber, examType: q.examType, examId: exam ? q.examId : undefined,
-    }, p, { tab: null, status: false })}`;
+    }, p, { tab: null, status: false, thisYear: true })}`;
     const run = (build) => { const p = params(); const sql = build(p); return pool.query(sql, p.list); };
     const subjPct = `((x->>'marksObtained')::numeric / NULLIF((x->>'maxMarks')::numeric, 0)) * 100`;
     const sat = `COALESCE(x->>'isAbsent', 'false') <> 'true'`;
@@ -1126,7 +1147,7 @@ async function analytics(schoolId, q = {}) {
     const gradeN = new Map(grades.rows.map((g) => [g.grade, g.n]));
     const bandN = new Map(bands.rows.map((b) => [num(b.band), b.n]));
     const [{ rows: years }, { rows: classes }, conf] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]),
+        pool.query(`SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c
                      WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [String(schoolId)]),
         settings.get(schoolId),
@@ -1182,7 +1203,7 @@ async function analytics(schoolId, q = {}) {
 async function meritList(schoolId, q = {}) {
     const id = String(schoolId);
     const [{ rows: years }, { rows: classList }] = await Promise.all([
-        pool.query(`SELECT "_id", "yearName", "status", "startDate" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [id]),
+        pool.query(`SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate" FROM ${T.years} WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [id]),
         pool.query(`SELECT c."classNumber", min(c."className") AS "className" FROM ${T.classes} c
                      WHERE c."school" = $1::uuid AND c."classNumber" IS NOT NULL GROUP BY 1 ORDER BY 1`, [id]),
     ]);

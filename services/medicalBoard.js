@@ -13,10 +13,20 @@
  * read time — nothing calendar-shaped is stored (services/medicalRules).
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const access = require('./medicalAccess');
 const settingsSvc = require('./medicalSettings');
 const meds = require('./medicalMeds');
 const R = require('./medicalRules');
+
+// A dated Medical Room table as a board or list should read it: the academic
+// year in view's rows (services/yearRules.js — a visit still in the room and an
+// incident still open stay in view until they are closed). Opening one record,
+// reports over a date range the reader chose, and every write read the table itself.
+const MedicalVisit = require('../models/MedicalVisit');
+const MedicalIncident = require('../models/MedicalIncident');
+const MedicalFirstAid = require('../models/MedicalFirstAid');
+const Y = (Model) => yearScope.table(Model);
 
 const { todayStr, addDays, isUuid, ZONE } = R;
 const run = (sql, params) => pool.query(sql, params).then((r) => r.rows);
@@ -118,12 +128,12 @@ async function overview(req) {
 
     const [figures] = await run(
         `SELECT
-           (SELECT count(*)::int FROM "medicalvisits" WHERE "school" = $1 AND "archivedAt" IS NULL AND ${localDay('"arrivedAt"')} = $2::date) AS "todayVisits",
-           (SELECT count(*)::int FROM "medicalvisits" WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" IN ('in_room','observation','emergency')) AS "inRoom",
-           (SELECT count(*)::int FROM "medicalvisits" WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" = 'emergency') AS "emergencyNow",
-           (SELECT count(*)::int FROM "medicalincidents" WHERE "school" = $1 AND "archivedAt" IS NULL AND ${localDay('"occurredAt"')} = $2::date) AS "todayIncidents",
-           ((SELECT count(*) FROM "medicalvisits" WHERE "school" = $1 AND "archivedAt" IS NULL AND "emergency" IS TRUE AND ${localDay('"arrivedAt"')} = $2::date)
-            + (SELECT count(*) FROM "medicalincidents" WHERE "school" = $1 AND "archivedAt" IS NULL AND "severity" = 'critical' AND "visit" IS NULL AND ${localDay('"occurredAt"')} = $2::date))::int AS "emergencies",
+           (SELECT count(*)::int FROM ${Y(MedicalVisit)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND ${localDay('"arrivedAt"')} = $2::date) AS "todayVisits",
+           (SELECT count(*)::int FROM ${Y(MedicalVisit)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" IN ('in_room','observation','emergency')) AS "inRoom",
+           (SELECT count(*)::int FROM ${Y(MedicalVisit)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" = 'emergency') AS "emergencyNow",
+           (SELECT count(*)::int FROM ${Y(MedicalIncident)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND ${localDay('"occurredAt"')} = $2::date) AS "todayIncidents",
+           ((SELECT count(*) FROM ${Y(MedicalVisit)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "emergency" IS TRUE AND ${localDay('"arrivedAt"')} = $2::date)
+            + (SELECT count(*) FROM ${Y(MedicalIncident)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "severity" = 'critical' AND "visit" IS NULL AND ${localDay('"occurredAt"')} = $2::date))::int AS "emergencies",
            (SELECT count(DISTINCT x.s)::int FROM (
                SELECT "student" AS s FROM "medicalallergies" WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" <> 'resolved' AND "severity" IN ('severe','life_threatening')
                UNION SELECT "student" FROM "medicalconditions" WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" <> 'resolved' AND "severity" IN ('severe','critical')
@@ -136,11 +146,11 @@ async function overview(req) {
            (SELECT count(DISTINCT p."student")::int FROM "medicationplans" p JOIN "users" u ON u."_id" = p."student" AND u."isActive" IS NOT FALSE
               WHERE p."school" = $1 AND p."status" = 'active' AND ${storedDay('p."startDate"')} <= $2::date
                 AND (p."endDate" IS NULL OR ${storedDay('p."endDate"')} >= $2::date)) AS "onMedication",
-           ((SELECT count(*) FROM "medicalvisits" WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending')
-            + (SELECT count(*) FROM "medicalincidents" WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending')
+           ((SELECT count(*) FROM ${Y(MedicalVisit)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending')
+            + (SELECT count(*) FROM ${Y(MedicalIncident)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending')
             + (SELECT count(*) FROM "medicalcheckups" WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending'))::int AS "pendingFollowUps",
-           ((SELECT count(*) FROM "medicalvisits" WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending' AND COALESCE((("followUp"->>'on')::timestamptz AT TIME ZONE 'UTC')::date, $2::date) <= $2::date)
-            + (SELECT count(*) FROM "medicalincidents" WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending' AND COALESCE((("followUp"->>'on')::timestamptz AT TIME ZONE 'UTC')::date, $2::date) <= $2::date)
+           ((SELECT count(*) FROM ${Y(MedicalVisit)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending' AND COALESCE((("followUp"->>'on')::timestamptz AT TIME ZONE 'UTC')::date, $2::date) <= $2::date)
+            + (SELECT count(*) FROM ${Y(MedicalIncident)} mx WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending' AND COALESCE((("followUp"->>'on')::timestamptz AT TIME ZONE 'UTC')::date, $2::date) <= $2::date)
             + (SELECT count(*) FROM "medicalcheckups" WHERE "school" = $1 AND "archivedAt" IS NULL AND "followUp"->>'status' = 'pending' AND COALESCE((("followUp"->>'on')::timestamptz AT TIME ZONE 'UTC')::date, $2::date) <= $2::date))::int AS "followUpsDue",
            (SELECT count(*)::int FROM "medicalcheckups" WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" = 'scheduled' AND ${storedDay('"scheduledOn"')} >= $2::date) AS "upcomingCheckups",
            (SELECT count(*)::int FROM "medicalrequests" WHERE "school" = $1 AND "status" IN ('requested','accepted')) AS "pendingRequests",
@@ -182,14 +192,14 @@ async function overview(req) {
               WHERE r."school" = $1 AND r."status" IN ('requested','accepted')
               ORDER BY CASE r."urgency" WHEN 'emergency' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, r."createdAt" ASC LIMIT 8`, [S]),
         run(`SELECT v."_id", v."number", v."reason", v."status", v."arrivedAt", v."handledByName", v."vitals", b."label" AS "bedLabel", ${STUDENT_SELECT}
-               FROM "medicalvisits" v ${STUDENT_JOIN('v."student"')} LEFT JOIN "medicalbeds" b ON b."_id" = v."bed"
+               FROM ${Y(MedicalVisit)} v ${STUDENT_JOIN('v."student"')} LEFT JOIN "medicalbeds" b ON b."_id" = v."bed"
               WHERE v."school" = $1 AND v."archivedAt" IS NULL AND v."status" IN ('in_room','observation','emergency')
               ORDER BY CASE v."status" WHEN 'emergency' THEN 0 ELSE 1 END, v."arrivedAt" ASC LIMIT 12`, [S]),
         run(`SELECT v."_id", v."number", v."reason", v."status", v."arrivedAt", v."emergency", v."handledByName", ${STUDENT_SELECT}
-               FROM "medicalvisits" v ${STUDENT_JOIN('v."student"')}
+               FROM ${Y(MedicalVisit)} v ${STUDENT_JOIN('v."student"')}
               WHERE v."school" = $1 AND v."archivedAt" IS NULL ORDER BY v."arrivedAt" DESC LIMIT 8`, [S]),
         run(`SELECT i."_id", i."number", i."type", i."severity", i."status", i."occurredAt", i."location", i."injury", ${STUDENT_SELECT}
-               FROM "medicalincidents" i ${STUDENT_JOIN('i."student"')}
+               FROM ${Y(MedicalIncident)} i ${STUDENT_JOIN('i."student"')}
               WHERE i."school" = $1 AND i."archivedAt" IS NULL ORDER BY i."occurredAt" DESC LIMIT 6`, [S]),
         run(`SELECT i."_id", i."name", i."kind", i."unit", i."minStock", i."strength", bt.usable
                FROM "medicalitems" i ${BATCH_LATERAL('$2', '$3')}
@@ -205,17 +215,17 @@ async function overview(req) {
                FROM "medicalcheckups" WHERE "school" = $1 AND "archivedAt" IS NULL AND "status" = 'scheduled' AND ${storedDay('"scheduledOn"')} >= $2::date
               GROUP BY "sessionId" ORDER BY MIN("scheduledOn") ASC LIMIT 5`, [S, today]),
         run(`SELECT to_char(d, 'YYYY-MM-DD') AS day,
-                    (SELECT count(*)::int FROM "medicalvisits" v WHERE v."school" = $1 AND v."archivedAt" IS NULL AND ${localDay('v."arrivedAt"')} = d) AS visits,
-                    (SELECT count(*)::int FROM "medicalincidents" i WHERE i."school" = $1 AND i."archivedAt" IS NULL AND ${localDay('i."occurredAt"')} = d) AS incidents
+                    (SELECT count(*)::int FROM ${Y(MedicalVisit)} v WHERE v."school" = $1 AND v."archivedAt" IS NULL AND ${localDay('v."arrivedAt"')} = d) AS visits,
+                    (SELECT count(*)::int FROM ${Y(MedicalIncident)} i WHERE i."school" = $1 AND i."archivedAt" IS NULL AND ${localDay('i."occurredAt"')} = d) AS incidents
                FROM generate_series($2::date - 13, $2::date, interval '1 day') AS g(d0), LATERAL (SELECT g.d0::date AS d) x
               ORDER BY d`, [S, today]),
-        run(`SELECT "reason" AS label, count(*)::int AS n FROM "medicalvisits"
+        run(`SELECT "reason" AS label, count(*)::int AS n FROM ${Y(MedicalVisit)} mx
               WHERE "school" = $1 AND "archivedAt" IS NULL AND ${localDay('"arrivedAt"')} >= $2::date - 29
               GROUP BY "reason" ORDER BY n DESC, "reason" LIMIT 6`, [S, today]),
-        run(`SELECT "status" AS key, count(*)::int AS n FROM "medicalvisits"
+        run(`SELECT "status" AS key, count(*)::int AS n FROM ${Y(MedicalVisit)} mx
               WHERE "school" = $1 AND "archivedAt" IS NULL AND ${localDay('"arrivedAt"')} >= $2::date - 29
               GROUP BY "status"`, [S, today]),
-        run(`SELECT "type" AS key, count(*)::int AS n FROM "medicalincidents"
+        run(`SELECT "type" AS key, count(*)::int AS n FROM ${Y(MedicalIncident)} mx
               WHERE "school" = $1 AND "archivedAt" IS NULL AND ${localDay('"occurredAt"')} >= $2::date - 89
               GROUP BY "type" ORDER BY n DESC`, [S, today]),
         run(`SELECT d."_id", d."medicineName", d."dosage", d."scheduledFor", d."status", ${STUDENT_SELECT}
@@ -270,7 +280,7 @@ BOARDS.requests = (S, f) => {
     dateFilters(where, p.$, f, 'r."createdAt"');
     if (R.URGENCY[f.urgency]) where.push(`r."urgency" = ${p.$(f.urgency)}`);
     return board({
-        from: `"medicalrequests" r ${STUDENT_JOIN('r."student"')} LEFT JOIN "medicalvisits" v ON v."_id" = r."visit"`,
+        from: `"medicalrequests" r ${STUDENT_JOIN('r."student"')} LEFT JOIN ${Y(MedicalVisit)} v ON v."_id" = r."visit"`,
         where, p, tab: f.tab, page: f.page, limit: f.limit,
         tabs: [
             ['open', 'Open', `r."status" IN ('requested','accepted','arrived','treatment')`],
@@ -351,7 +361,7 @@ BOARDS.firstaid = (S, f, s, today) => {
     dateFilters(where, p.$, f, 'fa."at"');
     const t = p.$(today);
     return board({
-        from: `"medicalfirstaids" fa ${STUDENT_JOIN('fa."student"')} LEFT JOIN "medicalvisits" v ON v."_id" = fa."visit" LEFT JOIN "medicalincidents" mi ON mi."_id" = fa."incident"`,
+        from: `"medicalfirstaids" fa ${STUDENT_JOIN('fa."student"')} LEFT JOIN ${Y(MedicalVisit)} v ON v."_id" = fa."visit" LEFT JOIN ${Y(MedicalIncident)} mi ON mi."_id" = fa."incident"`,
         where, p, tab: f.tab, page: f.page, limit: f.limit,
         tabs: [
             ['all', 'All', 'TRUE'],
@@ -388,7 +398,7 @@ BOARDS.profiles = (S, f, s, today) => {
                                FROM "medicalconditions" mc WHERE mc."student" = u."_id" AND mc."school" = $1 AND mc."archivedAt" IS NULL AND mc."status" <> 'resolved') co ON true
           LEFT JOIN LATERAL (SELECT count(*)::int AS n FROM "medicationplans" pl WHERE pl."student" = u."_id" AND pl."school" = $1 AND pl."status" = 'active'
                                 AND (pl."endDate" IS NULL OR ${storedDay('pl."endDate"')} >= ${t}::date)) pl ON true
-          LEFT JOIN LATERAL (SELECT max(v."arrivedAt") AS at, count(*)::int AS n FROM "medicalvisits" v WHERE v."student" = u."_id" AND v."school" = $1 AND v."archivedAt" IS NULL) vi ON true`,
+          LEFT JOIN LATERAL (SELECT max(v."arrivedAt") AS at, count(*)::int AS n FROM ${Y(MedicalVisit)} v WHERE v."student" = u."_id" AND v."school" = $1 AND v."archivedAt" IS NULL) vi ON true`,
         where, p, tab: f.tab, page: f.page, limit: f.limit,
         tabs: [
             ['all', 'All Students', 'TRUE'],
@@ -592,7 +602,7 @@ BOARDS.doses = (S, f, s, today) => {
     dateFilters(where, p.$, f, 'COALESCE(d."givenAt", d."scheduledFor", d."createdAt")');
     if (f.medicine) where.push(`d."medicineName" ILIKE ${p.$(like(f.medicine))}`);
     return board({
-        from: `"medicationdoses" d ${STUDENT_JOIN('d."student"')} LEFT JOIN "medicalvisits" v ON v."_id" = d."visit"`,
+        from: `"medicationdoses" d ${STUDENT_JOIN('d."student"')} LEFT JOIN ${Y(MedicalVisit)} v ON v."_id" = d."visit"`,
         where, p, tab: f.tab, page: f.page, limit: f.limit,
         tabs: [
             ['all', 'All', 'TRUE'],
@@ -854,21 +864,21 @@ async function room(req) {
                     v."restAdvised", v."restMinutes", v."bed"::text AS "bed", v."bedIn", b."label" AS "bedLabel", v."medicines", v."parentContacted",
                     v."triage", v."protocol"->>'key' AS "protocolKey", v."nextCheckAt", jsonb_array_length(COALESCE(v."readings", '[]'::jsonb)) AS "readingCount",
                     v."request"::text AS "request", ${STUDENT_SELECT}, v."student"::text AS "student"
-               FROM "medicalvisits" v ${STUDENT_JOIN('v."student"')} LEFT JOIN "medicalbeds" b ON b."_id" = v."bed"
+               FROM ${Y(MedicalVisit)} v ${STUDENT_JOIN('v."student"')} LEFT JOIN "medicalbeds" b ON b."_id" = v."bed"
               WHERE v."school" = $1 AND v."archivedAt" IS NULL AND v."status" IN ('in_room','observation','emergency')${inRoom('v."location"')}
               ORDER BY CASE v."status" WHEN 'emergency' THEN 0 ELSE 1 END,
                        CASE v."triage"->>'level' WHEN 'red' THEN 0 WHEN 'orange' THEN 1 WHEN 'yellow' THEN 2 WHEN 'green' THEN 3 WHEN 'blue' THEN 4 ELSE 3 END,
                        CASE v."status" WHEN 'observation' THEN 0 ELSE 1 END, v."arrivedAt" ASC`, [S]),
         run(`SELECT b."_id", b."label", b."kind", b."status", b."since", b."note", b."sortOrder", b."visit"::text AS "visit",
                     v."number" AS "visitNumber", v."reason", v."bedIn", v."status" AS "visitStatus", u."name" AS "studentName", u."profileImage" AS "studentPhoto"
-               FROM "medicalbeds" b LEFT JOIN "medicalvisits" v ON v."_id" = b."visit" LEFT JOIN "users" u ON u."_id" = v."student"
+               FROM "medicalbeds" b LEFT JOIN ${Y(MedicalVisit)} v ON v."_id" = b."visit" LEFT JOIN "users" u ON u."_id" = v."student"
               WHERE b."school" = $1 AND b."isActive" IS NOT FALSE${inRoom('b."location"')} ORDER BY b."sortOrder", b."label"`, [S]),
-        run(`SELECT v."status", count(*)::int AS n FROM "medicalvisits" v
+        run(`SELECT v."status", count(*)::int AS n FROM ${Y(MedicalVisit)} v
               WHERE v."school" = $1 AND v."archivedAt" IS NULL AND ${localDay('v."arrivedAt"')} = $2::date GROUP BY v."status"`, [S, today]),
         // Sent home and still waiting at school: nobody has been recorded as collecting them.
         run(`SELECT v."_id", v."number", v."reason", v."status", v."arrivedAt", v."departedAt", v."parentContacted", v."parentContactNote",
                     ${STUDENT_SELECT}, v."student"::text AS "student"
-               FROM "medicalvisits" v ${STUDENT_JOIN('v."student"')}
+               FROM ${Y(MedicalVisit)} v ${STUDENT_JOIN('v."student"')}
               WHERE v."school" = $1 AND v."archivedAt" IS NULL AND v."status" = 'sent_home'
                 AND (v."collection" IS NULL OR v."collection"->>'at' IS NULL)
                 AND v."departedAt" > now() - interval '18 hours'

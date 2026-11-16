@@ -151,13 +151,26 @@ function createModel(name, schema) {
     // do (utils/listOrder). Without one, Postgres returns them in no order.
     const defaultOrder = schema.get('defaultOrder') ? ` ORDER BY ${schema.get('defaultOrder')}` : '';
 
+    // What a SELECT reads from. The academic years are read "as this request
+    // sees them" — the year the switcher is on standing in for the active one
+    // (services/yearScope.js `yearsSource`); every other table is itself.
+    // A student's profile is read with the placement of the year in view
+    // (`profilesSource`) for the same reason.
+    const ALL_COLUMNS = ['_id', ...Object.keys(parsed.fields).filter((f) => f !== '_id')];
+    const AS_READ = { AcademicYear: ['status'], StudentProfile: ['currentClass', 'currentSection', 'rollNumber'] };
+    const readFrom = name === 'AcademicYear'
+        ? () => { const src = require('../services/yearScope').yearsSource(); return src ? `${src} AS ${T}` : T; }
+        : name === 'StudentProfile'
+            ? () => { const src = require('../services/yearScope').profilesSource(ALL_COLUMNS); return src ? `${src} AS ${T}` : T; }
+            : () => T;
+
     model._rawFind = async function (filter, opts = {}) {
         const params = [];
         const where = whereClause(parsed, filter, params);
         const order = orderClause(parsed, opts.sort) || defaultOrder;
         const cols = opts.select ? buildSelectColumns(parsed, opts.select) : null;
         const selectList = cols ? cols.map(qi).join(', ') : '*';
-        let sql = `SELECT ${selectList} FROM ${T} WHERE ${where}${order}`;
+        let sql = `SELECT ${selectList} FROM ${readFrom()} WHERE ${where}${order}`;
         if (opts.limit != null && Number.isFinite(Number(opts.limit))) sql += ` LIMIT ${Number(opts.limit)}`;
         if (opts.skip != null && Number(opts.skip) > 0) sql += ` OFFSET ${Number(opts.skip)}`;
         const { rows } = await run(sql, params);
@@ -165,10 +178,20 @@ function createModel(name, schema) {
         return rows;
     };
 
+    // A model may say how its rows belong to an academic year
+    // (schema.set('yearScope', rule) — services/yearScope.js). A READ made
+    // while a request has a year in view is then narrowed to that year; writes,
+    // jobs and reads by `_id` never are.
+    model._inYear = function (filter) {
+        const ys = require('../services/yearScope');
+        const rule = ys.ruleOf(Model);
+        return rule ? ys.narrow(rule, filter) : filter;
+    };
+
     model._count = async function (filter) {
         const params = [];
         const where = whereClause(parsed, filter, params);
-        const { rows } = await run(`SELECT COUNT(*)::int AS c FROM ${T} WHERE ${where}`, params);
+        const { rows } = await run(`SELECT COUNT(*)::int AS c FROM ${readFrom()} WHERE ${where}`, params);
         return rows[0].c;
     };
 
@@ -177,7 +200,7 @@ function createModel(name, schema) {
         if (r.mode === 'column') {
             const params = [];
             const where = whereClause(parsed, filter, params);
-            const { rows } = await run(`SELECT DISTINCT ${qi(r.name)} AS v FROM ${T} WHERE ${where} AND ${qi(r.name)} IS NOT NULL`, params);
+            const { rows } = await run(`SELECT DISTINCT ${qi(r.name)} AS v FROM ${readFrom()} WHERE ${where} AND ${qi(r.name)} IS NOT NULL`, params);
             return rows.map((x) => x.v);
         }
         const rows = await model._rawFind(filter, {});
@@ -208,8 +231,14 @@ function createModel(name, schema) {
         const cols = [];
         const vals = [];
         const params = [];
+        // Columns this request reads through a year's view (the active year's
+        // status, a student's class/section/roll — services/yearScope.js) are
+        // never written back from a document loaded that way: they have one
+        // writer each (set-active; services/enrollment.js).
+        const asRead = !isNew && readFrom() !== T ? AS_READ[name] : null;
         for (const [fname, meta] of Object.entries(parsed.fields)) {
             if (doc[fname] === undefined) continue;
+            if (asRead && asRead.includes(fname)) continue;
             const v = toColumnValue(meta, doc[fname]);
             // reflect normalized scalars (trim/lowercase/Date casts) on the doc
             if (meta.kind === 'string' || meta.kind === 'date' || meta.kind === 'number' || meta.kind === 'id') {
@@ -286,7 +315,7 @@ function createModel(name, schema) {
     Model.estimatedDocumentCount = () => new Query(model, 'count', {});
     Model.distinct = (field, filter) => new Query(model, 'distinct', filter, { fieldName: field });
     Model.exists = async (filter) => {
-        const rows = await model._rawFind(filter, { limit: 1 });
+        const rows = await model._rawFind(model._inYear(filter), { limit: 1 });
         return rows.length ? { _id: rows[0]._id } : null;
     };
 
@@ -357,7 +386,10 @@ function createModel(name, schema) {
     };
 
     Model.aggregate = function (pipeline) {
-        const p = runPipeline(model, pipeline);
+        // The pipeline's own reads of this table are the year's rows.
+        const scoped = Object.create(model);
+        scoped._rawFind = (filter, opts) => model._rawFind(model._inYear(filter), opts);
+        const p = runPipeline(scoped, pipeline);
         p.exec = () => p;
         return p;
     };

@@ -738,13 +738,13 @@ exports.teacherClassTimetable = async (req, res) => {
         // This year's sections. Classes repeat every year — a teacher who has
         // taken Class 1 – A four years running holds four rows with the same
         // name — so without this the picker is a list of identical labels
-        // pointing at four different grids. A teacher whose only attachment is
-        // to an older year still gets it rather than an empty page.
+        // pointing at four different grids. A teacher attached to nothing this
+        // year has no class this year: an older year's grid is not shown in
+        // its place (it used to be, under this year's name).
         const attached = [...own, ...extra];
-        const thisYear = activeYear
+        const allSections = activeYear
             ? attached.filter((s) => String(s.academicYear) === String(activeYear._id))
             : attached;
-        const allSections = thisYear.length ? thisYear : attached;
 
         const roleOf = (sec) => (String(sec.classTeacher || '') === String(req.userId) ? 'Class Teacher'
             : String(sec.substituteTeacher || '') === String(req.userId) ? 'Vice Class Teacher'

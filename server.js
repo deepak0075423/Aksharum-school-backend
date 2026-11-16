@@ -67,7 +67,9 @@ app.use(cors({
   // without it (see auth.controller googleLogin) — cross-origin in production.
   // X-Medical-Step-Up: the Medical Room's "confirm it is you" token
   // (services/medicalStepUp.js) — without it every staff request fails its preflight.
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Medical-Step-Up'],
+  // X-Academic-Year: the academic year the person is looking at, from the year
+  // switcher in the header (services/yearScope.js).
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Medical-Step-Up', 'X-Academic-Year'],
 }));
 app.use(morgan('dev'));
 // Signed webhooks are checked against the exact bytes that arrived.
@@ -79,6 +81,11 @@ app.use('/api', (_req, res, next) => {
     next();
 });
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Which academic year a read is about: the year switcher's choice travels in
+// the X-Academic-Year header and is remembered for the length of the request,
+// so every module resolves the same year (services/yearScope.js).
+app.use('/api', require('./services/yearScope').middleware);
 
 // Phone numbers are 10-digit Indian mobile numbers wherever a request carries
 // one: normalised to their ten digits, or refused with a 400. Multipart forms

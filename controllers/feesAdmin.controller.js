@@ -18,6 +18,7 @@
  * "Total fees" on a row is charged − waived, so total = paid + due.
  */
 const classLevels = require('../utils/classLevels');
+const yearScope = require('../services/yearScope');
 const pool          = require('../db/pool');
 const { isUuid }    = require('../db/schema');
 const TZ            = require('../config/timezone');
@@ -114,8 +115,9 @@ function classLabel(classNumber, className, sectionName) {
 const classTitle = (classNumber, className) => className || (classNumber != null ? `Class ${Number(classNumber)}` : '—');
 
 /**
- * The academic year a screen shows: the one asked for, else the one Fees →
- * Settings names as default, else the school's active year.
+ * The academic year a screen shows: the one asked for, else the one the year
+ * switcher in the header is on, else the one Fees → Settings names as default,
+ * else the school's active year.
  */
 async function resolveYear(schoolId, requested) {
     const [years, settings] = await Promise.all([
@@ -123,7 +125,11 @@ async function resolveYear(schoolId, requested) {
         feesCtl.getOrCreateSettings(schoolId),
     ]);
     const byId = (id) => years.find(y => String(y._id) === String(id));
+    // The year switcher in the header is the person's own choice for this
+    // read, so it comes before the module's standing default.
+    const picked = yearScope.picked();
     const year = (requested && uuidOr(requested) && byId(requested))
+        || (picked && byId(picked))
         || (settings?.defaultAcademicYear && byId(settings.defaultAcademicYear))
         || years.find(y => y.status === 'active')
         || newestYear(years);

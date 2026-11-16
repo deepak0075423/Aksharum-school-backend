@@ -18,6 +18,7 @@
  *   entry        one employee's line inside a run
  */
 const pool     = require('../db/pool');
+const yearScope = require('../services/yearScope');
 const { isUuid } = require('../db/schema');
 
 const SalaryStructure          = require('../models/SalaryStructure');
@@ -46,7 +47,11 @@ const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'S
 
 // ── Plumbing ─────────────────────────────────────────────────────────────────
 
-const T    = (Model) => `"${Model.tableName}"`;
+// A table as a list or board should read it: for a model whose rows belong to
+// an academic year (services/yearRules.js) that is the year in view's rows;
+// for every other model, and wherever one record is opened or anything is
+// written, it is the table itself (services/yearScope.js `table`).
+const T    = (Model) => yearScope.table(Model);
 const ok   = (res, data, extra) => res.json({ success: true, data, ...(extra || {}) });
 const bad  = (res, message, code = 400) => res.status(code).json({ success: false, message });
 const fail = (res, e) => {
@@ -716,7 +721,7 @@ async function refreshRunTotals(runId, { skipped, warnings, actorId } = {}) {
              COALESCE(SUM("netSalary"), 0)       AS "net",
              COALESCE(SUM("lopAmount"), 0)       AS "lop",
              COALESCE(SUM("employerCost"), 0)    AS "cost"
-        FROM ${T(PayrollEntry)}
+        FROM ${T(PayrollEntry)} pe
        WHERE "payrollRun" = ${$(String(runId))} AND COALESCE("isOnHold", false) = false`, list);
     const t = rows[0] || {};
     const update = {
@@ -786,7 +791,7 @@ exports.getOverview = async (req, res) => {
                 const from = new Date(Date.UTC(year, month - 6, 1));
                 return (await pool.query(`
                   SELECT "month", "year", "totalGross", "totalDeductions", "totalNet", "status"
-                    FROM ${T(PayrollRun)}
+                    FROM ${T(PayrollRun)} pr
                    WHERE "school" = ${s.$(String(req.schoolId))}
                      AND make_date("year"::int, "month"::int, 1) >= ${s.$(from)}
                      AND make_date("year"::int, "month"::int, 1) <= ${s.$(new Date(Date.UTC(year, month - 1, 1)))}
@@ -1507,7 +1512,7 @@ async function nextSlipSeq(schoolId, year, prefix, settings) {
     const { $, list } = params();
     const { rows } = await pool.query(`
       SELECT COALESCE(MAX(NULLIF(regexp_replace("slipNo", '^.*/', ''), '')::int), 0) AS "n"
-        FROM ${T(Payslip)}
+        FROM ${T(Payslip)} ps
        WHERE "school" = ${$(String(schoolId))} AND "year" = ${$(num(year))}
          AND "slipNo" ~ ${$(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/[0-9]+/[0-9]+$`)}`, list);
     const stored = num((settings?.payslipSeq || {})[String(year)]);
@@ -3234,7 +3239,7 @@ exports.getReportsOverview = async (req, res) => {
         const s6 = params();
         const { rows: trend } = await pool.query(`
           SELECT "month", "year", "totalGross", "totalDeductions", "totalNet"
-            FROM ${T(PayrollRun)}
+            FROM ${T(PayrollRun)} pr
            WHERE "school" = ${s6.$(String(req.schoolId))} AND "status" <> 'cancelled'
              AND make_date("year"::int, "month"::int, 1) BETWEEN ${s6.$(new Date(Date.UTC(year, month - 6, 1)))} AND ${s6.$(new Date(Date.UTC(year, month - 1, 1)))}`, s6.list);
         const byKey = new Map(trend.map(r => [`${r.year}-${r.month}`, r]));

@@ -1,5 +1,6 @@
 'use strict';
 const Holiday      = require('../models/Holiday');
+const yearScope = require('../services/yearScope');
 const AcademicYear = require('../models/AcademicYear');
 const Class        = require('../models/Class');
 const XLSX         = require('xlsx');
@@ -164,7 +165,7 @@ async function schoolYears(schoolId) {
     const { yearOrderSql } = require('../utils/listOrder');
     const { query } = require('../db/pool');
     const { rows } = await query(
-        `SELECT "_id", "yearName", "status", "startDate", "endDate" FROM "academicyears"
+        `SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate", "endDate" FROM "academicyears"
           WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
         [String(schoolId)],
     );
@@ -180,16 +181,20 @@ async function schoolYears(schoolId) {
 }
 
 /**
- * The academicYear filter a read asks for: `year` = 'all' → none; a year id →
- * that year; absent → this year, plus the old rows written before holidays
- * carried a year (they were all this year's).
+ * The year a read asks for, as a find() condition: `year` = 'all' → none; a
+ * year id → that year; absent → the year in view (the switcher's, else the
+ * school's active year — services/yearScope.js).
+ *
+ * A holiday names its year. One written before holidays carried a year names
+ * none, and used to be shown in EVERY year; it belongs to the year its first
+ * day falls in.
  */
 async function yearFilter(req) {
     const wanted = String(req.query?.year || '');
     if (wanted === 'all') return undefined;
-    if (wanted && wanted !== 'current') return wanted;
-    const { currentYear } = await schoolYears(req.schoolId);
-    return currentYear ? { $in: [currentYear, null] } : undefined;
+    const scope = await yearScope.resolve(req.schoolId, wanted && wanted !== 'current' ? wanted : undefined);
+    if (!scope.id) return undefined;
+    return { $or: [{ academicYear: scope.id }, { academicYear: null, ...scope.between('startDate') }] };
 }
 
 // ── The same holiday is not added twice ──────────────────────────────────────
@@ -577,15 +582,19 @@ exports.adminGetImportTemplate = async (req, res) => {
 exports.adminGetAuditLog = async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
+        // The academic year in view's holidays (`year=all` for every year).
+        const filter = { school: req.schoolId };
+        const yr = await yearFilter(req);
+        if (yr) filter.$and = [yr];
         const [holidays, total] = await Promise.all([
-            Holiday.find({ school: req.schoolId })
+            Holiday.find(filter)
                 .populate('createdBy', 'name email')
                 .populate('updatedBy', 'name email')
                 .sort({ createdAt: -1 })
                 .skip((page - 1) * +limit)
                 .limit(+limit)
                 .lean(),
-            Holiday.countDocuments({ school: req.schoolId }),
+            Holiday.countDocuments(filter),
         ]);
         res.json({ success: true, data: holidays, total, page: +page, pages: Math.ceil(total / +limit) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -638,7 +647,7 @@ async function getApplicableHolidays(req, res) {
         // "Applies to me" follows its year picker).
         const filter = { school: req.schoolId };
         const yr = await yearFilter(req);
-        if (yr) filter.academicYear = yr;
+        if (yr) filter.$and = [yr];
 
         const allHolidays = await Holiday.find(filter).sort({ startDate: 1 }).lean();
 
@@ -712,7 +721,7 @@ exports.parentGetHolidays = async (req, res) => {
 
         const filter = { school: req.schoolId };
         const yr = await yearFilter(req);   // this academic year by default
-        if (yr) filter.academicYear = yr;
+        if (yr) filter.$and = [yr];
 
         // Name, class and section exactly as every parent page's child switch
         // shows them; the class ids beside them decide which class days apply.
@@ -764,7 +773,7 @@ exports.teacherGetClassHolidays = async (req, res) => {
 
         const filter = { school: req.schoolId };
         const yr = await yearFilter(req);   // this academic year by default
-        if (yr) filter.academicYear = yr;
+        if (yr) filter.$and = [yr];
 
         const teacherClassIds = new Set();
 

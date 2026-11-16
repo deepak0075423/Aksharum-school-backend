@@ -10,6 +10,7 @@
  * every attempt the school has recorded into the process.
  */
 const pool             = require('../db/pool');
+const yearScope = require('./yearScope');
 const AptitudeExam     = require('../models/AptitudeExam');
 const AptitudeQuestion = require('../models/AptitudeQuestion');
 const ExamAttempt      = require('../models/ExamAttempt');
@@ -491,7 +492,7 @@ async function resolveYear(schoolId, raw) {
 async function yearOptions(schoolId, { where = 'true', params = [] } = {}) {
     const { rows } = await pool.query(
         `WITH ${EXAM_BASE}
-         SELECT y."_id", y."yearName" AS name, y."status", y."startDate",
+         SELECT y."_id", y."yearName" AS name, ${yearScope.yearStatus('y')} AS "status", y."startDate",
                 (SELECT count(*)::int FROM ex WHERE ex."academicYear" = y."_id" AND ${where}) AS count
            FROM ${T.years} y
           WHERE y."school" = $1

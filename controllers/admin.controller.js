@@ -1,6 +1,7 @@
 'use strict';
 const bcrypt        = require('bcryptjs');
 
+const ys = require('../services/yearScope');
 const XLSX          = require('xlsx');
 const User          = require('../models/User');
 const TeacherProfile = require('../models/TeacherProfile');
@@ -902,6 +903,10 @@ async function studentListYear(req) {
         const cl = await Class.findOne({ _id: classId, school: req.schoolId }, 'academicYear').lean();
         if (cl?.academicYear) return String(cl.academicYear);
     }
+    // Nothing picked on the screen, but the year switcher in the header is on
+    // a year other than the running one: that year's placements.
+    const viewed = ys.standIn();
+    if (viewed) return viewed;
     return null;
 }
 
@@ -989,12 +994,15 @@ const TAUGHT_SUBJECTS = `(
  * teacher, or a subject they teach on a section — in the active academic year —
  * is teaching, and everyone else is not. Keep the two in step.
  */
-const ACTIVE_YEAR_SECTION = `(
-        NOT EXISTS (SELECT 1 FROM ${qt(AcademicYear)} ay WHERE ay."school" = u."school" AND ay."status" = 'active')
+// Worked out as each statement is built, not once at load: which year reads
+// as the active one depends on the year the person is looking at
+// (services/yearScope.js `yearStatus`).
+const ACTIVE_YEAR_SECTION = { toString: () => `(
+        NOT EXISTS (SELECT 1 FROM ${qt(AcademicYear)} ay WHERE ay."school" = u."school" AND ${ys.yearStatus('ay')} = 'active')
      OR s."academicYear" = (SELECT ay."_id" FROM ${qt(AcademicYear)} ay
-                             WHERE ay."school" = u."school" AND ay."status" = 'active' LIMIT 1)
-    )`;
-const STAFF_TYPE = `(CASE
+                             WHERE ay."school" = u."school" AND ${ys.yearStatus('ay')} = 'active' LIMIT 1)
+    )` };
+const STAFF_TYPE = { toString: () => `(CASE
         WHEN tp."staffType" IN ('teaching', 'non_teaching') THEN tp."staffType"
         WHEN jsonb_typeof(tp."subjects") = 'array' AND jsonb_array_length(tp."subjects") > 0 THEN 'teaching'
         WHEN EXISTS (SELECT 1 FROM ${qt(ClassSection)} s
@@ -1006,9 +1014,9 @@ const STAFF_TYPE = `(CASE
                       WHERE sst."teacher" = u."_id" AND s."school" = u."school"
                         AND ${ACTIVE_YEAR_SECTION})
         THEN 'teaching'
-        ELSE 'non_teaching' END)`;
+        ELSE 'non_teaching' END)` };
 
-const TEACHER_COLUMNS = `
+const TEACHER_COLUMNS = { toString: () => `
         u."_id", u."name", u."email", u."phone", u."profileImage",
         u."isActive", u."createdAt",
         tp."employeeId", tp."designation", tp."department", tp."gender",
@@ -1017,7 +1025,7 @@ const TEACHER_COLUMNS = `
         tp."joiningDate", tp."qualification",
         COALESCE(tp."subjects", '[]'::jsonb) AS "profileSubjects",
         ${TAUGHT_SUBJECTS}                   AS "taughtSubjects",
-        COALESCE(tp."classes",  '[]'::jsonb) AS "classes"`;
+        COALESCE(tp."classes",  '[]'::jsonb) AS "classes"` };
 
 /** Profile-declared and actually-assigned subjects, deduplicated, in one list. */
 function withSubjects(row) {

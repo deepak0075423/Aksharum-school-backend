@@ -25,6 +25,7 @@
  * production is UTC.
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const Hostel = require('../models/Hostel');
 const HostelBuilding = require('../models/HostelBuilding');
 const HostelFloor = require('../models/HostelFloor');
@@ -40,7 +41,11 @@ const User = require('../models/User');
 const { MONTHS, dayRange } = require('./hostelService');
 const { yearOrderSql, newestYear } = require('../utils/listOrder');
 
-const T = (Model) => `"${Model.tableName}"`;
+// A table as a list or board should read it: for a model whose rows belong to
+// an academic year (services/yearRules.js) that is the year in view's rows;
+// for every other model, and wherever one record is opened or anything is
+// written, it is the table itself (services/yearScope.js `table`).
+const T = (Model) => yearScope.table(Model);
 
 /** The zone this process reads the clock in, read at call time. */
 const zone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -145,7 +150,7 @@ async function residence(schoolId, ids) {
     const params = [String(schoolId)];
     const { rows } = await pool.query(
         `SELECT "hostel", COALESCE("presence", 'in') AS "presence", count(*)::int AS "n"
-           FROM ${T(HostelAllocation)}
+           FROM ${T(HostelAllocation)} al
           WHERE "school" = $1 AND "status" = 'active'${scoped('"hostel"', ids, params)}
           GROUP BY 1, 2`,
         params,
@@ -164,7 +169,7 @@ async function residence(schoolId, ids) {
 async function staffResidents(schoolId, ids) {
     const params = [String(schoolId)];
     const { rows: [r] } = await pool.query(
-        `SELECT count(*)::int AS "n" FROM ${T(HostelAllocation)}
+        `SELECT count(*)::int AS "n" FROM ${T(HostelAllocation)} al
           WHERE "school" = $1 AND "status" = 'active' AND "residentType" = 'teacher'${scoped('"hostel"', ids, params)}`, params);
     return r.n;
 }
@@ -381,7 +386,7 @@ async function recentActivity(schoolId, allowed, limit = 4, { money = true } = {
  */
 async function academicYears(schoolId) {
     const { rows } = await pool.query(
-        `SELECT "_id", "yearName", "status", "startDate", "endDate" FROM ${T(AcademicYear)}
+        `SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate", "endDate" FROM ${T(AcademicYear)}
           WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
         [String(schoolId)],
     );

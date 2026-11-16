@@ -1237,7 +1237,9 @@ exports.getAdmissions = async (req, res) => {
         const q = await scopedFilter(req, {});
         const { status, academicYear, search = '' } = req.query;
         if (status) q.status = status;
-        if (academicYear) q.academicYear = academicYear;
+        // Nothing asked = the academic year in view (services/yearRules.js);
+        // `all` = every year.
+        if (academicYear && academicYear !== 'all') q.academicYear = academicYear;
 
         let rows = await HostelAdmission.find(q).sort('-createdAt')
             .skip((p.page - 1) * p.limit).limit(p.limit)

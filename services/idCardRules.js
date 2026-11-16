@@ -24,6 +24,7 @@
  * the calendar (the year whose dates contain today).
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const AcademicYear = require('../models/AcademicYear');
 const schoolClock = require('./schoolClock');
 
@@ -72,7 +73,7 @@ function yearCode(year) {
  */
 async function yearContext(schoolId) {
     const { rows } = await pool.query(
-        `SELECT "_id", "yearName", "startDate", "endDate", "status"
+        `SELECT "_id", "yearName", "startDate", "endDate", ${yearScope.yearStatus()} AS "status"
            FROM "${AcademicYear.tableName}" WHERE "school" = $1::uuid
           ORDER BY "startDate" ASC NULLS LAST, "yearName" ASC`, [String(schoolId)]);
     const today = schoolClock.todayIn(schoolClock.zoneOf(schoolId));

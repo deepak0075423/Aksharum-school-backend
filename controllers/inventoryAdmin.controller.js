@@ -2297,7 +2297,7 @@ exports.budgetBoard = async (req, res) => {
         if (tab === 'department') rows = rows.filter(hasDept);
         if (tab === 'category')   rows = rows.filter(hasCat);
         if (search)       rows = rows.filter(b => rx(search).test(`${b.name} ${b.code} ${b.department?.name || ''} ${b.category?.name || ''}`));
-        if (academicYear) rows = rows.filter(b => b.academicYearId === academicYear);
+        if (academicYear && academicYear !== 'all') rows = rows.filter(b => b.academicYearId === academicYear);
         if (department)   rows = rows.filter(b => b.departmentId === department);
         if (category)     rows = rows.filter(b => b.categoryId === category);
         if (status)       rows = rows.filter(b => b.state === status);

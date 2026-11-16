@@ -10,6 +10,7 @@
  * enforced by the web form alone, when they were enforced at all.
  */
 const FormalExam      = require('../models/FormalExam');
+const yearScope = require('../services/yearScope');
 const ExamMarksSheet  = require('../models/ExamMarksSheet');
 const FormalResult    = require('../models/FormalResult');
 const ClassSection    = require('../models/ClassSection');
@@ -220,9 +221,15 @@ exports.teacherRejectExam = async (req, res) => {
  */
 const heldFrom = (exam, studentId) => (Array.isArray(exam?.withheld) ? exam.withheld : []).find((w) => String(w.student) === String(studentId)) || null;
 
-async function familyResults(schoolId, studentId) {
+/**
+ * One academic year's results for a student — the running year unless the
+ * request names another (`academicYear=<id>`, or `all` for every year). The
+ * list used to carry every result the student had ever been given.
+ */
+async function familyResults(schoolId, studentId, req = null) {
     const now     = new Date();
-    const results = await FormalResult.find({ student: studentId, school: schoolId })
+    const year    = req ? (await yearScope.of(req)).match('academicYear') : await yearScope.thisYear(schoolId);
+    const results = await FormalResult.find({ student: studentId, school: schoolId, ...year })
         .populate('exam',             'title examType publishDate status showInPortal showRank school withheld')
         .populate('subjects.subject', 'subjectName name')
         .sort({ generatedAt: -1 })
@@ -265,7 +272,7 @@ async function childrenOf(req) {
 
 exports.studentGetResults = async (req, res) => {
     try {
-        res.json({ success: true, data: await familyResults(req.schoolId, req.userId) });
+        res.json({ success: true, data: await familyResults(req.schoolId, req.userId, req) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -281,7 +288,7 @@ exports.parentGetResults = async (req, res) => {
     try {
         const { child } = await childrenOf(req);
         if (!child) return res.json({ success: true, data: [] });
-        res.json({ success: true, data: await familyResults(req.schoolId, child) });
+        res.json({ success: true, data: await familyResults(req.schoolId, child, req) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 

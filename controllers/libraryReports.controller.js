@@ -25,6 +25,7 @@
 //     the filters matched rather than the page that happens to be on screen.
 // ─────────────────────────────────────────────────────────────────────────────
 const XLSX = require('xlsx');
+const yearScope = require('../services/yearScope');
 const pool = require('../db/pool');
 
 const LibraryBook     = require('../models/LibraryBook');
@@ -43,8 +44,10 @@ const {
 const T = {
     book: `"${LibraryBook.tableName}"`,
     copy: `"${LibraryBookCopy.tableName}"`,
-    iss:  `"${LibraryIssuance.tableName}"`,
-    fine: `"${LibraryFine.tableName}"`,
+    // The academic year in view's issues and fines (services/yearScope.js):
+    // read when a statement is built, since the year belongs to the request.
+    get iss()  { return yearScope.table(LibraryIssuance); },
+    get fine() { return yearScope.table(LibraryFine); },
     user: `"${User.tableName}"`,
     prof: `"${StudentProfile.tableName}"`,
     cls:  `"${Class.tableName}"`,
@@ -1299,20 +1302,20 @@ async function headline(schoolId) {
            (SELECT count(*)::int FROM ${T.book} WHERE "school" = $1 AND "createdAt" >= $2) AS "booksNew",
            (SELECT count(*)::int FROM ${T.book} WHERE "school" = $1
               AND "createdAt" >= $3 AND "createdAt" < $2)                                  AS "booksPrev",
-           (SELECT count(*)::int FROM ${T.iss}  WHERE "school" = $1
+           (SELECT count(*)::int FROM ${T.iss} lx  WHERE "school" = $1
               AND "status" = ANY($4::text[]))                                              AS "out",
-           (SELECT count(*)::int FROM ${T.iss}  WHERE "school" = $1 AND "issueDate" >= $2) AS "loans",
-           (SELECT count(*)::int FROM ${T.iss}  WHERE "school" = $1
+           (SELECT count(*)::int FROM ${T.iss} lx  WHERE "school" = $1 AND "issueDate" >= $2) AS "loans",
+           (SELECT count(*)::int FROM ${T.iss} lx  WHERE "school" = $1
               AND "issueDate" >= $3 AND "issueDate" < $2)                                  AS "loansPrev",
-           (SELECT count(DISTINCT "issuedTo")::int FROM ${T.iss} WHERE "school" = $1
+           (SELECT count(DISTINCT "issuedTo")::int FROM ${T.iss} lx WHERE "school" = $1
               AND "issueDate" >= $2)                                                       AS "readers",
-           (SELECT count(DISTINCT "issuedTo")::int FROM ${T.iss} WHERE "school" = $1
+           (SELECT count(DISTINCT "issuedTo")::int FROM ${T.iss} lx WHERE "school" = $1
               AND "issueDate" >= $3 AND "issueDate" < $2)                                  AS "readersPrev",
-           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${T.fine} WHERE "school" = $1
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${T.fine} lx WHERE "school" = $1
               AND "paidAt" >= $2)                                                          AS "collected",
-           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${T.fine} WHERE "school" = $1
+           (SELECT COALESCE(sum("paidAmount"), 0)::float FROM ${T.fine} lx WHERE "school" = $1
               AND "paidAt" >= $3 AND "paidAt" < $2)                                        AS "collectedPrev",
-           (SELECT count(*)::int FROM ${T.iss} WHERE "school" = $1
+           (SELECT count(*)::int FROM ${T.iss} lx WHERE "school" = $1
               AND "status" = ANY($4::text[]) AND "dueDate" < now())                        AS "overdue"`,
         [String(schoolId), from, prev, ACTIVE_ISSUANCE],
     );

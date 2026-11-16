@@ -4,6 +4,7 @@ const User   = require('../models/User');
 const School = require('../models/School');
 const pool   = require('../db/pool');
 const authCache = require('../utils/authCache');
+const yearScope = require('../services/yearScope');
 
 // Auth runs on EVERY authenticated request, so it is the single hottest query in
 // the app. A separate `User.findById(id)` + school lookup would cost two
@@ -115,6 +116,10 @@ const verifyToken = async (req, res, next) => {
         req.userId  = user._id;
         req.schoolId = user.school?._id || user.school;
         req.userRole = user.role;
+        // Which academic year this request's reads are about (the year switcher's
+        // choice, else the school's active year) — worked out once, here, so every
+        // model and every hand-written list agrees on it (services/yearScope.js).
+        if (req.schoolId) await yearScope.enter(req.schoolId, user.role);
         next();
     } catch (err) {
         const message = err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token';

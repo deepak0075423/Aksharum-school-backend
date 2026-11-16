@@ -29,8 +29,17 @@ function getPool() {
     return pool;
 }
 
+// While somebody's year switcher is on another academic year, a SELECT that
+// reads the student profiles reads them with THAT year's class, section and
+// roll number (services/yearScope.js `rewriteProfiles`). Every other statement
+// — and every statement the rest of the time — goes through as written.
+function asRead(text) {
+    if (typeof text !== 'string' || text.indexOf('"studentprofiles"') === -1) return text;
+    try { return require('../services/yearScope').rewriteProfiles(text); } catch { return text; }
+}
+
 async function query(text, params) {
-    return getPool().query(text, params);
+    return getPool().query(asRead(text), params);
 }
 
 async function end() {

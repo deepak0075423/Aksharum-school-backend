@@ -31,6 +31,7 @@
  * every read is one query over all of them, not one per student.
  */
 const crypto = require('crypto');
+const yearScope = require('./yearScope');
 const pool = require('../db/pool');
 const { rollInSection, rollInYear, rollOrder } = require('../utils/yearRoll');
 const School = require('../models/School');
@@ -78,7 +79,7 @@ const verifyUrl = (code) => `${FRONTEND()}/verify/report-card/${code}`;
 
 async function years(schoolId) {
     const { rows } = await pool.query(
-        `SELECT "_id", "yearName", "status", "startDate", "endDate" FROM ${T.years}
+        `SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate", "endDate" FROM ${T.years}
           WHERE "school" = $1::uuid ORDER BY ${yearOrderSql()}`, [String(schoolId)]);
     return rows;
 }
@@ -402,7 +403,7 @@ async function rollOf(sectionId) {
 /** The years a teacher holds a class teacher's post in, A–Z. */
 async function teacherYears(schoolId, teacherId) {
     const { rows } = await pool.query(`
-        SELECT DISTINCT y."_id", y."yearName", y."status", y."startDate", y."endDate" FROM ${T.sections} s JOIN ${T.years} y ON y."_id" = s."academicYear"
+        SELECT DISTINCT y."_id", y."yearName", ${yearScope.yearStatus('y')} AS "status", y."startDate", y."endDate" FROM ${T.sections} s JOIN ${T.years} y ON y."_id" = s."academicYear"
          WHERE s."school" = $1::uuid AND (s."classTeacher" = $2::uuid OR s."substituteTeacher" = $2::uuid)`, [String(schoolId), String(teacherId)]);
     return rows.sort(byYear);
 }

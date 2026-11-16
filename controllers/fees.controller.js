@@ -26,6 +26,7 @@ const { postDueCharges, legacyStart } = charging;
 const Sched = require('../services/feeSchedule');
 const { isUuid }          = require('../db/schema');
 const pool                = require('../db/pool');
+const yearScope           = require('../services/yearScope');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -97,7 +98,8 @@ exports.getDashboard = async (req, res) => {
                 { $match: { school: req.schoolId, ...(ay ? { academicYear: ay._id } : {}) } },
                 { $group: { _id: null, total: { $sum: { $cond: [{ $eq: ['$entryType', 'debit'] }, '$amount', { $multiply: ['$amount', -1] }] } } } },
             ]),
-            FeePayment.find({ school: req.schoolId })
+            // The year's own payments, like the figures beside them.
+            FeePayment.find({ school: req.schoolId, ...(ay ? { $or: [{ academicYear: ay._id }, { academicYear: null }] } : {}) })
                 .populate('student', 'name rollNumber')
                 .sort({ paymentDate: -1 })
                 .limit(10)
@@ -1262,6 +1264,12 @@ exports.getPayments = async (req, res) => {
         if (studentId)     filter.student       = studentId;
         if (paymentStatus) filter.paymentStatus = paymentStatus;
         if (paymentMode)   filter.paymentMode   = paymentMode;
+        // One academic year's payments (the year in view; `academicYear=all` for
+        // every year). One student's own history is not cut by year.
+        if (!studentId) {
+            const year = (await yearScope.of(req)).owns('academicYear', 'paymentDate');
+            if (Object.keys(year).length) filter.$and = [year];
+        }
 
         const [payments, total] = await Promise.all([
             FeePayment.find(filter)
@@ -1517,6 +1525,9 @@ exports.getSchoolLedger = async (req, res) => {
         const { category, page = 1, limit = 30 } = req.query;
         const filter = { school: req.schoolId };
         if (category) filter.category = category;
+        // One academic year's entries (the year in view; `academicYear=all` for every year).
+        const year = (await yearScope.of(req)).owns('academicYear', 'createdAt');
+        if (Object.keys(year).length) filter.$and = [year];
 
         const [entries, total] = await Promise.all([
             FeeLedger.find(filter)

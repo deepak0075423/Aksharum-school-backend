@@ -16,6 +16,7 @@
  * id belonging to another school is simply not found.
  */
 const fs = require('fs');
+const yearScope = require('../yearScope');
 const path = require('path');
 const {
     q, M, T, bad, notFound, conflict, str, id, idOrNull, int, oneOf, classLevel, levelLabel, like, paging,
@@ -39,7 +40,7 @@ const REQUEST_DIR = path.join(__dirname, '..', '..', 'uploads', 'lms-requests');
 // ── Reading the set-up ───────────────────────────────────────────────────────
 
 async function yearOf(schoolId, yearId) {
-    const years = await q(`SELECT "_id", "yearName", "status", "startDate" FROM ${T.year} WHERE "school" = $1 ORDER BY "startDate"`, [schoolId]);
+    const years = await q(`SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate" FROM ${T.year} WHERE "school" = $1 ORDER BY "startDate"`, [schoolId]);
     const year = yearId
         ? years.find((y) => String(y._id) === String(yearId))
         : (years.filter((y) => y.status === 'active').sort((a, b) => new Date(b.startDate) - new Date(a.startDate))[0] || years[years.length - 1]);

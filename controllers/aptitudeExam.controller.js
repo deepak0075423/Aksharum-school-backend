@@ -79,6 +79,11 @@ exports.getTeacherExams = async (req, res) => {
 
         const filter = { school: req.schoolId, $or: orConds };
         if (req.query.status) filter.status = req.query.status;
+        // One academic year's papers — the year in view unless another is asked
+        // for (`year=all` for every year), as the exam board reads them. This
+        // list used to carry every paper the teacher had ever set.
+        const { yearId } = await resolveYear(req.schoolId, req.query.year);
+        if (yearId) filter.academicYear = yearId;
 
         const exams = await AptitudeExam.find(filter)
             .populate('section',     'sectionName')

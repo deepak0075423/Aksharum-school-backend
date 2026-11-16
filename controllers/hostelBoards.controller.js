@@ -12,6 +12,7 @@
 //  statement handed more parameters than it references.
 // ─────────────────────────────────────────────────────────────────────────────
 const pool = require('../db/pool');
+const yearScope = require('../services/yearScope');
 const { ok, bad, fail, visibleHostelIds, getSettings, dayRange } = require('../services/hostelService');
 const Q = require('../services/hostelQuery');
 const { BED_STATE, bedCounts, hostelsInScope, structureCounts } = require('../services/hostelOverview');
@@ -977,7 +978,7 @@ function mealsInPlan(plan, timings) {
  */
 async function termStart(school) {
     const { rows: [y] } = await pool.query(
-        `SELECT "startDate", "endDate" FROM ${T(AcademicYear)} WHERE "school" = $1 AND "status" = 'active'
+        `SELECT "startDate", "endDate" FROM ${T(AcademicYear)} WHERE "school" = $1 AND ${yearScope.yearStatus()} = 'active'
           ORDER BY "startDate" DESC NULLS LAST LIMIT 1`, [String(school)]);
     const now = Date.now();
     const start = y?.startDate ? new Date(y.startDate).getTime() : null;

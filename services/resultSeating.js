@@ -24,6 +24,7 @@
  *   remove     the day's plan taken away — its invigilators told, if it was out
  */
 const pool = require('../db/pool');
+const yearScope = require('./yearScope');
 const ExamDayPlan = require('../models/ExamDayPlan');
 const FormalExam = require('../models/FormalExam');
 const Room = require('../models/Room');
@@ -46,7 +47,7 @@ async function daysAhead(schoolId) {
     const { rows } = await pool.query(`
         SELECT to_char((x->>'examDate')::date, 'YYYY-MM-DD') AS "day", count(*)::int AS "papers", count(DISTINCT e."_id")::int AS "exams"
           FROM "${FormalExam.tableName}" e CROSS JOIN LATERAL jsonb_array_elements(${jarr('e."subjects"')}) x
-         WHERE e."school" = $1::uuid AND e."archivedAt" IS NULL AND COALESCE(x->>'examDate', '') <> ''
+         WHERE e."school" = $1::uuid AND e."archivedAt" IS NULL${yearScope.isYear('e."academicYear"')} AND COALESCE(x->>'examDate', '') <> ''
            AND (x->>'examDate')::date >= $2::date
          GROUP BY 1 ORDER BY 1 LIMIT 60`, [String(schoolId), todayOf(schoolId)]);
     // The day as text: the driver reads a SQL date as local midnight, a day early east of Greenwich.
@@ -63,7 +64,7 @@ async function sittingsOf(schoolId, day) {
           JOIN "classsections" s ON s."_id" = e."section"
           LEFT JOIN "classes" c ON c."_id" = s."class"
           LEFT JOIN "subjects" sub ON sub."_id"::text = x->>'subject'
-         WHERE e."school" = $1::uuid AND e."archivedAt" IS NULL AND (x->>'examDate')::date = $2::date
+         WHERE e."school" = $1::uuid AND e."archivedAt" IS NULL${yearScope.isYear('e."academicYear"')} AND (x->>'examDate')::date = $2::date
          ORDER BY COALESCE(x->>'startTime', '99:99'), c."classNumber" NULLS LAST, s."sectionName", sub."subjectName"`,
     [String(schoolId), keyOf(day)]);
     const rosterOf = new Map(); const takersOf = new Map();

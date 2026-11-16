@@ -16,6 +16,7 @@
  * under no year, and for a student whose enrolment row has not been written.
  */
 const fs   = require('fs');
+const yearScope = require('./yearScope');
 const path = require('path');
 const pool = require('../db/pool');
 
@@ -252,7 +253,7 @@ const REACH = `
       FROM place p
      WHERE CASE d."targetType"
        WHEN 'whole_school' THEN
-         (d."academicYear" IS NULL OR COALESCE(ay."status", '') = 'active' OR p."y" = d."academicYear")
+         (d."academicYear" IS NULL OR COALESCE(${yearScope.yearStatus('ay')}, '') = 'active' OR p."y" = d."academicYear")
        WHEN 'class' THEN
          p."placed"
          AND ((d."academicYear" IS NOT NULL AND p."y" = d."academicYear") OR (d."academicYear" IS NULL AND p."cur"))
@@ -306,7 +307,7 @@ async function teacherReach(teacherId, schoolId) {
         `SELECT DISTINCT s."_id" AS "section", s."class",
                 c."className" || ' - ' || s."sectionName" AS "label",
                 c."classNumber", s."sectionName",
-                (ay."status" = 'active') AS "current"
+                (${yearScope.yearStatus('ay')} = 'active') AS "current"
            FROM ${qt(ClassSection)} s
            JOIN ${qt(Class)} c            ON c."_id"  = s."class"
            LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = c."academicYear"

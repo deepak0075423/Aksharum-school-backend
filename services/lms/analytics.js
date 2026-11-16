@@ -17,6 +17,7 @@
  *   central   platform-wide totals, for the Super Admin
  */
 const PDFDocument = require('pdfkit');
+const yearScope = require('../yearScope');
 const XLSX = require('xlsx');
 const { q, T, bad, forbidden, notFound, id, idOrNull, dateOrNull, like, paging, cached, levelLabel } = require('./common');
 const access = require('./access');
@@ -38,7 +39,8 @@ function expected(schoolId, filters = {}, pairs = null) {
         where.push(`EXISTS (SELECT 1 FROM unnest($2::uuid[], $3::uuid[]) AS tp(s, j) WHERE tp.s = r."section" AND tp.j = r."schoolSubject")`);
     }
     const add = (value, sql, label) => { const v = idOrNull(value, label); if (v) { params.push(v); where.push(sql.replace('?', `$${params.length}`)); } };
-    add(filters.academicYear, `r."academicYear" = ?`, 'Academic year');
+    // Nothing asked = the academic year in view; `all` = every year.
+    add(filters.academicYear === 'all' ? null : (filters.academicYear || yearScope.now()?.id), `r."academicYear" = ?`, 'Academic year');
     add(filters.class, `r."class" = ?`, 'Class');
     add(filters.section, `r."section" = ?`, 'Section');
     add(filters.subject, `r."schoolSubject" = ?`, 'Subject');
@@ -142,7 +144,19 @@ async function teacherFilters(scope) {
     };
 }
 
-async function teacherDashboard(user, filters, { fresh = false } = {}) {
+/**
+ * The filters with their academic year said out loud: an id, or 'all'. Nothing
+ * asked = the year in view — and since that belongs to the request, it has to
+ * be in the filters before they become a cache key.
+ */
+const withYear = (filters = {}) => ({
+    ...filters,
+    academicYear: filters.academicYear === 'all' ? 'all' : (filters.academicYear || yearScope.now()?.id || 'all'),
+});
+
+async function teacherDashboard(user, asked, { fresh = false } = {}) {
+    const filters = withYear(asked);
+    const ofYear = filters.academicYear === 'all' ? '' : filters.academicYear;
     const scope = await access.teacherScope(user);
     const options = await teacherFilters(scope);
     if (!scope.pairs.length) return { options, assignedStudents: 0, students: null, content: null, chapters: [], books: [] };
@@ -151,7 +165,7 @@ async function teacherDashboard(user, filters, { fresh = false } = {}) {
         // Everyone on the rosters in view — whether or not anything is released to them yet.
         const sections = scope.pairs.filter((p) => (!filters.section || String(p.section) === String(filters.section))
             && (!filters.class || String(p.class) === String(filters.class)) && (!filters.subject || String(p.schoolSubject) === String(filters.subject))
-            && (!filters.academicYear || String(p.academicYear) === String(filters.academicYear))).map((p) => p.section);
+            && (!ofYear || String(p.academicYear) === String(ofYear))).map((p) => p.section);
         const [{ n }] = await q(`
             SELECT count(DISTINCT e.sid)::int AS n FROM ${T.section} cs ${ROSTER}
               JOIN ${T.user} su ON su."_id"::text = e.sid AND su."role" = 'student' AND su."isActive" IS NOT FALSE
@@ -213,7 +227,8 @@ async function studentReport(user, studentId, filters = {}) {
 
 // ── School and platform ──────────────────────────────────────────────────────
 
-async function schoolOverview(schoolId, filters, { fresh = false } = {}) {
+async function schoolOverview(schoolId, asked, { fresh = false } = {}) {
+    const filters = withYear(asked);
     const compute = async () => {
         const { sql, params } = expected(schoolId, filters, null);
         const [data, sections, setup] = await Promise.all([
@@ -268,7 +283,7 @@ async function centralOverview({ fresh = false } = {}) {
                       (SELECT count(*) FROM ${T.release} r WHERE r."school" = s."_id" AND ${access.LIVE})::int AS "liveReleases",
                       (SELECT count(DISTINCT p."student") FROM ${T.progress} p WHERE p."school" = s."_id" AND p."watchedSeconds" > 0)::int AS viewers
                  FROM ${T.schoolConfig} c JOIN ${T.school} s ON s."_id" = c."school" JOIN ${T.board} b ON b."_id" = c."board"
-                 JOIN ${T.year} y ON y."_id" = c."academicYear" AND y."status" = 'active'
+                 JOIN ${T.year} y ON y."_id" = c."academicYear" AND ${yearScope.yearStatus('y')} = 'active'
                  LEFT JOIN ${T.assignment} a ON a."school" = s."_id" AND a."status" = 'active'
                 GROUP BY s."_id", s."name", b."code" ORDER BY books DESC, lower(s."name") LIMIT 12`, []),
             q(`SELECT "_id", "title", "provider", "processingStatus", "processingError", "updatedAt" FROM ${T.video}
