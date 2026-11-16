@@ -87,14 +87,13 @@ async function removeUnreferenced(names) {
     const wanted = [...new Set(ids(names))].filter((n) => /^[\w.-]+$/.test(n) && !n.startsWith('.'));
     for (const name of wanted) {
         try {
-            const pat = `%"${name.replace(/[%_\\]/g, (m) => `\\${m}`)}"%`;
             const { rows } = await pool.query(
-                `SELECT 1 FROM ${qt(Document)} WHERE "files"::text LIKE $1
-                 UNION ALL SELECT 1 FROM ${qt(DocumentVersion)} WHERE "files"::text LIKE $1
-                 UNION ALL SELECT 1 FROM ${qt(DocumentComment)} WHERE "files"::text LIKE $1
-                 UNION ALL SELECT 1 FROM ${qt(AssignmentSubmission)} WHERE "files"::text LIKE $1
+                `SELECT 1 FROM ${qt(Document)} WHERE "files" @> $1::jsonb
+                 UNION ALL SELECT 1 FROM ${qt(DocumentVersion)} WHERE "files" @> $1::jsonb
+                 UNION ALL SELECT 1 FROM ${qt(DocumentComment)} WHERE "files" @> $1::jsonb
+                 UNION ALL SELECT 1 FROM ${qt(AssignmentSubmission)} WHERE "files" @> $1::jsonb
                  LIMIT 1`,
-                [pat],
+                [holds(name)],
             );
             if (!rows.length) await fs.promises.unlink(path.join(FOLDER, name)).catch(() => {});
         } catch (e) { console.error('[documents] file cleanup:', e.message); }
@@ -102,6 +101,13 @@ async function removeUnreferenced(names) {
 }
 
 const namesOf = (files) => (Array.isArray(files) ? files : []).map((f) => f?.storedName).filter(Boolean);
+
+/**
+ * "Holds a file stored under this name", as the jsonb a `"files" @> $1` asks
+ * with — answered from the gin indexes db/migrate.js creates, where the
+ * `"files"::text LIKE` it replaces read every row of four tables.
+ */
+function holds(name) { return JSON.stringify([{ storedName: String(name) }]); }
 
 /** What the first bytes of a file are, for the kinds that can be told apart. */
 function sniff(buf) {
@@ -275,7 +281,8 @@ async function studentsReached(docId, studentIds) {
          SELECT ${REACH} AS "reaches"
            FROM ${qt(Document)} d
            LEFT JOIN ${qt(AcademicYear)} ay ON ay."_id" = d."academicYear"
-          WHERE d."_id" = $1`,
+          -- A draft has not been shared with anyone yet.
+          WHERE d."_id" = $1 AND NOT COALESCE(d."isDraft", false)`,
         [String(docId), wanted],
     );
     return rows[0]?.reaches || [];
@@ -330,8 +337,8 @@ async function teacherReach(teacherId, schoolId) {
 /** May this teacher open the document at all — their own, or one that reaches them. */
 async function teacherCanRead(doc, teacherId, schoolId) {
     if (String(doc.uploadedBy) === String(teacherId)) return true;
-    // Put away by the office: gone from everyone's shelf but its owner's.
-    if (doc.isArchived) return false;
+    // Put away by the office, or not shared yet: on nobody's shelf but its owner's.
+    if (doc.isArchived || doc.isDraft) return false;
     if (['all_teachers', 'whole_school'].includes(doc.targetType)) return true;
     if (doc.targetType === 'specific_teachers') return ids(doc.targetUsers).includes(String(teacherId));
     const reach = await teacherReach(teacherId, schoolId || doc.school);
@@ -374,7 +381,7 @@ async function canSeeDocument(viewer, doc) {
     if (!viewer || !doc || String(doc.school) !== String(viewer.sid)) return false;
     if (await isOffice(viewer)) return true;
     if (viewer.role === 'teacher') return teacherCanRead(doc, viewer.uid, viewer.sid);
-    if (doc.isArchived) return false;
+    if (doc.isArchived || doc.isDraft) return false;
     if (viewer.role === 'student') return (await studentsReached(doc._id, [viewer.uid])).length > 0;
     if (viewer.role === 'parent') {
         const kids = await childIds(viewer.uid, viewer.sid);
@@ -418,20 +425,19 @@ async function teachesStudent(teacherId, schoolId, studentId, yearId) {
 async function fileAccess(viewer, name) {
     const out = { ok: false, originalName: '' };
     if (!viewer || !name) return out;
-    const pat = `%"${String(name).replace(/[%_\\]/g, (m) => `\\${m}`)}"%`;
     const { rows } = await pool.query(
         `SELECT 'document' AS kind, d."_id" AS doc, NULL::uuid AS student, 'all' AS visibility, d."files"
-           FROM ${qt(Document)} d WHERE d."files"::text LIKE $1
+           FROM ${qt(Document)} d WHERE d."files" @> $1::jsonb
          UNION ALL
          SELECT 'document', v."document", NULL::uuid, 'all', v."files"
-           FROM ${qt(DocumentVersion)} v WHERE v."files"::text LIKE $1
+           FROM ${qt(DocumentVersion)} v WHERE v."files" @> $1::jsonb
          UNION ALL
          SELECT 'comment', c."document", NULL::uuid, COALESCE(c."visibility", 'all'), c."files"
-           FROM ${qt(DocumentComment)} c WHERE c."files"::text LIKE $1
+           FROM ${qt(DocumentComment)} c WHERE c."files" @> $1::jsonb
          UNION ALL
          SELECT 'submission', s."document", s."student", 'all', s."files"
-           FROM ${qt(AssignmentSubmission)} s WHERE s."files"::text LIKE $1`,
-        [pat],
+           FROM ${qt(AssignmentSubmission)} s WHERE s."files" @> $1::jsonb`,
+        [holds(name)],
     );
     if (!rows.length) return out;
 

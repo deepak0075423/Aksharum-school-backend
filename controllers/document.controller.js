@@ -15,6 +15,7 @@ const TeacherProfile       = require('../models/TeacherProfile');
 const Subject              = require('../models/Subject');
 const User                 = require('../models/User');
 const DocumentVersion      = require('../models/DocumentVersion');
+const DocumentReminder     = require('../models/DocumentReminder');
 const pool                 = require('../db/pool');
 const { yearOrderSql } = require('../utils/listOrder');
 const access               = require('../services/documentAccess');
@@ -159,7 +160,7 @@ exports.adminGetDocuments = async (req, res) => {
                         d."subject", d."assignmentType", d."questions",
                         d."targetType", d."isAssignment", d."dueDate", d."allowSubmission",
                         d."marksEnabled", d."totalMarks", d."tags", d."files",
-                        d."currentVersion", d."isArchived", d."createdAt", d."updatedAt",
+                        d."currentVersion", d."isArchived", d."isDraft", d."createdAt", d."updatedAt",
                         d."academicYear", d."targetClasses", d."targetSections", d."targetUsers",
                         u."_id"  AS "uploaderId",
                         u."name" AS "uploaderName",
@@ -257,6 +258,7 @@ function shapeRow(r) {
         fileSize: files.reduce((n, f) => n + (Number(f.fileSize) || 0), 0),
         currentVersion: r.currentVersion || 1,
         isArchived: !!r.isArchived,
+        isDraft: !!r.isDraft,
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
         academicYear: r.academicYear,
@@ -737,6 +739,7 @@ async function wipe(docs) {
         DocumentComment.deleteMany({ document: { $in: docIds } }),
         DocumentRead.deleteMany({ document: { $in: docIds } }),
         DocumentVersion.deleteMany({ document: { $in: docIds } }),
+        DocumentReminder.deleteMany({ document: { $in: docIds } }),
     ]);
     // The files go once no other document shares them (a duplicate does).
     access.removeUnreferenced(names);
@@ -911,6 +914,37 @@ const archiveBy = (own) => async (req, res) => {
 };
 exports.adminArchiveDocument   = archiveBy(false);
 exports.teacherArchiveDocument = archiveBy(true);
+
+/**
+ * Share a draft: from here on it is on its audience's shelves, and they are
+ * told — which is why a copy is not shared the moment it is made. It is dated
+ * from now, not from when the copy was taken: "Assigned on" is the day the
+ * class got it. Sharing something already shared changes nothing.
+ */
+const publishBy = (own) => async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
+        const doc = await Document.findOne({
+            _id: req.params.id, school: req.schoolId, ...(own ? { uploadedBy: req.userId } : {}),
+        }).lean();
+        if (!doc) return res.status(404).json({ success: false, message: 'Document not found' });
+        if (!doc.isDraft) return res.json({ success: true, data: clean(doc), already: true });
+        if (doc.isAssignment && !(doc.files || []).length) {
+            return res.status(400).json({ success: false, code: 'NEEDS_FILE', message: NEEDS_FILE });
+        }
+        // One statement, so two presses share it — and announce it — once.
+        const { rowCount } = await pool.query(
+            `UPDATE ${qt(Document)} SET "isDraft" = false, "createdAt" = now(), "updatedAt" = now()
+              WHERE "_id" = $1 AND COALESCE("isDraft", false)`,
+            [String(doc._id)],
+        );
+        const fresh = await Document.findById(doc._id).lean();
+        if (rowCount) announce(fresh, req);
+        res.json({ success: true, data: clean(fresh) });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
+exports.adminPublishDocument   = publishBy(false);
+exports.teacherPublishDocument = publishBy(true);
 
 exports.adminBulkArchive = async (req, res) => {
     try {

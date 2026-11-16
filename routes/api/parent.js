@@ -9,6 +9,7 @@ const classTestCtrl  = require('../../controllers/classTest.controller');
 const resultPortal   = require('../../controllers/resultPortal.controller');
 const docCtrl        = require('../../controllers/document.controller');
 const docViewer      = require('../../controllers/documentViewer.controller');
+const docDetail      = require('../../controllers/documentDetail.controller');
 const holidayCtrl    = require('../../controllers/holiday.controller');
 const feedbackParent = require('../../controllers/feedbackParent.controller');
 const timetableCtrl  = require('../../controllers/timetable.controller');
@@ -67,6 +68,13 @@ router.get('/documents',      docGuard, docViewer.parentGetDocuments);
 router.get('/documents/:id',  docGuard, docCtrl.parentGetDocument);
 router.post('/documents/read',     docGuard, docViewer.markRead);
 router.post('/documents/:id/read', docGuard, docViewer.markRead);
+// The discussion under a document that reaches one of their children: what is
+// marked for everyone, a question of their own, and their own words to edit or
+// take back. (Parents could read a document and not ask about it.)
+router.get('/documents/:id/comments',  docGuard, docViewer.parentDocumentAccess, docDetail.listComments);
+router.post('/documents/:id/comments', docGuard, docViewer.parentDocumentAccess, docDetail.addComment);
+router.patch('/documents/comments/:commentId',  docGuard, docDetail.updateComment);
+router.delete('/documents/comments/:commentId', docGuard, docDetail.deleteComment);
 
 // Holidays
 router.get('/holidays', holidayGuard, holidayCtrl.parentGetHolidays);

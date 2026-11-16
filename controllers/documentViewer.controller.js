@@ -74,6 +74,7 @@ const SELECT = (extra = '', reader = null) => `
          d."targetType", d."targetClasses", d."targetSections", d."targetUsers",
          d."isAssignment", d."assignmentType", d."dueDate", d."allowSubmission",
          d."totalMarks", d."files", d."createdAt", d."updatedAt", d."academicYear", d."isArchived",
+         d."isDraft", d."questions",
          u."_id" AS "uploaderId", u."name" AS "uploaderName",
          u."role" AS "uploaderRole", u."profileImage" AS "uploaderPhoto",
          ay."yearName" AS "academicYearName",
@@ -134,6 +135,11 @@ function shapeDoc(r) {
         // Opened by whoever is asking. Their own upload is never "unread".
         isRead: !!r.readAt,
         isArchived: !!r.isArchived,
+        // Their own copy, not shared yet (only its maker ever gets one here).
+        isDraft: !!r.isDraft,
+        // The question breakdown travels with the row: the teacher's edit form
+        // opens from it, and a field a row leaves out is one a save would blank.
+        questions: Array.isArray(r.questions) ? r.questions : [],
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
         academicYear: r.academicYear,
@@ -325,7 +331,8 @@ exports.studentGetDocuments = async (req, res) => {
             `WITH ${placeCte('$2')}
              ${LIGHT('', '$3::uuid')}
              ${REACH_JOIN}
-              WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
+              WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)
+                AND NOT COALESCE(d."isDraft", false)${year}
                 AND cardinality(reach.ids) > 0`,
             params,
         );
@@ -450,7 +457,8 @@ exports.parentGetDocuments = async (req, res) => {
             `WITH ${placeCte('$2')}
              ${LIGHT(', reach.ids AS "reaches"', '$3::uuid')}
              ${REACH_JOIN}
-              WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)${year}
+              WHERE d."school" = $1 AND NOT COALESCE(d."isArchived", false)
+                AND NOT COALESCE(d."isDraft", false)${year}
                 AND cardinality(reach.ids) > 0`,
             params,
         );
@@ -588,7 +596,8 @@ exports.teacherGetDocuments = async (req, res) => {
               -- Their own stay on their shelf when the office puts them away,
               -- marked as archived; everyone else's leave it.
               WHERE d."school" = $1
-                AND (NOT COALESCE(d."isArchived", false) OR d."uploadedBy" = $2::uuid)${year}
+                AND (NOT COALESCE(d."isArchived", false) OR d."uploadedBy" = $2::uuid)
+                AND (NOT COALESCE(d."isDraft", false)    OR d."uploadedBy" = $2::uuid)${year}
                 AND ( d."uploadedBy" = $2::uuid
                    OR d."targetType" IN ('all_teachers', 'whole_school')
                    OR (d."targetType" = 'specific_teachers' AND d."targetUsers"    ? $5)
@@ -718,5 +727,23 @@ exports.studentDocumentAccess = async (req, res, next) => {
         if (!doc || doc.isArchived) return res.status(404).json({ success: false, message: 'Document not found' });
         if ((await access.studentsReached(doc._id, [req.userId])).length) return next();
         return res.status(403).json({ success: false, message: 'This document was not shared with you' });
+    } catch (e) { return res.status(500).json({ success: false, message: e.message }); }
+};
+
+// ── A parent reading and joining the discussion ──────────────────────────────
+
+/**
+ * Route middleware: the document must reach one of this parent's own children.
+ * Parents could read a document and had no way to ask about it; they see what
+ * a student sees — never a comment the staff kept among themselves.
+ */
+exports.parentDocumentAccess = async (req, res, next) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Document not found' });
+        const doc = await Document.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!doc || doc.isArchived) return res.status(404).json({ success: false, message: 'Document not found' });
+        const kids = await access.childIds(req.userId, req.schoolId);
+        if ((await access.studentsReached(doc._id, kids)).length) return next();
+        return res.status(403).json({ success: false, message: 'This document was not shared with your child' });
     } catch (e) { return res.status(500).json({ success: false, message: e.message }); }
 };

@@ -589,6 +589,8 @@ router.get('/documents/:id',                          docGuard, docCtrl.adminGet
 router.put('/documents/:id',                          docGuard, uploadDocument.array('files', 10), checkUploads, docCtrl.adminEditDocument);
 router.delete('/documents/:id',                       docGuard, docCtrl.adminDeleteDocument);
 router.post('/documents/:id/archive',                 docGuard, docCtrl.adminArchiveDocument);
+// Share a draft (a duplicate starts as one).
+router.post('/documents/:id/publish',                 docGuard, docCtrl.adminPublishDocument);
 // Earlier sets of files, and putting one back.
 router.get('/documents/:id/versions',                 docGuard, docCtrl.getVersions);
 router.post('/documents/:id/versions/:versionId/restore', docGuard, docCtrl.restoreVersion);

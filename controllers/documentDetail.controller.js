@@ -25,6 +25,7 @@ const StudentProfile     = require('../models/StudentProfile');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const User               = require('../models/User');
 const DocumentRead       = require('../models/DocumentRead');
+const DocumentReminder   = require('../models/DocumentReminder');
 const StudentEnrollment  = require('../models/StudentEnrollment');
 const pool               = require('../db/pool');
 const { notify, withParents } = require('../services/notifyService');
@@ -299,6 +300,8 @@ async function header(doc, req) {
     // passed and "Archived" once it is off the shelf. A plain document with no
     // due date is simply Active — there is nothing for it to be late for.
     const status = doc.isArchived ? 'archived'
+        // Made but not shared: nobody it is aimed at can see it yet.
+        : doc.isDraft ? 'draft'
         : (doc.isAssignment && due && Date.now() > due.getTime()) ? 'overdue'
         : 'active';
 
@@ -329,6 +332,7 @@ async function header(doc, req) {
         files: access.publicFiles(doc.files),
         currentVersion: doc.currentVersion || 1,
         isArchived: !!doc.isArchived,
+        isDraft: !!doc.isDraft,
         status,
         readCount: readers,
         lastReminderAt: doc.lastReminderAt || null,
@@ -843,11 +847,15 @@ exports.reviewSubmission = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-// One student can be nudged again after ten minutes; the map only ever holds
-// the last few minutes of presses.
+// How often a reminder may go: to everyone outstanding once an hour, to one
+// named student once in ten minutes. Both limits are facts in the database —
+// the document's own `lastReminderAt`, and a DocumentReminder row per student
+// — claimed in one statement each, so every server process reads the same
+// answer and two presses at once cannot both get through. (The per-student one
+// used to be a list in this process's memory.)
 const REMIND_ALL_EVERY = 60 * 60 * 1000;
-const REMIND_ONE_EVERY = 10 * 60 * 1000;
-const lastNudge = new Map();   // `${doc}|${student}` → time
+const REMIND_ONE_MINUTES = 10;
+const clock = (d) => new Date(d).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 
 /** Nudge everyone the assignment is still waiting on — and their parents. */
 exports.remindPending = async (req, res) => {
@@ -857,6 +865,7 @@ exports.remindPending = async (req, res) => {
         const bad = (message, status = 400, code) => res.status(status).json({ success: false, message, ...(code ? { code } : {}) });
         if (!doc.isAssignment)    return bad('This document is not an assignment');
         // A reminder asks for something. Neither of these can be answered.
+        if (doc.isDraft)          return bad('This is still a draft — share it before sending a reminder');
         if (doc.isArchived)       return bad('This assignment is archived — restore it before sending a reminder');
         if (!doc.allowSubmission) return bad('Submissions are closed on this assignment, so there is nothing a reminder could ask for');
 
@@ -868,13 +877,24 @@ exports.remindPending = async (req, res) => {
         }
 
         const now = Date.now();
-        if (!only && doc.lastReminderAt && now - new Date(doc.lastReminderAt).getTime() < REMIND_ALL_EVERY) {
-            const again = new Date(new Date(doc.lastReminderAt).getTime() + REMIND_ALL_EVERY);
-            return bad(
-                `A reminder already went to everyone at ${new Date(doc.lastReminderAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })}. `
-                + `The next one can go after ${again.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })}.`,
-                429, 'REMINDED_RECENTLY');
+        if (!only) {
+            // Claimed before anything is sent: the hour starts now or not at all.
+            const claim = await pool.query(
+                `UPDATE ${qt(Document)} SET "lastReminderAt" = now()
+                  WHERE "_id" = $1
+                    AND ("lastReminderAt" IS NULL OR "lastReminderAt" < now() - interval '${REMIND_ALL_EVERY / 60000} minutes')`,
+                [String(doc._id)],
+            );
+            if (!claim.rowCount) {
+                const last = (await Document.findById(doc._id).select('lastReminderAt').lean())?.lastReminderAt || doc.lastReminderAt;
+                return bad(
+                    `A reminder already went to everyone at ${clock(last)}. `
+                    + `The next one can go after ${clock(new Date(last).getTime() + REMIND_ALL_EVERY)}.`,
+                    429, 'REMINDED_RECENTLY');
+            }
         }
+        // Nothing went out after all: the hour is given back.
+        const release = () => (only ? null : Document.updateOne({ _id: doc._id }, { lastReminderAt: doc.lastReminderAt || null }));
 
         const sections = await audienceSections(doc);
         const { sql: cte, params } = rosterCte({
@@ -890,15 +910,28 @@ exports.remindPending = async (req, res) => {
             [...params, ...extra],
         );
         let students = rows.map((r) => String(r.studentId));
-        if (only) {
-            for (const [k, t] of lastNudge) if (now - t > REMIND_ONE_EVERY) lastNudge.delete(k);
-            const fresh = students.filter((id) => !lastNudge.has(`${doc._id}|${id}`));
-            if (students.length && !fresh.length) {
+        if (only && students.length) {
+            // Each named student is claimed in the same statement that decides
+            // whether their ten minutes are up; the ones that come back are
+            // the ones to send to.
+            const claimed = await pool.query(
+                `INSERT INTO ${qt(DocumentReminder)} ("_id", "document", "student", "school", "sentAt", "createdAt", "updatedAt")
+                 SELECT gen_random_uuid(), $1::uuid, s::uuid, $2::uuid, now(), now(), now()
+                   FROM unnest($3::text[]) s
+                 ON CONFLICT ("document", "student") DO UPDATE
+                    SET "sentAt" = now(), "updatedAt" = now()
+                  WHERE ${qt(DocumentReminder)}."sentAt" < now() - interval '${REMIND_ONE_MINUTES} minutes'
+                 RETURNING "student"`,
+                [String(doc._id), String(doc.school), students],
+            );
+            const fresh = claimed.rows.map((r) => String(r.student));
+            if (!fresh.length) {
                 return bad('A reminder was sent a few minutes ago — give it a little time', 429, 'REMINDED_RECENTLY');
             }
             students = fresh;
         }
         if (!students.length) {
+            await release();
             return res.json({ success: true, sent: 0, message: 'Everyone has already submitted' });
         }
 
@@ -914,9 +947,6 @@ exports.remindPending = async (req, res) => {
             about: students,
             link: { type: 'documents.item', entityId: doc._id },
         });
-
-        if (only) for (const id of students) lastNudge.set(`${doc._id}|${id}`, now);
-        else await Document.updateOne({ _id: doc._id }, { lastReminderAt: new Date(now) });
 
         res.json({ success: true, sent: students.length });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -934,6 +964,10 @@ exports.remindPending = async (req, res) => {
  * classes and sections. It used to keep the original's year and ids, so a copy
  * made after a rollover sat in last year, out of every default view, with a
  * roster of nobody.
+ *
+ * And it starts as a DRAFT: nobody it is aimed at sees it, or hears of it,
+ * until whoever copied it has made it this week's and shared it. A copy used
+ * to land on the class's shelf as it was made — "… (copy)", no due date.
  */
 exports.duplicate = async (req, res) => {
     try {
@@ -991,6 +1025,7 @@ exports.duplicate = async (req, res) => {
             targetSections: sections,
             currentVersion: 1,
             isArchived: false,
+            isDraft: true,
             dueDate: null,
         });
         const out = typeof copy.toObject === 'function' ? copy.toObject() : copy;

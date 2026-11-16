@@ -192,6 +192,8 @@ router.post('/documents/:id/duplicate',           docGuard, canOwn, docDetail.du
 // Their own to put away and take back out, to see who has opened, and to roll
 // back to an earlier set of files.
 router.post('/documents/:id/archive',             docGuard, docCtrl.teacherArchiveDocument);
+// Share their own draft (a duplicate starts as one).
+router.post('/documents/:id/publish',             docGuard, docCtrl.teacherPublishDocument);
 router.get('/documents/:id/readers',              docGuard, canOwn, docDetail.getReaders);
 router.get('/documents/:id/versions',             docGuard, canOwn, docCtrl.getVersions);
 router.post('/documents/:id/versions/:versionId/restore', docGuard, canOwn, docCtrl.restoreVersion);

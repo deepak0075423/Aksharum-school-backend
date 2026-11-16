@@ -13,7 +13,19 @@
  */
 const pool = require('./pool');
 
+/**
+ * Opening any Documents file asks "what does this file belong to" of four
+ * tables. That was `"files"::text LIKE '%name%'` — every row of each, read and
+ * turned to text, for every file opened. With these the same question is
+ * `"files" @> '[{"storedName": …}]'` and answered from an index.
+ */
+const FILE_LOOKUPS = ['documents', 'documentversions', 'documentcomments', 'assignmentsubmissions'].map((t) => ({
+    name: `${t}: files findable by stored name`,
+    sql:  `CREATE INDEX IF NOT EXISTS "ix_${t}_files_gin" ON "${t}" USING gin ("files" jsonb_path_ops)`,
+}));
+
 const STEPS = [
+    ...FILE_LOOKUPS,
     {
         // users.email was unique platform-wide, which made one address one
         // person at one school in one role. It is now one PERSON, who may hold

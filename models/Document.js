@@ -159,6 +159,18 @@ const DocumentSchema = new db.Schema({
     },
 
     /**
+     * Made, but not shared yet. A duplicate starts here: it used to go live to
+     * its whole audience the moment it was copied — with last week's title and
+     * no due date — before anyone had edited it into this week's. A draft is
+     * seen by whoever made it and by the office, and by nobody it is aimed at
+     * until it is shared (the publish route), which is also when they are told.
+     */
+    isDraft: {
+        type: Boolean,
+        default: false,
+    },
+
+    /**
      * When "remind everyone still outstanding" was last sent. One press reaches
      * a whole class and their parents, so it is held to once an hour — there
      * was nothing to stop it being pressed ten times in a row.
