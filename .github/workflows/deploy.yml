@@ -1,15 +1,38 @@
-name: School2.0
+# Deploys the API to the EC2 server on every push to main.
+#
+#   push to main ─▶ test (admission tests) ─▶ deploy (SSH → deploy/server-deploy.sh)
+#
+# Repository secrets (Settings → Secrets and variables → Actions → Secrets):
+#   EC2_HOST      the server's address (13.50.231.82)
+#   EC2_USER      the login that runs pm2: ec2-user (the server runs Amazon Linux)
+#   EC2_SSH_KEY   the whole private key file (.pem), BEGIN/END lines included
+# Optional repository variable (… → Variables):
+#   DEPLOY_DIR    the server folder of this repo — only if the deploy cannot
+#                 find it from pm2 (process "school-backend") or git
+#
+# Run it by hand: Actions → Deploy backend → Run workflow. Tick "skip tests"
+# only to push out an urgent fix while the test job itself is broken.
+# Roll back: re-run the deploy job of an older successful run.
+name: Deploy backend
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: Deploy without running the admission tests (emergencies only)
+        type: boolean
+        default: false
 
 jobs:
-  # The admission module's tests (tests/admission, ~60 s) run first; a red
-  # run stops the deploy. Throwaway Postgres and Redis, nothing from production.
+  # The admission module's tests (tests/admission, ~4 min). A red run stops
+  # the deploy. Throwaway Postgres, Redis and mail server — nothing from
+  # production, and no mail leaves the runner.
   test:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_tests) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18
@@ -29,6 +52,17 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 20
+      # Accepts every message and keeps it. Account-activation emails go
+      # through the platform SMTP; without a server to accept them the app
+      # (rightly) tells the family "the school will give you the details",
+      # and the enrolment test that expects "emailed" fails.
+      mailpit:
+        image: axllent/mailpit:latest
+        env:
+          MP_SMTP_AUTH_ACCEPT_ANY: 1
+          MP_SMTP_AUTH_ALLOW_INSECURE: 1
+        ports:
+          - 1025:1025
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/aksharum_test
       REDIS_URL: redis://localhost:6379
@@ -36,44 +70,65 @@ jobs:
       JWT_REFRESH_SECRET: ci-only-refresh-secret
       INTERNAL_SECRET: ci-only-internal-secret
       FRONTEND_URL: http://localhost:3000
+      SMTP_HOST: localhost
+      SMTP_PORT: 1025
+      SMTP_USER: ci@aksharum.test
+      SMTP_PASS: ci-only
       NODE_ENV: test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 25
           cache: npm
-      - run: npm ci
+      - run: npm ci --no-audit --no-fund
       - name: Admission module tests
         run: npm run test:admission
 
   deploy:
     needs: test
+    if: ${{ !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     runs-on: ubuntu-latest
-
+    timeout-minutes: 20
+    # One deploy at a time; a newer push waits for the running one.
+    concurrency:
+      group: deploy-backend
+      cancel-in-progress: false
     steps:
-      - name: Deploy to EC2 via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            cd School-2.0
-            git fetch --all
-            git reset --hard origin/main
-            npm install --production
-            mkdir -p logs
+      - uses: actions/checkout@v5
 
-            # ── nginx: ensure SSE proxying works (port 3010) ─────────
-            NGINX_CONF="/etc/nginx/sites-available/default"
-            if [ -f "$NGINX_CONF" ] && ! grep -q "proxy_buffering off" "$NGINX_CONF"; then
-              sudo sed -i 's|proxy_pass http://localhost:3010;|proxy_pass http://localhost:3010;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_http_version 1.1;\n        proxy_set_header Connection "";|' "$NGINX_CONF"
-              echo "✅ nginx SSE config applied"
-            fi
-            sudo nginx -t && sudo systemctl reload nginx
+      - name: Connect to the server
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          for v in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            [ -n "${!v}" ] || { echo "::error::Repository secret $v is not set (Settings → Secrets and variables → Actions)"; exit 1; }
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if ! timeout 15 bash -c "exec 3<>/dev/tcp/$EC2_HOST/22" 2>/dev/null; then
+            echo "::error::Cannot reach $EC2_HOST on port 22 from GitHub Actions. In the EC2 security group, allow inbound SSH (port 22) from anywhere — the key still guards the login."
+            exit 1
+          fi
+          ssh-keyscan -T 15 -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $EC2_HOST
+            User $EC2_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            ConnectTimeout 20
+            ServerAliveInterval 30
+          EOF
+          ssh server true || { echo "::error::SSH login as $EC2_USER@$EC2_HOST was refused — check EC2_USER (ec2-user on this server) and that EC2_SSH_KEY holds the whole .pem file"; exit 1; }
+          echo "Connected to $EC2_USER@$EC2_HOST"
 
-            # ── PM2: always delete + fresh start with ecosystem ──────
-            pm2 delete school-app 2>/dev/null || true
-            pm2 start ecosystem.config.js
-            pm2 save
+      - name: Deploy on the server
+        env:
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+        run: |
+          ssh server "bash -s -- $(printf '%q ' "$GITHUB_SHA" school-backend Aksharum-school-backend 3010 "$DEPLOY_DIR")" < deploy/server-deploy.sh
