@@ -37,6 +37,11 @@ const ComponentSchema = new db.Schema({
     wageCeiling: { type: Number, default: 0 },   // cap the BASE before the % is taken
     capAmount:   { type: Number, default: 0 },   // cap the resulting amount
     minAmount:   { type: Number, default: 0 },   // floor the resulting amount
+    // An eligibility limit, not a cap: the line applies only while its base
+    // (for a whole month) is at or under this figure, and is zero above it.
+    // ESI is the case it exists for — owed on the full wage up to ₹21,000 and
+    // not at all beyond. `percentageOf: 'Gross'` is the base that goes with it.
+    applyUpTo:   { type: Number, default: 0 },
     // Does a loss-of-pay day reduce this line? Earnings normally yes; a fixed
     // reimbursement or a flat professional tax normally no.
     proRated: { type: Boolean, default: true },

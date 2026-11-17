@@ -11,19 +11,26 @@
  */
 const PDFDocument = require('pdfkit');
 const { schoolLogoPath } = require('./schoolLogoFile');
+const { registerPayFonts, money } = require('./payslipPdf');
 
 const C = {
     ink: '#1E293B', muted: '#64748B', line: '#CBD5E1', soft: '#F1F5F9',
     head: '#1E3A5F', accent: '#4F46E5', alt: '#F8FAFC', white: '#FFFFFF',
 };
 
-const INR = (n) => '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 
-function renderReportPdf(res, { filename, title, period, school, columns, rows, summary }) {
+/**
+ * @param lines     short lines printed under the header, before the table (who a statement is for)
+ * @param footnote  a sentence at the foot of the table
+ */
+function renderReportPdf(res, { filename, title, period, school, columns, rows, summary, lines = [], footnote = '' }) {
     const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margins: { top: 36, bottom: 40, left: 32, right: 32 }, bufferPages: true });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${filename || 'report.pdf'}"`);
     doc.pipe(res);
+    // Helvetica has no rupee sign — every amount printed a superscript 1 in its place.
+    const F = registerPayFonts(doc);
+    const INR = (n) => 'Rs. ' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });   // the totals band is one sentence
 
     const L = doc.page.margins.left;
     const W = doc.page.width - L - doc.page.margins.right;
@@ -44,11 +51,11 @@ function renderReportPdf(res, { filename, title, period, school, columns, rows, 
         if (logo) {
             try { doc.image(logo, x, 16, { fit: [42, 42] }); x += 52; } catch { /* a missing logo must not break the report */ }
         }
-        doc.fillColor(C.white).font('Helvetica-Bold').fontSize(14).text(school?.name || 'School', x, 18, { width: W - (x - L) });
-        doc.font('Helvetica').fontSize(9).fillColor('#C7D2FE').text(school?.address || '', x, 36, { width: W - (x - L), height: 22 });
-        doc.font('Helvetica-Bold').fontSize(12).fillColor(C.white)
+        doc.fillColor(C.white).font(F.bold).fontSize(14).text(school?.name || 'School', x, 18, { width: W - (x - L) });
+        doc.font(F.regular).fontSize(9).fillColor('#C7D2FE').text(school?.address || '', x, 36, { width: W - (x - L), height: 22 });
+        doc.font(F.bold).fontSize(12).fillColor(C.white)
             .text(title, L, 18, { width: W, align: 'right' });
-        doc.font('Helvetica').fontSize(9).fillColor('#C7D2FE')
+        doc.font(F.regular).fontSize(9).fillColor('#C7D2FE')
             .text(period || '', L, 36, { width: W, align: 'right' });
         doc.fillColor(C.ink);
     };
@@ -56,7 +63,7 @@ function renderReportPdf(res, { filename, title, period, school, columns, rows, 
     const drawColumnHeads = (y) => {
         doc.rect(L, y, W, 20).fill(C.soft);
         let x = L;
-        doc.font('Helvetica-Bold').fontSize(7.5).fillColor(C.ink);
+        doc.font(F.bold).fontSize(7.5).fillColor(C.ink);
         columns.forEach((c, i) => {
             doc.text(String(c.label), x + 4, y + 6.5, { width: widths[i] - 8, align: c.align === 'right' ? 'right' : 'left', lineBreak: false, ellipsis: true });
             x += widths[i];
@@ -67,23 +74,32 @@ function renderReportPdf(res, { filename, title, period, school, columns, rows, 
 
     drawHeader();
     let y = 86;
+    for (const text of (lines || []).filter(Boolean)) {
+        doc.font(F.regular).fontSize(9).fillColor(C.ink).text(String(text), L, y, { width: W });
+        y += 14;
+    }
+    if ((lines || []).filter(Boolean).length) y += 4;
     y = drawColumnHeads(y);
 
     const rowH = 17;
-    doc.font('Helvetica').fontSize(7.5);
+    doc.font(F.regular).fontSize(7.5);
     rows.forEach((r, idx) => {
         if (y + rowH > doc.page.height - doc.page.margins.bottom - 30) {
             doc.addPage();
             drawHeader();
             y = drawColumnHeads(86);
-            doc.font('Helvetica').fontSize(7.5);
+            doc.font(F.regular).fontSize(7.5);
         }
         if (idx % 2 === 1) doc.rect(L, y, W, rowH).fill(C.alt);
         let x = L;
         columns.forEach((c, i) => {
             const raw = r[c.key];
-            const text = c.money ? INR(raw) : (raw === null || raw === undefined ? '' : String(raw));
-            doc.fillColor(C.ink).text(text, x + 4, y + 5, { width: widths[i] - 8, align: c.align === 'right' ? 'right' : 'left', lineBreak: false, ellipsis: true });
+            if (c.money) {
+                money(doc, F, raw, x + 4, y + 5, widths[i] - 8, { font: F.regular, size: 7.5, color: C.ink, align: c.align === 'right' ? 'right' : 'left', digits: 0 });
+            } else {
+                const text = raw === null || raw === undefined ? '' : String(raw);
+                doc.font(F.regular).fontSize(7.5).fillColor(C.ink).text(text, x + 4, y + 5, { width: widths[i] - 8, align: c.align === 'right' ? 'right' : 'left', lineBreak: false, ellipsis: true });
+            }
             x += widths[i];
         });
         y += rowH;
@@ -94,7 +110,7 @@ function renderReportPdf(res, { filename, title, period, school, columns, rows, 
         if (y + 34 > doc.page.height - doc.page.margins.bottom) { doc.addPage(); drawHeader(); y = 86; }
         y += 6;
         doc.rect(L, y, W, 26).fill(C.accent);
-        doc.fillColor(C.white).font('Helvetica-Bold').fontSize(9);
+        doc.fillColor(C.white).font(F.bold).fontSize(9);
         const parts = [
             `Employees: ${summary.employees ?? 0}`,
             `Gross: ${INR(summary.gross)}`,
@@ -104,12 +120,15 @@ function renderReportPdf(res, { filename, title, period, school, columns, rows, 
         doc.text(parts.join('     ·     '), L + 10, y + 8, { width: W - 20 });
         y += 26;
     }
+    if (footnote) {
+        doc.font(F.regular).fontSize(7.5).fillColor(C.muted).text(String(footnote), L, y + 8, { width: W });
+    }
 
     // Footer on every page.
     const range = doc.bufferedPageRange();
     for (let i = 0; i < range.count; i++) {
         doc.switchToPage(range.start + i);
-        doc.font('Helvetica').fontSize(7).fillColor(C.muted)
+        doc.font(F.regular).fontSize(7).fillColor(C.muted)
             .text(`Generated ${new Date().toLocaleString('en-IN')}`, L, doc.page.height - 28, { width: W / 2 })
             .text(`Page ${i + 1} of ${range.count}`, L + W / 2, doc.page.height - 28, { width: W / 2, align: 'right' });
     }

@@ -24,7 +24,7 @@ const PayrollAuditLogSchema = new db.Schema({
     },
     entityType: {
         type: String,
-        enum: ['SalaryStructure', 'EmployeeSalaryAssignment', 'PayrollRun', 'PayrollEntry', 'Payslip', 'PayrollSettings', 'PayrollReport'],
+        enum: ['SalaryStructure', 'EmployeeSalaryAssignment', 'PayrollRun', 'PayrollEntry', 'Payslip', 'PayrollSettings', 'PayrollReport', 'SalaryAdvance', 'SalaryClaim'],
     },
     entityId: { type: db.Types.UUID },
     // A sentence a human can read without joining anything.

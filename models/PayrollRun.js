@@ -57,6 +57,18 @@ const PayrollRunSchema = new db.Schema({
     pendingRecovery: { type: db.Types.JSON, default: null },
     pendingClaims:   { type: db.Types.JSON, default: null },
     failureReason: { type: String, default: '' },
+    // The publish lock: what the run was before it was claimed, and when. A
+    // claim older than ten minutes belongs to a process that died, and the
+    // next publish may take it over — see publishRun().
+    publishingFrom: { type: String, default: '' },
+    publishingAt:   { type: Date, default: null },
+    // Why the last publish was reversed, or the run sent back to draft.
+    reversalReason: { type: String, default: '' },
+    // Published is not paid. When the transfer actually went out, and the
+    // bank's reference for it; entries may carry their own where they differ.
+    paidOn:     { type: Date, default: null },
+    paymentRef: { type: String, default: '', trim: true },
+    paidBy:     { type: db.Types.UUID, ref: 'User', default: null },
     processedBy: { type: db.Types.UUID, ref: 'User' },
     processedAt: Date,
     computedAt: Date,

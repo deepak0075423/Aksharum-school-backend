@@ -56,6 +56,32 @@ const PayrollEntrySchema = new db.Schema({
     reimbursement: { type: Number, default: 0 },
     // Instalments of advances and loans taken out of this month's pay.
     advanceRecovery: { type: Number, default: 0 },
+    /**
+     * WHICH advances that recovery comes off, and WHICH claims the
+     * reimbursement pays: [{ id, amount, kind }] and [claim id].
+     *
+     * Kept on the entry, not on the run. The run-level list was rebuilt on
+     * every recompute from the entries being recomputed, so a hand-edited
+     * entry kept its deduction but lost its place in the list — the payslip
+     * took the instalment, the advance never heard about it, and next month
+     * took it again. Publish now moves the ledger from the entries that
+     * actually got a payslip, which also means a held entry moves nothing.
+     */
+    advanceTaken: { type: db.Types.JSON, default: null },
+    claimsPaid:   { type: db.Types.JSON, default: null },
+    // Full-and-final settlement paid with this month: leave encashment plus
+    // gratuity, as one figure in the net, with its working beside it.
+    settlementAmount: { type: Number, default: 0 },
+    settlement:       { type: db.Types.JSON, default: null },
+    /**
+     * What this month added to the year's TAXABLE income — earnings flagged
+     * taxable, overtime, bonus, arrears and taxable claims — the TDS taken,
+     * and the projection it came from. Null on rows written before this
+     * existed; readers fall back to gross + bonus + arrears for those.
+     */
+    taxableIncome: { type: Number, default: null },
+    tds:           { type: Number, default: 0 },
+    taxWorking:    { type: db.Types.JSON, default: null },
     otherDeductions: { type: Number, default: 0 },
     // A recovery bigger than the month's pay. Net floors at zero and the
     // remainder is carried rather than handing someone a negative payslip.
@@ -64,6 +90,14 @@ const PayrollEntrySchema = new db.Schema({
     // Set on a PAST entry once a back-dated CTC revision has been settled as
     // arrears in a later run, so the same difference is never paid twice.
     arrearsSettledBy: { type: db.Types.UUID, ref: 'PayrollRun', default: null },
+    // Every settlement of this month, in order: [{ run, ctc, amount }]. The
+    // last one's `ctc` is what the month has been paid up to, so a SECOND
+    // back-dated raise pays only its own difference, and releasing one run's
+    // settlement (a recompute, a cancel) does not forget an earlier run's.
+    arrearsSettled: { type: db.Types.JSON, default: null },
+    // When this person's money actually went out, where it differs from the run.
+    paidOn:     { type: Date, default: null },
+    paymentRef: { type: String, default: '', trim: true },
     // An entry on hold is excluded from the run totals and gets no payslip —
     // the way a school withholds one person's pay without blocking the month.
     isOnHold: { type: Boolean, default: false },

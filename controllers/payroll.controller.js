@@ -119,7 +119,18 @@ exports.getMyCtc = async (req, res) => {
             data: {
                 hasSalary: true,
                 employee: who,
-                assignment: asgn,
+                /**
+                 * Only what is theirs to read. The whole assignment row used
+                 * to be sent — including the office's private `notes` on the
+                 * person, who assigned it, and the internal revision log.
+                 */
+                assignment: {
+                    _id: asgn._id, effectiveDate: asgn.effectiveDate, endDate: asgn.endDate,
+                    paymentMode: asgn.paymentMode || 'bank_transfer',
+                    declaredDeductions: r2(asgn.declaredDeductions),
+                },
+                // How this month's tax was worked out, from the last payslip.
+                tax: recent[0] && recent[0].taxWorking ? { ...recent[0].taxWorking, month: recent[0].month, year: recent[0].year } : null,
                 structure: {
                     _id: asgn.structure._id, name: asgn.structure.name, type: asgn.structure.type || 'general',
                     description: asgn.structure.description || '',
@@ -134,14 +145,17 @@ exports.getMyCtc = async (req, res) => {
                 pendingRevision: pending ? {
                     annualCtc: r2(pending.annualCtc),
                     effectiveLabel: `${['January','February','March','April','May','June','July','August','September','October','November','December'][pending.effectiveMonth - 1]} ${pending.effectiveYear}`,
-                    note: pending.note || '',
+                    // The office's note on a revision is the office's.
+                    note: '',
                 } : null,
                 breakdown,
                 series,
                 revisions: [...(asgn.ctcRevisions || [])].sort((a, b) =>
                     (b.effectiveYear - a.effectiveYear) || (b.effectiveMonth - a.effectiveMonth))
                     .map(r => ({
-                        ...r,
+                        annualCtc: r2(r.annualCtc), previousCtc: r2(r.previousCtc),
+                        incrementType: r.incrementType, incrementValue: num(r.incrementValue),
+                        effectiveMonth: r.effectiveMonth, effectiveYear: r.effectiveYear,
                         effectiveLabel: `${MONTHS_SHORT[r.effectiveMonth - 1]} ${r.effectiveYear}`,
                     })),
                 recent: recent.map(e => ({
@@ -151,7 +165,10 @@ exports.getMyCtc = async (req, res) => {
                 })),
             },
         });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    } catch (e) {
+        console.error('[Payroll] my salary:', e);
+        res.status(500).json({ success: false, message: 'Something went wrong on our side. Please try again.' });
+    }
 };
 
 // ── Compatibility: the admin handlers under their previous names ─────────────

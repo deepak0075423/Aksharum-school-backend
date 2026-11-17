@@ -15,7 +15,7 @@ const PayrollReportSchema = new db.Schema({
     name:   { type: String, required: true, trim: true },
     type: {
         type: String,
-        enum: ['summary', 'salary_register', 'deductions', 'department', 'annual', 'bank_transfer', 'employee'],
+        enum: ['summary', 'salary_register', 'deductions', 'department', 'annual', 'bank_transfer', 'employee', 'form16', 'pf', 'esi', 'pt', 'tds'],
         required: true,
     },
     // Either one month, or a whole year when `month` is null.

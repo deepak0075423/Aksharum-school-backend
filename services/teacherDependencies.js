@@ -149,7 +149,7 @@ async function collect(teacherId, schoolId) {
         payroll.assignment = live ? {
             assignmentId: String(live._id),
             structure:    live.structure?.name || '',
-            ctc:          live.ctc || 0,
+            ctc:          EmployeeSalaryAssignment.activeCtc(live, new Date().getFullYear(), new Date().getMonth() + 1) || live.ctc || 0,
             effectiveDate: live.effectiveDate || null,
         } : null;
         payroll.entries  = entries;

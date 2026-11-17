@@ -43,6 +43,10 @@ const EmployeeSalaryAssignmentSchema = new db.Schema({
     componentOverrides: [OverrideSchema],
     // How this person is paid. The bank file only lists bank_transfer rows.
     paymentMode:      { type: String, enum: ['bank_transfer', 'cash', 'cheque'], default: 'bank_transfer' },
+    // What this person has declared for the year under the OLD tax regime
+    // (80C, 80D, HRA exemption …), as one annual figure. Ignored under the new
+    // regime, which allows none of it. See services/incomeTax.js.
+    declaredDeductions: { type: Number, default: 0 },
     isActive:         { type: Boolean, default: true },
     assignedBy:       { type: db.Types.UUID, ref: 'User' },
     notes:            { type: String, default: '' },

@@ -18,6 +18,7 @@
  *   entry        one employee's line inside a run
  */
 const pool     = require('../db/pool');
+const { patch, insert } = require('../db/patch');
 const yearScope = require('../services/yearScope');
 const { isUuid } = require('../db/schema');
 
@@ -55,8 +56,11 @@ const T    = (Model) => yearScope.table(Model);
 const ok   = (res, data, extra) => res.json({ success: true, data, ...(extra || {}) });
 const bad  = (res, message, code = 400) => res.status(code).json({ success: false, message });
 const fail = (res, e) => {
+    // The detail goes to the log. The browser used to be handed e.message,
+    // which for anything unexpected is a Postgres error naming tables and
+    // columns — every message a person is MEANT to read is sent with bad().
     console.error('[PayrollAdmin]', e);
-    res.status(500).json({ success: false, message: e.message || 'Something went wrong' });
+    res.status(500).json({ success: false, message: 'Something went wrong on our side. Nothing was changed — please try again.' });
 };
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const r2  = (n) => Math.round(num(n) * 100) / 100;
@@ -207,38 +211,69 @@ async function leaveLopDaysFor(schoolId, year, month) {
 
 // ── The run engine ───────────────────────────────────────────────────────────
 
+const qt = (Model) => `"${Model.tableName}"`;
+
+/** A TDS line, however the structure spelled it. Matching on the code alone
+ *  missed hand-built components with no code, which were then deducted twice. */
+const isTdsLine = (d) => String(d?.code || '').toUpperCase() === 'TDS' || /^(tds|income[\s-]*tax)\b/i.test(String(d?.name || ''));
+
+/** The one definition of what an entry pays out. Every writer ends here. */
+const netRaw = (e) => num(e.grossSalary) - num(e.totalDeductions)
+    + num(e.arrears) + num(e.bonus) + num(e.reimbursement) + num(e.settlementAmount)
+    - num(e.otherDeductions) - num(e.advanceRecovery);
+function settleNet(e, settings) {
+    const raw = netRaw(e);
+    e.netSalary   = calc.roundAmount(Math.max(0, raw), settings.roundTo);
+    e.unrecovered = calc.roundAmount(Math.max(0, -raw), settings.roundTo);
+    return e;
+}
+
+const ASSIGNMENT_COLUMNS = `
+      a."_id", a."employee", a."structure", a."ctc", a."ctcRevisions",
+      a."componentOverrides", a."effectiveDate", a."endDate", a."paymentMode",
+      a."isActive", a."declaredDeductions",
+      u."name" AS "employeeName", u."role" AS "employeeRole",
+      COALESCE(u."isActive", true) AS "userActive",
+      tp."employeeId" AS "empCode", tp."department", tp."designation",
+      tp."joiningDate", tp."bankAccountNumber", tp."bankIfsc", tp."bankBranch",
+      tp."panNumber", tp."uanNumber"`;
+const ASSIGNMENT_FROM = (Asg, Usr, Tp) => `
+        FROM ${Asg} a
+        JOIN ${Usr} u ON u."_id" = a."employee"
+        LEFT JOIN ${Tp} tp ON tp."user" = u."_id" AND tp."school" = a."school"`;
+
 /**
  * The assignments a run should pay, one per employee.
  *
- * Three rules the old engine had none of:
- *   • the validity window must cover the pay month (a leaver stops being paid
- *     the month after their assignment ends);
- *   • the employee must still be an active employee of THIS school;
- *   • one assignment per employee. Two active assignments used to produce two
- *     entries for one person, which the (run, employee) unique index rejected
- *     — taking the whole insertMany, and therefore the whole run, down with a
- *     raw Postgres error. The newest assignment wins and the other is reported
- *     as skipped.
+ * Who is paid is decided by the DATES, and by nothing else:
+ *
+ *   • the assignment's window must overlap the pay month;
+ *   • a row that has been switched off still counts for the days up to its end
+ *     date. `isActive` used to be required outright — so carrying assignments
+ *     into the new year (which closes the old rows) and then running March
+ *     paid nobody at all, and a leaver whose assignment was deactivated on
+ *     their last day lost that month's pay. Only a row that is off AND has no
+ *     end date — the pre-window way of retiring one — is left out;
+ *   • a deactivated ACCOUNT is paid up to the assignment's end date, and
+ *     reported rather than paid where there is none: an account switched off
+ *     with an open-ended salary would otherwise be paid for ever, or (as
+ *     before) silently dropped from the month they actually worked.
+ *
+ * One assignment per employee; the newest wins and the other is reported.
  */
-async function eligibleAssignments(schoolId, year, month) {
+async function eligibleAssignments(schoolId, year, month, { employeeId = null } = {}) {
     const monthStart = new Date(Date.UTC(year, month - 1, 1));
     const monthEnd   = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
     const { $, list } = params();
     const sql = `
-      SELECT a."_id", a."employee", a."structure", a."ctc", a."ctcRevisions",
-             a."componentOverrides", a."effectiveDate", a."endDate", a."paymentMode",
-             u."name" AS "employeeName", u."role" AS "employeeRole",
-             tp."employeeId" AS "empCode", tp."department", tp."designation",
-             tp."joiningDate", tp."bankAccountNumber", tp."bankIfsc", tp."bankBranch",
-             tp."panNumber", tp."uanNumber"
-        FROM ${T(EmployeeSalaryAssignment)} a
-        JOIN ${T(User)} u ON u."_id" = a."employee"
-        LEFT JOIN ${T(TeacherProfile)} tp ON tp."user" = u."_id" AND tp."school" = a."school"
+      SELECT ${ASSIGNMENT_COLUMNS}
+        ${ASSIGNMENT_FROM(qt(EmployeeSalaryAssignment), qt(User), qt(TeacherProfile))}
        WHERE a."school" = ${$(String(schoolId))}
-         AND COALESCE(a."isActive", true) = true
+         AND u."school" = ${$(String(schoolId))} AND u."role" = ANY(${$(EMPLOYEE_ROLES)})
          AND a."effectiveDate" <= ${$(monthEnd)}
          AND (a."endDate" IS NULL OR a."endDate" >= ${$(monthStart)})
-         AND ${employeeWhere($, schoolId, 'u')}
+         AND (COALESCE(a."isActive", true) = true OR a."endDate" IS NOT NULL)
+         ${employeeId ? `AND a."employee" = ${$(String(employeeId))}` : ''}
        ORDER BY a."employee", a."effectiveDate" DESC, a."createdAt" DESC`;
     const { rows } = await pool.query(sql, list);
 
@@ -246,10 +281,32 @@ async function eligibleAssignments(schoolId, year, month) {
     const duplicates = [];
     for (const row of rows) {
         const key = String(row.employee);
-        if (byEmployee.has(key)) { duplicates.push({ employee: key, name: row.employeeName, reason: 'More than one active salary assignment — the newest was used' }); continue; }
+        if (byEmployee.has(key)) {
+            duplicates.push({ employee: key, name: row.employeeName, reason: 'Two salary assignments cover this month — only the newer one was paid. Add the earlier days by hand if they are owed.' });
+            continue;
+        }
         byEmployee.set(key, row);
     }
-    return { assignments: [...byEmployee.values()], duplicates };
+    const assignments = [], notPayable = [];
+    for (const row of byEmployee.values()) {
+        if (row.userActive === false && !row.endDate) {
+            notPayable.push({ employee: String(row.employee), name: row.employeeName, reason: 'The account is deactivated but the salary assignment has no end date — set the last working day on it' });
+            continue;
+        }
+        assignments.push(row);
+    }
+    return { assignments, duplicates: [...duplicates, ...notPayable] };
+}
+
+/** One assignment in the shape the engine prices, whatever its dates. */
+async function assignmentRow(schoolId, id) {
+    if (!uuidOr(id)) return null;
+    const { $, list } = params();
+    const { rows } = await pool.query(`
+      SELECT ${ASSIGNMENT_COLUMNS}
+        ${ASSIGNMENT_FROM(qt(EmployeeSalaryAssignment), qt(User), qt(TeacherProfile))}
+       WHERE a."_id" = ${$(String(id))} AND a."school" = ${$(String(schoolId))}`, list);
+    return rows[0] || null;
 }
 
 /**
@@ -285,62 +342,113 @@ function notEmployedDaysFor({ effectiveDate, endDate }, year, month, workingDays
  * Arrears owed because a CTC revision was back-dated over months that have
  * already been paid.
  *
- * Back-dating used to be refused outright, which left a school that agreed a
- * raise in July effective from April with no way to pay the difference at all.
- * Now the revision is allowed and each already-published month is recomputed at
- * the CTC that should have applied; the shortfall is carried into this run as
- * arrears, and each settled entry is stamped so it can never be paid twice.
+ * Each paid month is priced twice through the SAME engine with the SAME days —
+ * once at the CTC it has been paid up to, once at the CTC that should have
+ * applied — and the arrear is the difference in (gross − statutory
+ * deductions). The previous version compared a fresh, adjustment-free
+ * computation against the month's actual NET, so whatever else that month's
+ * net happened to contain leaked into the arrear: a ₹5,000 bonus that month
+ * swallowed a ₹5,000 arrear whole, an advance instalment was handed back as
+ * "arrears", and so was the month's TDS.
+ *
+ * "Paid up to" is the last entry of the month's `arrearsSettled` log, so a
+ * second back-dated raise pays only its own step. `run` settlements are
+ * ignored while reading, because this is that run being recomputed.
  */
 async function arrearsFor(schoolId, asgn, structure, run, settings) {
+    const none = { total: 0, settled: [], detail: [] };
+    if (structure.payBasis === 'rate') return none;
     const { $, list } = params();
     const { rows } = await pool.query(`
-      SELECT e."_id", e."month", e."year", e."netSalary", e."grossSalary", e."annualCtc",
-             e."workingDays", e."lopDays", e."notEmployedDays", e."units"
-        FROM ${T(PayrollEntry)} e
-        JOIN ${T(PayrollRun)} r ON r."_id" = e."payrollRun"
+      SELECT e."_id", e."month", e."year", e."annualCtc", e."workingDays", e."lopDays",
+             e."notEmployedDays", e."units", e."arrearsSettled", e."arrearsSettledBy"
+        FROM ${qt(PayrollEntry)} e
        WHERE e."school" = ${$(String(schoolId))} AND e."employee" = ${$(String(asgn.employee))}
-         AND r."status" = 'published' AND e."arrearsSettledBy" IS NULL
+         AND e."payslip" IS NOT NULL
          AND make_date(e."year"::int, e."month"::int, 1) < make_date(${$(num(run.year))}::int, ${$(num(run.month))}::int, 1)
        ORDER BY e."year", e."month"`, list);
 
     let total = 0;
     const settled = [], detail = [];
     for (const past of rows) {
+        const log = Array.isArray(past.arrearsSettled)
+            ? past.arrearsSettled.filter(x => String(x.run) !== String(run._id)) : null;
+        // Stamped before the log existed, by some other run: settled, to a CTC
+        // nobody recorded. Leave it alone rather than guess.
+        if (!log && past.arrearsSettledBy && String(past.arrearsSettledBy) !== String(run._id)) continue;
+        const paidAt = log && log.length ? num(log[log.length - 1].ctc) : num(past.annualCtc);
         const shouldHave = EmployeeSalaryAssignment.activeCtc(asgn, num(past.year), num(past.month));
-        if (Math.abs(shouldHave - num(past.annualCtc)) < 1) continue;   // paid on the right CTC
-        const redone = calc.computePay({
-            structure,
-            annualCtc: shouldHave,
-            overrides: asgn.componentOverrides || [],
+        if (shouldHave - paidAt < 1) continue;   // never claw back through arrears — that is a recovery decision
+
+        const days = {
+            structure, overrides: asgn.componentOverrides || [],
             lopDays: num(past.lopDays), notEmployedDays: num(past.notEmployedDays),
             workingDays: num(past.workingDays) || run.workingDays,
-            units: num(past.units),
-            roundTo: settings.roundTo,
-        });
-        const diff = r2(redone.netSalary - num(past.netSalary));
-        if (diff <= 0) continue;   // never claw back through arrears — that is a recovery decision
+            units: num(past.units), roundTo: settings.roundTo,
+        };
+        const was = calc.computePay({ ...days, annualCtc: paidAt });
+        const now = calc.computePay({ ...days, annualCtc: shouldHave });
+        const diff = r2((now.grossSalary - now.totalDeductions) - (was.grossSalary - was.totalDeductions));
+        if (diff <= 0) continue;
         total += diff;
-        settled.push(past._id);
+        settled.push({ id: String(past._id), ctc: shouldHave, amount: diff });
         detail.push({ month: num(past.month), year: num(past.year), label: shortLabel(past.month, past.year), amount: diff });
     }
     return { total: r2(total), settled, detail };
 }
 
 /**
+ * Take a run's arrears settlements back off the months it settled — on a
+ * recompute (for the employees being recomputed), a cancel and a delete. A
+ * cancelled or deleted run used to leave its stamps behind, and those months'
+ * arrears were then never paid by anybody.
+ */
+async function releaseArrears(runId, { exceptEmployees = [], q = null } = {}) {
+    const run = q || ((sql, p) => pool.query(sql, p));
+    const log = `(CASE WHEN jsonb_typeof("arrearsSettled") = 'array' THEN "arrearsSettled" ELSE '[]'::jsonb END)`;
+    await run(`
+      UPDATE ${qt(PayrollEntry)} SET
+        "arrearsSettled" = (SELECT jsonb_agg(x ORDER BY n) FROM jsonb_array_elements(${log}) WITH ORDINALITY t(x, n) WHERE x->>'run' <> $1::text),
+        "arrearsSettledBy" = (SELECT (x->>'run')::uuid FROM jsonb_array_elements(${log}) WITH ORDINALITY t(x, n) WHERE x->>'run' <> $1::text ORDER BY n DESC LIMIT 1)
+       WHERE ("arrearsSettledBy" = $1::uuid OR ${log} @> jsonb_build_array(jsonb_build_object('run', $1::text)))
+         AND NOT ("employee" = ANY($2::uuid[]))`, [String(runId), exceptEmployees.map(String)]);
+}
+
+/** Record what a run settled, on the months it settled. */
+async function stampArrears(runId, settled, q = null) {
+    const run = q || ((sql, p) => pool.query(sql, p));
+    for (const s of settled) {
+        await run(`
+          UPDATE ${qt(PayrollEntry)} SET
+            "arrearsSettled" = (CASE WHEN jsonb_typeof("arrearsSettled") = 'array' THEN "arrearsSettled" ELSE '[]'::jsonb END) || $2::jsonb,
+            "arrearsSettledBy" = $3::uuid
+           WHERE "_id" = $1::uuid`,
+            [String(s.id), JSON.stringify([{ run: String(runId), ctc: s.ctc, amount: s.amount }]), String(runId)]);
+    }
+}
+
+const isoDay = (d) => new Date(d).toISOString().slice(0, 10);
+
+/**
  * Unpaid days the staff attendance register says were not worked.
  *
- * Only days marked Absent with no approved leave behind them — a day covered
- * by leave is the Leave module's business and counting it here would dock the
- * same day twice. A Half-Day costs half a day. Empty unless the school has
- * switched this on, and empty on any failure: the register must never be the
- * reason a payroll run cannot be made.
+ * Only days with no approved leave behind them — a day covered by leave is the
+ * Leave module's business. That used to be assumed rather than checked: an
+ * approved HALF-DAY leave is written to the register as `Half-Day`, which is
+ * exactly the status counted here, so a paid half day cost half a day's pay and
+ * an unpaid one was charged twice. Every register row is now tested against the
+ * approved leave applications for the month.
+ *
+ * Empty unless the school has switched this on, and empty on any failure: the
+ * register must never be the reason a payroll run cannot be made.
  */
 async function attendanceLopFor(schoolId, year, month, settings) {
     if (settings.useAttendanceForLop !== true) return {};
     try {
         const { schoolModuleFlags } = require('../config/modules');
         const school = await School.findById(schoolId).select('modules').lean();
-        if (!schoolModuleFlags(school).attendance) return {};
+        const flags = schoolModuleFlags(school);
+        if (!flags.attendance) return {};
 
         const TeacherAttendance = require('../models/TeacherAttendance');
         const from = new Date(Date.UTC(year, month - 1, 1));
@@ -348,10 +456,26 @@ async function attendanceLopFor(schoolId, year, month, settings) {
         const rows = await TeacherAttendance.find({
             school: schoolId, date: { $gte: from, $lte: to },
             status: { $in: ['Absent', 'Half-Day'] },
-        }).select('teacher status').lean();
+        }).select('teacher status date').lean();
+
+        const onLeave = new Map();   // teacher -> [[fromDay, toDay]]
+        if (flags.leave && rows.length) {
+            const LeaveApplication = require('../models/LeaveApplication');
+            const apps = await LeaveApplication.find({
+                school: schoolId, status: 'approved',
+                fromDate: { $lte: to }, toDate: { $gte: from },
+            }).select('teacher fromDate toDate').lean();
+            for (const a of apps) {
+                const list2 = onLeave.get(String(a.teacher)) || [];
+                list2.push([isoDay(a.fromDate), isoDay(a.toDate)]);
+                onLeave.set(String(a.teacher), list2);
+            }
+        }
 
         const out = {};
         for (const r of rows) {
+            const day = isoDay(r.date);
+            if ((onLeave.get(String(r.teacher)) || []).some(([a, b]) => day >= a && day <= b)) continue;
             const cost = r.status === 'Half-Day' ? 0.5 : 1;
             out[String(r.teacher)] = r2((out[String(r.teacher)] || 0) + cost);
         }
@@ -382,21 +506,28 @@ function monthsLeftInFy(fy, month, year) {
 }
 
 /**
- * What every employee has been paid, and had deducted as tax, so far this
+ * What every employee has been PAID, and had deducted as tax, so far this
  * financial year — the context monthly TDS needs and a single month cannot know.
- * Only PUBLISHED months count: a draft is not money anybody has received.
+ *
+ * "Paid" means a payslip was issued: an entry held back in a published run has
+ * no payslip and was counted as income anyway. The taxable figure is the one
+ * each month recorded (`taxableIncome` — earnings flagged taxable, overtime,
+ * bonus, arrears); months written before that column existed fall back to
+ * gross + bonus + arrears, which is closer than the gross alone they used to
+ * be read as.
  */
-async function taxContext(schoolId, fy, month, year) {
+async function taxContext(schoolId, fy, month, year, { employeeId = null } = {}) {
     const { $, list } = params();
     const { rows } = await pool.query(`
       SELECT e."employee",
-             COALESCE(SUM(e."grossSalary"), 0) AS "paid",
+             COALESCE(SUM(COALESCE(e."taxableIncome", e."grossSalary" + COALESCE(e."arrears", 0) + COALESCE(e."bonus", 0))), 0) AS "paid",
              COALESCE(SUM((SELECT COALESCE(SUM((d->>'amount')::numeric), 0)
                              FROM jsonb_array_elements(COALESCE(e."deductions", '[]'::jsonb)) d
-                            WHERE upper(COALESCE(d->>'code', '')) = 'TDS')), 0) AS "tds"
-        FROM ${T(PayrollEntry)} e
-        JOIN ${T(PayrollRun)} r ON r."_id" = e."payrollRun"
-       WHERE e."school" = ${$(String(schoolId))} AND r."status" = 'published'
+                            WHERE upper(COALESCE(d->>'code', '')) = 'TDS'
+                               OR COALESCE(d->>'name', '') ~* '^(tds|income[ -]*tax)')), 0) AS "tds"
+        FROM ${qt(PayrollEntry)} e
+       WHERE e."school" = ${$(String(schoolId))} AND e."payslip" IS NOT NULL
+         ${employeeId ? `AND e."employee" = ${$(String(employeeId))}` : ''}
          AND make_date(e."year"::int, e."month"::int, 1)
              BETWEEN make_date(${$(fy.from.year)}::int, ${$(fy.from.month)}::int, 1)
                  AND make_date(${$(year)}::int, ${$(month)}::int, 1) - interval '1 day'
@@ -405,295 +536,356 @@ async function taxContext(schoolId, fy, month, year) {
 }
 
 /**
- * What each employee owes in advance instalments this month, and what they are
- * owed in approved expenses.
+ * What each employee owes on advances, and what they are owed in approved
+ * expenses — less whatever ANOTHER run has already spoken for.
  *
- * Both are read once for the whole run rather than per employee, and both are
- * capped by what is actually outstanding: an advance whose last instalment is
- * smaller than the rest takes only the remainder, and never more.
+ * Two open months each used to take the same one-instalment advance and each
+ * pay the same claim: the first to publish moved the ledger, the second
+ * published a payslip the ledger no longer backed. Anything sitting on an
+ * unpaid entry of another live run is treated as taken.
  */
 async function advancesAndClaims(schoolId, run) {
     const key = (y, m) => y * 12 + m;
-    const [advances, claims] = await Promise.all([
+    const [advances, claims, spoken] = await Promise.all([
         SalaryAdvance.find({ school: schoolId, status: 'active' }).lean(),
         SalaryClaim.find({ school: schoolId, status: 'approved' }).lean(),
+        pool.query(`
+          SELECT e."advanceTaken", e."claimsPaid"
+            FROM ${qt(PayrollEntry)} e
+            JOIN ${qt(PayrollRun)} r ON r."_id" = e."payrollRun"
+           WHERE e."school" = $1 AND r."_id" <> $2 AND r."status" NOT IN ('cancelled', 'failed')
+             AND e."payslip" IS NULL
+             AND (e."advanceTaken" IS NOT NULL OR e."claimsPaid" IS NOT NULL)`, [String(schoolId), String(run._id)]),
     ]);
+    const reserved = new Map();
+    const claimed = new Set();
+    for (const row of spoken.rows) {
+        for (const t of (Array.isArray(row.advanceTaken) ? row.advanceTaken : [])) {
+            reserved.set(String(t.id), r2((reserved.get(String(t.id)) || 0) + num(t.amount)));
+        }
+        for (const id of (Array.isArray(row.claimsPaid) ? row.claimsPaid : [])) claimed.add(String(id));
+    }
 
-    const owed = new Map();     // employee -> { amount, advances: [{id, amount}] }
+    const owed = new Map();     // employee -> [{ id, kind, take, outstanding, started }]
     for (const a of advances) {
-        // Recovery has not started yet.
-        if (key(num(a.startYear), num(a.startMonth)) > key(run.year, run.month)) continue;
-        const outstanding = r2(num(a.amount) - num(a.recovered));
+        const outstanding = r2(num(a.amount) - num(a.recovered) - (reserved.get(String(a._id)) || 0));
         if (outstanding <= 0) continue;
         const instalment = num(a.instalmentAmount) > 0
             ? num(a.instalmentAmount)
             : r2(num(a.amount) / Math.max(1, num(a.instalments)));
-        const take = r2(Math.min(instalment, outstanding));
-        if (take <= 0) continue;
-        const bucket = owed.get(String(a.employee)) || { amount: 0, advances: [] };
-        bucket.amount = r2(bucket.amount + take);
-        bucket.advances.push({ id: a._id, amount: take, kind: a.kind });
-        owed.set(String(a.employee), bucket);
+        const list2 = owed.get(String(a.employee)) || [];
+        list2.push({
+            id: String(a._id), kind: a.kind, outstanding,
+            take: r2(Math.min(instalment, outstanding)),
+            // Recovery has not begun for one that starts in a later month.
+            started: key(num(a.startYear), num(a.startMonth)) <= key(run.year, run.month),
+        });
+        owed.set(String(a.employee), list2);
     }
 
-    const due = new Map();      // employee -> { amount, claims: [id] }
+    const due = new Map();      // employee -> { amount, taxable, claims: [id] }
     for (const c of claims) {
-        const bucket = due.get(String(c.employee)) || { amount: 0, claims: [] };
+        if (claimed.has(String(c._id))) continue;
+        const bucket = due.get(String(c.employee)) || { amount: 0, taxable: 0, claims: [] };
         bucket.amount = r2(bucket.amount + num(c.amount));
-        bucket.claims.push(c._id);
+        // The claim's own flag — it was stored and never read.
+        if (c.taxable === true) bucket.taxable = r2(bucket.taxable + num(c.amount));
+        bucket.claims.push(String(c._id));
         due.set(String(c.employee), bucket);
     }
     return { owed, due };
 }
 
 /**
- * Compute every line of a run and write the entries.
- *
- * `preserve` keeps hand-edited and held entries exactly as they are, which is
- * what makes "Recompute" safe to press after fixing one person's CTC.
+ * Unpaid leave for LAST month that was approved after last month was paid.
+ * Nothing recovers it on its own — the month is published and a payslip is a
+ * record — so the run says so, and the admin decides whether to dock it here.
  */
-async function computeRunEntries(schoolId, run, settings, { preserve = false, actorId = null } = {}) {
-    const { assignments, duplicates } = await eligibleAssignments(schoolId, run.year, run.month);
-    const structureIds = [...new Set(assignments.map(a => String(a.structure)).filter(Boolean))];
-    const structures = structureIds.length
-        ? await SalaryStructure.find({ _id: { $in: structureIds }, school: schoolId }).lean()
-        : [];
-    const structById = new Map(structures.map(s => [String(s._id), s]));
+async function lateLopFor(schoolId, run, settings) {
+    if (settings.useLeaveForLop === false) return new Map();
+    try {
+        const prev = prevMonth(run.year, run.month);
+        const { rows } = await pool.query(`
+          SELECT e."employee", e."lopDays", e."lopSource"
+            FROM ${qt(PayrollEntry)} e
+           WHERE e."school" = $1 AND e."year" = $2 AND e."month" = $3 AND e."payslip" IS NOT NULL`,
+            [String(schoolId), prev.year, prev.month]);
+        if (!rows.length) return new Map();
+        const nowSays = await leaveLopDaysFor(schoolId, prev.year, prev.month);
+        const out = new Map();
+        for (const e of rows) {
+            if (e.lopSource === 'manual') continue;
+            const extra = r2(num(nowSays[String(e.employee)]) - num(e.lopDays));
+            if (extra >= 0.5) out.set(String(e.employee), { days: extra, label: monthLabel(prev.month, prev.year) });
+        }
+        return out;
+    } catch (err) {
+        console.warn('[PayrollAdmin] late LOP check skipped:', err.message);
+        return new Map();
+    }
+}
 
-    const [lopFromLeave, lopFromRegister] = await Promise.all([
-        settings.useLeaveForLop === false ? {} : leaveLopDaysFor(schoolId, run.year, run.month),
-        attendanceLopFor(schoolId, run.year, run.month, settings),
-    ]);
-
-    const { owed, due } = await advancesAndClaims(schoolId, run);
-    const advanceTaken = [];   // [{ id, amount, employee }] — written back after the entries
-    const claimsPaid   = [];
-
-    // Income tax needs the year, not the month — see services/incomeTax.js.
+/** Everything a run's pricing reads that is the same for every employee in it. */
+async function runContext(schoolId, run, settings, { employeeId = null } = {}) {
     const taxOn = tax.config(settings).regime !== 'none';
     const fy = fyRange(settings.financialYearStartMonth, run.month, run.year);
-    const ytd = taxOn ? await taxContext(schoolId, fy, run.month, run.year) : new Map();
-    const monthsLeft = monthsLeftInFy(fy, run.month, run.year);
+    const [lopFromLeave, lopFromRegister, ledger, ytd, lateLop] = await Promise.all([
+        settings.useLeaveForLop === false ? {} : leaveLopDaysFor(schoolId, run.year, run.month),
+        attendanceLopFor(schoolId, run.year, run.month, settings),
+        advancesAndClaims(schoolId, run),
+        taxOn ? taxContext(schoolId, fy, run.month, run.year, { employeeId }) : new Map(),
+        lateLopFor(schoolId, run, settings),
+    ]);
+    return {
+        schoolId, run, settings, taxOn, fy, ytd, lateLop,
+        monthsLeft: monthsLeftInFy(fy, run.month, run.year),
+        lopFromLeave, lopFromRegister, owed: ledger.owed, due: ledger.due,
+    };
+}
 
-    const existing = preserve
-        ? await PayrollEntry.find({ payrollRun: run._id }).lean()
-        : [];
-    const keepById = new Map(existing.filter(e => e.isEdited || e.isOnHold).map(e => [String(e.employee), e]));
+/**
+ * Price ONE employee's month — the only place an entry is put together.
+ *
+ * The run, an edit to one line and a settlement all come through here, so a
+ * figure cannot be right when the run computes it and wrong after somebody
+ * touches it. (Editing an entry used to re-run the pay engine alone, which
+ * silently dropped that person's TDS and left it dropped: the entry was then
+ * "hand-edited" and every later recompute stepped round it.)
+ *
+ * `inputs` are the things a person typed on the entry; anything absent is
+ * derived. `settle` turns the month into a leaver's last one.
+ *
+ * @returns {{ doc, warnings, arrears }} or {{ skip }}
+ */
+async function priceEmployee(ctx, a, structure, { inputs = {}, settle = null } = {}) {
+    const { schoolId, run, settings } = ctx;
+    const emp = String(a.employee);
+    const byRate = structure.payBasis === 'rate';
+
+    const annualCtc = EmployeeSalaryAssignment.activeCtc(a, run.year, run.month);
+    if (!byRate && !(annualCtc > 0)) return { skip: 'No CTC set for this month' };
+
+    // Leave and the register are added, not maxed: they describe different
+    // days — attendanceLopFor() drops every day an approved leave covers.
+    const fromLeave    = num(ctx.lopFromLeave[emp] || 0);
+    const fromRegister = num(ctx.lopFromRegister[emp] || 0);
+    const typedLop = inputs.lopDays !== undefined;
+    const lopDays = typedLop ? num(inputs.lopDays) : r2(fromLeave + fromRegister);
+    const lopSource = typedLop ? (inputs.lopSource || (lopDays > 0 ? 'manual' : 'none'))
+        : fromLeave > 0 ? 'leave'
+        : fromRegister > 0 ? 'attendance' : 'none';
+    const notEmployedDays = notEmployedDaysFor(
+        settle ? { effectiveDate: a.effectiveDate, endDate: settle.lastDay } : a,
+        run.year, run.month, run.workingDays);
+    const units = num(inputs.units);
+
+    // A back-dated raise settles here, unless a figure was typed by hand.
+    const backPay = inputs.arrears !== undefined
+        ? { total: num(inputs.arrears), settled: [], detail: [] }
+        : await arrearsFor(schoolId, a, structure, run, settings);
+
+    const pay = calc.computePay({
+        structure, annualCtc,
+        overrides: a.componentOverrides || [],
+        lopDays, notEmployedDays,
+        workingDays: run.workingDays,
+        units,
+        arrears: backPay.total,
+        bonus: num(inputs.bonus),
+        otherDeductions: num(inputs.otherDeductions),
+        roundTo: settings.roundTo,
+    });
 
     /**
-     * Release the past months this run had previously settled BEFORE anything
-     * is recomputed. A recompute that ran with its own stamps still in place
-     * would see those months as already paid and quietly drop the arrears.
+     * Overtime is an EARNING (taxable, part of gross). A reimbursement is not
+     * earnings at all — it is money being handed back — so it is added to the
+     * net without touching gross. An advance instalment is a recovery, taken
+     * after everything else and capped by what is left to pay.
      */
-    await PayrollEntry.updateMany({ arrearsSettledBy: run._id }, { arrearsSettledBy: null });
+    const otRate  = num(inputs.overtimeRate) > 0 ? num(inputs.overtimeRate) : num(structure.overtimeRate);
+    const otHours = num(inputs.overtimeHours);
+    const otAmount = calc.roundAmount(otHours * otRate, settings.roundTo);
+    if (otAmount > 0) {
+        pay.earnings.push({ name: 'Overtime', code: 'OT', amount: otAmount, fullAmount: otAmount });
+        pay.grossSalary = r2(pay.grossSalary + otAmount);
+    }
+
+    const claim = ctx.due.get(emp);
+    const reimbursement = claim ? claim.amount : 0;
+
+    /**
+     * Income tax. Bonus, arrears and taxable claims are income like any other
+     * and were never taxed: they sat outside gross, so the projection could
+     * not see them. They count ONCE — not multiplied over the months left the
+     * way the regular month is. A hand-set TDS line is replaced, not joined.
+     */
+    const oneOff = r2(pay.arrears + pay.bonus + (claim ? claim.taxable : 0));
+    const regular = tax.taxableEarnings(pay.earnings, structure);
+    let tdsAmount = 0, taxWorking = null;
+    // Rate-paid staff were never taxed at all. They are now, on the same
+    // projection — unless their structure carries its own TDS line (a flat
+    // 10% on a guest lecturer's fees), which is then the school's choice and
+    // is left as it is.
+    const ownTds = byRate && pay.deductions.some(isTdsLine);
+    if (ctx.taxOn && !ownTds) {
+        const seen = ctx.ytd.get(emp) || { paid: 0, tds: 0 };
+        // Someone leaving before the year ends is not projected past their last month.
+        let left = ctx.monthsLeft;
+        const lastDay = settle?.lastDay || a.endDate;
+        if (lastDay) {
+            const d = new Date(lastDay);
+            left = Math.max(1, Math.min(left, (d.getUTCFullYear() * 12 + d.getUTCMonth() + 1) - (run.year * 12 + run.month) + 1));
+        }
+        const due = tax.monthlyTds({
+            taxablePaidToDate: seen.paid, taxableThisMonth: regular, tdsPaidToDate: seen.tds,
+            monthsRemaining: left, settings, oneOffThisMonth: oneOff,
+            declared: num(a.declaredDeductions),
+        });
+        pay.deductions = pay.deductions.filter(d => !isTdsLine(d));
+        // Tax cannot be taken from money that is not there this month.
+        tdsAmount = calc.roundAmount(Math.min(due.amount, Math.max(0, pay.grossSalary + oneOff)), settings.roundTo);
+        if (tdsAmount > 0) pay.deductions.push({ name: 'Income Tax (TDS)', code: 'TDS', amount: tdsAmount, fullAmount: tdsAmount });
+        taxWorking = due.projection ? { ...due.projection, thisMonthTds: tdsAmount, fy: ctx.fy.label } : null;
+    } else {
+        tdsAmount = r2(pay.deductions.filter(isTdsLine).reduce((t, d) => t + num(d.amount), 0));
+    }
+    pay.totalDeductions = r2(pay.deductions.reduce((t, d) => t + num(d.amount), 0));
+
+    const settlementAmount = settle ? r2(num(settle.leaveEncashment) + num(settle.gratuity)) : 0;
+
+    // Recover what the month can actually bear, and no more. A settlement
+    // takes everything still outstanding; an ordinary month, the instalments
+    // whose recovery has begun.
+    const advances = (ctx.owed.get(emp) || [])
+        .map(x => ({ ...x, want: settle ? x.outstanding : (x.started ? x.take : 0) }))
+        .filter(x => x.want > 0);
+    const wantedTotal = r2(advances.reduce((t, x) => t + x.want, 0));
+    const payable = r2(pay.grossSalary - pay.totalDeductions + pay.arrears + pay.bonus + reimbursement + settlementAmount - pay.otherDeductions);
+    const advanceRecovery = r2(Math.min(wantedTotal, Math.max(0, payable)));
+    const advanceTaken = [];
+    let left = advanceRecovery;
+    for (const one of advances) {
+        if (left <= 0) break;
+        const take = r2(Math.min(one.want, left));
+        advanceTaken.push({ id: one.id, amount: take, kind: one.kind });
+        left = r2(left - take);
+    }
+
+    const warnings = [];
+    const warn = (kind, message) => warnings.push({ employee: emp, name: a.employeeName, kind, message });
+    if (wantedTotal > 0 && advanceRecovery < wantedTotal) {
+        warn('advance_short', `Only ${inr(advanceRecovery)} of ${inr(wantedTotal)} due on advances could be recovered this month`);
+    }
+    if (pay.overpaysCtc) {
+        warn('over_ctc', `Paid ${inr(pay.monthlyCost)} against a monthly CTC of ${inr(pay.monthlyCtc)} — the “${structure.name}” structure's fixed components come to more than this CTC`);
+    }
+    if (pay.zeroPay && !settle) {
+        warn('zero_pay', notEmployedDays >= run.workingDays
+            ? 'Not on the payroll for any day of this month'
+            : 'Every working day of this month is unpaid leave');
+    }
+    if (byRate && !(units > 0)) {
+        const unitWord = { class: 'classes', hour: 'hours', day: 'days' }[structure.rateUnit] || 'units';
+        warn('no_units', `No ${unitWord} entered — this entry pays ₹0 until the ${unitWord} worked are typed in`);
+    }
+    if (backPay.detail.length) {
+        warn('arrears', `${inr(backPay.total)} of arrears for ${backPay.detail.map(d => d.label).join(', ')}`);
+    }
+    const late = ctx.lateLop.get(emp);
+    if (late && !typedLop) {
+        warn('late_lop', `${late.days} unpaid leave day${late.days === 1 ? '' : 's'} in ${late.label} ${late.days === 1 ? 'was' : 'were'} approved after ${late.label} was paid. Add ${late.days === 1 ? 'it' : 'them'} to this month's loss-of-pay days if ${late.days === 1 ? 'it' : 'they'} should be recovered.`);
+    }
+
+    const doc = settleNet({
+        payrollRun: run._id, employee: a.employee, school: schoolId,
+        month: run.month, year: run.year,
+        salaryAssignment: a._id, structure: structure._id,
+        annualCtc: pay.annualCtc,
+        earnings: pay.earnings, deductions: pay.deductions,
+        employerContributions: pay.employerContributions,
+        grossSalary: pay.grossSalary, totalDeductions: pay.totalDeductions,
+        employerCost: pay.employerCost,
+        workingDays: pay.workingDays, paidDays: pay.paidDays,
+        notEmployedDays: pay.notEmployedDays,
+        lopDays: pay.lopDays, lopAmount: pay.lopAmount, lopSource,
+        units, rate: byRate ? num(structure.rate) : 0,
+        arrears: pay.arrears, bonus: pay.bonus, otherDeductions: pay.otherDeductions,
+        overtimeHours: otHours, overtimeRate: otRate, overtimeAmount: otAmount,
+        reimbursement, advanceRecovery,
+        advanceTaken: advanceTaken.length ? advanceTaken : null,
+        claimsPaid: claim && reimbursement > 0 ? claim.claims : null,
+        settlementAmount,
+        settlement: settle ? { ...settle.record, lastDay: settle.lastDay } : null,
+        taxableIncome: r2(regular + oneOff), tds: tdsAmount, taxWorking,
+        remarks: inputs.remarks || '',
+        isOnHold: false, isEdited: false,
+    }, settings);
+
+    return { doc, warnings, arrears: backPay.settled };
+}
+
+/** The structures a set of assignments needs, by id. */
+async function structuresFor(schoolId, assignments) {
+    const ids = [...new Set(assignments.map(a => String(a.structure)).filter(Boolean))];
+    const rows = ids.length ? await SalaryStructure.find({ _id: { $in: ids }, school: schoolId }).lean() : [];
+    return new Map(rows.map(s => [String(s._id), s]));
+}
+
+/**
+ * Compute every line of a run and write the entries.
+ *
+ * `preserve` keeps hand-edited and held entries exactly as they are — their
+ * figures, the advances and claims they carry and the arrears they settled —
+ * which is what makes "Recompute" safe to press after fixing one person's CTC.
+ *
+ * Everything is priced first and written in ONE transaction: the old entries
+ * out, the new ones in, the arrears stamps moved. A failure half-way used to
+ * leave a run with some of its people deleted and none of them replaced.
+ */
+async function computeRunEntries(schoolId, run, settings, { preserve = false, actorId = null } = {}) {
+    const existing = await PayrollEntry.find({ payrollRun: run._id }).lean();
+    const kept = preserve ? existing.filter(e => e.isEdited || e.isOnHold) : [];
+    const keptEmployees = new Set(kept.map(e => String(e.employee)));
+
+    const { assignments, duplicates } = await eligibleAssignments(schoolId, run.year, run.month);
+    const [structById, ctx] = await Promise.all([
+        structuresFor(schoolId, assignments),
+        runContext(schoolId, run, settings),
+    ]);
 
     const skipped = [...duplicates];
     const warnings = [];
-    const arrearsToStamp = [];
+    const settled = [];
     const docs = [];
 
     for (const a of assignments) {
+        const skip = (reason) => skipped.push({ employee: String(a.employee), name: a.employeeName, reason });
         const structure = structById.get(String(a.structure));
-        if (!structure) {
-            skipped.push({ employee: String(a.employee), name: a.employeeName, reason: 'Salary structure missing or deleted' });
-            continue;
-        }
-        if (structure.isActive === false) {
-            skipped.push({ employee: String(a.employee), name: a.employeeName, reason: `Structure "${structure.name}" is inactive` });
-            continue;
-        }
-        const kept = keepById.get(String(a.employee));
-        if (kept) continue;   // hand-edited or held: leave untouched
+        if (!structure) { skip('Salary structure missing or deleted'); continue; }
+        if (structure.isActive === false) { skip(`Structure "${structure.name}" is inactive`); continue; }
+        if (keptEmployees.has(String(a.employee))) continue;   // hand-edited or held: leave untouched
 
-        const annualCtc = EmployeeSalaryAssignment.activeCtc(a, run.year, run.month);
-        if (structure.payBasis !== 'rate' && !(annualCtc > 0)) {
-            skipped.push({ employee: String(a.employee), name: a.employeeName, reason: 'No CTC set for this month' });
-            continue;
-        }
-
-        const manualLop = existing.find(e => String(e.employee) === String(a.employee) && e.lopSource === 'manual');
-        // Leave and the register are added, not maxed: they describe different
-        // days. attendanceLopFor() already excludes days covered by leave, so
-        // nothing is counted twice.
-        const fromLeave    = num(lopFromLeave[String(a.employee)] || 0);
-        const fromRegister = num(lopFromRegister[String(a.employee)] || 0);
-        const lopDays = manualLop ? num(manualLop.lopDays) : r2(fromLeave + fromRegister);
-        const lopSource = manualLop ? 'manual'
-            : fromRegister > 0 && fromLeave > 0 ? 'leave'
-            : fromRegister > 0 ? 'attendance'
-            : fromLeave > 0 ? 'leave' : 'none';
-        const prior   = existing.find(e => String(e.employee) === String(a.employee));
-        const notEmployedDays = notEmployedDaysFor(a, run.year, run.month, run.workingDays);
-
-        // A back-dated raise settles here, unless the admin has already typed
-        // an arrears figure by hand on this entry.
-        const backPay = prior && prior.isEdited
-            ? { total: num(prior.arrears), settled: [], detail: [] }
-            : await arrearsFor(schoolId, a, structure, run, settings);
-        if (backPay.settled.length) arrearsToStamp.push(...backPay.settled);
-
-        const pay = calc.computePay({
-            structure,
-            annualCtc,
-            overrides: a.componentOverrides || [],
-            lopDays, notEmployedDays,
-            workingDays: run.workingDays,
-            units: prior ? num(prior.units) : 0,
-            arrears: backPay.total,
-            bonus: prior ? num(prior.bonus) : 0,
-            otherDeductions: prior ? num(prior.otherDeductions) : 0,
-            roundTo: settings.roundTo,
-        });
-
-        /**
-         * Overtime, expenses and advance instalments.
-         *
-         * Overtime is an EARNING (taxable, part of gross). A reimbursement is
-         * not earnings at all — it is money being handed back — so it is added
-         * to the net without touching gross or tax. An advance instalment is a
-         * recovery, taken after everything else, and capped by what is left to
-         * pay so nobody is taken below zero.
-         */
-        const otRate = prior && num(prior.overtimeRate) > 0 ? num(prior.overtimeRate) : num(structure.overtimeRate);
-        const otHours = prior ? num(prior.overtimeHours) : 0;
-        const otAmount = calc.roundAmount(otHours * otRate, settings.roundTo);
-        if (otAmount > 0) {
-            pay.earnings.push({ name: 'Overtime', code: 'OT', amount: otAmount, fullAmount: otAmount });
-            pay.grossSalary = r2(pay.grossSalary + otAmount);
-        }
-
-        /**
-         * TDS replaces any hand-set TDS line rather than joining it: a
-         * structure that carries a flat "TDS ₹0" placeholder would otherwise
-         * deduct tax twice, once as the placeholder and once as the real thing.
-         */
-        if (taxOn && structure.payBasis !== 'rate') {
-            const seen = ytd.get(String(a.employee)) || { paid: 0, tds: 0 };
-            const thisMonthTaxable = tax.taxableEarnings(pay.earnings, structure);
-            const due = tax.monthlyTds({
-                taxablePaidToDate: seen.paid,
-                taxableThisMonth: thisMonthTaxable,
-                tdsPaidToDate: seen.tds,
-                monthsRemaining: monthsLeft,
-                settings,
-            });
-            pay.deductions = pay.deductions.filter(d => String(d.code || '').toUpperCase() !== 'TDS');
-            if (due.amount > 0) {
-                pay.deductions.push({
-                    name: 'Income Tax (TDS)', code: 'TDS',
-                    amount: calc.roundAmount(due.amount, settings.roundTo),
-                    fullAmount: calc.roundAmount(due.amount, settings.roundTo),
-                });
-            }
-            pay.totalDeductions = r2(pay.deductions.reduce((t, d) => t + num(d.amount), 0));
-            const raw = pay.grossSalary - pay.totalDeductions + pay.arrears + pay.bonus - pay.otherDeductions;
-            pay.netSalary   = calc.roundAmount(Math.max(0, raw), settings.roundTo);
-            pay.unrecovered = calc.roundAmount(Math.max(0, -raw), settings.roundTo);
-        }
-
-        const claim = due.get(String(a.employee));
-        const reimbursement = claim ? claim.amount : 0;
-
-        // Recover what the month can actually bear, and no more.
-        const wanted = owed.get(String(a.employee));
-        const payable = r2(pay.grossSalary - pay.totalDeductions + pay.arrears + pay.bonus + reimbursement - pay.otherDeductions);
-        const advanceRecovery = wanted ? r2(Math.min(wanted.amount, Math.max(0, payable))) : 0;
-        if (wanted && advanceRecovery > 0) {
-            // Instalments are taken in order until the month's capacity runs out.
-            let left = advanceRecovery;
-            for (const one of wanted.advances) {
-                if (left <= 0) break;
-                const take = r2(Math.min(one.amount, left));
-                advanceTaken.push({ id: one.id, amount: take, employee: a.employee });
-                left = r2(left - take);
-            }
-        }
-        if (claim && reimbursement > 0) claimsPaid.push(...claim.claims);
-
-        const finalRaw = r2(payable - advanceRecovery);
-        pay.netSalary   = calc.roundAmount(Math.max(0, finalRaw), settings.roundTo);
-        pay.unrecovered = calc.roundAmount(Math.max(0, -finalRaw), settings.roundTo);
-
-        if (wanted && advanceRecovery < wanted.amount) {
-            warnings.push({
-                employee: String(a.employee), name: a.employeeName, kind: 'advance_short',
-                message: `Only ${inr(advanceRecovery)} of a ${inr(wanted.amount)} advance instalment could be recovered this month`,
-            });
-        }
-
-        if (pay.overpaysCtc) {
-            warnings.push({
-                employee: String(a.employee), name: a.employeeName, kind: 'over_ctc',
-                message: `Paid ${inr(pay.monthlyCost)} against a monthly CTC of ${inr(pay.monthlyCtc)} — the “${structure.name}” structure's fixed components come to more than this CTC`,
-            });
-        }
-        if (pay.zeroPay) {
-            warnings.push({
-                employee: String(a.employee), name: a.employeeName, kind: 'zero_pay',
-                message: notEmployedDays >= run.workingDays
-                    ? 'Not on the payroll for any day of this month'
-                    : 'Every working day of this month is unpaid leave',
-            });
-        }
-        if (backPay.total > 0) {
-            warnings.push({
-                employee: String(a.employee), name: a.employeeName, kind: 'arrears',
-                message: `${inr(backPay.total)} of arrears for ${backPay.detail.map(d => d.label).join(', ')}`,
-            });
-        }
-
-        docs.push({
-            payrollRun: run._id, employee: a.employee, school: schoolId,
-            month: run.month, year: run.year,
-            salaryAssignment: a._id, structure: structure._id,
-            annualCtc: pay.annualCtc,
-            earnings: pay.earnings, deductions: pay.deductions,
-            employerContributions: pay.employerContributions,
-            grossSalary: pay.grossSalary, totalDeductions: pay.totalDeductions,
-            employerCost: pay.employerCost, netSalary: pay.netSalary,
-            workingDays: pay.workingDays, paidDays: pay.paidDays,
-            notEmployedDays: pay.notEmployedDays,
-            lopDays: pay.lopDays, lopAmount: pay.lopAmount,
-            lopSource,
-            units: prior ? num(prior.units) : 0,
-            rate: structure.payBasis === 'rate' ? num(structure.rate) : 0,
-            arrears: pay.arrears, bonus: pay.bonus, otherDeductions: pay.otherDeductions,
-            overtimeHours: otHours, overtimeRate: otRate, overtimeAmount: otAmount,
-            reimbursement, advanceRecovery,
-            unrecovered: pay.unrecovered,
-            remarks: prior ? (prior.remarks || '') : '',
-            isOnHold: false, isEdited: false,
-        });
+        const priced = await priceEmployee(ctx, a, structure);
+        if (priced.skip) { skip(priced.skip); continue; }
+        docs.push(priced.doc);
+        warnings.push(...priced.warnings);
+        settled.push(...priced.arrears);
     }
 
-    // Replace everything that is not being preserved, so an employee whose
-    // assignment ended stops appearing in a recomputed run.
-    const keepIds = [...keepById.values()].map(e => e._id);
-    if (existing.length) {
-        const doomed = existing.filter(e => !keepIds.some(id => String(id) === String(e._id))).map(e => e._id);
-        if (doomed.length) await PayrollEntry.deleteMany({ _id: { $in: doomed } });
-    }
-    if (docs.length) await PayrollEntry.insertMany(docs);
-
-    // Stamp the past months whose arrears this run settles, so a later
-    // recompute cannot pay the same difference a second time.
-    if (arrearsToStamp.length) {
-        await PayrollEntry.updateMany({ _id: { $in: arrearsToStamp } }, { arrearsSettledBy: run._id });
-    }
-
-    /**
-     * Advances and claims are only MARKED here — the run has computed what it
-     * will take and pay. The actual ledger movement happens on publish, so a
-     * draft that is recomputed or thrown away never leaves an advance
-     * half-recovered or a claim marked paid for a month nobody was paid in.
-     */
-    await PayrollRun.updateOne({ _id: run._id }, {
-        pendingRecovery: advanceTaken.length ? advanceTaken.map(x => ({ ...x, id: String(x.id), employee: String(x.employee) })) : null,
-        pendingClaims: claimsPaid.length ? claimsPaid.map(String) : null,
+    const doomed = existing.filter(e => !keptEmployees.has(String(e.employee))).map(e => String(e._id));
+    await pool.withTransaction(async (q) => {
+        await releaseArrears(run._id, { exceptEmployees: [...keptEmployees], q });
+        if (doomed.length) await q(`DELETE FROM ${qt(PayrollEntry)} WHERE "_id" = ANY($1::uuid[])`, [doomed]);
+        for (const doc of docs) await insert(PayrollEntry, doc, { q });
+        await stampArrears(run._id, settled, q);
     });
 
+    // The run-level lists are written at publish now, from the entries that
+    // were actually paid. Clear whatever an earlier computation left.
+    await patch(PayrollRun, run._id, { pendingRecovery: null, pendingClaims: null });
+
     await refreshRunTotals(run._id, { skipped, warnings, actorId });
-    return { count: docs.length + keepIds.length, skipped, warnings };
+    return { count: docs.length + kept.length, skipped, warnings };
 }
 
 /**
@@ -733,7 +925,10 @@ async function refreshRunTotals(runId, { skipped, warnings, actorId } = {}) {
     if (skipped !== undefined) update.skipped = skipped && skipped.length ? skipped : null;
     if (warnings !== undefined) update.warnings = warnings && warnings.length ? warnings : null;
     if (actorId) update.processedBy = actorId;
-    await PayrollRun.updateOne({ _id: runId }, update);
+    // patch(), not updateOne(): the ORM's update reads the row and writes every
+    // column back, which is how a re-sum used to undo a status change made in
+    // the same moment (and the other way round).
+    await patch(PayrollRun, runId, update);
     return update;
 }
 
@@ -779,8 +974,8 @@ exports.getOverview = async (req, res) => {
             workforce(req.schoolId),
             // Active assignments now, and how many were already in force a month ago.
             pool.query(`
-              SELECT COUNT(*) FILTER (WHERE COALESCE(a."isActive", true))::int AS "active",
-                     COUNT(*) FILTER (WHERE COALESCE(a."isActive", true) AND a."effectiveDate" <= ${p1.$(new Date(Date.UTC(prev.year, prev.month, 0, 23, 59, 59)))})::int AS "activeBefore"
+              SELECT COUNT(*) FILTER (WHERE ${ASSIGN_STATE} = 'active')::int AS "active",
+                     COUNT(*) FILTER (WHERE ${ASSIGN_STATE} = 'active' AND a."effectiveDate" <= ${p1.$(new Date(Date.UTC(prev.year, prev.month, 0, 23, 59, 59)))})::int AS "activeBefore"
                 FROM ${T(EmployeeSalaryAssignment)} a
                 JOIN ${T(User)} u ON u."_id" = a."employee"
                WHERE a."school" = ${p1.$(String(req.schoolId))} AND ${employeeWhere(p1.$, req.schoolId, 'u')}`, p1.list),
@@ -878,7 +1073,8 @@ exports.getOverview = async (req, res) => {
                 subtitle: tax.config(settings).regime === 'none'
                     ? 'Set up a tax regime first'
                     : `For FY ${fyRange(settings.financialYearStartMonth, month, year).label}`,
-                due: new Date(Date.UTC(fyEndYear, 4, 15)),
+                // Form 16 is due by 15 June after the year ends (month index 5).
+                due: new Date(Date.UTC(fyEndYear, 5, 15)),
                 // The dashboard card now points at a report that exists.
                 to: '/admin/payroll/reports?type=form16',
                 ready: tax.config(settings).regime !== 'none',
@@ -891,7 +1087,7 @@ exports.getOverview = async (req, res) => {
             academicYear: yearOut(acYear), academicYears: years.map(yearOut),
             settings: publicSettings(settings),
             tiles: {
-                totalEmployees: { value: staff.total, deltaPct: 0, caption: 'Active staff members' },
+                totalEmployees: { value: staff.total, deltaPct: null, caption: 'Active staff members' },
                 activeAssignments: {
                     value: num(assignRows.rows[0]?.active),
                     deltaPct: change(num(assignRows.rows[0]?.active), num(assignRows.rows[0]?.activeBefore)),
@@ -951,6 +1147,8 @@ function shapeRun(r) {
         approvedByName: r.approvedByName || null,
         publishedByName: r.publishedByName || null,
         createdAt: r.createdAt, publishedAt: r.publishedAt, payDate: r.payDate,
+        paidOn: r.paidOn || null, paymentRef: r.paymentRef || '',
+        reversalReason: r.reversalReason || '',
     };
 }
 
@@ -978,7 +1176,10 @@ async function approverCount(schoolId) {
        WHERE ${employeeWhere($, schoolId, 'u')}
          AND (u."role" = 'school_admin'
               OR COALESCE(d."permissions" ->> 'payroll', '') = 'admin')`, list);
-    return num(rows[0]?.n);
+    let fromService = 0;
+    try { fromService = (await require('../services/designationService').moduleAdminIds(schoolId, 'payroll')).length; }
+    catch { /* the count below stands */ }
+    return Math.max(num(rows[0]?.n), fromService);
 }
 
 const publicSettings = (s) => ({
@@ -993,6 +1194,8 @@ const publicSettings = (s) => ({
     autoOpenRun: s.autoOpenRun === true, autoOpenDay: num(s.autoOpenDay) || 25,
     remindBeforePayDay: s.remindBeforePayDay === true, remindDaysBefore: num(s.remindDaysBefore) || 3,
     payslipPrefix: s.payslipPrefix || 'PS', payslipNote: s.payslipNote || '',
+    protectPayslipPdf: s.protectPayslipPdf === true,
+    employerTan: s.employerTan || '', employerPan: s.employerPan || '',
     bankName: s.bankName || '', bankAccountNumber: s.bankAccountNumber || '', bankIfsc: s.bankIfsc || '',
     tax: tax.config(s),
 });
@@ -1113,12 +1316,14 @@ exports.getRun = async (req, res) => {
                  tp."employeeId" AS "empCode", tp."department", tp."designation",
                  tp."bankAccountNumber", tp."bankIfsc",
                  s."name" AS "structureName", s."type" AS "structureType",
-                 p."_id" AS "payslipId", p."slipNo"
+                 p."_id" AS "payslipId", p."slipNo", p."notificationSent" AS "slipNotified",
+                 COALESCE(pa."paymentMode", 'bank_transfer') AS "paymentMode"
             FROM ${T(PayrollEntry)} e
             JOIN ${T(User)} u ON u."_id" = e."employee"
             LEFT JOIN ${T(TeacherProfile)} tp ON tp."user" = u."_id" AND tp."school" = e."school"
             LEFT JOIN ${T(SalaryStructure)} s ON s."_id" = e."structure"
             LEFT JOIN ${T(Payslip)} p ON p."payrollEntry" = e."_id"
+            LEFT JOIN ${T(EmployeeSalaryAssignment)} pa ON pa."_id" = e."salaryAssignment"
            WHERE ${ew.join(' AND ')}
            ORDER BY u."name" ASC`, e.list);
 
@@ -1158,12 +1363,308 @@ function shapeEntry(e) {
         arrears: r2(e.arrears), bonus: r2(e.bonus), otherDeductions: r2(e.otherDeductions),
         overtimeHours: num(e.overtimeHours), overtimeRate: r2(e.overtimeRate), overtimeAmount: r2(e.overtimeAmount),
         reimbursement: r2(e.reimbursement), advanceRecovery: r2(e.advanceRecovery),
+        settlementAmount: r2(e.settlementAmount), settlement: e.settlement || null,
+        tds: r2(e.tds), taxableIncome: e.taxableIncome === null || e.taxableIncome === undefined ? null : r2(e.taxableIncome),
+        taxWorking: e.taxWorking || null,
+        paidOn: e.paidOn || null, paymentRef: e.paymentRef || '',
         unrecovered: r2(e.unrecovered),
         remarks: e.remarks || '', isOnHold: !!e.isOnHold, isEdited: !!e.isEdited,
         bank: { accountNumber: e.bankAccountNumber || '', ifsc: e.bankIfsc || '' },
-        payslip: e.payslipId ? { _id: e.payslipId, slipNo: e.slipNo || '' } : null,
+        paymentMode: e.paymentMode || 'bank_transfer',
+        payslip: e.payslipId ? { _id: e.payslipId, slipNo: e.slipNo || '', notified: !!e.slipNotified } : null,
     };
 }
+
+// ── Guards every writer shares ───────────────────────────────────────────────
+
+const STALE_LOCK_MS = 10 * 60 * 1000;
+/** Is somebody publishing this run right now? A claim older than ten minutes
+ *  belongs to a process that died, and no longer counts. */
+const isPublishing = (run) => run.status === 'publishing'
+    && (!run.publishingAt || Date.now() - new Date(run.publishingAt).getTime() < STALE_LOCK_MS);
+const BUSY = 'This run is being published right now. Try again in a minute.';
+
+/**
+ * A change to a run that somebody has already signed off takes the sign-off
+ * with it.
+ *
+ * Entries could be edited, held, recomputed and settled on an APPROVED run and
+ * it stayed approved — so what was published need not have been what the
+ * approver looked at, and the maker-checker rule checked nothing. Any change
+ * now sends the run back to draft, says so in the audit log, and it has to be
+ * reviewed and approved again.
+ */
+async function reopen(req, run, why) {
+    if (!['reviewed', 'approved'].includes(run.status)) return false;
+    const row = await patch(PayrollRun, run._id,
+        { status: 'draft', reviewedBy: null, reviewedAt: null, approvedBy: null, approvedAt: null },
+        { where: { status: run.status } });
+    if (!row) return false;
+    await logAudit(req, 'RUN_REOPENED', 'PayrollRun', run._id,
+        `${why} — ${defaultRunName(run.month, run.year)} went back to draft and must be reviewed and approved again`,
+        { status: run.status }, { status: 'draft' });
+    return true;
+}
+
+/**
+ * Nobody sets their own pay. A payroll administrator could raise their own
+ * CTC, edit their own entry and approve their own expense claim; with a second
+ * administrator in the school there is somebody else to ask, and without one
+ * the rule steps aside (as it does for approving a run). Follows the same
+ * "separate approver" setting.
+ */
+async function ownPayBlocked(req, employeeId, settings = null) {
+    if (String(employeeId) !== String(req.userId)) return null;
+    const s = settings || await settingsFor(req.schoolId);
+    if (s.separateApprover === false) return null;
+    if (await approverCount(req.schoolId) <= 1) return null;
+    return 'You cannot change your own pay. Ask another payroll administrator to do this — or turn off “separate approver” in Payroll settings if this school works differently.';
+}
+
+// ── Payslips, the ledger and the notices ─────────────────────────────────────
+
+/**
+ * Take `n` payslip numbers in one statement, so two months published in the
+ * same second cannot be handed the same ones. The floor is the highest number
+ * already on a payslip, for schools whose slips predate the stored counter.
+ */
+async function reserveSlipNumbers(schoolId, year, prefix, n) {
+    const { $, list } = params();
+    const { rows } = await pool.query(`
+      SELECT COALESCE(MAX(NULLIF(regexp_replace("slipNo", '^.*/', ''), '')::int), 0) AS "n"
+        FROM ${qt(Payslip)} ps
+       WHERE "school" = ${$(String(schoolId))} AND "year" = ${$(num(year))}
+         AND "slipNo" ~ ${$(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/[0-9]+/[0-9]+$`)}`, list);
+    const floor = num(rows[0]?.n);
+    await settingsFor(schoolId);   // the row has to exist to be updated
+    const key = String(year);
+    const { rows: top } = await pool.query(`
+      UPDATE ${qt(PayrollSettings)} SET "payslipSeq" = jsonb_set(
+               CASE WHEN jsonb_typeof("payslipSeq") = 'object' THEN "payslipSeq" ELSE '{}'::jsonb END,
+               ARRAY[$2::text],
+               to_jsonb(GREATEST(COALESCE((CASE WHEN jsonb_typeof("payslipSeq") = 'object' THEN "payslipSeq" ELSE '{}'::jsonb END ->> $2)::int, 0), $3::int) + $4::int))
+       WHERE "school" = $1::uuid
+       RETURNING ("payslipSeq" ->> $2)::int AS "top"`, [String(schoolId), key, floor, n]);
+    return num(top[0]?.top || floor + n) - n;   // the last number BEFORE this batch
+}
+
+/** Write a payslip for every entry that does not have one yet. Idempotent. */
+async function issuePayslips(req, run, entries, settings) {
+    if (!entries.length) return { created: [], school: null };
+    const have = new Set((await Payslip.find({ payrollEntry: { $in: entries.map(e => e._id) } })
+        .select('payrollEntry').lean()).map(p => String(p.payrollEntry)));
+    const payable = entries.filter(e => !have.has(String(e._id)));
+    const school = await School.findById(req.schoolId).lean();
+    if (!payable.length) return { created: [], school };
+
+    const employeeIds = [...new Set(payable.map(e => String(e.employee)))];
+    const [emps, profiles, asgns] = await Promise.all([
+        User.find({ _id: { $in: employeeIds } }).lean(),
+        TeacherProfile.find({ user: { $in: employeeIds }, school: req.schoolId }).lean(),
+        EmployeeSalaryAssignment.find({ _id: { $in: [...new Set(payable.map(e => e.salaryAssignment).filter(Boolean))] } })
+            .select('paymentMode').lean(),
+    ]);
+    const empById     = new Map(emps.map(u => [String(u._id), u]));
+    const profileById = new Map(profiles.map(p => [String(p.user), p]));
+    const asgnById    = new Map(asgns.map(a => [String(a._id), a]));
+
+    const prefix = trim(settings.payslipPrefix) || 'PS';
+    let seq = await reserveSlipNumbers(req.schoolId, run.year, prefix, payable.length);
+
+    const docs = payable.map((entry) => {
+        const emp     = empById.get(String(entry.employee));
+        const profile = profileById.get(String(entry.employee));
+        const asgn    = asgnById.get(String(entry.salaryAssignment));
+        seq += 1;
+        return {
+            payrollEntry: entry._id, payrollRun: run._id, employee: entry.employee, school: req.schoolId,
+            slipNo: `${prefix}/${run.year}/${String(seq).padStart(4, '0')}`,
+            month: run.month, year: run.year,
+            employeeSnapshot: {
+                name: emp?.name || '', email: emp?.email || '',
+                employeeId: profile?.employeeId || '',
+                designation: profile?.designation || '', department: profile?.department || '',
+                joiningDate: profile?.joiningDate || null,
+                bankAccountNumber: profile?.bankAccountNumber || '', bankIfsc: profile?.bankIfsc || '',
+                bankName: profile?.bankBranch || '',
+                panNumber: profile?.panNumber || '', uanNumber: profile?.uanNumber || '',
+                paymentMode: asgn?.paymentMode || 'bank_transfer',
+            },
+            schoolSnapshot: {
+                name: school?.name || '', address: school?.address || '',
+                email: school?.email || '', phone: school?.phone || '',
+            },
+            earnings: entry.earnings, deductions: entry.deductions,
+            employerContributions: entry.employerContributions || [],
+            grossSalary: entry.grossSalary, totalDeductions: entry.totalDeductions,
+            employerCost: entry.employerCost, netSalary: entry.netSalary,
+            workingDays: entry.workingDays, paidDays: entry.paidDays,
+            notEmployedDays: entry.notEmployedDays,
+            lopDays: entry.lopDays, lopAmount: entry.lopAmount,
+            arrears: entry.arrears || 0, bonus: entry.bonus || 0, otherDeductions: entry.otherDeductions || 0,
+            overtimeHours: entry.overtimeHours || 0, overtimeAmount: entry.overtimeAmount || 0,
+            reimbursement: entry.reimbursement || 0, advanceRecovery: entry.advanceRecovery || 0,
+            settlementAmount: entry.settlementAmount || 0, settlement: entry.settlement || null,
+            tds: entry.tds || 0, taxWorking: entry.taxWorking || null,
+            remarks: entry.remarks || '',
+            generatedBy: req.userId,
+        };
+    });
+
+    // Twenty-five at a time. The ORM's insertMany is a loop of single inserts,
+    // so "one insertMany" for 500 staff was 500 round-trips in a row; the
+    // unique index on payrollEntry makes a slip written by a publish that died
+    // half-way a no-op here rather than an error.
+    for (let i = 0; i < docs.length; i += 25) {
+        await Promise.all(docs.slice(i, i + 25).map(d => Payslip.create(d).catch((err) => {
+            if (err.code === '23505' || /unique|duplicate/i.test(err.message || '')) return null;
+            throw err;
+        })));
+    }
+    // Point every entry at its slip in one statement.
+    await pool.query(`
+      UPDATE ${qt(PayrollEntry)} e SET "payslip" = p."_id"
+        FROM ${qt(Payslip)} p
+       WHERE p."payrollEntry" = e."_id" AND e."payrollRun" = $1::uuid AND e."payslip" IS NULL`, [String(run._id)]);
+
+    const written = await Payslip.find({ payrollEntry: { $in: payable.map(e => e._id) } })
+        .select('_id payrollEntry slipNo').lean();
+    const slipByEntry = new Map(written.map(x => [String(x.payrollEntry), x]));
+    return {
+        school,
+        created: payable.filter(e => slipByEntry.has(String(e._id)))
+            .map(e => ({ payslip: slipByEntry.get(String(e._id)), entry: e })),
+    };
+}
+
+/**
+ * Has the ledger moved under a run since it was computed? An advance written
+ * off, or a claim rejected, after the entry took it into account would leave
+ * a payslip deducting or paying something nothing backs.
+ */
+async function ledgerProblems(schoolId, run, entries) {
+    const advIds = [...new Set(entries.flatMap(e => (Array.isArray(e.advanceTaken) ? e.advanceTaken : []).map(t => String(t.id))))];
+    const claimIds = [...new Set(entries.flatMap(e => (Array.isArray(e.claimsPaid) ? e.claimsPaid : []).map(String)))];
+    if (!advIds.length && !claimIds.length) return [];
+    const [advs, claims] = await Promise.all([
+        advIds.length ? SalaryAdvance.find({ _id: { $in: advIds }, school: schoolId }).lean() : [],
+        claimIds.length ? SalaryClaim.find({ _id: { $in: claimIds }, school: schoolId }).lean() : [],
+    ]);
+    const advById = new Map(advs.map(a => [String(a._id), a]));
+    const claimById = new Map(claims.map(c => [String(c._id), c]));
+    const offenders = new Map();   // employee -> what changed
+    for (const e of entries) {
+        for (const t of (Array.isArray(e.advanceTaken) ? e.advanceTaken : [])) {
+            const adv = advById.get(String(t.id));
+            if (adv && (adv.history || []).some(h => String(h.payrollRun) === String(run._id))) continue;   // already applied
+            if (!adv || adv.status !== 'active' || r2(num(adv.amount) - num(adv.recovered)) < num(t.amount) - 0.5) {
+                offenders.set(String(e.employee), 'an advance');
+            }
+        }
+        for (const id of (Array.isArray(e.claimsPaid) ? e.claimsPaid : [])) {
+            const c = claimById.get(String(id));
+            const fine = c && (c.status === 'approved' || (c.status === 'paid' && String(c.paidInRun) === String(run._id)));
+            if (!fine) offenders.set(String(e.employee), offenders.has(String(e.employee)) ? 'an advance and an expense claim' : 'an expense claim');
+        }
+    }
+    if (!offenders.size) return [];
+    const people = await User.find({ _id: { $in: [...offenders.keys()] } }).select('name').lean();
+    return people.map(p => `${p.name}: ${offenders.get(String(p._id))} changed after this run was computed.`);
+}
+
+/**
+ * Move the ledger for the entries that were actually paid: take the advance
+ * instalments, mark the claims paid. Idempotent — an advance already carrying
+ * this run in its history is not touched again — so a publish that died after
+ * this step can simply be run again.
+ *
+ * @returns what was applied, which the run keeps so a reversal can undo it.
+ */
+async function moveLedger(schoolId, run, entries) {
+    let takes = entries.flatMap(e => (Array.isArray(e.advanceTaken) ? e.advanceTaken : [])
+        .map(t => ({ id: String(t.id), amount: num(t.amount), employee: String(e.employee) })));
+    let claimIds = entries.flatMap(e => (Array.isArray(e.claimsPaid) ? e.claimsPaid : []).map(String));
+    // A run computed before the lists moved onto the entries still carries them itself.
+    if (!takes.length && !claimIds.length && !entries.some(e => e.advanceTaken !== undefined && e.advanceTaken !== null)) {
+        const paid = new Set(entries.map(e => String(e.employee)));
+        takes = (run.pendingRecovery || []).filter(t => !t.employee || paid.has(String(t.employee)))
+            .map(t => ({ id: String(t.id), amount: num(t.amount), employee: String(t.employee || '') }));
+        claimIds = (run.pendingClaims || []).map(String);
+    }
+
+    for (const take of takes) {
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const adv = await SalaryAdvance.findOne({ _id: take.id, school: schoolId }).lean();
+            if (!adv || adv.status !== 'active') break;
+            if ((adv.history || []).some(h => String(h.payrollRun) === String(run._id))) break;
+            const recovered = r2(num(adv.recovered) + take.amount);
+            const done = recovered >= num(adv.amount) - 0.5;
+            const row = await patch(SalaryAdvance, adv._id,
+                { recovered, ...(done ? { status: 'closed', closedAt: new Date(), closeNote: 'Fully recovered' } : {}) },
+                {
+                    where: { recovered: num(adv.recovered), status: 'active' },
+                    push: { history: { payrollRun: String(run._id), month: run.month, year: run.year, amount: take.amount, recoveredAt: new Date() } },
+                });
+            if (row) break;   // otherwise somebody else moved it: read again
+        }
+    }
+    if (claimIds.length) {
+        await SalaryClaim.updateMany(
+            { _id: { $in: claimIds }, school: schoolId, status: 'approved' },
+            { status: 'paid', paidInRun: run._id, paidOn: new Date() });
+    }
+    return { recovery: takes, claims: claimIds };
+}
+
+/** PAN in capitals, else the employee ID — what opens a protected payslip. */
+function pdfPassword(slip) {
+    const pan = trim(slip.employeeSnapshot?.panNumber).toUpperCase();
+    if (/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) return { password: pan, hint: 'The attached PDF opens with your PAN, in capital letters.' };
+    const id = trim(slip.employeeSnapshot?.employeeId);
+    if (id) return { password: id, hint: 'The attached PDF opens with your employee ID.' };
+    return { password: null, hint: '' };
+}
+
+/**
+ * Tell people their payslip is out, one after another, and record that each
+ * was told. The notice no longer carries the net figure: it is also the phone's
+ * own notification, and a salary does not belong on a lock screen.
+ */
+function sendPayslipNotices(req, run, created, settings, school) {
+    if (!created.length) return;
+    const { renderPayslipBuffer } = require('../utils/payslipPdf');
+    const protect = settings.protectPayslipPdf === true;
+    (async () => {
+        const slipById = new Map((await Payslip.find({ _id: { $in: created.map(c => c.payslip._id) } }).lean())
+            .map(x => [String(x._id), x]));
+        for (const { payslip, entry } of created) {
+            const full = slipById.get(String(payslip._id));
+            if (!full) continue;
+            const lock = protect ? pdfPassword(full) : { password: null, hint: '' };
+            notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: '💵 Payslip published',
+                body: `Your payslip for ${monthLabel(run.month, run.year)} is now available.${lock.hint ? `\n${lock.hint}` : ''}`,
+                recipients: [entry.employee],
+                includeSender: true,
+                email: true,
+                // The payslip itself rides along. People forward these to banks
+                // and landlords; a link behind a login is no use to them.
+                attachmentFor: async () => {
+                    const content = await renderPayslipBuffer(full, school, { note: settings.payslipNote, password: lock.password });
+                    await patch(Payslip, full._id, { notificationSent: true, notifiedAt: new Date() }, { touch: false });
+                    return { filename: `payslip_${MONTHS[run.month - 1]}_${run.year}.pdf`, content, contentType: 'application/pdf' };
+                },
+                link: { type: 'payroll.payslips', entityId: payslip._id },
+            });
+            // notify() queues and returns; a short gap keeps a 500-person month
+            // from rendering 500 PDFs in the same tick.
+            await new Promise(r => setTimeout(r, 40));
+        }
+    })().catch(err => console.warn('[PayrollAdmin] payslip notices failed:', err.message));
+}
+
+// ── Run lifecycle ────────────────────────────────────────────────────────────
 
 exports.createRun = async (req, res) => {
     try {
@@ -1176,9 +1677,17 @@ exports.createRun = async (req, res) => {
             return bad(res, `Choose a year between ${thisYear - 10} and ${thisYear + 1}`);
         }
 
+        /**
+         * One run per month — but a CANCELLED or FAILED one is not a run, it is
+         * the remains of one, and it used to block the month until somebody
+         * found the delete action. Creating the month again takes it over.
+         */
         const existing = await PayrollRun.findOne({ school: req.schoolId, year, month }).lean();
-        if (existing) {
+        if (existing && !['cancelled', 'failed'].includes(existing.status)) {
             return bad(res, `A payroll run for ${monthLabel(month, year)} already exists (${RUN_STAGE[existing.status]?.label || existing.status}).`);
+        }
+        if (existing && await Payslip.countDocuments({ payrollRun: existing._id })) {
+            return bad(res, `Payslips exist for the cancelled ${monthLabel(month, year)} run. Delete that run before starting the month again.`);
         }
 
         const settings = await settingsFor(req.schoolId);
@@ -1187,41 +1696,53 @@ exports.createRun = async (req, res) => {
             : await calc.workingDaysFor(req.schoolId, year, month, settings);
         const { year: acYear } = await resolveYear(req.schoolId, req.body.academicYear);
         const payDay = Math.min(28, Math.max(1, num(settings.payDay) || 1));
+        const fields = {
+            runName: trim(req.body.runName) || defaultRunName(month, year),
+            academicYear: acYear?._id || null,
+            status: 'draft', workingDays,
+            payDate: new Date(Date.UTC(month === 12 ? year + 1 : year, month === 12 ? 0 : month, payDay)),
+            processedBy: req.userId, processedAt: new Date(),
+            notes: trim(req.body.notes),
+        };
 
         let run;
-        try {
-            run = await PayrollRun.create({
-                school: req.schoolId, month, year,
-                runName: trim(req.body.runName) || defaultRunName(month, year),
-                academicYear: acYear?._id || null,
-                status: 'draft', workingDays,
-                payDate: new Date(Date.UTC(month === 12 ? year + 1 : year, month === 12 ? 0 : month, payDay)),
-                processedBy: req.userId, processedAt: new Date(),
-                notes: trim(req.body.notes),
-            });
-        } catch (err) {
-            // Two admins pressing Create at the same second hit the unique
-            // (school, year, month) index. Say so in words rather than leaking
-            // a Postgres constraint name.
-            if (String(err.message || '').includes('unique') || err.code === '23505' || err.code === 11000) {
-                return bad(res, `A payroll run for ${monthLabel(month, year)} already exists.`);
+        if (existing) {
+            await releaseArrears(existing._id);
+            await PayrollEntry.deleteMany({ payrollRun: existing._id });
+            run = await patch(PayrollRun, existing._id, {
+                ...fields, failureReason: '', skipped: null, warnings: null,
+                reviewedBy: null, reviewedAt: null, approvedBy: null, approvedAt: null,
+                cancelledBy: null, cancelledAt: null, pendingRecovery: null, pendingClaims: null,
+            }, { where: { status: existing.status } });
+            if (!run) return bad(res, `A payroll run for ${monthLabel(month, year)} already exists.`);
+        } else {
+            try {
+                run = await PayrollRun.create({ school: req.schoolId, month, year, ...fields });
+            } catch (err) {
+                // Two admins pressing Create at the same second hit the unique
+                // (school, year, month) index. Say so in words rather than leaking
+                // a Postgres constraint name.
+                if (String(err.message || '').includes('unique') || err.code === '23505' || err.code === 11000) {
+                    return bad(res, `A payroll run for ${monthLabel(month, year)} already exists.`);
+                }
+                throw err;
             }
-            throw err;
         }
 
         try {
             const { count, skipped } = await computeRunEntries(req.schoolId, run, settings, { actorId: req.userId });
             await logAudit(req, 'RUN_CREATED', 'PayrollRun', run._id,
-                `Created ${defaultRunName(month, year)} for ${count} employee${count === 1 ? '' : 's'}`);
+                `Created ${defaultRunName(month, year)} for ${count} employee${count === 1 ? '' : 's'}${existing ? ` (replacing the ${existing.status} run)` : ''}`);
             const fresh = await PayrollRun.findById(run._id).lean();
             return res.status(201).json({ success: true, data: { ...shapeRun(fresh), skipped } });
         } catch (err) {
             // A run that could not be computed is marked failed and kept, with
-            // the reason on it — the old engine threw and left a draft run with
-            // no entries and nothing to say why.
-            await PayrollRun.updateOne({ _id: run._id }, { status: 'failed', failureReason: err.message || 'Computation failed' });
-            await logAudit(req, 'RUN_FAILED', 'PayrollRun', run._id, err.message);
-            return bad(res, `Payroll could not be computed: ${err.message}`);
+            // a reason a person can act on. The detail is in the log.
+            console.error('[PayrollAdmin] run computation failed:', err);
+            const reason = 'The entries could not be computed. Check the salary structures and assignments, then recompute.';
+            await patch(PayrollRun, run._id, { status: 'failed', failureReason: reason });
+            await logAudit(req, 'RUN_FAILED', 'PayrollRun', run._id, String(err.message || err).slice(0, 300));
+            return bad(res, `Payroll could not be computed. ${reason}`);
         }
     } catch (e) { fail(res, e); }
 };
@@ -1232,39 +1753,69 @@ exports.recomputeRun = async (req, res) => {
         const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status === 'published') return bad(res, 'A published run is locked. Reverse the publish first if it must be recomputed.');
-        if (run.status === 'cancelled') return bad(res, 'This run was cancelled.');
+        if (run.status === 'cancelled') return bad(res, 'This run was cancelled. Create the month again to start over.');
+        if (run.status === 'publishing') {
+            if (isPublishing(run)) return bad(res, BUSY, 409);
+            // A publish that died. Hand the run back to where it was.
+            await patch(PayrollRun, run._id, { status: run.publishingFrom || 'approved', publishingFrom: '', publishingAt: null }, { where: { status: 'publishing' } });
+            run.status = run.publishingFrom || 'approved';
+        }
 
         const settings = await settingsFor(req.schoolId);
         const preserve = req.body?.keepEdits !== false;
         if (num(req.body?.workingDays) > 0) {
-            await PayrollRun.updateOne({ _id: run._id }, { workingDays: Math.min(31, num(req.body.workingDays)) });
             run.workingDays = Math.min(31, num(req.body.workingDays));
+            await patch(PayrollRun, run._id, { workingDays: run.workingDays });
         }
         const { count, skipped } = await computeRunEntries(req.schoolId, run, settings, { preserve, actorId: req.userId });
-        await PayrollRun.updateOne({ _id: run._id }, { status: run.status === 'failed' ? 'draft' : run.status, failureReason: '' });
+        if (run.status === 'failed') await patch(PayrollRun, run._id, { status: 'draft', failureReason: '' }, { where: { status: 'failed' } });
+        const reopened = await reopen(req, run, 'The run was recomputed');
         await logAudit(req, 'RUN_RECOMPUTED', 'PayrollRun', run._id, `Recomputed ${count} entries${preserve ? ' (edits kept)' : ''}`);
         const fresh = await PayrollRun.findById(run._id).lean();
-        ok(res, { ...shapeRun(fresh), skipped });
+        ok(res, { ...shapeRun(fresh), skipped, reopened });
     } catch (e) { fail(res, e); }
 };
 
-/** draft → reviewed → approved. Nothing else moves through here. */
+/** draft → reviewed → approved, or back to draft. Nothing else moves through here. */
 exports.updateRunStatus = async (req, res) => {
     try {
         const status = trim(req.body.status);
-        // Strictly one step at a time. Turning approval off (settings) lets a
-        // REVIEWED run publish without an approve step; it never lets a draft
-        // jump the review.
-        const FLOW = { reviewed: ['draft'], approved: ['reviewed'] };
-        if (!FLOW[status]) return bad(res, 'Status must be one of: reviewed, approved');
+        // Strictly one step at a time going forward. Turning approval off
+        // (settings) lets a REVIEWED run publish without an approve step; it
+        // never lets a draft jump the review. `draft` is the way back: a
+        // reviewer who does not like what they see had no way to say so.
+        const FLOW = { reviewed: ['draft'], approved: ['reviewed'], draft: ['reviewed', 'approved'] };
+        if (!FLOW[status]) return bad(res, 'Status must be one of: reviewed, approved, draft');
 
         const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status === 'published') return bad(res, 'This run is already published.');
         if (run.status === 'cancelled') return bad(res, 'This run was cancelled.');
+        if (run.status === 'publishing') return bad(res, BUSY, 409);
         if (!FLOW[status].includes(run.status)) {
             return bad(res, `A ${RUN_STAGE[run.status]?.label.toLowerCase() || run.status} run cannot be marked ${status}.`);
         }
+
+        if (status === 'draft') {
+            const reason = trim(req.body.reason).slice(0, 300);
+            if (reason.length < 3) return bad(res, 'Say why the run is being sent back, so whoever prepared it knows what to fix.');
+            const row = await patch(PayrollRun, run._id,
+                { status: 'draft', reviewedBy: null, reviewedAt: null, approvedBy: null, approvedAt: null, reversalReason: reason },
+                { where: { status: run.status } });
+            if (!row) return bad(res, 'This run changed while you were looking at it. Reload and try again.', 409);
+            await logAudit(req, 'RUN_SENT_BACK', 'PayrollRun', run._id,
+                `${defaultRunName(run.month, run.year)} sent back to draft: ${reason}`, { status: run.status }, { status: 'draft' });
+            if (run.processedBy && String(run.processedBy) !== String(req.userId)) {
+                notify({
+                    school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                    title: '↩️ Payroll sent back',
+                    body: `${defaultRunName(run.month, run.year)} was sent back to draft.\nReason: ${reason}`,
+                    recipients: [run.processedBy], link: { type: 'payroll.runs' },
+                });
+            }
+            return ok(res, shapeRun(await PayrollRun.findById(run._id).lean()));
+        }
+
         const entryCount = await PayrollEntry.countDocuments({ payrollRun: run._id, isOnHold: false });
         if (!entryCount) return bad(res, 'This run has no payable entries. Recompute it or release a held entry first.');
 
@@ -1281,7 +1832,8 @@ exports.updateRunStatus = async (req, res) => {
         const update = { status };
         if (status === 'reviewed') { update.reviewedBy = req.userId; update.reviewedAt = new Date(); }
         if (status === 'approved') { update.approvedBy = req.userId; update.approvedAt = new Date(); }
-        await PayrollRun.updateOne({ _id: run._id }, update);
+        const row = await patch(PayrollRun, run._id, update, { where: { status: run.status } });
+        if (!row) return bad(res, 'This run changed while you were looking at it. Reload and try again.', 409);
         await logAudit(req, `RUN_${status.toUpperCase()}`, 'PayrollRun', run._id,
             `${defaultRunName(run.month, run.year)} marked ${status}`, { status: run.status }, { status });
         const fresh = await PayrollRun.findById(run._id).lean();
@@ -1292,43 +1844,47 @@ exports.updateRunStatus = async (req, res) => {
 /**
  * Publish: freeze the run, write one payslip per payable entry, tell everyone.
  *
- * Idempotent by construction. The old version flipped the run to `published`
- * FIRST and then generated payslips in a loop; a failure at slip 40 of 200
- * left a published run, 40 slips, and no way back in (re-publishing was
- * refused because the status was no longer `approved`). Here the slips are
- * written first, the run is flipped only once they all exist, and a slip that
- * already exists for an entry is never written twice.
+ * ── The lock ────────────────────────────────────────────────────────────────
+ * The run is claimed with ONE conditional UPDATE. The previous "claim" went
+ * through the ORM's updateOne, which reads the row and then saves it — two
+ * requests could both read `approved` and both believe they had won; only the
+ * unique index on payslips stood between that and double pay. The claim also
+ * records what the run was before and when, so a process that dies holding it
+ * does not hold it for ever: after ten minutes the next publish takes it over.
+ *
+ * ── Safe to run twice ───────────────────────────────────────────────────────
+ * Every step skips what is already done — a slip that exists is not rewritten,
+ * an advance already carrying this run is not taken again, a claim already
+ * paid is not paid again — so taking over a dead publish finishes it rather
+ * than repeating it.
  */
 exports.publishRun = async (req, res) => {
+    let claimed = null;      // { id, prior } once the lock is ours
+    const unclaim = () => (claimed
+        ? patch(PayrollRun, claimed.id, { status: claimed.prior, publishingFrom: '', publishingAt: null }, { where: { status: 'publishing' } })
+        : null);
     try {
-        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId });
+        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status === 'published') return bad(res, 'This run is already published.');
         if (run.status === 'cancelled' || run.status === 'failed') return bad(res, `A ${run.status} run cannot be published.`);
+        if (isPublishing(run)) return bad(res, 'Someone else is publishing this run right now.', 409);
 
-        /**
-         * Claim the run before doing any work. Two admins pressing Publish at
-         * the same moment both passed the status check above and both went on
-         * to issue payslips; this conditional flip means exactly one of them
-         * wins, and the loser is told so rather than double-paying everyone.
-         *
-         * `publishing` is not a status the rest of the module reasons about —
-         * it exists for the length of this handler and is replaced by
-         * `published` at the end, or put back on failure.
-         */
-        const claimed = await PayrollRun.updateOne(
-            { _id: run._id, school: req.schoolId, status: run.status },
-            { status: 'publishing' });
-        if (!claimed.modifiedCount) {
-            return bad(res, 'Someone else is publishing this run right now.');
-        }
-        const priorStatus = run.status;
-        const unclaim = () => PayrollRun.updateOne({ _id: run._id, status: 'publishing' }, { status: priorStatus });
-
+        // A stale lock stands in for the status it was taken from.
+        const prior = run.status === 'publishing' ? (run.publishingFrom || 'approved') : run.status;
         const settings = await settingsFor(req.schoolId);
         const needsApproval = settings.requireApproval !== false;
-        if (needsApproval && priorStatus !== 'approved') { await unclaim(); return bad(res, 'The run must be approved before it can be published.'); }
-        if (!needsApproval && priorStatus === 'draft')   { await unclaim(); return bad(res, 'The run must be reviewed before it can be published.'); }
+        if (needsApproval && prior !== 'approved') return bad(res, 'The run must be approved before it can be published.');
+        if (!needsApproval && prior === 'draft')   return bad(res, 'The run must be reviewed before it can be published.');
+
+        const { rows: won } = await pool.query(`
+          UPDATE ${qt(PayrollRun)}
+             SET "status" = 'publishing', "publishingFrom" = $3, "publishingAt" = now(), "updatedAt" = now()
+           WHERE "_id" = $1::uuid AND "school" = $2::uuid AND "status" = $4
+             AND ("status" <> 'publishing' OR "publishingAt" IS NULL OR "publishingAt" < now() - interval '10 minutes')
+       RETURNING "_id"`, [String(run._id), String(req.schoolId), prior, run.status]);
+        if (!won.length) return bad(res, 'Someone else is publishing this run right now.', 409);
+        claimed = { id: run._id, prior };
 
         // Totals are re-summed immediately before the freeze, so what is
         // published is what the entries actually say.
@@ -1337,202 +1893,46 @@ exports.publishRun = async (req, res) => {
         const entries = await PayrollEntry.find({ payrollRun: run._id, isOnHold: false }).lean();
         if (!entries.length) { await unclaim(); return bad(res, 'This run has no payable entries.'); }
 
-        const alreadySlipped = await Payslip.find({ payrollEntry: { $in: entries.map(e => e._id) } })
-            .select('payrollEntry').lean();
-        const haveSlip = new Set(alreadySlipped.map(p => String(p.payrollEntry)));
-
-        const employeeIds = [...new Set(entries.map(e => String(e.employee)))];
-        const [emps, profiles, school] = await Promise.all([
-            User.find({ _id: { $in: employeeIds } }).lean(),
-            TeacherProfile.find({ user: { $in: employeeIds }, school: req.schoolId }).lean(),
-            School.findById(req.schoolId).lean(),
-        ]);
-        const empById     = new Map(emps.map(u => [String(u._id), u]));
-        const profileById = new Map(profiles.map(p => [String(p.user), p]));
-        const asgnById    = new Map((await EmployeeSalaryAssignment.find({
-            _id: { $in: [...new Set(entries.map(e => e.salaryAssignment).filter(Boolean))] },
-        }).select('paymentMode').lean()).map(a => [String(a._id), a]));
-
-        const prefix = trim(settings.payslipPrefix) || 'PS';
-        const payable = entries.filter(e => !haveSlip.has(String(e._id)));
-        // Continue the year's numbering from the highest slip number already
-        // issued, not from a row count — reversing a publish deletes rows, and
-        // counting them would hand the next run numbers that have been used.
-        let seq = await nextSlipSeq(req.schoolId, run.year, prefix, settings);
-
-        /**
-         * Built as a list and written in ONE insert, rather than a create plus
-         * an update per employee inside the request. At 500 staff that was a
-         * thousand sequential round-trips; a school that size would have
-         * watched the request time out halfway and left the run half-published.
-         */
-        const slipDocs = [];
-        for (const entry of payable) {
-            const emp     = empById.get(String(entry.employee));
-            const profile = profileById.get(String(entry.employee));
-            const asgn    = asgnById.get(String(entry.salaryAssignment));
-            seq += 1;
-
-            slipDocs.push({
-                payrollEntry: entry._id, payrollRun: run._id, employee: entry.employee, school: req.schoolId,
-                slipNo: `${prefix}/${run.year}/${String(seq).padStart(4, '0')}`,
-                month: run.month, year: run.year,
-                employeeSnapshot: {
-                    name: emp?.name || '', email: emp?.email || '',
-                    employeeId: profile?.employeeId || '',
-                    designation: profile?.designation || '', department: profile?.department || '',
-                    joiningDate: profile?.joiningDate || null,
-                    bankAccountNumber: profile?.bankAccountNumber || '', bankIfsc: profile?.bankIfsc || '',
-                    bankName: profile?.bankBranch || '',
-                    panNumber: profile?.panNumber || '', uanNumber: profile?.uanNumber || '',
-                    paymentMode: asgn?.paymentMode || 'bank_transfer',
-                },
-                schoolSnapshot: {
-                    name: school?.name || '', address: school?.address || '',
-                    email: school?.email || '', phone: school?.phone || '',
-                },
-                earnings: entry.earnings, deductions: entry.deductions,
-                employerContributions: entry.employerContributions || [],
-                grossSalary: entry.grossSalary, totalDeductions: entry.totalDeductions,
-                employerCost: entry.employerCost, netSalary: entry.netSalary,
-                workingDays: entry.workingDays, paidDays: entry.paidDays,
-                notEmployedDays: entry.notEmployedDays,
-                lopDays: entry.lopDays, lopAmount: entry.lopAmount,
-                // These three were on the payslip schema all along and were
-                // never copied across, so a slip carrying a bonus showed a net
-                // that its own lines could not add up to.
-                arrears: entry.arrears || 0, bonus: entry.bonus || 0, otherDeductions: entry.otherDeductions || 0,
-                overtimeHours: entry.overtimeHours || 0, overtimeAmount: entry.overtimeAmount || 0,
-                reimbursement: entry.reimbursement || 0, advanceRecovery: entry.advanceRecovery || 0,
-                remarks: entry.remarks || '',
-                generatedBy: req.userId,
-            });
+        const problems = await ledgerProblems(req.schoolId, run, entries);
+        if (problems.length) {
+            await unclaim();
+            return bad(res, `${problems.slice(0, 3).join(' ')}${problems.length > 3 ? ` (and ${problems.length - 3} more)` : ''} Recompute the run, then approve and publish it again.`);
         }
 
-        if (slipDocs.length) await Payslip.insertMany(slipDocs);
+        const { created, school } = await issuePayslips(req, run, entries, settings);
+        const moved = await moveLedger(req.schoolId, run, entries);
 
-        // Read back what was written (insertMany does not hand ids back) and
-        // point each entry at its slip in one statement per batch.
-        const written = slipDocs.length
-            ? await Payslip.find({ payrollEntry: { $in: payable.map(e => e._id) } })
-                .select('_id payrollEntry slipNo').lean()
-            : [];
-        const slipByEntry = new Map(written.map(x => [String(x.payrollEntry), x]));
-        await Promise.all(payable
-            .filter(e => slipByEntry.has(String(e._id)))
-            .map(e => PayrollEntry.updateOne({ _id: e._id }, { payslip: slipByEntry.get(String(e._id))._id })));
+        // Named columns only, and only if the lock is still ours.
+        const done = await patch(PayrollRun, run._id, {
+            status: 'published', publishedBy: req.userId, publishedAt: new Date(),
+            publishingFrom: '', publishingAt: null,
+            pendingRecovery: moved.recovery.length ? moved.recovery : null,
+            pendingClaims: moved.claims.length ? moved.claims : null,
+        }, { where: { status: 'publishing' } });
+        claimed = null;
 
-        const created = payable
-            .filter(e => slipByEntry.has(String(e._id)))
-            .map(e => ({ payslip: slipByEntry.get(String(e._id)), entry: e }));
-
-        await recordSlipSeq(req.schoolId, run.year, seq, settings);
-
-        /**
-         * Now the run is really happening, move the ledger: take the advance
-         * instalments and mark the reimbursed claims paid. Done here and not at
-         * computation time so a draft can be recomputed freely.
-         */
-        for (const take of (run.pendingRecovery || [])) {
-            const adv = await SalaryAdvance.findOne({ _id: take.id, school: req.schoolId });
-            if (!adv || adv.status !== 'active') continue;
-            adv.recovered = r2(num(adv.recovered) + num(take.amount));
-            adv.history.push({ payrollRun: run._id, month: run.month, year: run.year, amount: num(take.amount) });
-            if (adv.recovered >= num(adv.amount) - 0.5) {
-                adv.status = 'closed';
-                adv.closedAt = new Date();
-                adv.closeNote = 'Fully recovered';
-            }
-            await adv.save();
-        }
-        if ((run.pendingClaims || []).length) {
-            await SalaryClaim.updateMany(
-                { _id: { $in: run.pendingClaims }, school: req.schoolId, status: 'approved' },
-                { status: 'paid', paidInRun: run._id, paidOn: new Date() });
-        }
-
-        run.status      = 'published';
-        run.publishedBy = req.userId;
-        run.publishedAt = new Date();
-        await run.save();
-
-        // Notify after the state is safe, and in one call per employee rather
-        // than awaiting each in turn inside the request.
-        if (settings.notifyOnPublish !== false && created.length) {
-            const { renderPayslipBuffer } = require('../utils/payslipPdf');
-            const slipById = new Map((await Payslip.find({ _id: { $in: created.map(c => c.payslip._id) } }).lean())
-                .map(x => [String(x._id), x]));
-
-            Promise.allSettled(created.map(({ payslip, entry }) => notify({
-                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
-                title: '💵 Payslip published',
-                body: `Your payslip for ${monthLabel(run.month, run.year)} is now available.\nNet salary: ₹${num(entry.netSalary).toLocaleString('en-IN')}`,
-                recipients: [entry.employee],
-                email: true,
-                // The payslip itself rides along. People forward these to banks
-                // and landlords; a link behind a login is no use to them.
-                attachmentFor: async () => {
-                    const full = slipById.get(String(payslip._id));
-                    if (!full) return null;
-                    return {
-                        filename: `payslip_${MONTHS[run.month - 1]}_${run.year}.pdf`,
-                        content: await renderPayslipBuffer(full, school),
-                        contentType: 'application/pdf',
-                    };
-                },
-                link: { type: 'payroll.payslips', entityId: payslip._id },
-            }))).then((results) => {
-                const failed = results.filter(r => r.status === 'rejected').length;
-                if (failed) console.warn(`[PayrollAdmin] ${failed} payslip notifications failed for run ${run._id}`);
-            });
-        }
+        if (settings.notifyOnPublish !== false) sendPayslipNotices(req, run, created, settings, school);
 
         await logAudit(req, 'RUN_PUBLISHED', 'PayrollRun', run._id,
             `Published ${defaultRunName(run.month, run.year)} — ${created.length} payslip${created.length === 1 ? '' : 's'}`);
-        ok(res, { ...shapeRun(run.toObject ? run.toObject() : run), payslipsCreated: created.length });
+        ok(res, { ...shapeRun(done || await PayrollRun.findById(run._id).lean()), payslipsCreated: created.length });
     } catch (e) {
         // Never leave the run holding the publish lock: whatever went wrong,
         // the next person to press Publish has to be able to try again.
-        try { await PayrollRun.updateOne({ _id: req.params.id, status: 'publishing' }, { status: 'approved' }); }
-        catch { /* the flip below is best effort */ }
+        try { await unclaim(); } catch { /* best effort — the lock also expires */ }
         fail(res, e);
     }
 };
 
 /**
- * The highest payslip number issued this year, so numbering never repeats.
+ * Reverse a publish: withdraw the payslips this run issued and return it to
+ * approved.
  *
- * Read from BOTH the live rows and the stored high-water mark, and the higher
- * wins. The rows alone are not enough: reversing a publish deletes them, and
- * the next publish would reissue numbers that have already been sent out. The
- * mark alone is not enough either — it did not exist before this redesign, so
- * a school with payslips already on file has to be read from the rows once.
- */
-async function nextSlipSeq(schoolId, year, prefix, settings) {
-    const { $, list } = params();
-    const { rows } = await pool.query(`
-      SELECT COALESCE(MAX(NULLIF(regexp_replace("slipNo", '^.*/', ''), '')::int), 0) AS "n"
-        FROM ${T(Payslip)} ps
-       WHERE "school" = ${$(String(schoolId))} AND "year" = ${$(num(year))}
-         AND "slipNo" ~ ${$(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/[0-9]+/[0-9]+$`)}`, list);
-    const stored = num((settings?.payslipSeq || {})[String(year)]);
-    return Math.max(num(rows[0]?.n), stored);
-}
-
-/** Record the highest number issued, so it is never handed out twice. */
-async function recordSlipSeq(schoolId, year, seq, settings) {
-    const map = { ...(settings?.payslipSeq || {}) };
-    if (num(map[String(year)]) >= seq) return;
-    map[String(year)] = seq;
-    try { await PayrollSettings.updateOne({ school: schoolId }, { payslipSeq: map }, { upsert: true }); }
-    catch (e) { console.warn('[PayrollAdmin] payslip counter not stored:', e.message); }
-}
-
-/**
- * Reverse a publish: delete the payslips this run created and return it to
- * approved. Deliberately explicit and audited — there was no way back at all
- * before, so a run published with a wrong figure could only be fixed in the
- * database.
+ * Three things it did not ask before. WHY — a reason is required and kept.
+ * WHETHER IT IS SAFE — a later published month built its tax-to-date and its
+ * arrears on this one, so the later month has to come back first. And WHO
+ * NEEDS TO KNOW — people were emailed a payslip that no longer exists, and
+ * nobody told them.
  */
 exports.unpublishRun = async (req, res) => {
     try {
@@ -1540,20 +1940,34 @@ exports.unpublishRun = async (req, res) => {
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status !== 'published') return bad(res, 'Only a published run can be reversed.');
 
-        const entries = await PayrollEntry.find({ payrollRun: run._id }).select('_id').lean();
+        const reason = trim(req.body?.reason).slice(0, 300);
+        if (reason.length < 5) return bad(res, 'Say why this run is being reversed — it is kept with the audit trail.');
+        if (run.paidOn) {
+            return bad(res, `Payment was recorded for this run on ${new Date(run.paidOn).toLocaleDateString('en-IN')}. Clear the payment record first if the money did not actually go out.`);
+        }
+        const later = await PayrollRun.findOne({
+            school: req.schoolId, status: 'published',
+            $or: [{ year: { $gt: run.year } }, { year: run.year, month: { $gt: run.month } }],
+        }).select('month year').sort({ year: 1, month: 1 }).lean();
+        if (later) {
+            return bad(res, `${monthLabel(later.month, later.year)} has been published since, and its tax and arrears were worked out from this month. Reverse ${monthLabel(later.month, later.year)} first.`);
+        }
+
+        const entries = await PayrollEntry.find({ payrollRun: run._id }).select('_id employee payslip').lean();
         const ids = entries.map(e => e._id);
-        const slips = await Payslip.find({ payrollEntry: { $in: ids } }).select('_id').lean();
+        const slips = await Payslip.find({ payrollEntry: { $in: ids } }).select('_id employee').lean();
         if (slips.length) await Payslip.deleteMany({ _id: { $in: slips.map(s => s._id) } });
-        await PayrollEntry.updateMany({ payrollRun: run._id }, { payslip: null });
+        await pool.query(`UPDATE ${qt(PayrollEntry)} SET "payslip" = NULL, "paidOn" = NULL, "paymentRef" = '' WHERE "payrollRun" = $1::uuid`, [String(run._id)]);
 
         // Put the ledger back exactly as publish moved it: give the advance
         // instalments back and return the claims to approved-but-unpaid.
         for (const take of (run.pendingRecovery || [])) {
             const adv = await SalaryAdvance.findOne({ _id: take.id, school: req.schoolId });
             if (!adv) continue;
+            if (!(adv.history || []).some(h => String(h.payrollRun) === String(run._id))) continue;   // never applied
             adv.recovered = r2(Math.max(0, num(adv.recovered) - num(take.amount)));
             adv.history = (adv.history || []).filter(h => String(h.payrollRun) !== String(run._id));
-            if (adv.status === 'closed' && adv.recovered < num(adv.amount)) {
+            if (adv.status === 'closed' && adv.closeNote === 'Fully recovered' && adv.recovered < num(adv.amount)) {
                 adv.status = 'active'; adv.closedAt = null; adv.closeNote = '';
             }
             await adv.save();
@@ -1564,26 +1978,46 @@ exports.unpublishRun = async (req, res) => {
                 { status: 'approved', paidInRun: null, paidOn: null });
         }
 
-        run.status = 'approved';
-        run.publishedBy = null; run.publishedAt = null;
-        await run.save();
+        const row = await patch(PayrollRun, run._id, {
+            status: 'approved', publishedBy: null, publishedAt: null,
+            pendingRecovery: null, pendingClaims: null, reversalReason: reason,
+        }, { where: { status: 'published' } });
+
+        const settings = await settingsFor(req.schoolId);
+        if (settings.notifyOnPublish !== false && slips.length) {
+            notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: '↩️ Payslip withdrawn',
+                body: `Your payslip for ${monthLabel(run.month, run.year)} has been withdrawn for correction. Please disregard the copy you were sent — a new one will be issued.`,
+                recipients: [...new Set(slips.map(s => String(s.employee)))],
+                includeSender: true, email: true,
+                link: { type: 'payroll.payslips' },
+            });
+        }
         await logAudit(req, 'RUN_UNPUBLISHED', 'PayrollRun', run._id,
-            `Reversed ${defaultRunName(run.month, run.year)} — ${slips.length} payslip${slips.length === 1 ? '' : 's'} withdrawn`);
-        ok(res, shapeRun(run.toObject ? run.toObject() : run));
+            `Reversed ${defaultRunName(run.month, run.year)} — ${slips.length} payslip${slips.length === 1 ? '' : 's'} withdrawn. Reason: ${reason}`);
+        ok(res, shapeRun(row || await PayrollRun.findById(run._id).lean()));
     } catch (e) { fail(res, e); }
 };
 
 exports.cancelRun = async (req, res) => {
     try {
-        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId });
+        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status === 'published') return bad(res, 'A published run cannot be cancelled. Reverse the publish first.');
-        run.status = 'cancelled';
-        run.cancelledBy = req.userId; run.cancelledAt = new Date();
-        run.notes = trim(req.body?.reason) || run.notes;
-        await run.save();
+        if (isPublishing(run)) return bad(res, BUSY, 409);
+        if (await Payslip.countDocuments({ payrollRun: run._id })) {
+            return bad(res, 'Some payslips were already issued for this run. Publish it again to finish, then reverse the publish.');
+        }
+        // The months this run settled arrears for are owed again.
+        await releaseArrears(run._id);
         await PayrollEntry.deleteMany({ payrollRun: run._id });
-        await PayrollRun.updateOne({ _id: run._id }, { totalEmployees: 0, totalGross: 0, totalDeductions: 0, totalNet: 0, totalLop: 0, totalEmployerCost: 0 });
+        await patch(PayrollRun, run._id, {
+            status: 'cancelled', cancelledBy: req.userId, cancelledAt: new Date(),
+            notes: trim(req.body?.reason) || run.notes || '',
+            totalEmployees: 0, totalGross: 0, totalDeductions: 0, totalNet: 0, totalLop: 0, totalEmployerCost: 0,
+            pendingRecovery: null, pendingClaims: null, publishingFrom: '', publishingAt: null,
+        });
         await logAudit(req, 'RUN_CANCELLED', 'PayrollRun', run._id, trim(req.body?.reason) || 'Cancelled');
         const fresh = await PayrollRun.findById(run._id).lean();
         ok(res, shapeRun(fresh));
@@ -1600,8 +2034,10 @@ exports.deleteRun = async (req, res) => {
         const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status === 'published') return bad(res, 'A published run cannot be deleted. Reverse the publish first.');
+        if (isPublishing(run)) return bad(res, BUSY, 409);
         const slips = await Payslip.countDocuments({ payrollRun: run._id });
         if (slips) return bad(res, 'Payslips exist for this run. Reverse the publish first.');
+        await releaseArrears(run._id);
         await PayrollEntry.deleteMany({ payrollRun: run._id });
         await PayrollRun.deleteOne({ _id: run._id });
         await logAudit(req, 'RUN_DELETED', 'PayrollRun', run._id, `Deleted ${defaultRunName(run.month, run.year)}`);
@@ -1609,19 +2045,100 @@ exports.deleteRun = async (req, res) => {
     } catch (e) { fail(res, e); }
 };
 
+/**
+ * Published is not paid. Record when the transfer went out and the bank's
+ * reference — for the whole run, or for the entries named.
+ */
+exports.recordPayment = async (req, res) => {
+    try {
+        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!run) return bad(res, 'Payroll run not found', 404);
+        if (run.status !== 'published') return bad(res, 'Payment is recorded once the run has been published.');
+
+        const b = req.body || {};
+        const clear = b.clear === true;
+        const paidOn = clear ? null : asDate(b.paidOn);
+        if (!clear && !paidOn) return bad(res, 'Enter the date the salaries were paid');
+        if (paidOn && paidOn.getTime() > Date.now() + 86400000) return bad(res, 'The payment date cannot be in the future');
+        const reference = clear ? '' : trim(b.reference).slice(0, 80);
+        const entryIds = (Array.isArray(b.entryIds) ? b.entryIds : []).map(uuidOr).filter(Boolean);
+
+        const only = entryIds.length ? ` AND "_id" = ANY($4::uuid[])` : '';
+        const args = [String(run._id), paidOn, reference, ...(entryIds.length ? [entryIds] : [])];
+        const { rowCount } = await pool.query(
+            `UPDATE ${qt(PayrollEntry)} SET "paidOn" = $2, "paymentRef" = $3 WHERE "payrollRun" = $1::uuid AND "payslip" IS NOT NULL${only}`, args);
+        await pool.query(
+            `UPDATE ${qt(Payslip)} SET "paidOn" = $2, "paymentRef" = $3 WHERE "payrollRun" = $1::uuid${entryIds.length ? ` AND "payrollEntry" = ANY($4::uuid[])` : ''}`, args);
+        if (!entryIds.length) await patch(PayrollRun, run._id, { paidOn, paymentRef: reference, paidBy: clear ? null : req.userId });
+
+        await logAudit(req, clear ? 'PAYMENT_CLEARED' : 'PAYMENT_RECORDED', 'PayrollRun', run._id,
+            clear ? `Payment record cleared for ${rowCount} entr${rowCount === 1 ? 'y' : 'ies'}`
+                : `${rowCount} salar${rowCount === 1 ? 'y' : 'ies'} marked paid on ${paidOn.toLocaleDateString('en-IN')}${reference ? ` (ref ${reference})` : ''}`);
+        ok(res, { ...shapeRun(await PayrollRun.findById(run._id).lean()), updated: rowCount });
+    } catch (e) { fail(res, e); }
+};
+
+/** Send the payslip notice again — to everyone not yet told, or to one person. */
+exports.resendPayslips = async (req, res) => {
+    try {
+        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!run) return bad(res, 'Payroll run not found', 404);
+        if (run.status !== 'published') return bad(res, 'Payslips exist only once a run is published.');
+        const filter = { payrollRun: run._id, school: req.schoolId };
+        const entryId = uuidOr(req.body?.entryId);
+        if (entryId) filter.payrollEntry = entryId;
+        else if (req.body?.all !== true) filter.notificationSent = { $ne: true };
+        const slips = await Payslip.find(filter).select('_id payrollEntry employee').lean();
+        if (!slips.length) return ok(res, { queued: 0 }, { message: 'Everyone has already been sent their payslip.' });
+
+        const [settings, school] = await Promise.all([settingsFor(req.schoolId), School.findById(req.schoolId).lean()]);
+        sendPayslipNotices(req, run, slips.map(s => ({ payslip: s, entry: { employee: s.employee } })), settings, school);
+        await logAudit(req, 'PAYSLIPS_RESENT', 'PayrollRun', run._id, `Payslip notice sent again to ${slips.length} employee${slips.length === 1 ? '' : 's'}`);
+        ok(res, { queued: slips.length });
+    } catch (e) { fail(res, e); }
+};
+
+/** Every payslip of a run as one PDF, a page each — for printing or filing. */
+exports.downloadRunPayslips = async (req, res) => {
+    try {
+        const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!run) return bad(res, 'Payroll run not found', 404);
+        const slips = await Payslip.find({ payrollRun: run._id, school: req.schoolId }).lean();
+        if (!slips.length) return bad(res, 'No payslips have been issued for this run yet.');
+        slips.sort((a, b) => String(a.employeeSnapshot?.name || '').localeCompare(String(b.employeeSnapshot?.name || '')));
+        const [settings, school] = await Promise.all([settingsFor(req.schoolId), School.findById(req.schoolId).select('name logo').lean()]);
+        require('../utils/payslipPdf').generatePayslipsPDF(res, slips,
+            `payslips_${shortLabel(run.month, run.year).replace(' ', '_')}.pdf`, school, { note: settings.payslipNote });
+    } catch (e) { fail(res, e); }
+};
+
 // ── Entries ──────────────────────────────────────────────────────────────────
+
+/** The fields priceEmployee() decides, copied onto a stored entry. */
+const PRICED_FIELDS = ['annualCtc', 'earnings', 'deductions', 'employerContributions', 'grossSalary', 'totalDeductions',
+    'employerCost', 'netSalary', 'unrecovered', 'workingDays', 'paidDays', 'notEmployedDays', 'lopDays', 'lopAmount',
+    'lopSource', 'units', 'rate', 'arrears', 'bonus', 'otherDeductions', 'overtimeHours', 'overtimeRate',
+    'overtimeAmount', 'reimbursement', 'advanceRecovery', 'advanceTaken', 'claimsPaid', 'settlementAmount',
+    'settlement', 'taxableIncome', 'tds', 'taxWorking'];
+
+/** Replace one employee's warnings on a run, leaving everyone else's. */
+function mergeWarnings(run, employeeId, fresh) {
+    const others = (Array.isArray(run.warnings) ? run.warnings : []).filter(w => String(w.employee) !== String(employeeId));
+    return [...others, ...fresh];
+}
 
 /**
  * Edit one person's line in a run.
  *
  * Two modes. Change the inputs (loss-of-pay days, units worked, arrears, a
- * bonus) and the line is recomputed through the same engine the run used, so
- * every dependent figure — pro-rated allowances, PF on the reduced basic, the
- * net — moves together. Send explicit `earnings`/`deductions` and those lines
- * are taken literally, for the cases no rule covers.
+ * bonus, overtime) and the line is priced again by the same function the run
+ * used — pro-rated allowances, PF on the reduced basic, TDS on the new figure,
+ * the advances and claims, the net: all of it moves together. Send explicit
+ * `earnings`/`deductions` and those lines are taken literally, for the cases
+ * no rule covers.
  *
- * Either way the run's totals are re-summed. The previous version recomputed
- * the entry and left the run row stating the pre-edit figures.
+ * Either way the run's totals are re-summed, and a run that had been reviewed
+ * or approved goes back to draft.
  */
 exports.updateEntry = async (req, res) => {
     try {
@@ -1629,16 +2146,20 @@ exports.updateEntry = async (req, res) => {
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status === 'published') return bad(res, 'A published run is locked. Reverse the publish to change an entry.');
         if (run.status === 'cancelled') return bad(res, 'This run was cancelled.');
+        if (run.status === 'publishing') return bad(res, BUSY, 409);
 
         const entry = await PayrollEntry.findOne({ _id: req.params.entryId, payrollRun: run._id, school: req.schoolId });
         if (!entry) return bad(res, 'Entry not found', 404);
+
+        const settings = await settingsFor(req.schoolId);
+        const own = await ownPayBlocked(req, entry.employee, settings);
+        if (own) return bad(res, own, 403);
 
         const before = {
             grossSalary: entry.grossSalary, totalDeductions: entry.totalDeductions,
             netSalary: entry.netSalary, lopDays: entry.lopDays,
         };
         const b = req.body || {};
-        const settings = await settingsFor(req.schoolId);
 
         const adj = {
             arrears: b.arrears !== undefined ? num(b.arrears) : num(entry.arrears),
@@ -1660,112 +2181,141 @@ exports.updateEntry = async (req, res) => {
             }
         }
 
-        const lopDays = b.lopDays !== undefined
+        // The form always sends the figure it was showing; it is only "typed"
+        // when it differs — otherwise saving a bonus turned leave-derived loss
+        // of pay into a hand-entered one.
+        const typedLop = b.lopDays !== undefined && num(b.lopDays) !== num(entry.lopDays);
+        const lopDays = typedLop
             ? Math.max(0, Math.min(num(entry.workingDays) || 26, num(b.lopDays)))
             : num(entry.lopDays);
         const units = b.units !== undefined ? Math.max(0, num(b.units)) : num(entry.units);
-
-        // Overtime is an earning: taxable, inside gross, and therefore added to
-        // the lines rather than bolted onto the net the way a bonus is.
         const otHours = b.overtimeHours !== undefined ? Math.max(0, num(b.overtimeHours)) : num(entry.overtimeHours);
         const otRate  = b.overtimeRate  !== undefined ? Math.max(0, num(b.overtimeRate))  : num(entry.overtimeRate);
         if (otHours > 744) return bad(res, 'There are not that many hours in a month');
+        const remarks = b.remarks !== undefined ? trim(b.remarks).slice(0, 500) : (entry.remarks || '');
 
+        let warnings;
         if (Array.isArray(b.earnings) || Array.isArray(b.deductions)) {
             const clean = (list, fallback) => (Array.isArray(list)
                 ? list.filter(x => x && trim(x.name)).map(x => ({ name: trim(x.name), code: trim(x.code), amount: r2(x.amount), fullAmount: r2(x.fullAmount ?? x.amount) }))
                 : fallback);
+            const structure = entry.structure ? await SalaryStructure.findOne({ _id: entry.structure, school: req.schoolId }).lean() : null;
             entry.earnings   = clean(b.earnings, entry.earnings);
             entry.deductions = clean(b.deductions, entry.deductions);
             entry.grossSalary     = r2(entry.earnings.reduce((s, x) => s + num(x.amount), 0));
             entry.totalDeductions = r2(entry.deductions.reduce((s, x) => s + num(x.amount), 0));
             entry.lopAmount = r2(Math.max(0, entry.earnings.reduce((s, x) => s + num(x.fullAmount), 0) - entry.grossSalary));
+            entry.lopDays = lopDays;
+            if (typedLop) entry.lopSource = lopDays > 0 ? 'manual' : 'none';
+            entry.units = units;
+            entry.overtimeHours = otHours; entry.overtimeRate = otRate;
+            entry.overtimeAmount = calc.roundAmount(otHours * otRate, settings.roundTo);
+            entry.arrears = adj.arrears; entry.bonus = adj.bonus; entry.otherDeductions = adj.otherDeductions;
+            entry.paidDays = r2(Math.max(0, (num(entry.workingDays) || 26) - num(entry.notEmployedDays) - lopDays));
+            // The lines are the admin's, so the tax on them is whatever TDS
+            // line they wrote — but the month still records what it taxed.
+            entry.tds = r2(entry.deductions.filter(isTdsLine).reduce((s, x) => s + num(x.amount), 0));
+            entry.taxableIncome = r2(tax.taxableEarnings(entry.earnings, structure) + adj.arrears + adj.bonus);
+            entry.taxWorking = null;
+            settleNet(entry, settings);
         } else {
             const structure = entry.structure ? await SalaryStructure.findOne({ _id: entry.structure, school: req.schoolId }).lean() : null;
-            const asgn = entry.salaryAssignment
-                ? await EmployeeSalaryAssignment.findOne({ _id: entry.salaryAssignment, school: req.schoolId }).lean()
-                : null;
-            if (!structure) return bad(res, 'This entry has no salary structure, so it cannot be recomputed. Edit the lines directly instead.');
-            const pay = calc.computePay({
-                structure,
-                annualCtc: asgn ? EmployeeSalaryAssignment.activeCtc(asgn, run.year, run.month) : num(entry.annualCtc),
-                overrides: asgn?.componentOverrides || [],
-                lopDays, units,
-                notEmployedDays: num(entry.notEmployedDays),
-                workingDays: num(entry.workingDays) || num(run.workingDays),
-                ...adj,
-                roundTo: settings.roundTo,
+            const a = await assignmentRow(req.schoolId, entry.salaryAssignment);
+            if (!structure || !a) return bad(res, 'This entry has no salary structure or assignment, so it cannot be recomputed. Edit the lines directly instead.');
+            const ctx = await runContext(req.schoolId, run, settings, { employeeId: entry.employee });
+            const st = entry.settlement;
+            const priced = await priceEmployee(ctx, a, structure, {
+                inputs: {
+                    lopDays, lopSource: typedLop ? (lopDays > 0 ? 'manual' : 'none') : (entry.lopSource || 'none'),
+                    units, overtimeHours: otHours, overtimeRate: otRate, remarks,
+                    // Always the figure on the entry: an edit never re-derives
+                    // arrears, so the months they settled stay settled.
+                    arrears: adj.arrears, bonus: adj.bonus, otherDeductions: adj.otherDeductions,
+                },
+                settle: st ? { lastDay: st.lastDay, leaveEncashment: st.leaveEncashment, gratuity: st.gratuity, record: st } : null,
             });
-            entry.earnings = pay.earnings; entry.deductions = pay.deductions;
-            // computePay() knows nothing about overtime; it is added back here
-            // so a recompute does not quietly drop it.
-            const otAmount = calc.roundAmount(otHours * otRate, settings.roundTo);
-            if (otAmount > 0) {
-                entry.earnings = [...pay.earnings, { name: 'Overtime', code: 'OT', amount: otAmount, fullAmount: otAmount }];
-                pay.grossSalary = r2(pay.grossSalary + otAmount);
-            }
-            entry.employerContributions = pay.employerContributions;
-            entry.grossSalary = pay.grossSalary; entry.totalDeductions = pay.totalDeductions;
-            entry.employerCost = pay.employerCost;
-            entry.lopAmount = pay.lopAmount; entry.paidDays = pay.paidDays;
-            entry.notEmployedDays = pay.notEmployedDays;
-            entry.annualCtc = pay.annualCtc;
+            if (priced.skip) return bad(res, priced.skip);
+            for (const key of PRICED_FIELDS) entry[key] = priced.doc[key];
+            warnings = mergeWarnings(run, entry.employee, priced.warnings);
         }
-
-        entry.lopDays = lopDays;
-        if (b.lopDays !== undefined) entry.lopSource = lopDays > 0 ? 'manual' : 'none';
-        entry.units = units;
-        entry.overtimeHours = otHours;
-        entry.overtimeRate = otRate;
-        entry.overtimeAmount = calc.roundAmount(otHours * otRate, settings.roundTo);
-        entry.arrears = adj.arrears; entry.bonus = adj.bonus; entry.otherDeductions = adj.otherDeductions;
-        if (b.remarks !== undefined) entry.remarks = trim(b.remarks).slice(0, 500);
-        entry.paidDays = r2(Math.max(0, (num(entry.workingDays) || 26) - num(entry.notEmployedDays) - lopDays));
-        // Net never goes below zero — see services/payrollCalc.js. What could
-        // not be taken this month is carried on the entry rather than turned
-        // into a payslip that says the employee owes the school money.
-        const rawNet = num(entry.grossSalary) - num(entry.totalDeductions)
-            + adj.arrears + adj.bonus + num(entry.reimbursement)
-            - adj.otherDeductions - num(entry.advanceRecovery);
-        entry.netSalary  = calc.roundAmount(Math.max(0, rawNet), settings.roundTo);
-        entry.unrecovered = calc.roundAmount(Math.max(0, -rawNet), settings.roundTo);
+        entry.remarks = remarks;
         entry.isEdited = true;
         await entry.save();
 
-        await refreshRunTotals(run._id);
+        const reopened = await reopen(req, run, 'An entry was edited');
+        await refreshRunTotals(run._id, warnings ? { warnings } : {});
         await logAudit(req, 'ENTRY_UPDATED', 'PayrollEntry', entry._id,
             `Entry edited in ${defaultRunName(run.month, run.year)}`, before,
             { grossSalary: entry.grossSalary, totalDeductions: entry.totalDeductions, netSalary: entry.netSalary, lopDays: entry.lopDays });
 
         const fresh = await PayrollRun.findById(run._id).lean();
-        ok(res, { entry: entry.toObject ? entry.toObject() : entry, run: shapeRun(fresh) });
+        ok(res, { entry: entry.toObject ? entry.toObject() : entry, run: shapeRun(fresh), reopened });
     } catch (e) { fail(res, e); }
 };
 
-/** Withhold one person's pay without blocking the month. */
+/**
+ * Withhold one person's pay without blocking the month — and, once whatever
+ * held it is sorted out, pay it.
+ *
+ * Releasing used to be possible only BEFORE the run was published. After that
+ * the money was stranded: no payslip, no way to issue one, and nothing carried
+ * it into the next month. A held entry in a published run can now be released
+ * on its own: it gets its payslip and its place in the ledger then.
+ */
 exports.holdEntry = async (req, res) => {
     try {
         const run = await PayrollRun.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
-        if (run.status === 'published') return bad(res, 'A published run is locked.');
+        if (run.status === 'cancelled') return bad(res, 'This run was cancelled.');
+        if (run.status === 'publishing') return bad(res, BUSY, 409);
         const entry = await PayrollEntry.findOne({ _id: req.params.entryId, payrollRun: run._id, school: req.schoolId });
         if (!entry) return bad(res, 'Entry not found', 404);
+        const hold = req.body?.hold !== undefined ? !!req.body.hold : !entry.isOnHold;
 
-        entry.isOnHold = req.body?.hold !== undefined ? !!req.body.hold : !entry.isOnHold;
-        if (entry.isOnHold && trim(req.body?.reason)) entry.remarks = trim(req.body.reason).slice(0, 500);
+        const settings = await settingsFor(req.schoolId);
+        const own = await ownPayBlocked(req, entry.employee, settings);
+        if (own) return bad(res, own, 403);
+
+        if (run.status === 'published') {
+            if (hold || !entry.isOnHold) return bad(res, 'A published run is locked. Only an entry that was held back can still be released.');
+            const plain = entry.toObject ? entry.toObject() : entry;
+            const problems = await ledgerProblems(req.schoolId, run, [plain]);
+            if (problems.length) return bad(res, `${problems[0]} It cannot be paid as it stands — settle it in the next payroll run instead.`);
+
+            await patch(PayrollEntry, entry._id, { isOnHold: false }, { where: { isOnHold: true } });
+            const { created, school } = await issuePayslips(req, run, [{ ...plain, isOnHold: false }], settings);
+            const moved = await moveLedger(req.schoolId, run, [plain]);
+            await patch(PayrollRun, run._id, {}, {
+                push: { pendingRecovery: moved.recovery, pendingClaims: moved.claims }, touch: true,
+            }).catch(() => null);
+            await refreshRunTotals(run._id);
+            if (settings.notifyOnPublish !== false) sendPayslipNotices(req, run, created, settings, school);
+            await logAudit(req, 'ENTRY_RELEASED', 'PayrollEntry', entry._id,
+                `Released after ${defaultRunName(run.month, run.year)} was published — payslip ${created[0]?.payslip?.slipNo || ''} issued`);
+            const [freshEntry, fresh] = await Promise.all([PayrollEntry.findById(entry._id).lean(), PayrollRun.findById(run._id).lean()]);
+            return ok(res, { entry: freshEntry, run: shapeRun(fresh), payslipIssued: created.length === 1 });
+        }
+
+        entry.isOnHold = hold;
+        if (hold && trim(req.body?.reason)) entry.remarks = trim(req.body.reason).slice(0, 500);
         await entry.save();
+        const reopened = await reopen(req, run, hold ? 'An entry was put on hold' : 'A held entry was released');
         await refreshRunTotals(run._id);
-        await logAudit(req, entry.isOnHold ? 'ENTRY_HELD' : 'ENTRY_RELEASED', 'PayrollEntry', entry._id,
-            `${entry.isOnHold ? 'Held' : 'Released'} in ${defaultRunName(run.month, run.year)}`);
+        await logAudit(req, hold ? 'ENTRY_HELD' : 'ENTRY_RELEASED', 'PayrollEntry', entry._id,
+            `${hold ? 'Held' : 'Released'} in ${defaultRunName(run.month, run.year)}`);
         const fresh = await PayrollRun.findById(run._id).lean();
-        ok(res, { entry: entry.toObject ? entry.toObject() : entry, run: shapeRun(fresh) });
+        ok(res, { entry: entry.toObject ? entry.toObject() : entry, run: shapeRun(fresh), reopened });
     } catch (e) { fail(res, e); }
 };
 
 // ── Exports ──────────────────────────────────────────────────────────────────
 
 const csvCell = (v) => {
-    const s = v === null || v === undefined ? '' : String(v);
+    let s = v === null || v === undefined ? '' : String(v);
+    // Text a spreadsheet would run as a formula is made plain text. A remark
+    // or a department typed as "=HYPERLINK(…)" opened as exactly that in
+    // Excel; numbers are untouched, so a negative figure is still a figure.
+    if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 const toCsv = (columns, rows) => [
@@ -1778,6 +2328,26 @@ function sendCsv(res, filename, columns, rows) {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     // A BOM so Excel opens ₹ and Indian names correctly instead of as mojibake.
     res.send('﻿' + toCsv(columns, rows));
+}
+
+/**
+ * A real .xlsx. "Excel" used to hand back a CSV with a .csv name — which
+ * Excel opens, but which is not what was asked for and loses the number
+ * formatting on the way.
+ */
+function sendXlsx(res, filename, columns, rows, sheetName = 'Report') {
+    const XLSX = require('xlsx');
+    const cell = (c, r) => (typeof c.value === 'function' ? c.value(r) : r[c.key]);
+    const sheet = XLSX.utils.aoa_to_sheet([
+        columns.map(c => c.label),
+        ...rows.map(r => columns.map(c => { const v = cell(c, r); return v === null || v === undefined ? '' : v; })),
+    ]);
+    sheet['!cols'] = columns.map(c => ({ wch: Math.min(40, Math.max(10, String(c.label).length + 4)) }));
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, sheet, String(sheetName).replace(/[\\/?*[\]:]/g, ' ').slice(0, 31) || 'Report');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(XLSX.write(book, { type: 'buffer', bookType: 'xlsx' }));
 }
 
 /**
@@ -1846,11 +2416,16 @@ exports.bankFile = async (req, res) => {
         if (!id) return bad(res, 'Run not found', 404);
         const run = await PayrollRun.findOne({ _id: id, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
+        // The file is an instruction to a bank. It was downloadable for a
+        // draft — figures nobody had reviewed, let alone approved.
+        if (!['approved', 'publishing', 'published'].includes(run.status)) {
+            return bad(res, 'The bank file is available once the run has been approved. Until then the figures can still change.');
+        }
         const settings = await settingsFor(req.schoolId);
 
         const { $, list } = params();
         const { rows } = await pool.query(`
-          SELECT e."netSalary", u."name" AS "employeeName", tp."employeeId" AS "empCode",
+          SELECT e."_id", e."netSalary", u."name" AS "employeeName", tp."employeeId" AS "empCode",
                  tp."bankAccountNumber", tp."bankIfsc", tp."bankAccountHolder",
                  COALESCE(a."paymentMode", 'bank_transfer') AS "paymentMode"
             FROM ${T(PayrollEntry)} e
@@ -1860,9 +2435,26 @@ exports.bankFile = async (req, res) => {
            WHERE e."payrollRun" = ${$(id)} AND COALESCE(e."isOnHold", false) = false
            ORDER BY u."name"`, list);
 
-        const payable = rows.filter(r => r.paymentMode === 'bank_transfer' && trim(r.bankAccountNumber));
-        res.setHeader('X-Payroll-Skipped', String(rows.length - payable.length));
-        res.setHeader('Access-Control-Expose-Headers', 'X-Payroll-Skipped');
+        // Once published, the account is the one frozen on the payslip — a
+        // bank change next month must not rewrite where this month was sent.
+        const frozen = new Map((await Payslip.find({ payrollRun: run._id }).select('payrollEntry employeeSnapshot').lean())
+            .map(p => [String(p.payrollEntry), p.employeeSnapshot || {}]));
+        for (const r of rows) {
+            const snap = frozen.get(String(r._id));
+            if (!snap) continue;
+            r.bankAccountNumber = snap.bankAccountNumber || '';
+            r.bankIfsc = snap.bankIfsc || '';
+            r.paymentMode = snap.paymentMode || r.paymentMode;
+        }
+
+        const byTransfer = rows.filter(r => r.paymentMode === 'bank_transfer' && num(r.netSalary) > 0);
+        const payable = byTransfer.filter(r => trim(r.bankAccountNumber));
+        const missing = byTransfer.filter(r => !trim(r.bankAccountNumber)).map(r => r.employeeName);
+        // WHO was left out, not only how many: a count in a header nobody
+        // reads is how somebody goes unpaid.
+        res.setHeader('X-Payroll-Skipped', String(missing.length));
+        res.setHeader('X-Payroll-Skipped-Names', encodeURIComponent(missing.slice(0, 20).join(', ')));
+        res.setHeader('Access-Control-Expose-Headers', 'X-Payroll-Skipped, X-Payroll-Skipped-Names');
         const columns = [
             { label: 'Beneficiary Name', value: r => trim(r.bankAccountHolder) || r.employeeName },
             { label: 'Employee ID', value: r => r.empCode || '' },
@@ -1934,8 +2526,9 @@ exports.listAssignments = async (req, res) => {
 
         const [rows, cnt] = await Promise.all([
             pool.query(`
-              SELECT a."_id", a."employee", a."structure", a."ctc", a."effectiveDate", a."endDate",
+              SELECT a."_id", a."employee", a."structure", a."ctc", a."ctcRevisions", a."effectiveDate", a."endDate",
                      a."paymentMode", a."isActive", a."notes", a."componentOverrides", a."createdAt",
+                     a."declaredDeductions",
                      ${ASSIGN_STATE} AS "state",
                      u."name" AS "employeeName", u."email" AS "employeeEmail", u."role" AS "employeeRole",
                      tp."employeeId" AS "empCode", tp."department", tp."designation", tp."joiningDate",
@@ -1957,6 +2550,10 @@ exports.listAssignments = async (req, res) => {
                 FROM ${T(EmployeeSalaryAssignment)} a
                 JOIN ${T(User)} u ON u."_id" = a."employee"
                WHERE a."school" = ${s.$(String(req.schoolId))} AND ${employeeWhere(s.$, req.schoolId, 'u')}
+                 ${acYear && req.query.academicYear !== 'all'
+                    // The tiles count the year the list below them shows.
+                    ? `AND (a."academicYear" = ${s.$(String(acYear._id))} OR (a."academicYear" IS NULL AND a."effectiveDate" <= ${s.$(new Date(acYear.endDate))}))`
+                    : ''}
                GROUP BY 1`, s.list),
             (async () => { const q = params(); return pool.query(`SELECT COUNT(*)::int AS "n" FROM ${T(User)} u WHERE ${employeeWhere(q.$, req.schoolId, 'u')}`, q.list); })(),
             (async () => {
@@ -1988,8 +2585,22 @@ exports.listAssignments = async (req, res) => {
 
 const ASSIGN_STATE_LABEL = { active: 'Active', pending: 'Pending', inactive: 'Inactive', ended: 'Ended' };
 
+/**
+ * The CTC in force TODAY. The stored `ctc` column is only a cache of it: a
+ * revision dated next April, or a correction back-dated behind a newer one,
+ * used to be written straight into that column, and the list, the advance
+ * check and the carry-forward all read it as "current".
+ */
+function ctcToday(a) {
+    const now = new Date();
+    return Array.isArray(a.ctcRevisions) && a.ctcRevisions.length
+        ? EmployeeSalaryAssignment.activeCtc(a, now.getFullYear(), now.getMonth() + 1)
+        : num(a.ctc);
+}
+
 function shapeAssignment(a) {
-    const monthly = r2(num(a.ctc) / 12);
+    const ctc = ctcToday(a);
+    const monthly = r2(ctc / 12);
     return {
         _id: a._id,
         employee: {
@@ -2002,9 +2613,10 @@ function shapeAssignment(a) {
             _id: a.structure, name: a.structureName || '—', type: a.structureType || 'general',
             payBasis: a.payBasis || 'monthly', rate: r2(a.rate), rateUnit: a.rateUnit || 'class',
         } : null,
-        ctc: r2(a.ctc), monthlyCtc: monthly,
+        ctc: r2(ctc), monthlyCtc: monthly,
         effectiveDate: a.effectiveDate, endDate: a.endDate,
         paymentMode: a.paymentMode || 'bank_transfer',
+        declaredDeductions: r2(a.declaredDeductions),
         academicYearName: a.academicYearName || null,
         state: a.state, stateLabel: ASSIGN_STATE_LABEL[a.state] || a.state,
         isActive: a.isActive !== false,
@@ -2110,11 +2722,11 @@ exports.getEmployees = async (req, res) => {
           SELECT u."_id", u."name", u."email", u."role",
                  tp."employeeId" AS "empCode", tp."department", tp."designation", tp."joiningDate",
                  tp."bankAccountNumber", ${staffBucketSql('u', 'tp')} AS "bucket",
-                 a."_id" AS "assignmentId", a."ctc", s."name" AS "structureName"
+                 a."_id" AS "assignmentId", a."ctc", a."ctcRevisions", s."name" AS "structureName"
             FROM ${T(User)} u
             LEFT JOIN ${T(TeacherProfile)} tp ON tp."user" = u."_id" AND tp."school" = u."school"
             LEFT JOIN LATERAL (
-                 SELECT x."_id", x."ctc", x."structure" FROM ${T(EmployeeSalaryAssignment)} x
+                 SELECT x."_id", x."ctc", x."ctcRevisions", x."structure" FROM ${T(EmployeeSalaryAssignment)} x
                   WHERE x."employee" = u."_id" AND x."school" = u."school" AND COALESCE(x."isActive", true)
                   ORDER BY x."effectiveDate" DESC LIMIT 1) a ON true
             LEFT JOIN ${T(SalaryStructure)} s ON s."_id" = a."structure"
@@ -2128,7 +2740,7 @@ exports.getEmployees = async (req, res) => {
             _id: r._id, name: r.name, email: r.email, role: r.role,
             employeeId: r.empCode || '', department: r.department || '', designation: r.designation || '',
             joiningDate: r.joiningDate || null, hasBank: !!trim(r.bankAccountNumber), bucket: r.bucket,
-            assignmentId: r.assignmentId || null, ctc: r2(r.ctc), structureName: r.structureName || null,
+            assignmentId: r.assignmentId || null, ctc: r2(r.assignmentId ? ctcToday(r) : 0), structureName: r.structureName || null,
         })), { page, limit, hasMore: more });
     } catch (e) { fail(res, e); }
 };
@@ -2192,6 +2804,8 @@ exports.assignEmployee = async (req, res) => {
 
         const error = await validateAssignment(req.schoolId, { employeeId, structureId, effectiveDate, endDate: b.endDate, annualCtc });
         if (error) return bad(res, error);
+        const own = await ownPayBlocked(req, employeeId);
+        if (own) return bad(res, own, 403);
 
         const eff = asDate(effectiveDate);
         const { year: acYear } = await resolveYear(req.schoolId, b.academicYear);
@@ -2209,6 +2823,7 @@ exports.assignEmployee = async (req, res) => {
                 ? b.componentOverrides.filter(o => o && trim(o.componentName)).map(o => ({ componentName: trim(o.componentName), value: num(o.value) }))
                 : [],
             paymentMode: ['bank_transfer', 'cash', 'cheque'].includes(b.paymentMode) ? b.paymentMode : 'bank_transfer',
+            declaredDeductions: Math.max(0, num(b.declaredDeductions)),
             assignedBy: req.userId, notes: trim(b.notes),
         });
         await logAudit(req, 'ASSIGNMENT_CREATED', 'EmployeeSalaryAssignment', assignment._id,
@@ -2228,7 +2843,10 @@ exports.bulkAssign = async (req, res) => {
 
         const { year: acYear } = await resolveYear(req.schoolId, b.academicYear);
         const created = [], rejected = [];
+        const settings = await settingsFor(req.schoolId);
         for (const employeeId of ids) {
+            const own = await ownPayBlocked(req, employeeId, settings);
+            if (own) { rejected.push({ employeeId, reason: own }); continue; }
             const error = await validateAssignment(req.schoolId, {
                 employeeId, structureId: b.structureId, effectiveDate: b.effectiveDate,
                 endDate: b.endDate, annualCtc: b.annualCtc,
@@ -2269,13 +2887,23 @@ exports.copyAssignments = async (req, res) => {
         if (!source) return bad(res, 'There is no earlier academic year to copy from');
 
         const hikePct = num(b.incrementPercent);
-        const sourceRows = await EmployeeSalaryAssignment.find({
+        if (hikePct < 0 || hikePct > 100) return bad(res, 'The increment must be between 0 and 100 percent');
+        const start = asDate(b.effectiveDate) || new Date(target.startDate);
+        const everyRow = await EmployeeSalaryAssignment.find({
             school: req.schoolId, isActive: true,
             $or: [{ academicYear: source._id }, { academicYear: null }],
         }).lean();
+        // Only people who are still here. A row that is flagged active but
+        // ended before the new year starts belongs to someone who has left —
+        // carrying it forward re-hired them on an open-ended salary — and so
+        // does the row of an account that has been deactivated.
+        const stillHere = new Set((await User.find({
+            _id: { $in: everyRow.map(r => r.employee) }, school: req.schoolId, isActive: { $ne: false },
+        }).select('_id').lean()).map(u => String(u._id)));
+        const sourceRows = everyRow.filter(r =>
+            stillHere.has(String(r.employee)) && (!r.endDate || new Date(r.endDate) >= start));
 
         const created = [], skipped = [];
-        const start = asDate(b.effectiveDate) || new Date(target.startDate);
 
         // Who already has a row in the target year — one query, not one per
         // employee. A 500-staff school was making 1,500 round-trips here.
@@ -2287,14 +2915,18 @@ exports.copyAssignments = async (req, res) => {
         const toOpen = [];
         for (const row of sourceRows) {
             if (taken.has(String(row.employee))) { skipped.push(String(row.employee)); continue; }
-            const newCtc = calc.roundAmount(num(row.ctc) * (1 + hikePct / 100), 1);
+            // The CTC in force the day before the new year starts — not the
+            // stored column, which may hold a figure that has not begun yet.
+            const dayBefore = new Date(start.getTime() - 86400000);
+            const wasCtc = EmployeeSalaryAssignment.activeCtc(row, dayBefore.getUTCFullYear(), dayBefore.getUTCMonth() + 1) || num(row.ctc);
+            const newCtc = calc.roundAmount(wasCtc * (1 + hikePct / 100), 1);
             toClose.push(row);
             toOpen.push({
                 employee: row.employee, school: req.schoolId, structure: row.structure,
                 academicYear: target._id, effectiveDate: start, endDate: null,
                 ctc: newCtc,
                 ctcRevisions: [{
-                    annualCtc: newCtc, previousCtc: num(row.ctc),
+                    annualCtc: newCtc, previousCtc: wasCtc,
                     incrementType: hikePct ? 'increment_pct' : 'manual',
                     incrementValue: hikePct || 0,
                     effectiveMonth: start.getUTCMonth() + 1, effectiveYear: start.getUTCFullYear(),
@@ -2308,15 +2940,17 @@ exports.copyAssignments = async (req, res) => {
             created.push(String(row.employee));
         }
 
-        // The source rows are closed the day before the new ones open, so the
-        // two windows never overlap and no run can pick up both.
+        // New rows first, then the old ones are closed the day before the new
+        // ones open — so a failure part-way leaves people with two rows (the
+        // newer wins) rather than with none. The closed rows keep paying up
+        // to their end date: a month before the new year can still be run.
+        if (toOpen.length) await EmployeeSalaryAssignment.insertMany(toOpen);
         if (toClose.length) {
-            await Promise.all(toClose.map(row => EmployeeSalaryAssignment.updateOne({ _id: row._id }, {
+            await Promise.all(toClose.map(row => patch(EmployeeSalaryAssignment, row._id, {
                 isActive: false,
                 endDate: row.endDate || new Date(start.getTime() - 86400000),
             })));
         }
-        if (toOpen.length) await EmployeeSalaryAssignment.insertMany(toOpen);
 
         await logAudit(req, 'ASSIGNMENT_CREATED', 'EmployeeSalaryAssignment', null,
             `Carried ${created.length} assignment${created.length === 1 ? '' : 's'} into ${target.yearName}${hikePct ? ` with a ${hikePct}% increment` : ''}`);
@@ -2329,13 +2963,27 @@ exports.updateAssignment = async (req, res) => {
         const b = req.body || {};
         const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId });
         if (!asgn) return bad(res, 'Assignment not found', 404);
+        const own = await ownPayBlocked(req, asgn.employee);
+        if (own) return bad(res, own, 403);
 
         if (b.structureId !== undefined || b.structure !== undefined) {
             const structureId = b.structureId ?? b.structure;
             const structure = await SalaryStructure.findOne({ _id: structureId, school: req.schoolId }).select('_id isActive name').lean();
             if (!structure) return bad(res, 'That salary structure does not exist');
             if (structure.isActive === false) return bad(res, `“${structure.name}” is inactive`);
+            if (String(asgn.structure) !== String(structureId)) {
+                // The history column existed and nothing ever wrote to it, so
+                // a change of structure left no trace on the assignment.
+                asgn.revisionHistory = [...(asgn.revisionHistory || []), {
+                    structure: asgn.structure, effectiveDate: new Date(), changedBy: req.userId,
+                    changedAt: new Date(), notes: `Structure changed to “${structure.name}”`,
+                }];
+            }
             asgn.structure = structureId;
+        }
+        if (b.declaredDeductions !== undefined) {
+            if (num(b.declaredDeductions) < 0) return bad(res, 'Declared deductions cannot be negative');
+            asgn.declaredDeductions = num(b.declaredDeductions);
         }
         if (b.effectiveDate !== undefined) {
             const d = asDate(b.effectiveDate);
@@ -2366,6 +3014,8 @@ exports.setAssignmentActive = async (req, res) => {
         const active = req.body?.isActive !== undefined ? !!req.body.isActive : req.path.endsWith('/activate');
         const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId });
         if (!asgn) return bad(res, 'Assignment not found', 404);
+        const own = await ownPayBlocked(req, asgn.employee);
+        if (own) return bad(res, own, 403);
 
         if (active) {
             const clash = await EmployeeSalaryAssignment.findOne({
@@ -2406,18 +3056,23 @@ exports.updateCtc = async (req, res) => {
         const b = req.body || {};
         const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId });
         if (!asgn) return bad(res, 'Assignment not found', 404);
-
-        const prevCtc = num(asgn.ctc);
-        const type = ['increment_pct', 'increment_value', 'manual'].includes(b.incrementType) ? b.incrementType : 'manual';
-        let annualCtc = num(b.annualCtc);
-        if (type === 'increment_pct')   annualCtc = calc.roundAmount(prevCtc * (1 + num(b.incrementValue) / 100), 1);
-        if (type === 'increment_value') annualCtc = calc.roundAmount(prevCtc + num(b.incrementValue), 1);
-        if (!(annualCtc > 0)) return bad(res, 'Enter the new annual CTC');
+        const own = await ownPayBlocked(req, asgn.employee);
+        if (own) return bad(res, own, 403);
 
         const effectiveMonth = num(b.effectiveMonth), effectiveYear = num(b.effectiveYear);
         if (!(effectiveMonth >= 1 && effectiveMonth <= 12) || !(effectiveYear >= 2000 && effectiveYear <= 2100)) {
             return bad(res, 'Choose the month the new CTC takes effect');
         }
+        // The raise is measured from the CTC in force just BEFORE the month it
+        // starts — not from the stored column, which could be a later figure.
+        const before = prevMonth(effectiveYear, effectiveMonth);
+        const plain = asgn.toObject ? asgn.toObject() : asgn;
+        const prevCtc = num(EmployeeSalaryAssignment.activeCtc(plain, before.year, before.month)) || num(asgn.ctc);
+        const type = ['increment_pct', 'increment_value', 'manual'].includes(b.incrementType) ? b.incrementType : 'manual';
+        let annualCtc = num(b.annualCtc);
+        if (type === 'increment_pct')   annualCtc = calc.roundAmount(prevCtc * (1 + num(b.incrementValue) / 100), 1);
+        if (type === 'increment_value') annualCtc = calc.roundAmount(prevCtc + num(b.incrementValue), 1);
+        if (!(annualCtc > 0)) return bad(res, 'Enter the new annual CTC');
         /**
          * Back-dating over a month that has already been paid is allowed, and
          * is the normal case: a raise agreed in July and effective from April
@@ -2431,13 +3086,38 @@ exports.updateCtc = async (req, res) => {
             $or: [{ year: { $gt: effectiveYear } }, { year: effectiveYear, month: { $gte: effectiveMonth } }],
         }).select('month year').lean();
 
-        asgn.ctc = annualCtc;
-        asgn.ctcRevisions.push({
+        const revision = {
             annualCtc, previousCtc: prevCtc, incrementType: type,
             incrementValue: type === 'manual' ? r2(annualCtc - prevCtc) : num(b.incrementValue),
             effectiveMonth, effectiveYear, note: trim(b.note), updatedBy: req.userId,
-        });
+            updatedAt: new Date(),   // the tiebreak between two revisions for one month
+        };
+        asgn.ctcRevisions.push(revision);
+        // `ctc` is the figure in force TODAY. A revision dated next April
+        // leaves it alone until April; one back-dated behind a newer revision
+        // does not overwrite the newer figure.
+        const today = new Date();
+        asgn.ctc = EmployeeSalaryAssignment.activeCtc(
+            { ctc: asgn.ctc, ctcRevisions: [...(plain.ctcRevisions || []), revision] },
+            today.getFullYear(), today.getMonth() + 1) || annualCtc;
         await asgn.save();
+
+        // Every other payroll administrator is told. A raise used to take
+        // effect on one person's say-so with nobody else any the wiser; the
+        // figure itself stays out of the notice.
+        try {
+            const others = (await require('../services/designationService').moduleAdminIds(req.schoolId, 'payroll'))
+                .filter(id => String(id) !== String(req.userId));
+            const who = await User.findById(asgn.employee).select('name').lean();
+            if (others.length) {
+                notify({
+                    school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                    title: '📝 Salary revision recorded',
+                    body: `A CTC revision was recorded for ${who?.name || 'an employee'}, effective ${monthLabel(effectiveMonth, effectiveYear)}. Review it under Payroll → Assignments.`,
+                    recipients: others, link: { type: 'payroll.runs' },
+                });
+            }
+        } catch (err) { console.warn('[PayrollAdmin] revision notice skipped:', err.message); }
         await logAudit(req, 'CTC_UPDATED', 'EmployeeSalaryAssignment', asgn._id,
             `CTC ₹${prevCtc.toLocaleString('en-IN')} → ₹${annualCtc.toLocaleString('en-IN')} from ${monthLabel(effectiveMonth, effectiveYear)}`
             + (publishedClash ? ' (back-dated — arrears will be settled in the next run)' : ''),
@@ -2547,6 +3227,7 @@ function shapeStructure(s) {
         _id: s._id, name: s.name, description: s.description || '',
         type: s.type || 'general',
         payBasis: s.payBasis || 'monthly', rate: r2(s.rate), rateUnit: s.rateUnit || 'class',
+        overtimeRate: r2(s.overtimeRate),
         basic: basicOf(s),
         components: s.components || [],
         counts: { total: comps.length, earnings, deductions, employer },
@@ -2583,12 +3264,17 @@ function validateComponents(components) {
             if (num(c.percentage) > 100) return `“${name}” cannot be more than 100%`;
             const base = trim(c.percentageOf);
             if (!base) return `“${name}” needs something to take its percentage of`;
-            // A percentage may only name a component resolved before it.
-            if (!/^ctc$/i.test(base) && !order.includes(base.toLowerCase())) {
+            // A percentage may only name a component resolved before it —
+            // or CTC, or Gross (the earnings above it, taken together).
+            if (/^gross$/i.test(base)) {
+                if (!earnings) return `“${name}” takes a percentage of gross, so at least one earning has to come above it`;
+            } else if (!/^ctc$/i.test(base) && !order.includes(base.toLowerCase())) {
                 return `“${name}” takes a percentage of “${base}”, which is not defined above it`;
             }
         }
-        if (num(c.value) < 0 || num(c.capAmount) < 0 || num(c.wageCeiling) < 0) return `“${name}” cannot hold a negative amount`;
+        if (num(c.value) < 0 || num(c.capAmount) < 0 || num(c.wageCeiling) < 0 || num(c.minAmount) < 0 || num(c.applyUpTo) < 0) {
+            return `“${name}” cannot hold a negative amount`;
+        }
         order.push(name.toLowerCase());
     }
     if (!earnings) return 'A structure needs at least one earning';
@@ -2602,6 +3288,7 @@ const cleanComponents = (components) => (components || []).map((c, i) => ({
     value: num(c.value), percentage: num(c.percentage),
     percentageOf: trim(c.percentageOf) || 'CTC',
     wageCeiling: num(c.wageCeiling), capAmount: num(c.capAmount), minAmount: num(c.minAmount),
+    applyUpTo: num(c.applyUpTo),
     proRated: c.proRated !== false, taxable: c.taxable !== false,
     order: c.order !== undefined ? num(c.order) : i + 1,
     isActive: c.isActive !== false,
@@ -2638,6 +3325,9 @@ exports.createStructure = async (req, res) => {
             description: trim(b.description),
             type: STRUCTURE_TYPES.includes(b.type) ? b.type : 'general',
             payBasis, rate: num(b.rate), rateUnit: ['class', 'hour', 'day'].includes(b.rateUnit) ? b.rateUnit : 'class',
+            // The default overtime rate was read by every run and could never
+            // be set: nothing on the way in accepted it.
+            overtimeRate: Math.max(0, num(b.overtimeRate)),
             components, isActive: b.isActive !== false,
             createdBy: req.userId, updatedBy: req.userId,
         });
@@ -2680,6 +3370,10 @@ exports.updateStructure = async (req, res) => {
         if (b.payBasis !== undefined) update.payBasis = b.payBasis === 'rate' ? 'rate' : 'monthly';
         if (b.rate !== undefined) update.rate = num(b.rate);
         if (b.rateUnit !== undefined && ['class', 'hour', 'day'].includes(b.rateUnit)) update.rateUnit = b.rateUnit;
+        if (b.overtimeRate !== undefined) {
+            if (num(b.overtimeRate) < 0) return bad(res, 'The overtime rate cannot be negative');
+            update.overtimeRate = num(b.overtimeRate);
+        }
         if (b.components !== undefined) {
             const components = cleanComponents(b.components);
             const error = validateComponents(components);
@@ -2756,7 +3450,7 @@ exports.duplicateStructure = async (req, res) => {
         for (let i = 2; await SalaryStructure.countDocuments({ school: req.schoolId, name }); i++) name = `${s.name} (Copy ${i})`;
         const copy = await SalaryStructure.create({
             school: req.schoolId, name, description: s.description, type: s.type,
-            payBasis: s.payBasis, rate: s.rate, rateUnit: s.rateUnit,
+            payBasis: s.payBasis, rate: s.rate, rateUnit: s.rateUnit, overtimeRate: s.overtimeRate || 0,
             components: s.components, isActive: true, isDefault: false,
             createdBy: req.userId, updatedBy: req.userId,
         });
@@ -2878,13 +3572,33 @@ const REPORT_TYPES = {
     bank_transfer:   { label: 'Bank Transfer',     hint: 'Payment status and bank details',  period: 'month' },
     employee:        { label: 'Employee Report',   hint: 'One employee, month by month',     period: 'year'  },
     form16:          { label: 'Form 16 (Part B)',  hint: 'Annual salary and tax, per employee', period: 'year' },
+    // The monthly statements the statutory returns are filled in from.
+    pf:              { label: 'PF Statement',      hint: 'Employee and employer provident fund', period: 'month' },
+    esi:             { label: 'ESI Statement',     hint: 'Employee and employer ESI',        period: 'month' },
+    pt:              { label: 'Professional Tax',  hint: 'Professional tax deducted',        period: 'month' },
+    tds:             { label: 'TDS Statement',     hint: 'Tax deducted at source, per employee', period: 'month' },
 };
 exports.REPORT_TYPES = REPORT_TYPES;
 
-/** Entries for a period, with the employee context every report needs. */
-async function reportEntries(schoolId, { month, year, department, employeeId }) {
+/**
+ * Entries for a period, with the employee context every report needs.
+ *
+ * Two readings, and a report says which it wants:
+ *
+ *   'payable'  what a run is going to pay — its entries less the ones on hold.
+ *              This is what the Runs screen totals, so a month's report and
+ *              the month's run agree. (They did not: reports counted held
+ *              entries, so September read ₹40,000 more here than there.)
+ *   'paid'     what somebody actually received — entries with a payslip.
+ *              Anything stated about a YEAR (annual, Form 16, an employee's
+ *              own statement) reads this: a draft is not income.
+ *
+ * Cancelled and failed runs are in neither.
+ */
+async function reportEntries(schoolId, { month, year, department, employeeId, scope = 'payable' }) {
     const { $, list } = params();
-    const where = [`e."school" = ${$(String(schoolId))}`, `e."year" = ${$(num(year))}`, `r."status" <> 'cancelled'`];
+    const where = [`e."school" = ${$(String(schoolId))}`, `e."year" = ${$(num(year))}`, `r."status" NOT IN ('cancelled', 'failed')`];
+    where.push(scope === 'paid' ? `e."payslip" IS NOT NULL` : `COALESCE(e."isOnHold", false) = false`);
     if (month) where.push(`e."month" = ${$(num(month))}`);
     if (trim(department)) where.push(`COALESCE(tp."department", '') = ${$(trim(department))}`);
     if (uuidOr(employeeId)) where.push(`e."employee" = ${$(String(employeeId))}`);
@@ -2894,6 +3608,7 @@ async function reportEntries(schoolId, { month, year, department, employeeId }) 
              tp."employeeId" AS "empCode", tp."department", tp."designation",
              tp."bankAccountNumber", tp."bankIfsc", tp."bankAccountHolder", tp."panNumber", tp."uanNumber",
              COALESCE(a."paymentMode", 'bank_transfer') AS "paymentMode",
+             COALESCE(a."declaredDeductions", 0) AS "declaredDeductions",
              ${staffBucketSql('u', 'tp')} AS "bucket"
         FROM ${T(PayrollEntry)} e
         JOIN ${T(PayrollRun)} r ON r."_id" = e."payrollRun"
@@ -2921,7 +3636,7 @@ async function fyEntries(schoolId, spec) {
     const settings = await settingsFor(schoolId);
     const fy = fyRange(settings.financialYearStartMonth, settings.financialYearStartMonth, num(spec.year));
     const years = [...new Set([fy.from.year, fy.to.year])];
-    const parts = await Promise.all(years.map(y => reportEntries(schoolId, { ...spec, year: y, month: null })));
+    const parts = await Promise.all(years.map(y => reportEntries(schoolId, { ...spec, year: y, month: null, scope: 'paid' })));
     const key = (y, m) => y * 12 + m;
     return parts.flat().filter(e =>
         key(e.year, e.month) >= key(fy.from.year, fy.from.month) &&
@@ -2931,9 +3646,17 @@ async function fyEntries(schoolId, spec) {
 /** Build one report: its title, its columns, its rows and its totals. */
 async function buildReport(schoolId, spec) {
     const { type, month, year, department, employeeId } = spec;
-    const rows = await reportEntries(schoolId, spec);
-    const periodLabel = month ? monthLabel(month, year) : `${year}`;
+    // One employee's history is what they were paid; everything else for a
+    // month is what the run is paying.
+    const rows = await reportEntries(schoolId, { ...spec, scope: type === 'employee' ? 'paid' : 'payable' });
+    // A month that has not been published says so in its heading. These
+    // reports used to print a draft's figures under the same title as a
+    // finished month's.
+    const unpublished = month && rows.some(e => e.runStatus !== 'published');
+    const periodLabel = month ? `${monthLabel(month, year)}${unpublished ? ' — DRAFT, not yet published' : ''}` : `${year}`;
     const money = (n) => r2(n);
+
+    if (STATUTORY[type]) return statutoryReport(type, rows, periodLabel);
 
     if (type === 'department') {
         const by = new Map();
@@ -3113,24 +3836,32 @@ async function buildReport(schoolId, spec) {
             const key = String(e.employee);
             const g = by.get(key) || {
                 empCode: e.empCode || '', name: e.employeeName, pan: e.panNumber || '',
-                months: 0, gross: 0, exempt: 0, deductions: 0, tdsDeducted: 0, net: 0,
+                months: 0, gross: 0, exempt: 0, deductions: 0, tdsDeducted: 0, net: 0, declared: 0,
             };
+            // Everything paid as salary — bonus and arrears included, which
+            // sat outside gross and were therefore missing from this form —
+            // and, of that, the part the month recorded as taxable.
+            const paid = num(e.grossSalary) + num(e.arrears) + num(e.bonus);
+            const taxed = e.taxableIncome === null || e.taxableIncome === undefined ? paid : num(e.taxableIncome);
             g.months += 1;
-            g.gross      += num(e.grossSalary);
+            g.gross      += paid;
+            g.exempt     += Math.max(0, paid - taxed);
             g.net        += num(e.netSalary);
             g.deductions += num(e.totalDeductions);
+            g.declared    = cfg.regime === 'old' ? num(e.declaredDeductions) : 0;
             for (const d of e.deductions || []) {
-                if (String(d.code || '').toUpperCase() === 'TDS') g.tdsDeducted += num(d.amount);
+                if (isTdsLine(d)) g.tdsDeducted += num(d.amount);
             }
             by.set(key, g);
         }
 
         const data = [...by.values()].map(g => {
-            const taxable = Math.max(0, r2(g.gross - g.exempt - stdDeduction));
+            const taxable = Math.max(0, r2(g.gross - g.exempt - stdDeduction - g.declared));
             const computed = tax.annualTax(taxable, { tax: cfg });
             return {
                 empCode: g.empCode, name: g.name, pan: g.pan || '—', months: g.months,
                 gross: r2(g.gross),
+                exempt: r2(g.exempt + g.declared),
                 standardDeduction: stdDeduction,
                 taxable,
                 taxPayable: computed.total,
@@ -3149,6 +3880,7 @@ async function buildReport(schoolId, spec) {
                 { key: 'pan', label: 'PAN' },
                 { key: 'months', label: 'Months', align: 'right' },
                 { key: 'gross', label: 'Gross Salary', align: 'right', money: true },
+                { key: 'exempt', label: 'Exempt / Declared', align: 'right', money: true },
                 { key: 'standardDeduction', label: 'Std. Deduction', align: 'right', money: true },
                 { key: 'taxable', label: 'Taxable Income', align: 'right', money: true },
                 { key: 'taxPayable', label: 'Tax Payable', align: 'right', money: true },
@@ -3187,6 +3919,136 @@ async function buildReport(schoolId, spec) {
         rows: data, summary: totalsOf(rows),
     };
 }
+
+/**
+ * The monthly statements the statutory returns are filled in from. Each reads
+ * the lines a run actually wrote, by code first and by name where a school's
+ * own structure left the code blank, and lists only the people it applies to.
+ */
+const STATUTORY = {
+    pf:  { title: 'Provident Fund Statement', own: /^(pf|epf)$|provident/i, employer: /^(epf|eepf|erpf)$|provident|pension/i },
+    esi: { title: 'ESI Statement', own: /^esi$|state insurance|\besi\b/i, employer: /^(eesi|eresi)$|state insurance|\besi\b/i },
+    pt:  { title: 'Professional Tax Statement', own: /^pt$|professional tax|profession tax/i },
+    tds: { title: 'TDS Statement' },
+};
+function statutoryReport(type, rows, periodLabel) {
+    const def = STATUTORY[type];
+    const hit = (re) => (d) => re.test(String(d.code || '')) || re.test(String(d.name || ''));
+    const sumOf = (lines, test) => r2((lines || []).filter(test).reduce((s, d) => s + num(d.amount), 0));
+    const data = rows.map(e => {
+        const own = type === 'tds' ? sumOf(e.deductions, isTdsLine) : sumOf(e.deductions, hit(def.own));
+        const employer = def.employer ? sumOf(e.employerContributions, hit(def.employer)) : 0;
+        return {
+            empCode: e.empCode || '', name: e.employeeName,
+            uan: e.uanNumber || '', pan: e.panNumber || '',
+            paidDays: num(e.paidDays), lopDays: num(e.lopDays),
+            gross: r2(e.grossSalary),
+            taxable: r2(e.taxableIncome === null || e.taxableIncome === undefined ? num(e.grossSalary) + num(e.arrears) + num(e.bonus) : e.taxableIncome),
+            own, employer, total: r2(own + employer),
+        };
+    }).filter(r => r.total > 0);
+    const columns = {
+        pf: [
+            { key: 'uan', label: 'UAN' }, { key: 'empCode', label: 'Employee ID' }, { key: 'name', label: 'Employee' },
+            { key: 'gross', label: 'Gross Wages', align: 'right', money: true },
+            { key: 'lopDays', label: 'NCP Days', align: 'right' },
+            { key: 'own', label: 'Employee PF', align: 'right', money: true },
+            { key: 'employer', label: 'Employer PF', align: 'right', money: true },
+            { key: 'total', label: 'Total', align: 'right', money: true },
+        ],
+        esi: [
+            { key: 'empCode', label: 'Employee ID' }, { key: 'name', label: 'Employee' },
+            { key: 'paidDays', label: 'Days Paid', align: 'right' },
+            { key: 'gross', label: 'Gross Wages', align: 'right', money: true },
+            { key: 'own', label: 'Employee ESI', align: 'right', money: true },
+            { key: 'employer', label: 'Employer ESI', align: 'right', money: true },
+            { key: 'total', label: 'Total', align: 'right', money: true },
+        ],
+        pt: [
+            { key: 'empCode', label: 'Employee ID' }, { key: 'name', label: 'Employee' },
+            { key: 'gross', label: 'Gross Wages', align: 'right', money: true },
+            { key: 'own', label: 'Professional Tax', align: 'right', money: true },
+        ],
+        tds: [
+            { key: 'pan', label: 'PAN' }, { key: 'empCode', label: 'Employee ID' }, { key: 'name', label: 'Employee' },
+            { key: 'taxable', label: 'Taxable Pay', align: 'right', money: true },
+            { key: 'own', label: 'TDS Deducted', align: 'right', money: true },
+        ],
+    }[type];
+    const paying = new Set(data.map(r => `${r.empCode}|${r.name}`));
+    return {
+        title: def.title, periodLabel, columns, rows: data,
+        summary: {
+            ...totalsOf(rows.filter(e => paying.has(`${e.empCode || ''}|${e.employeeName}`))),
+            statutory: r2(data.reduce((s, r) => s + r.total, 0)),
+        },
+    };
+}
+
+/**
+ * One employee's year: what they were paid, what was exempt, how the tax on it
+ * is worked out and what was actually withheld — the working behind Form 16
+ * Part B, on a page they can hand to whoever asks.
+ *
+ * It is the school's statement of its own payroll, not the certificate itself:
+ * the certificate carrying a TRACES number is issued through the tax
+ * department's portal from the quarterly returns, and says so at the foot.
+ */
+async function taxStatement(schoolId, employeeId, fyStartYear) {
+    const settings = await settingsFor(schoolId);
+    const cfg = tax.config(settings);
+    const fy = fyRange(settings.financialYearStartMonth, settings.financialYearStartMonth, num(fyStartYear));
+    const entries = await fyEntries(schoolId, { year: fy.from.year, employeeId: String(employeeId) });
+    if (!entries.length) return null;
+
+    const first = entries[0];
+    const paidOf = (e) => num(e.grossSalary) + num(e.arrears) + num(e.bonus);
+    const gross = r2(entries.reduce((s, e) => s + paidOf(e), 0));
+    const taxed = r2(entries.reduce((s, e) => s + (e.taxableIncome === null || e.taxableIncome === undefined ? paidOf(e) : num(e.taxableIncome)), 0));
+    const tds = r2(entries.reduce((s, e) => s + (e.deductions || []).filter(isTdsLine).reduce((t, d) => t + num(d.amount), 0), 0));
+    const declared = cfg.regime === 'old' ? num(first.declaredDeductions) : 0;
+    const taxable = Math.max(0, r2(taxed - cfg.standardDeduction - declared));
+    const computed = cfg.regime === 'none' ? null : tax.annualTax(taxable, settings);
+
+    const line = (particulars, amount, note = '') => ({ particulars, amount: r2(amount), note });
+    const rows = [
+        line('Gross salary paid (including bonus and arrears)', gross, `${entries.length} month${entries.length === 1 ? '' : 's'}`),
+        line('Less: allowances not taxable', Math.max(0, r2(gross - taxed))),
+        line('Less: standard deduction', cfg.regime === 'none' ? 0 : cfg.standardDeduction),
+        ...(cfg.regime === 'old' ? [line('Less: deductions declared', declared, '80C, 80D, HRA exemption …')] : []),
+        line('Taxable income', cfg.regime === 'none' ? taxed : taxable),
+        ...(computed ? [
+            line('Tax on that income', computed.baseTax),
+            line('Less: rebate under section 87A', computed.rebate),
+            ...(computed.marginalRelief > 0 ? [line('Less: marginal relief', computed.marginalRelief)] : []),
+            line('Health and education cess', computed.cess, `${cfg.cessPercent}%`),
+            line('Total tax for the year', computed.total),
+        ] : []),
+        line('Tax deducted at source', tds),
+        ...(computed ? [line(computed.total - tds >= 0 ? 'Balance still to be deducted' : 'Deducted in excess', Math.abs(r2(computed.total - tds)))] : []),
+    ];
+    return {
+        title: 'Annual Salary and Tax Statement (Form 16 Part B working)',
+        periodLabel: `Financial Year ${fy.label}`,
+        employee: { name: first.employeeName, empCode: first.empCode || '', pan: first.panNumber || '' },
+        employer: { tan: settings.employerTan || '', pan: settings.employerPan || '' },
+        regime: cfg.regime,
+        columns: [
+            { key: 'particulars', label: 'Particulars' },
+            { key: 'note', label: '' },
+            { key: 'amount', label: 'Amount', align: 'right', money: true },
+        ],
+        rows,
+        monthly: entries.map(e => ({
+            period: shortLabel(e.month, e.year), gross: r2(paidOf(e)),
+            tds: r2((e.deductions || []).filter(isTdsLine).reduce((t, d) => t + num(d.amount), 0)), net: r2(e.netSalary),
+        })),
+        summary: { employees: 1, gross, deductions: tds, net: r2(entries.reduce((s, e) => s + num(e.netSalary), 0)) },
+        fy,
+    };
+}
+exports.taxStatement = taxStatement;
+exports.fyRange = fyRange;
 
 const totalsOf = (entries) => ({
     employees: new Set(entries.map(e => String(e.employee))).size,
@@ -3255,7 +4117,9 @@ exports.getReportsOverview = async (req, res) => {
             month, year, monthLabel: monthLabel(month, year),
             academicYear: yearOut(acYear), academicYears: years.map(yearOut),
             tiles: {
-                employees: { value: staff.total, deltaPct: change(staff.total, staff.total) },
+                // No comparison is made, so none is shown. This printed a
+                // fixed "0%" as though last month had been looked at.
+                employees: { value: staff.total, deltaPct: null },
                 gross: { value: t.gross, deltaPct: change(t.gross, p.gross), caption: `Gross salary` },
                 deductions: { value: t.deductions, deltaPct: change(t.deductions, p.deductions), caption: 'PF, ESI, TDS etc.' },
                 net: { value: t.net, deltaPct: change(t.net, p.net), caption: 'Amount disbursed' },
@@ -3319,7 +4183,8 @@ exports.generateReport = async (req, res) => {
         const format = ['pdf', 'excel', 'csv'].includes(b.format) ? b.format : 'pdf';
 
         const spec = { type, month, year, department: trim(b.department) === 'all' ? '' : trim(b.department), employeeId: uuidOr(b.employeeId) };
-        const built = await buildReport(req.schoolId, spec);
+        const built = (type === 'form16' && spec.employeeId && await taxStatement(req.schoolId, spec.employeeId, year))
+            || await buildReport(req.schoolId, spec);
         if (!built.rows.length) return bad(res, `There is no payroll data for ${built.periodLabel} to report on yet.`);
 
         const report = await PayrollReport.create({
@@ -3344,8 +4209,13 @@ exports.downloadReport = async (req, res) => {
     try {
         const report = await PayrollReport.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!report) return bad(res, 'Report not found', 404);
-        const built = await buildReport(req.schoolId, report.filters || { type: report.type, month: report.month, year: report.year });
-        const base = `${report.type}_${(report.periodLabel || '').replace(/\s+/g, '_')}`;
+        const spec = report.filters || { type: report.type, month: report.month, year: report.year };
+        const built = (spec.type === 'form16' && spec.employeeId && await taxStatement(req.schoolId, spec.employeeId, spec.year))
+            || await buildReport(req.schoolId, spec);
+        const base = `${report.type}_${(report.periodLabel || '').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '')}`;
+        if (report.format === 'excel') {
+            return sendXlsx(res, `${base}.xlsx`, built.columns.map(c => ({ label: c.label || ' ', value: (r) => r[c.key] })), built.rows, built.title);
+        }
 
         if (report.format === 'pdf') {
             const school = await School.findById(req.schoolId).select('name address email phone logo').lean();
@@ -3377,7 +4247,9 @@ exports.getSettings = async (req, res) => {
         const s = await settingsFor(req.schoolId);
         const now = new Date();
         const preview = await calc.workingDaysFor(req.schoolId, now.getFullYear(), now.getMonth() + 1, s);
-        ok(res, { ...publicSettings(s), workingDaysThisMonth: preview });
+        // Both regimes' starting tables, so the screen can load the right one
+        // when the regime is switched instead of keeping the other's slabs.
+        ok(res, { ...publicSettings(s), workingDaysThisMonth: preview, taxDefaults: tax.DEFAULTS_BY_REGIME });
     } catch (e) { fail(res, e); }
 };
 
@@ -3415,11 +4287,21 @@ exports.updateSettings = async (req, res) => {
             update.roundTo = r;
         }
         for (const key of ['useLeaveForLop', 'useAttendanceForLop', 'notifyOnPublish', 'requireApproval',
-            'separateApprover', 'autoOpenRun', 'remindBeforePayDay']) {
+            'separateApprover', 'autoOpenRun', 'remindBeforePayDay', 'protectPayslipPdf']) {
             if (b[key] !== undefined) update[key] = !!b[key];
         }
         for (const key of ['payslipPrefix', 'payslipNote', 'bankName', 'bankAccountNumber', 'bankIfsc']) {
             if (b[key] !== undefined) update[key] = trim(b[key]).slice(0, 200);
+        }
+        if (b.employerTan !== undefined) {
+            const tan = trim(b.employerTan).toUpperCase();
+            if (tan && !/^[A-Z]{4}[0-9]{5}[A-Z]$/.test(tan)) return bad(res, 'A TAN is four letters, five digits and a letter — for example DELA12345B');
+            update.employerTan = tan;
+        }
+        if (b.employerPan !== undefined) {
+            const pan = trim(b.employerPan).toUpperCase();
+            if (pan && !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) return bad(res, 'A PAN is five letters, four digits and a letter — for example AAACS1234K');
+            update.employerPan = pan;
         }
         if (b.tax !== undefined) {
             const t = b.tax || {};
@@ -3432,14 +4314,25 @@ exports.updateSettings = async (req, res) => {
             for (const x of slabs) {
                 if (num(x.rate) < 0 || num(x.rate) > 100) return bad(res, 'A tax rate must be between 0 and 100');
             }
+            /**
+             * A figure that was not sent is not zero. Switching a regime on
+             * with just `{ regime }` (the phone does) stored a standard
+             * deduction, cess and rebate of 0 — taxing every rupee, with no
+             * rebate and no cess. A missing figure is left out, so the
+             * regime's own default applies (services/incomeTax.js config()).
+             */
+            const given = (v) => (v === undefined || v === null || v === '' ? undefined : num(v));
             update.tax = {
                 regime: t.regime,
-                slabs: slabs.map(x => ({ upTo: x.upTo === null || x.upTo === undefined || x.upTo === '' ? null : num(x.upTo), rate: num(x.rate) })),
-                standardDeduction: num(t.standardDeduction),
-                cessPercent: num(t.cessPercent),
-                rebateUpTo: num(t.rebateUpTo),
-                rebateMax: num(t.rebateMax),
+                ...(slabs.length ? { slabs: slabs.map(x => ({ upTo: x.upTo === null || x.upTo === undefined || x.upTo === '' ? null : num(x.upTo), rate: num(x.rate) })) } : {}),
+                ...Object.fromEntries(['standardDeduction', 'cessPercent', 'rebateUpTo', 'rebateMax']
+                    .map(k => [k, given(t[k])]).filter(([, v]) => v !== undefined)),
+                ...(t.marginalRelief !== undefined ? { marginalRelief: !!t.marginalRelief } : {}),
             };
+            for (const k of ['standardDeduction', 'cessPercent', 'rebateUpTo', 'rebateMax']) {
+                if (update.tax[k] !== undefined && update.tax[k] < 0) return bad(res, 'Tax figures cannot be negative');
+            }
+            if (update.tax.cessPercent !== undefined && update.tax.cessPercent > 100) return bad(res, 'The cess is a percentage between 0 and 100');
         }
 
         await PayrollSettings.updateOne({ school: req.schoolId }, update, { upsert: true });
@@ -3592,9 +4485,11 @@ exports.createAdvance = async (req, res) => {
          * it cleared. The run caps what it takes anyway, but saying so here is
          * better than finding out at payroll time.
          */
-        const asgn = await EmployeeSalaryAssignment.findOne({ school: req.schoolId, employee: b.employeeId, isActive: true }).select('ctc').lean();
+        const own = await ownPayBlocked(req, b.employeeId);
+        if (own) return bad(res, own, 403);
+        const asgn = await EmployeeSalaryAssignment.findOne({ school: req.schoolId, employee: b.employeeId, isActive: true }).select('ctc ctcRevisions').lean();
         const instalmentAmount = r2(amount / instalments);
-        const monthly = asgn ? r2(num(asgn.ctc) / 12) : 0;
+        const monthly = asgn ? r2(ctcToday(asgn) / 12) : 0;
         if (monthly > 0 && instalmentAmount > monthly && b.force !== true) {
             return bad(res, `An instalment of ${inr(instalmentAmount)} is more than ${emp.name}'s monthly CTC of ${inr(monthly)}. Spread it over more months, or confirm to record it anyway.`);
         }
@@ -3618,6 +4513,8 @@ exports.closeAdvance = async (req, res) => {
         const adv = await SalaryAdvance.findOne({ _id: req.params.id, school: req.schoolId });
         if (!adv) return bad(res, 'Advance not found', 404);
         if (adv.status !== 'active') return bad(res, `This ${adv.kind} is already ${adv.status}.`);
+        const own = await ownPayBlocked(req, adv.employee);
+        if (own) return bad(res, own, 403);
         const outstanding = r2(num(adv.amount) - num(adv.recovered));
         // Cancelling is for one that was never handed over; writing off accepts
         // the loss. Both close it, and the audit log says which it was.
@@ -3697,6 +4594,10 @@ exports.createClaim = async (req, res) => {
         const emp = await User.findOne({ _id: b.employeeId, school: req.schoolId, role: { $in: EMPLOYEE_ROLES } }).select('name').lean();
         if (!emp) return bad(res, 'That employee is not on this school’s staff');
         if (!(num(b.amount) > 0)) return bad(res, 'Enter the amount claimed');
+        if (b.approve === true) {
+            const own = await ownPayBlocked(req, b.employeeId);
+            if (own) return bad(res, 'You cannot approve your own expense claim. Record it as pending and ask another payroll administrator to approve it.', 403);
+        }
 
         const claim = await SalaryClaim.create({
             employee: b.employeeId, school: req.schoolId,
@@ -3724,6 +4625,9 @@ exports.decideClaim = async (req, res) => {
         const claim = await SalaryClaim.findOne({ _id: req.params.id, school: req.schoolId });
         if (!claim) return bad(res, 'Claim not found', 404);
         if (claim.status === 'paid') return bad(res, 'This claim has already been paid through payroll.');
+        if (await ownPayBlocked(req, claim.employee)) {
+            return bad(res, 'You cannot decide your own expense claim. Ask another payroll administrator.', 403);
+        }
 
         claim.status = decision;
         claim.decidedBy = req.userId;
@@ -3749,87 +4653,91 @@ exports.deleteClaim = async (req, res) => {
 // ── Full and final settlement ────────────────────────────────────────────────
 
 /**
- * What a leaver is owed, or owes, on their last day.
+ * Unused leave that can be cashed in on leaving.
  *
- * A settlement is not a payroll run of its own: it is the final month's pay
- * plus what the employment relationship leaves behind. Computing it separately
- * and then ADDING it to that month's entry keeps one payslip per month per
- * person, which is what every downstream figure in this module assumes.
- *
- * Five parts, each of which a school can argue with — so each is returned
- * separately with its working, and the admin decides what actually goes on the
- * entry rather than the software deciding for them:
- *
- *   final salary       the last month, pro-rated to the leaving date
- *   leave encashment   unused paid leave, at a day's basic
- *   gratuity           statutory, after five years of service
- *   notice recovery    where notice was not served
- *   advances           whatever is still outstanding, recovered in full
+ * This read `available` and `allocated` — two fields a leave balance does not
+ * have — so the figure was zero for every leaver, always. It reads the real
+ * ones now, for this year's balances, and only for the leave types the school
+ * has marked encashable, each capped at its own limit.
  */
-exports.settlementPreview = async (req, res) => {
+async function encashableLeave(schoolId, employeeId) {
+    const out = { days: 0, lines: [], source: 'none' };
     try {
-        const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId }).lean();
-        if (!asgn) return bad(res, 'Assignment not found', 404);
-        const lastDay = asDate(req.query.lastDay) || (asgn.endDate ? new Date(asgn.endDate) : new Date());
+        const { schoolModuleFlags } = require('../config/modules');
+        const school = await School.findById(schoolId).select('modules').lean();
+        if (!schoolModuleFlags(school).leave) return out;
+        const LeaveBalance = require('../models/LeaveBalance');
+        const LeaveType = require('../models/LeaveType');
+        const { getActiveAcademicYearLabel } = require('../utils/leaveDays');
 
-        const [emp, profile, structure, settings] = await Promise.all([
-            User.findOne({ _id: asgn.employee, school: req.schoolId }).select('name email').lean(),
-            TeacherProfile.findOne({ user: asgn.employee, school: req.schoolId }).select('employeeId designation joiningDate').lean(),
-            SalaryStructure.findOne({ _id: asgn.structure, school: req.schoolId }).lean(),
-            settingsFor(req.schoolId),
-        ]);
-        if (!structure) return bad(res, 'This assignment has no salary structure, so a settlement cannot be computed.');
+        out.source = 'leave module';
+        const types = await LeaveType.find({ school: schoolId, encashable: true, isActive: { $ne: false } }).lean();
+        if (!types.length) return { ...out, note: 'No leave type is marked encashable' };
+        const label = await getActiveAcademicYearLabel(schoolId);
+        const balances = await LeaveBalance.find({
+            school: schoolId, teacher: employeeId, academicYear: label, leaveType: { $in: types.map(t => t._id) },
+        }).lean();
+        const typeById = new Map(types.map(t => [String(t._id), t]));
+        for (const b of balances) {
+            const type = typeById.get(String(b.leaveType));
+            // Days applied for but not yet taken are still theirs to cash in.
+            const unused = Math.max(0, num(b.totalAllocated) + num(b.carriedForward) - num(b.used) - num(b.expired));
+            const days = r2(num(type.maxEncashableDays) > 0 ? Math.min(unused, num(type.maxEncashableDays)) : unused);
+            if (days > 0) out.lines.push({ type: type.name, days });
+        }
+        out.days = r2(out.lines.reduce((s, l) => s + l.days, 0));
+    } catch (err) { console.warn('[settlement] leave balance lookup skipped:', err.message); }
+    return out;
+}
 
-        const month = lastDay.getUTCMonth() + 1, year = lastDay.getUTCFullYear();
-        const workingDays = await calc.workingDaysFor(req.schoolId, year, month, settings);
-        const annualCtc = EmployeeSalaryAssignment.activeCtc(asgn, year, month);
+/**
+ * What a leaver is owed, or owes, on their last day — computed once, here, and
+ * used by both the preview and the apply. The screen used to add the parts up
+ * itself and post the totals, which is how the two came to disagree.
+ */
+async function buildSettlement(schoolId, asgn, lastDay, settings) {
+    const [emp, profile, structure] = await Promise.all([
+        User.findOne({ _id: asgn.employee, school: schoolId }).select('name email').lean(),
+        TeacherProfile.findOne({ user: asgn.employee, school: schoolId }).select('employeeId designation joiningDate').lean(),
+        SalaryStructure.findOne({ _id: asgn.structure, school: schoolId }).lean(),
+    ]);
+    if (!structure) return { error: 'This assignment has no salary structure, so a settlement cannot be computed.' };
 
-        // The final month, stopped at the leaving date.
-        const notEmployedDays = notEmployedDaysFor(
-            { effectiveDate: asgn.effectiveDate, endDate: lastDay }, year, month, workingDays);
-        const finalMonth = calc.computePay({
-            structure, annualCtc, overrides: asgn.componentOverrides || [],
-            notEmployedDays, workingDays, roundTo: settings.roundTo,
-        });
+    const month = lastDay.getUTCMonth() + 1, year = lastDay.getUTCFullYear();
+    const workingDays = await calc.workingDaysFor(schoolId, year, month, settings);
+    const annualCtc = EmployeeSalaryAssignment.activeCtc(asgn, year, month);
 
-        // A day's basic, which is what leave is encashed at.
-        const fullMonth = calc.computePay({ structure, annualCtc, overrides: asgn.componentOverrides || [], workingDays, roundTo: settings.roundTo });
-        const basicLine = fullMonth.earnings.find(e => /basic/i.test(e.name)) || fullMonth.earnings[0];
-        const dailyBasic = r2(num(basicLine?.fullAmount || basicLine?.amount) / workingDays);
+    // The final month, stopped at the leaving date.
+    const notEmployedDays = notEmployedDaysFor({ effectiveDate: asgn.effectiveDate, endDate: lastDay }, year, month, workingDays);
+    const finalMonth = calc.computePay({
+        structure, annualCtc, overrides: asgn.componentOverrides || [],
+        notEmployedDays, workingDays, roundTo: settings.roundTo,
+    });
 
-        // Unused paid leave, when the Leave module is keeping the balance.
-        let leaveDays = 0, leaveSource = 'none';
-        try {
-            const { schoolModuleFlags } = require('../config/modules');
-            const school = await School.findById(req.schoolId).select('modules').lean();
-            if (schoolModuleFlags(school).leave) {
-                const LeaveBalance = require('../models/LeaveBalance');
-                const balances = await LeaveBalance.find({ school: req.schoolId, teacher: asgn.employee }).lean();
-                leaveDays = r2(balances.reduce((s, b) => s + Math.max(0, num(b.available ?? (num(b.allocated) - num(b.used)))), 0));
-                leaveSource = 'leave module';
-            }
-        } catch (err) { console.warn('[settlement] leave balance lookup skipped:', err.message); }
-        const leaveEncashment = r2(leaveDays * dailyBasic);
+    // A day's basic, which is what leave is encashed at.
+    const fullMonth = calc.computePay({ structure, annualCtc, overrides: asgn.componentOverrides || [], workingDays, roundTo: settings.roundTo });
+    const basicLine = fullMonth.earnings.find(e => /basic/i.test(e.name)) || fullMonth.earnings[0];
+    const monthlyBasic = r2(num(basicLine?.fullAmount || basicLine?.amount));
+    const dailyBasic = r2(monthlyBasic / workingDays);
 
-        // Gratuity: 15 days' basic per completed year, after five years.
-        const joined = profile?.joiningDate ? new Date(profile.joiningDate) : (asgn.effectiveDate ? new Date(asgn.effectiveDate) : null);
-        const years = joined ? Math.floor((lastDay - joined) / (365.25 * 86400000)) : 0;
-        const gratuityEligible = years >= 5;
-        const monthlyBasic = r2(num(basicLine?.fullAmount || basicLine?.amount));
-        const gratuity = gratuityEligible ? r2((monthlyBasic * 15 * years) / 26) : 0;
+    const leave = await encashableLeave(schoolId, asgn.employee);
+    const leaveEncashment = r2(leave.days * dailyBasic);
 
-        // Everything still owed on advances comes back in one go.
-        const advances = await SalaryAdvance.find({ school: req.schoolId, employee: asgn.employee, status: 'active' }).lean();
-        const advanceOutstanding = r2(advances.reduce((s, a) => s + Math.max(0, num(a.amount) - num(a.recovered)), 0));
+    // Gratuity: 15 days' basic per completed year, after five years.
+    const joined = profile?.joiningDate ? new Date(profile.joiningDate) : (asgn.effectiveDate ? new Date(asgn.effectiveDate) : null);
+    const years = joined ? Math.floor((lastDay - joined) / (365.25 * 86400000)) : 0;
+    const gratuityEligible = years >= 5;
+    const gratuity = gratuityEligible ? r2((monthlyBasic * 15 * years) / 26) : 0;
 
-        // Approved expenses not yet paid are still owed to them.
-        const claims = await SalaryClaim.find({ school: req.schoolId, employee: asgn.employee, status: 'approved' }).lean();
-        const claimsDue = r2(claims.reduce((s, c) => s + num(c.amount), 0));
+    const advances = await SalaryAdvance.find({ school: schoolId, employee: asgn.employee, status: 'active' }).lean();
+    const advanceOutstanding = r2(advances.reduce((s, a) => s + Math.max(0, num(a.amount) - num(a.recovered)), 0));
+    const claims = await SalaryClaim.find({ school: schoolId, employee: asgn.employee, status: 'approved' }).lean();
+    const claimsDue = r2(claims.reduce((s, c) => s + num(c.amount), 0));
 
-        const payable = r2(finalMonth.netSalary + leaveEncashment + gratuity + claimsDue);
-        const recoverable = advanceOutstanding;
-
-        ok(res, {
+    const payable = r2(finalMonth.netSalary + leaveEncashment + gratuity + claimsDue);
+    return {
+        structure,
+        preview: {
             employee: {
                 _id: asgn.employee, name: emp?.name || '', email: emp?.email || '',
                 employeeId: profile?.employeeId || '', designation: profile?.designation || '',
@@ -3838,12 +4746,12 @@ exports.settlementPreview = async (req, res) => {
             lastDay,
             service: { years, months: joined ? Math.max(0, Math.round((lastDay - joined) / (30.44 * 86400000))) : 0 },
             finalMonth: {
-                label: monthLabel(month, year),
+                label: monthLabel(month, year), month, year,
                 workingDays, paidDays: finalMonth.paidDays, notEmployedDays: finalMonth.notEmployedDays,
                 gross: finalMonth.grossSalary, deductions: finalMonth.totalDeductions, net: finalMonth.netSalary,
                 earnings: finalMonth.earnings, deductionLines: finalMonth.deductions,
             },
-            leaveEncashment: { days: leaveDays, dailyBasic, amount: leaveEncashment, source: leaveSource },
+            leaveEncashment: { days: leave.days, dailyBasic, amount: leaveEncashment, source: leave.source, lines: leave.lines, note: leave.note || '' },
             gratuity: {
                 eligible: gratuityEligible, years, monthlyBasic, amount: gratuity,
                 basis: gratuityEligible ? '15 days’ basic per completed year, over a 26-day month' : 'Five years of service are required',
@@ -3853,62 +4761,130 @@ exports.settlementPreview = async (req, res) => {
                 count: advances.length, outstanding: advanceOutstanding,
                 items: advances.map(a => ({ _id: a._id, kind: a.kind, amount: r2(a.amount), recovered: r2(a.recovered), outstanding: r2(num(a.amount) - num(a.recovered)) })),
             },
-            payable, recoverable,
-            settlement: r2(payable - recoverable),
-            // Nothing here has been written. The admin applies it to a run.
+            payable, recoverable: advanceOutstanding,
+            settlement: r2(payable - advanceOutstanding),
+            // Income tax, if the school deducts it, is worked out when the
+            // settlement is applied to a run — this is before tax.
+            beforeTax: tax.config(settings).regime !== 'none',
             applied: false,
-        });
+        },
+    };
+}
+
+/**
+ * Full and final settlement — the preview.
+ *
+ * A settlement is not a payroll run of its own: it is the leaver's last entry
+ * plus what the employment leaves behind, so there is still one payslip per
+ * month per person. Each part is returned with its working, and nothing is
+ * written until it is applied to a run.
+ */
+exports.settlementPreview = async (req, res) => {
+    try {
+        const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!asgn) return bad(res, 'Assignment not found', 404);
+        const lastDay = asDate(req.query.lastDay) || (asgn.endDate ? new Date(asgn.endDate) : new Date());
+        const built = await buildSettlement(req.schoolId, asgn, lastDay, await settingsFor(req.schoolId));
+        if (built.error) return bad(res, built.error);
+        ok(res, built.preview);
     } catch (e) { fail(res, e); }
 };
 
 /**
- * Put a settlement onto the leaver's entry in a run, as a one-off addition and
- * a one-off recovery. The entry is then an ordinary edited entry — it goes
- * through the same review, the same approval and the same payslip as everyone
- * else's month, which is the whole point of not making it a separate run.
+ * Apply a settlement to a run.
+ *
+ * The leaver's entry in that run is priced again as their LAST month by the
+ * same function that prices everybody else's:
+ *
+ *   • the month stops at the last working day (it used to stay a full month —
+ *     the preview pro-rated it and the apply did not);
+ *   • leave encashment and gratuity go on as the settlement amount, with their
+ *     working kept on the entry and printed on the payslip;
+ *   • every advance still outstanding is recovered in full and closes when the
+ *     run is published (it used to be taken as "other deductions" on top of
+ *     the month's instalment, and the advance itself never closed);
+ *   • approved claims are paid once, through the entry's own reimbursement
+ *     line (the screen used to add them a second time as a bonus).
+ *
+ * Applying it again replaces the first application rather than adding to it.
+ * A run for a LATER month than the last day works too — the regular pay is
+ * then nothing, and the entry carries only what is being settled.
  */
 exports.applySettlement = async (req, res) => {
     try {
-        const asgn = await EmployeeSalaryAssignment.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        const asgn = await assignmentRow(req.schoolId, req.params.id);
         if (!asgn) return bad(res, 'Assignment not found', 404);
-        const runId = uuidOr(req.body?.runId);
+        const b = req.body || {};
+        const runId = uuidOr(b.runId);
         if (!runId) return bad(res, 'Choose the payroll run to settle in');
+        const lastDay = asDate(b.lastDay) || (asgn.endDate ? new Date(asgn.endDate) : null);
+        if (!lastDay) return bad(res, 'Enter the last working day');
+        if (asgn.effectiveDate && lastDay < new Date(asgn.effectiveDate)) return bad(res, 'The last working day cannot be before the assignment started');
+
+        const settings = await settingsFor(req.schoolId);
+        const own = await ownPayBlocked(req, asgn.employee, settings);
+        if (own) return bad(res, own, 403);
 
         const run = await PayrollRun.findOne({ _id: runId, school: req.schoolId }).lean();
         if (!run) return bad(res, 'Payroll run not found', 404);
         if (run.status === 'published') return bad(res, 'That run is published. Settle in an open run.');
+        if (run.status === 'cancelled' || run.status === 'failed') return bad(res, `That run is ${run.status}. Choose an open run.`);
+        if (run.status === 'publishing') return bad(res, BUSY, 409);
+        if (run.year * 12 + run.month < lastDay.getUTCFullYear() * 12 + lastDay.getUTCMonth() + 1) {
+            return bad(res, `The last working day is in ${monthLabel(lastDay.getUTCMonth() + 1, lastDay.getUTCFullYear())}. Settle in that month's run, or a later one.`);
+        }
 
-        const entry = await PayrollEntry.findOne({ payrollRun: run._id, employee: asgn.employee, school: req.schoolId });
-        if (!entry) return bad(res, 'This employee has no entry in that run — recompute it first, or choose another month.');
+        const built = await buildSettlement(req.schoolId, asgn, lastDay, settings);
+        if (built.error) return bad(res, built.error);
+        const p = built.preview;
+        // The school may argue with either figure; the rest is not negotiable.
+        const leaveEncashment = b.leaveEncashment !== undefined ? r2(num(b.leaveEncashment)) : p.leaveEncashment.amount;
+        const gratuity = b.gratuity !== undefined ? r2(num(b.gratuity)) : p.gratuity.amount;
+        if (leaveEncashment < 0 || gratuity < 0) return bad(res, 'A settlement amount cannot be negative');
 
-        const addition = r2(num(req.body?.addition));
-        const recovery = r2(num(req.body?.recovery));
-        if (addition < 0 || recovery < 0) return bad(res, 'A settlement cannot be negative');
-
-        const settings = await settingsFor(req.schoolId);
-        entry.bonus = r2(num(entry.bonus) + addition);
-        entry.otherDeductions = r2(num(entry.otherDeductions) + recovery);
-        entry.remarks = trim(req.body?.note) || 'Full and final settlement';
-        entry.isEdited = true;
-
-        const raw = num(entry.grossSalary) - num(entry.totalDeductions)
-            + num(entry.arrears) + num(entry.bonus) + num(entry.reimbursement)
-            - num(entry.otherDeductions) - num(entry.advanceRecovery);
-        entry.netSalary   = calc.roundAmount(Math.max(0, raw), settings.roundTo);
-        entry.unrecovered = calc.roundAmount(Math.max(0, -raw), settings.roundTo);
-        await entry.save();
-
-        // The assignment ends here, so no later run picks this person up.
-        const lastDay = asDate(req.body?.lastDay);
-        await EmployeeSalaryAssignment.updateOne({ _id: asgn._id }, {
-            isActive: false,
-            endDate: lastDay || asgn.endDate || new Date(),
+        const existing = await PayrollEntry.findOne({ payrollRun: run._id, employee: asgn.employee, school: req.schoolId });
+        const note = trim(b.note).slice(0, 500) || 'Full and final settlement';
+        const ctx = await runContext(req.schoolId, run, settings, { employeeId: asgn.employee });
+        const priced = await priceEmployee(ctx, { ...asgn, endDate: lastDay }, built.structure, {
+            inputs: existing ? {
+                units: existing.units, bonus: existing.bonus, otherDeductions: existing.otherDeductions,
+                overtimeHours: existing.overtimeHours, overtimeRate: existing.overtimeRate,
+                arrears: existing.arrears,
+                ...(existing.lopSource === 'manual' ? { lopDays: existing.lopDays, lopSource: 'manual' } : {}),
+                remarks: note,
+            } : { remarks: note },
+            settle: {
+                lastDay, leaveEncashment, gratuity,
+                record: {
+                    leaveEncashment, gratuity,
+                    leaveDays: p.leaveEncashment.days, dailyBasic: p.leaveEncashment.dailyBasic,
+                    serviceYears: p.gratuity.years, monthlyBasic: p.gratuity.monthlyBasic,
+                    appliedBy: String(req.userId), appliedAt: new Date(),
+                },
+            },
         });
+        if (priced.skip) return bad(res, priced.skip);
 
-        await refreshRunTotals(run._id);
+        let entry = existing;
+        if (existing) {
+            for (const key of PRICED_FIELDS) existing[key] = priced.doc[key];
+            existing.remarks = note;
+            existing.isEdited = true;
+            await existing.save();
+        } else {
+            entry = await PayrollEntry.create({ ...priced.doc, isEdited: true });
+            await stampArrears(run._id, priced.arrears);
+        }
+
+        // The assignment ends on the last day, so no later run picks this
+        // person up. It keeps paying up to that date — see eligibleAssignments.
+        await patch(EmployeeSalaryAssignment, asgn._id, { isActive: false, endDate: lastDay });
+
+        const reopened = await reopen(req, run, 'A settlement was applied');
+        await refreshRunTotals(run._id, { warnings: mergeWarnings(run, asgn.employee, priced.warnings) });
         await logAudit(req, 'SETTLEMENT_APPLIED', 'PayrollEntry', entry._id,
-            `Settlement in ${defaultRunName(run.month, run.year)}: ${inr(addition)} paid, ${inr(recovery)} recovered`);
+            `Settlement for ${asgn.employeeName} in ${defaultRunName(run.month, run.year)}: ${inr(priced.doc.settlementAmount)} leave encashment and gratuity, ${inr(priced.doc.advanceRecovery)} advances recovered, net ${inr(priced.doc.netSalary)}`);
         const fresh = await PayrollRun.findById(run._id).lean();
-        ok(res, { entry: entry.toObject ? entry.toObject() : entry, run: shapeRun(fresh) });
+        ok(res, { entry: entry.toObject ? entry.toObject() : entry, run: shapeRun(fresh), reopened });
     } catch (e) { fail(res, e); }
 };

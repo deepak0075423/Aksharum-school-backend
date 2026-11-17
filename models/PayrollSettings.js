@@ -79,6 +79,20 @@ const PayrollSettingsSchema = new db.Schema({
     // The month a reminder last went out for, so an hourly sweep sends one
     // reminder and not twenty-four.
     lastReminderFor:   { type: String, default: '' },
+    // The month an OVERDUE reminder last went out for (pay day has passed and
+    // the month is still unpublished) — separate from the one before pay day.
+    lastOverdueFor:    { type: String, default: '' },
+
+    /**
+     * Lock the emailed payslip PDF with a password — the employee's PAN in
+     * capitals, or their employee ID where no PAN is on file. Off by default:
+     * a school has to tell its staff what the password is before it starts
+     * sending them files they cannot open.
+     */
+    protectPayslipPdf: { type: Boolean, default: false },
+    // Printed on the annual salary and tax statement.
+    employerTan:       { type: String, default: '', trim: true },
+    employerPan:       { type: String, default: '', trim: true },
 
     payslipPrefix:     { type: String, default: 'PS', trim: true },
     /**

@@ -57,6 +57,15 @@ const PayslipSchema = new db.Schema({
     overtimeAmount: { type: Number, default: 0 },
     reimbursement: { type: Number, default: 0 },
     advanceRecovery: { type: Number, default: 0 },
+    settlementAmount: { type: Number, default: 0 },
+    settlement:       { type: db.Types.JSON, default: null },
+    tds:              { type: Number, default: 0 },
+    // How this month's TDS was arrived at, frozen with the slip so the
+    // employee can read the working months later.
+    taxWorking:       { type: db.Types.JSON, default: null },
+    paidOn:           { type: Date, default: null },
+    paymentRef:       { type: String, default: '' },
+    notifiedAt:       { type: Date, default: null },
     otherDeductions: { type: Number, default: 0 },
     remarks: { type: String, default: '' },
     generatedAt: { type: Date, default: Date.now },

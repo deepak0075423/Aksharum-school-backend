@@ -47,7 +47,7 @@ function roundAmount(n, step = 1) {
     const v = num(n);
     if (!step || step <= 0) return r2(v);
     if (step === 1) return Math.round(v);
-    return Math.round(v / step) * step;
+    return r2(Math.round(v / step) * step);
 }
 
 /**
@@ -102,88 +102,151 @@ async function workingDaysFor(schoolId, year, month, settings) {
 }
 
 /**
+ * Price ONE line, given everything that resolved before it.
+ *
+ * `st` carries two views of every line already priced:
+ *   actual   what is being paid
+ *   whole    what the days on the payroll are worth before unpaid leave
+ * A percentage of another line reads `actual` when it follows loss of pay and
+ * `whole` when the component is flagged `proRated: false` — the flag used to
+ * be ignored on these lines because the base had already been reduced.
+ */
+function priceLine(comp, name, st, { monthlyCtc, overrideMap, factor, employmentFactor, step, pre }) {
+    const proRated = comp.proRated !== false;
+    const hasOverride = Object.prototype.hasOwnProperty.call(overrideMap, name);
+    const limits = (v) => {
+        let out = v;
+        if (num(comp.capAmount) > 0) out = Math.min(out, num(comp.capAmount));
+        if (num(comp.minAmount) > 0) out = Math.max(out, num(comp.minAmount));
+        return out;
+    };
+    const ceiling = (b) => (num(comp.wageCeiling) > 0 ? Math.min(b, num(comp.wageCeiling)) : b);
+    // "Applies only up to" is an eligibility test, not a cap: ESI is owed on
+    // the whole wage while it is at or under the limit and not at all above.
+    const outOfRange = (monthBase) => num(comp.applyUpTo) > 0 && monthBase > num(comp.applyUpTo) + 0.5;
+
+    let whole = 0, amount = 0;
+    const key = String(comp.percentageOf || '').trim();
+    const viaLine = !hasOverride && comp.calculationType === 'percentage' && !/^ctc$/i.test(key);
+
+    if (!viaLine) {
+        let month = 0;
+        if (hasOverride) month = num(overrideMap[name]);
+        else if (comp.calculationType === 'fixed') month = num(comp.value);
+        else if (comp.calculationType === 'balance') month = pre ? num(pre[name]) : 0;
+        else month = outOfRange(monthlyCtc) ? null : (num(comp.percentage) / 100) * ceiling(monthlyCtc);
+        month = month === null ? 0 : limits(month);
+        whole  = month * employmentFactor;
+        amount = month * (proRated ? factor : 1) * employmentFactor;
+    } else {
+        const gross = /^gross$/i.test(key);
+        const baseWhole  = gross ? st.grossWhole  : num(st.whole[key]);
+        const baseActual = gross ? st.grossActual : num(st.actual[key]);
+        const monthBase  = employmentFactor > 0 ? baseWhole / employmentFactor : baseWhole;
+        if (!outOfRange(monthBase)) {
+            const pct = num(comp.percentage) / 100;
+            whole  = limits(pct * ceiling(baseWhole));
+            amount = limits(pct * ceiling(proRated ? baseActual : baseWhole));
+        }
+    }
+    return { comp, name, proRated, amount: roundAmount(amount, step), full: roundAmount(whole, step) };
+}
+
+/**
  * Resolve every component of a structure once.
+ *
+ * A balance component cannot be priced until everything else that draws on CTC
+ * is known — and anything that takes a percentage OF the balance (TDS on a
+ * consolidated pay, ESI on gross) cannot be priced until the balance is. Those
+ * lines used to read a base of zero: the built-in Contract template deducted no
+ * TDS at all on a full month. They now wait, the balance is settled, and then
+ * they are priced in their own order.
  *
  * @param pre  the FULL-month amounts from a first pass, used to hold a balance
  *             component steady while the rest of the sheet shrinks. Omitted on
  *             the first pass itself.
  */
 function resolvePass(structure, { monthlyCtc, overrideMap, factor, employmentFactor = 1, step, pre }) {
-    const resolved = { CTC: monthlyCtc, Ctc: monthlyCtc, ctc: monthlyCtc };
-    const rows = [];
+    const ctx = { monthlyCtc, overrideMap, factor, employmentFactor, step, pre };
     const comps = [...(structure.components || [])]
-        .filter(c => c && c.isActive !== false)
+        .filter(c => c && c.isActive !== false && String(c.name || '').trim())
         .sort((a, b) => num(a.order) - num(b.order));
 
-    let takenFromCtc = 0;   // earnings + employer cost resolved so far, at FULL value
-    const balanceRows = [];
+    const fresh = () => ({ actual: {}, whole: {}, grossActual: 0, grossWhole: 0 });
+    const record = (st, row) => {
+        st.actual[row.name] = row.amount;
+        st.whole[row.name]  = row.full;
+        if (row.comp.type === 'earning') { st.grossActual += row.amount; st.grossWhole += row.full; }
+    };
 
-    for (const comp of comps) {
-        const name = String(comp.name || '').trim();
-        if (!name) continue;
+    const state = fresh();
+    const rows = new Array(comps.length).fill(null);
+    const balances = [];           // positions of the residual line(s)
+    const waiting  = [];           // positions whose base is not known yet
+    const unknown  = new Set();    // names not priced yet
+    let unknownEarnings = 0;
+    let taken = 0;                 // earnings + employer cost priced so far, at full value
+
+    comps.forEach((comp, i) => {
+        const name = String(comp.name).trim();
         const hasOverride = Object.prototype.hasOwnProperty.call(overrideMap, name);
-        const proRated = comp.proRated !== false;
-        let amount = 0;
-        let full = 0;
-        // A percentage taken of another component reads a base that has ALREADY
-        // been pro-rated, so applying the factor again would halve it twice.
-        let baseIsPreProrated = false;
+        const park = (list) => { list.push(i); unknown.add(name); if (comp.type === 'earning') unknownEarnings += 1; };
 
-        if (hasOverride) {
-            full = num(overrideMap[name]);
-        } else if (comp.calculationType === 'fixed') {
-            full = num(comp.value);
-        } else if (comp.calculationType === 'balance') {
-            // Held from the full pass so loss of pay cannot be absorbed by the
-            // residual and quietly cancel itself out.
-            full = pre ? num(pre[name]) : null;   // null → filled in after the loop
-        } else {
+        if (!hasOverride && comp.calculationType === 'balance' && !pre) return park(balances);
+        if (!hasOverride && comp.calculationType === 'percentage') {
             const key = String(comp.percentageOf || '').trim();
-            const isCtc = /^ctc$/i.test(key);
-            let base = isCtc ? monthlyCtc : num(resolved[key]);
-            baseIsPreProrated = !isCtc;
-            if (num(comp.wageCeiling) > 0) base = Math.min(base, num(comp.wageCeiling));
-            full = (num(comp.percentage) / 100) * base;
+            if (unknown.has(key) || (/^gross$/i.test(key) && unknownEarnings > 0)) return park(waiting);
         }
+        const row = priceLine(comp, name, state, ctx);
+        rows[i] = row;
+        record(state, row);
+        if (comp.type !== 'deduction') taken += row.full;
+        return undefined;
+    });
 
-        if (full === null) {
-            // Balance on the first pass: park it and settle up once the rest is in.
-            balanceRows.push({ comp, name, proRated, index: rows.length });
-            rows.push({ comp, name, amount: 0, full: 0, proRated, baseIsPreProrated, pending: true });
-            continue;
+    if (balances.length) {
+        const left = Math.max(0, monthlyCtc - taken);
+        const n = balances.length;
+        // Price the residual at `each` and everything that was waiting on it.
+        const trial = (each) => {
+            const st = { actual: { ...state.actual }, whole: { ...state.whole }, grossActual: state.grossActual, grossWhole: state.grossWhole };
+            const out = [];
+            let extra = 0;      // what the waiting lines themselves draw from CTC
+            for (const i of balances) {
+                const comp = comps[i], name = String(comp.name).trim();
+                const proRated = comp.proRated !== false;
+                const row = {
+                    comp, name, proRated,
+                    full: roundAmount(each * employmentFactor, step),
+                    amount: roundAmount(each * (proRated ? factor : 1) * employmentFactor, step),
+                };
+                record(st, row); out.push([i, row]);
+            }
+            for (const i of waiting) {
+                const comp = comps[i];
+                const row = priceLine(comp, String(comp.name).trim(), st, ctx);
+                record(st, row); out.push([i, row]);
+                if (comp.type !== 'deduction') extra += row.full;
+            }
+            return { out, extra };
+        };
+
+        let each = left / n;
+        // An earning that is itself a share of the residual (rare, but legal)
+        // makes the residual depend on itself. Bisect for the figure at which
+        // residual + its dependants exactly use up what is left.
+        if (trial(each).extra > 0.005) {
+            let lo = 0, hi = left / n;
+            for (let k = 0; k < 40; k++) {
+                const mid = (lo + hi) / 2;
+                if (mid * n + trial(mid).extra > left) hi = mid; else lo = mid;
+            }
+            each = lo;
         }
-
-        if (num(comp.capAmount) > 0) full = Math.min(full, num(comp.capAmount));
-        if (num(comp.minAmount) > 0) full = Math.max(full, num(comp.minAmount));
-
-        // The loss-of-pay fraction is opt-in per component; the employment
-        // fraction is not — see the header of computePay(). Neither is applied
-        // to a base that was already reduced, or it would count twice.
-        amount = baseIsPreProrated ? full : full * (proRated ? factor : 1) * employmentFactor;
-        full   = roundAmount(full * (baseIsPreProrated ? 1 : employmentFactor), step);
-        amount = roundAmount(amount, step);
-
-        resolved[name] = amount;
-        if (comp.type !== 'deduction') takenFromCtc += full;
-        rows.push({ comp, name, amount, full, proRated, baseIsPreProrated });
+        for (const [i, row] of trial(roundAmount(each, step)).out) { rows[i] = row; record(state, row); }
     }
 
-    // Settle the residual: whatever is left of monthly CTC once every other
-    // earning and employer cost is taken. Split evenly if a structure declares
-    // more than one, so a mis-built structure still adds up.
-    if (balanceRows.length) {
-        const left = Math.max(0, monthlyCtc - takenFromCtc);
-        const each = roundAmount(left / balanceRows.length, step);
-        for (const b of balanceRows) {
-            const row = rows[b.index];
-            row.full = roundAmount(each * employmentFactor, step);
-            row.amount = roundAmount(each * (b.proRated ? factor : 1) * employmentFactor, step);
-            row.pending = false;
-            resolved[b.name] = row.amount;
-        }
-    }
-
-    return { rows, resolved };
+    return { rows: rows.filter(Boolean), resolved: state.actual };
 }
 
 /**
@@ -435,11 +498,11 @@ const COMMON_COMPONENTS = [
     { name: 'Medical Allowance', code: 'MED', type: 'earning', calculationType: 'fixed', value: 1250, proRated: false },
     { name: 'Special Allowance', code: 'SPL', type: 'earning', calculationType: 'balance' },
     { name: 'Provident Fund', code: 'PF', type: 'deduction', calculationType: 'percentage', percentage: 12, percentageOf: 'Basic Salary', wageCeiling: 15000 },
-    { name: 'ESI', code: 'ESI', type: 'deduction', calculationType: 'percentage', percentage: 0.75, percentageOf: 'Basic Salary', wageCeiling: 21000 },
+    { name: 'ESI', code: 'ESI', type: 'deduction', calculationType: 'percentage', percentage: 0.75, percentageOf: 'Gross', applyUpTo: 21000 },
     { name: 'Professional Tax', code: 'PT', type: 'deduction', calculationType: 'fixed', value: 200, proRated: false },
     { name: 'TDS', code: 'TDS', type: 'deduction', calculationType: 'fixed', value: 0 },
     { name: 'Employer PF', code: 'EPF', type: 'employer', calculationType: 'percentage', percentage: 12, percentageOf: 'Basic Salary', wageCeiling: 15000 },
-    { name: 'Employer ESI', code: 'EESI', type: 'employer', calculationType: 'percentage', percentage: 3.25, percentageOf: 'Basic Salary', wageCeiling: 21000 },
+    { name: 'Employer ESI', code: 'EESI', type: 'employer', calculationType: 'percentage', percentage: 3.25, percentageOf: 'Gross', applyUpTo: 21000 },
     { name: 'Gratuity', code: 'GRAT', type: 'employer', calculationType: 'percentage', percentage: 4.81, percentageOf: 'Basic Salary' },
 ];
 

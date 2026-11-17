@@ -73,6 +73,9 @@ router.post('/admin/runs/:id/unpublish', adminGuard, adminCtrl.unpublishRun);
 router.patch('/admin/runs/:id/cancel',  adminGuard, adminCtrl.cancelRun);
 router.get('/admin/runs/:id/export',    adminGuard, adminCtrl.exportRun);
 router.get('/admin/runs/:id/bank-file', adminGuard, adminCtrl.bankFile);
+router.get('/admin/runs/:id/payslips',  adminGuard, adminCtrl.downloadRunPayslips);
+router.patch('/admin/runs/:id/paid',    adminGuard, adminCtrl.recordPayment);
+router.post('/admin/runs/:id/notify',   adminGuard, adminCtrl.resendPayslips);
 router.put('/admin/runs/:id/entries/:entryId',        adminGuard, adminCtrl.updateEntry);
 router.patch('/admin/runs/:id/entries/:entryId/hold', adminGuard, adminCtrl.holdEntry);
 
@@ -119,6 +122,13 @@ mine('payslips', payslipCtrl.getMyPayslips);
 // to produce at any level before this. Declared ahead of the :id route so
 // "statement" is never read as a payslip id.
 mine('statement',             payslipCtrl.downloadMyStatement);
+// My own tax for the year, on screen and as a statement.
+mine('tax',                   payslipCtrl.getMyTax);
+mine('tax/statement',         payslipCtrl.downloadMyTaxStatement);
+// My expense claims and my advances.
+mine('claims',                payslipCtrl.getMyClaims);
+router.post('/me/claims',       selfGuard, payslipCtrl.createMyClaim);
+router.delete('/me/claims/:id', selfGuard, payslipCtrl.deleteMyClaim);
 mine('payslips/:id',          payslipCtrl.getPayslipDetail);
 mine('payslips/:id/download', payslipCtrl.downloadPayslip);
 

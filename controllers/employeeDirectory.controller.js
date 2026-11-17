@@ -1119,8 +1119,11 @@ exports.getEmployee = async (req, res) => {
         if (vis.payroll && viewer.modules.payroll) {
             const assign = await EmployeeSalaryAssignment
                 .findOne({ employee: uid, school: req.schoolId, isActive: true }).lean();
+            // The CTC in force this month — the stored column is a cache that
+            // a future-dated revision does not move until its month arrives.
+            const today = new Date();
             out.payroll = assign ? {
-                annualCtc: assign.ctc || 0,
+                annualCtc: EmployeeSalaryAssignment.activeCtc(assign, today.getFullYear(), today.getMonth() + 1) || assign.ctc || 0,
                 effectiveDate: assign.effectiveDate || null,
                 revisions: (assign.ctcRevisions || []).length,
             } : null;
