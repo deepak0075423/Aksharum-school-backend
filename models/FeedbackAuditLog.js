@@ -18,6 +18,10 @@ const FeedbackAuditLogSchema = new db.Schema({
     entityId:    { type: db.Types.UUID, default: null },
     campaign:    { type: db.Types.UUID, ref: 'FeedbackCampaign', default: null },
     assignment:  { type: db.Types.UUID, ref: 'FeedbackAssignment', default: null },
+    // The campaign's academic year (Nov 2026), so the log of a year's campaigns
+    // shows under that year whenever it was written. Null for entries about
+    // the question bank, templates and settings — those are dated instead.
+    academicYear: { type: db.Types.UUID, ref: 'AcademicYear', default: null },
     description: { type: String, default: '' },
     meta:        { type: db.Types.JSON, default: {} },
 }, { timestamps: true });

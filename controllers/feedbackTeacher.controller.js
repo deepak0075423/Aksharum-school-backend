@@ -225,7 +225,7 @@ exports.getTrends = async (req, res) => {
         const key = dim ? String(req.query[dim]) : null;
 
         let campaigns = await visibleCampaigns(req.schoolId, settings);
-        if (req.query.academicYear) {
+        if (req.query.academicYear && req.query.academicYear !== 'all') {
             campaigns = campaigns.filter((c) => sid(c.academicYear) === String(req.query.academicYear));
         }
         if (!campaigns.length) return ok(res, { points: [], categories: [], filters: await filterOptions(req), dimension: dim });

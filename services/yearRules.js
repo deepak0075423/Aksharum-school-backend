@@ -92,7 +92,8 @@ module.exports = {
     // An assignment is of its campaign's year (copied on to the row); the date
     // is only the fallback for a row written before the column existed.
     FeedbackAssignment: { id: 'academicYear', at: ['assignedAt', 'createdAt'] },
-    FeedbackAuditLog:   AUDIT,
+    // Entries about a campaign carry its year; the rest (bank, settings) are dated.
+    FeedbackAuditLog:   { id: 'academicYear', at: 'createdAt' },
 
     // ── Staff attendance & leave paperwork ───────────────────────────────────
     TeacherAttendanceRegularization: { at: ['date', 'createdAt'], open: ['Pending'] },

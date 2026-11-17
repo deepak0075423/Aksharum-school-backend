@@ -345,6 +345,17 @@ ONCE.push({
     },
 });
 
+ONCE.push({
+    // The feedback activity log was put in a year by the day each entry was
+    // written; an entry about a campaign now carries that campaign's year.
+    name: 'feedback: activity log entries carry their campaign\'s academic year (Nov 2026)',
+    run: async () => {
+        const r = await pool.query(`UPDATE "feedbackauditlogs" l SET "academicYear" = c."academicYear"
+            FROM "feedbackcampaigns" c WHERE l."campaign" = c."_id" AND l."academicYear" IS NULL AND c."academicYear" IS NOT NULL`);
+        return `${r.rowCount} activity entries given their campaign's year`;
+    },
+});
+
 async function runOnce() {
     try {
         await pool.query(`CREATE TABLE IF NOT EXISTS "datamigrations" ("name" text PRIMARY KEY, "ranAt" timestamptz NOT NULL DEFAULT now(), "result" text)`);

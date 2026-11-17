@@ -120,7 +120,11 @@ const DEFAULT_TEMPLATE_NAME = 'Standard Teacher Evaluation';
 // ═════════════════════════════════════════════════════════════════════════════
 async function logAudit(req, actionType, entityType, entityId, description, extra = {}) {
     try {
+        const year = extra.campaign
+            ? (await FeedbackCampaign.findById(extra.campaign).select('academicYear').lean())?.academicYear || null
+            : null;
         await FeedbackAuditLog.create({
+            academicYear: year ? sid(year) : null,
             school: req.schoolId,
             user:   req.userId,
             role:   req.userRole,

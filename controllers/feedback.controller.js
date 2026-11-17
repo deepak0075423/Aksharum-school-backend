@@ -432,7 +432,7 @@ exports.getTemplates = async (req, res) => {
             // still ran it. Only counted since campaigns began recording it.
             pool.query(
                 `SELECT "template", count(*)::int AS "n" FROM "feedbackcampaigns"
-                  WHERE "school" = $1 AND "template" IS NOT NULL GROUP BY "template"`,
+                  WHERE "school" = $1 AND "template" IS NOT NULL${yearScope.isYear('"academicYear"')} GROUP BY "template"`,
                 [String(req.schoolId)],
             ).then((r) => new Map(r.rows.map((x) => [sid(x.template), x.n]))).catch(() => new Map()),
         ]);
@@ -681,8 +681,13 @@ exports.getCampaignOptions = async (req, res) => {
             };
         });
 
+        const pickedId = yearScope.picked();
+        const viewingYear = pickedId && pickedId !== scope.yearId
+            ? await yearScope.allYears(() => AcademicYear.findOne({ _id: pickedId, school }).select('yearName').lean())
+            : null;
         const base = {
             academicYear: null, classes: [], sections: [], subjects: [], teachers: [], links: [],
+            viewingYear: viewingYear ? { _id: sid(viewingYear._id), yearName: viewingYear.yearName } : null,
             templates: templateRows,
             defaults: {
                 isAnonymous: settings?.defaultAnonymous !== false,
@@ -1449,8 +1454,19 @@ exports.getTeacherAnalytics = async (req, res) => {
 
         const profile = await TeacherProfile.findOne({ user: teacherId }).select('department designation employeeId').lean();
 
+        // A teacher's results are the campaigns of ONE academic year — the one
+        // in view (or the page's own year), never every year at once. The route
+        // carries the teacher's id, and a read that "opens one record" is not
+        // narrowed automatically, so the year is put on the filter here.
         const campaignFilter = { school: req.schoolId, status: { $in: ['active', 'closed', 'archived'] } };
-        if (req.query.academicYear && req.query.academicYear !== 'all') campaignFilter.academicYear = str(req.query.academicYear, 40);
+        // Opened for one campaign (from that campaign's page): that campaign's year.
+        const askedYear = str(req.query.academicYear, 40);
+        const forCampaign = !askedYear && req.query.campaignId
+            ? await FeedbackCampaign.findOne({ _id: str(req.query.campaignId, 40), school: req.schoolId }).select('academicYear').lean()
+            : null;
+        if (askedYear && askedYear !== 'all') campaignFilter.academicYear = askedYear;
+        else if (forCampaign?.academicYear) campaignFilter.academicYear = sid(forCampaign.academicYear);
+        else if (askedYear !== 'all') Object.assign(campaignFilter, await yearScope.thisYear(req.schoolId));
         const campaigns = await FeedbackCampaign.find(campaignFilter)
             .select('name term startDate status minimumResponses').sort({ startDate: -1 }).lean();
         if (!campaigns.length) return ok(res, { teacher, profile, campaigns: [], summary: null, categories: [], trend: [] });
