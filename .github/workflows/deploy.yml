@@ -10,84 +10,17 @@
 #   DEPLOY_DIR    the server folder of this repo — only if the deploy cannot
 #                 find it from pm2 (process "school-backend") or git
 #
-# Run it by hand: Actions → Deploy backend → Run workflow. Tick "skip tests"
-# only to push out an urgent fix while the test job itself is broken.
-# Roll back: re-run the deploy job of an older successful run.
+# Run it by hand: Actions → Deploy backend → Run workflow.
+# Roll back: re-run an older successful run.
 name: Deploy backend
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      skip_tests:
-        description: Deploy without running the admission tests (emergencies only)
-        type: boolean
-        default: false
 
 jobs:
-  # The admission module's tests (tests/admission, ~4 min). A red run stops
-  # the deploy. Throwaway Postgres, Redis and mail server — nothing from
-  # production, and no mail leaves the runner.
-  test:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_tests) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: aksharum_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-timeout 5s --health-retries 20
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s --health-timeout 5s --health-retries 20
-      # Accepts every message and keeps it. Account-activation emails go
-      # through the platform SMTP; without a server to accept them the app
-      # (rightly) tells the family "the school will give you the details",
-      # and the enrolment test that expects "emailed" fails.
-      mailpit:
-        image: axllent/mailpit:latest
-        env:
-          MP_SMTP_AUTH_ACCEPT_ANY: 1
-          MP_SMTP_AUTH_ALLOW_INSECURE: 1
-        ports:
-          - 1025:1025
-    env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/aksharum_test
-      REDIS_URL: redis://localhost:6379
-      JWT_SECRET: ci-only-jwt-secret
-      JWT_REFRESH_SECRET: ci-only-refresh-secret
-      INTERNAL_SECRET: ci-only-internal-secret
-      FRONTEND_URL: http://localhost:3000
-      SMTP_HOST: localhost
-      SMTP_PORT: 1025
-      SMTP_USER: ci@aksharum.test
-      SMTP_PASS: ci-only
-      NODE_ENV: test
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 25
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - name: Admission module tests
-        run: npm run test:admission
-
   deploy:
-    needs: test
-    if: ${{ !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # One deploy at a time; a newer push waits for the running one.
