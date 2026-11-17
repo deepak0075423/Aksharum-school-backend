@@ -1467,21 +1467,48 @@ exports.getTeacherAnalytics = async (req, res) => {
         if (askedYear && askedYear !== 'all') campaignFilter.academicYear = askedYear;
         else if (forCampaign?.academicYear) campaignFilter.academicYear = sid(forCampaign.academicYear);
         else if (askedYear !== 'all') Object.assign(campaignFilter, await yearScope.thisYear(req.schoolId));
-        const campaigns = await FeedbackCampaign.find(campaignFilter)
+        const yearCampaigns = await FeedbackCampaign.find(campaignFilter)
             .select('name term startDate status minimumResponses').sort({ startDate: -1 }).lean();
-        if (!campaigns.length) return ok(res, { teacher, profile, campaigns: [], summary: null, categories: [], trend: [] });
 
-        const focus = req.query.campaignId
-            ? campaigns.find((c) => sid(c._id) === String(req.query.campaignId))
-            : campaigns[0];
+        // Only the campaigns that actually asked about this teacher: one that
+        // targeted other classes has nothing to say about them, and opening on
+        // it showed an empty page.
+        const allRows = yearCampaigns.length
+            ? await FeedbackAssignment.find({ campaign: { $in: yearCampaigns.map((c) => c._id) }, teacher: teacherId })
+                .select('campaign status overallRating').lean()
+            : [];
+        const rowsOf = allRows.reduce((acc, r) => {
+            (acc[sid(r.campaign)] = acc[sid(r.campaign)] || []).push(r);
+            return acc;
+        }, {});
+        const campaigns = yearCampaigns.filter((c) => rowsOf[sid(c._id)]?.length);
+        if (!campaigns.length) return ok(res, { teacher, profile, campaigns: [], summary: null, categories: [], trend: [], history: [] });
+
+        // Each campaign in one line: how far its responses are, and its rating
+        // when it has cleared its floor. Counts are not answers, so they are
+        // shown whatever the floor — they are what tells an admin how close a
+        // withheld result is.
+        const history = campaigns.map((c) => {
+            const a = fb.aggregate(rowsOf[sid(c._id)], c.minimumResponses);
+            return {
+                _id: sid(c._id), name: c.name, term: c.term, status: c.status, startDate: c.startDate,
+                assigned: rowsOf[sid(c._id)].length, responses: a.responses,
+                minimumResponses: c.minimumResponses, locked: a.locked,
+                rating: a.locked ? null : a.averageRating,
+            };
+        });
+
+        // Opened without a campaign (from a report, a list): the newest one whose
+        // results can be shown — a page that opens on "withheld" while an
+        // earlier campaign has results reads as an empty page.
+        const asked = req.query.campaignId ? String(req.query.campaignId) : '';
+        const focus = asked
+            ? campaigns.find((c) => sid(c._id) === asked)
+            : campaigns.find((c) => !history.find((h) => h._id === sid(c._id)).locked) || campaigns[0];
         if (!focus) return bad(res, 'Campaign not found.', 404);
 
-        const [focusRows, allRows] = await Promise.all([
-            FeedbackAssignment.find({ campaign: focus._id, teacher: teacherId })
-                .select('status overallRating categoryScores subject section').lean(),
-            FeedbackAssignment.find({ campaign: { $in: campaigns.map((c) => c._id) }, teacher: teacherId })
-                .select('campaign status overallRating').lean(),
-        ]);
+        const focusRows = await FeedbackAssignment.find({ campaign: focus._id, teacher: teacherId })
+            .select('status overallRating categoryScores subject section').lean();
 
         const agg = fb.aggregate(focusRows, focus.minimumResponses);
 
@@ -1512,10 +1539,7 @@ exports.getTeacherAnalytics = async (req, res) => {
             }));
         }
 
-        const byCampaign = allRows.reduce((acc, r) => {
-            (acc[sid(r.campaign)] = acc[sid(r.campaign)] || []).push(r);
-            return acc;
-        }, {});
+        const byCampaign = rowsOf;
         const trend = [...campaigns]
             .sort((a, b) => new Date(a.startDate) - new Date(b.startDate))
             .map((c) => {
@@ -1523,9 +1547,40 @@ exports.getTeacherAnalytics = async (req, res) => {
                 return { label: c.term || c.name, rating: a.locked ? null : a.averageRating, responses: a.responses, locked: a.locked };
             });
 
+        // Where the responses stand, by section and subject — counts only, so
+        // they are shown below the floor too: they say who still has to answer,
+        // never what anybody said.
+        let progress = [];
+        if (agg.locked) {
+            const subjIds = [...new Set(focusRows.map((r) => sid(r.subject)).filter(Boolean))];
+            const [subs, labels] = await Promise.all([
+                subjIds.length ? Subject.find({ _id: { $in: subjIds } }).select('subjectName').lean() : [],
+                fb.sectionLabels(focusRows.map((r) => r.section)),
+            ]);
+            const subName = new Map(subs.map((x) => [sid(x._id), x.subjectName]));
+            const groups = new Map();
+            for (const r of focusRows) {
+                const key = `${sid(r.section)}|${sid(r.subject)}`;
+                if (!groups.has(key)) {
+                    groups.set(key, {
+                        section: labels.get(sid(r.section))?.label || 'Section',
+                        subject: subName.get(sid(r.subject)) || '',
+                        assigned: 0, responses: 0,
+                    });
+                }
+                const g = groups.get(key);
+                g.assigned += 1;
+                if (r.status === 'submitted') g.responses += 1;
+            }
+            progress = [...groups.values()].sort((a, b) => a.section.localeCompare(b.section, 'en', { numeric: true })
+                || a.subject.localeCompare(b.subject));
+        }
+
         ok(res, {
             teacher: { _id: sid(teacher._id), name: teacher.name, email: teacher.email },
             profile: { department: profile?.department || '', designation: profile?.designation || '', employeeId: profile?.employeeId || '' },
+            history,
+            progress,
             campaigns: campaigns.map((c) => ({ _id: sid(c._id), name: c.name, term: c.term, status: c.status })),
             campaign: { _id: sid(focus._id), name: focus.name, term: focus.term, minimumResponses: focus.minimumResponses },
             summary: {
