@@ -15,6 +15,7 @@ const School                = require('../models/School');
 const StudentProfile        = require('../models/StudentProfile');
 const ClassSection          = require('../models/ClassSection');
 const AcademicYear          = require('../models/AcademicYear');
+const Class                 = require('../models/Class');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const Subject               = require('../models/Subject');
 const Attendance            = require('../models/Attendance');
@@ -87,13 +88,20 @@ async function resolveScope(req) {
     if (req.userRole === 'school_admin') {
         const filter = { school };
         if (activeYear) { filter.academicYear = activeYear._id; filter.status = 'active'; }
-        const sections = await ClassSection.find(filter)
-            .populate('class', 'className classNumber').lean();
+        const [sections, classes] = await Promise.all([
+            ClassSection.find(filter).populate('class', 'className classNumber').lean(),
+            // Every class of the year, sections or not. The filter used to be
+            // built from the sections alone, so a class still waiting for its
+            // sections was missing from "All classes" altogether.
+            Class.find(activeYear ? { school, academicYear: activeYear._id } : { school })
+                .select('className classNumber').lean(),
+        ]);
         return {
             canSeeAll:  true,
             activeYear,
             sections:   sections.map((s) => shapeSection(s, [], [])),
             sectionIds: sections.map((s) => String(s._id)),
+            classes:    classes.map((c) => ({ _id: String(c._id), className: c.className, classNumber: c.classNumber ?? null })),
         };
     }
 
@@ -180,6 +188,17 @@ async function getModules(schoolId) {
     };
 }
 
+// The class filter's choices: every class of the year for an admin; for a
+// teacher, the classes of the sections they work in.
+function classesOf(scope) {
+    if (scope.classes) return [...scope.classes];
+    const map = new Map();
+    for (const s of scope.sections) {
+        if (s.classId && !map.has(s.classId)) map.set(s.classId, { _id: s.classId, className: s.className, classNumber: s.classNumber });
+    }
+    return [...map.values()];
+}
+
 // ── GET /scope — sections the caller may analyse + enabled module flags ───────
 exports.getScope = async (req, res) => {
     try {
@@ -191,6 +210,7 @@ exports.getScope = async (req, res) => {
                 ? { _id: scope.activeYear._id, yearName: scope.activeYear.yearName }
                 : null,
             sections: scope.sections.sort((a, b) => byClass(a, b) || bySection(a, b)),
+            classes:  classesOf(scope).sort(byClass),
             modules,
         });
     } catch (e) { err(res, e); }
@@ -311,15 +331,21 @@ async function scopedProfiles(req, scope, { paginate = false } = {}) {
         allowed = [String(sectionId)];
     } else if (classId) {
         const inClass = scope.sections.filter((s) => String(s.classId) === String(classId)).map((s) => String(s._id));
-        if (!inClass.length) return { profiles: [], total: 0, page, limit };
+        // An admin's class filter also offers classes with no section yet —
+        // their admitted-but-unplaced students are still that class's.
+        const classKnown = scope.canSeeAll && (scope.classes || []).some((c) => String(c._id) === String(classId));
+        if (!inClass.length && !classKnown) return { profiles: [], total: 0, page, limit };
         allowed = inClass;
     }
     // An admin browsing unfiltered should also see students who have been
     // admitted but not placed in a section yet — they are invisible to any
-    // section-based filter, and they are exactly the ones worth chasing.
-    const includeUnplaced = scope.canSeeAll && !sectionId && !classId;
+    // section-based filter, and they are exactly the ones worth chasing. With a
+    // class picked, those admitted to THAT class.
+    const includeUnplaced = scope.canSeeAll && !sectionId;
     if (!allowed.length && !includeUnplaced) return { profiles: [], total: 0, page, limit };
-    if (includeUnplaced) {
+    if (includeUnplaced && classId) {
+        filter.$or = [{ currentSection: { $in: allowed } }, { currentClass: classId, currentSection: null }];
+    } else if (includeUnplaced) {
         filter.$or = [{ currentSection: { $in: allowed } }, { currentSection: null }];
     } else {
         filter.currentSection = { $in: allowed };

@@ -414,10 +414,10 @@ exports.importYearStructure = async (req, res) => {
             ClassSection.find({ school: req.schoolId, academicYear: target._id }).lean(),
             ClassSubject.find({ class: { $in: srcClassIds } }).lean(),
             Subject.find({ school: req.schoolId, academicYear: source._id })
-                .select('subjectName subjectCode type description').lean(),
+                .select('subjectName subjectCode type description teachers').lean(),
         ]);
         const tgtSubjects = await Subject.find({ school: req.schoolId, academicYear: target._id })
-            .select('subjectName subjectCode').lean();
+            .select('subjectName subjectCode teachers').lean();
         // Matched on name, case-insensitively: the same subject typed into both
         // years by hand must not become two rows.
         const tgtSubjectByName = new Map(tgtSubjects.map((x) => [x.subjectName.trim().toLowerCase(), x]));
@@ -452,6 +452,7 @@ exports.importYearStructure = async (req, res) => {
         const teacherIds = [...new Set([
             ...srcSST.map((r) => String(r.teacher)),
             ...srcSections.flatMap((s) => [s.classTeacher, s.substituteTeacher].filter(Boolean).map(String)),
+            ...subjects.flatMap((s) => (s.teachers || []).map(String)),
         ])];
         const teachers = teacherIds.length
             ? await User.find({ _id: { $in: teacherIds }, school: req.schoolId, role: 'teacher' })
@@ -623,7 +624,10 @@ exports.importYearStructure = async (req, res) => {
             if (p?.existing) {
                 const tgtSec = tgtSections.find((s) => String(s.class) === String(p.existing._id)
                     && String(s.sectionName).toUpperCase() === String(sec.sectionName).toUpperCase());
-                if (tgtSec && tgtSSTKey.has(`${String(tgtSec._id)}#${String(r.subject)}#${String(r.teacher)}`)) {
+                // Keyed on the TARGET year's subject row, as the write is — the
+                // source id never matched, so a re-run counted every one as new.
+                const tgtSubj = subjectMap.get(String(r.subject));
+                if (tgtSec && tgtSubj && tgtSSTKey.has(`${String(tgtSec._id)}#${String(tgtSubj._id)}#${String(r.teacher)}`)) {
                     note('assignment', `${label} · ${teacher.name}`, 'already in this year');
                     continue;
                 }
@@ -642,6 +646,37 @@ exports.importYearStructure = async (req, res) => {
             }
             sstPlan.push({ row: r, sec, label });
             assignmentsToCreate += 1;
+        }
+
+        // ── Plan: each subject's own teacher list ────────────────────────────
+        // A subject carries the teachers who teach it (the Subjects screen's
+        // Teachers column, and the shortlist a section's "add subject teacher"
+        // picker offers). Imported subjects used to start with that list EMPTY
+        // even with "Subject teachers" ticked, so a copied year showed every
+        // subject untaught while its sections had teachers against them. With
+        // that box ticked the list now comes across — active staff only — onto
+        // new rows and topped up onto rows the year already has, together with
+        // anyone this run gives the subject in a section.
+        const tgtPool = new Map(tgtSubjects.map((x) => [String(x._id), new Set((x.teachers || []).map(String))]));
+        const poolPlan = new Map();   // source subject id -> teacher ids to add
+        let subjectTeachersToAdd = 0;
+        if (inc.assignments) {
+            for (const s of subjects) {
+                const tgt = subjectMap.get(String(s._id));
+                if (!tgt && !inc.subjects) continue;   // its subject will not be in the year
+                const have = tgt ? (tgtPool.get(String(tgt._id)) || new Set()) : new Set();
+                const fromSections = sstPlan.filter(({ row }) => String(row.subject) === String(s._id))
+                    .map(({ row }) => String(row.teacher));
+                const add = [];
+                for (const id of new Set([...(s.teachers || []).map(String), ...fromSections])) {
+                    if (have.has(id)) continue;
+                    const t = teacherById.get(id);
+                    if (!t) { note('assignment', `${s.subjectName} (subject list)`, 'that teacher is no longer on the staff list'); continue; }
+                    if (t.isActive === false) { note('assignment', `${s.subjectName} (subject list) · ${t.name}`, 'that teacher is deactivated'); continue; }
+                    add.push(id);
+                }
+                if (add.length) { poolPlan.set(String(s._id), add); subjectTeachersToAdd += add.length; }
+            }
         }
 
         // ── Plan: class / vice class teacher, only when asked for ────────────
@@ -682,6 +717,7 @@ exports.importYearStructure = async (req, res) => {
             subjectsToCreate,
             linksToCreate,
             assignmentsToCreate,
+            subjectTeachersToAdd,
             classTeachersToSet,
             skipped,
             targetHas,
@@ -797,6 +833,19 @@ exports.importYearStructure = async (req, res) => {
             createdAssignments += 1;
         }
 
+        let addedSubjectTeachers = 0;
+        for (const [srcId, add] of poolPlan) {
+            const tgtSubject = subjectMap.get(srcId);
+            if (!tgtSubject) continue;
+            // Re-read: a row created above, or edited since the plan, is the truth.
+            const fresh = await Subject.findById(tgtSubject._id).select('teachers').lean();
+            const have = (fresh?.teachers || []).map(String);
+            const merged = [...new Set([...have, ...add])];
+            if (merged.length === have.length) continue;
+            await Subject.updateOne({ _id: tgtSubject._id }, { $set: { teachers: merged } });
+            addedSubjectTeachers += merged.length - have.length;
+        }
+
         // Importing into the year that is already active gives those teachers
         // their class at once; into any other it changes nothing until that
         // year is activated, and the nudge is simply answered "no change".
@@ -806,6 +855,7 @@ exports.importYearStructure = async (req, res) => {
             ...summary,
             preview: false,
             createdClasses, createdSections, createdSubjects, createdLinks, createdAssignments, setClassTeachers,
+            addedSubjectTeachers,
         }, 201);
     } catch (e) {
         if (e.code === 11000) return err(res, { message: 'Part of that structure already exists — reload and try again.' }, 400);
@@ -1394,14 +1444,33 @@ exports.autoAssignStudents = async (req, res) => {
             [String(req.schoolId), targetYearId],
         );
 
+        // Who is already placed in the target year, where, and by what. A
+        // placement this button made earlier follows the student's previous
+        // year when that has changed since (moved from 5 A to 5 B last year →
+        // 5 B here too); re-running used to skip them as "already enrolled",
+        // so every such change had to be redone by hand. A placement made by
+        // hand in the target year is a decision and stays.
+        const { rows: targetRows } = await pool.query(
+            `SELECT "student", "section", "source" FROM "${require('../models/StudentEnrollment').tableName}"
+              WHERE "school" = $1::uuid AND "academicYear" = $2::uuid`,
+            [String(req.schoolId), targetYearId],
+        );
+        const targetRowOf = new Map(targetRows.map((r) => [String(r.student), r]));
+
         // ── Match each student to the same-named section in the target year ──
         const sectionAddMap = {};
-        let skipped = 0;
+        let skipped = 0, updated = 0;
         for (const src of sources) {
             const userId = String(src.student);
-            if (targetEnrolledSet.has(userId)) { skipped++; continue; }
             const key = `${String(src.className).trim().toLowerCase()}||${String(src.sectionName).trim().toLowerCase()}`;
             const targetSection = targetLookup[key];
+            if (targetEnrolledSet.has(userId)) {
+                const row = targetRowOf.get(userId);
+                const follows = row && row.source === 'autoAssign' && targetSection
+                    && String(row.section || '') !== String(targetSection._id);
+                if (!follows) { skipped++; continue; }
+                updated++;
+            }
             if (!targetSection) continue;   // no matching section in the target year
             const sid = targetSection._id.toString();
             (sectionAddMap[sid] = sectionAddMap[sid] || []).push(userId);
@@ -1414,10 +1483,10 @@ exports.autoAssignStudents = async (req, res) => {
                 });
             }
         }
-        const assigned = Object.values(sectionAddMap).reduce((sum, arr) => sum + arr.length, 0);
+        const assigned = Object.values(sectionAddMap).reduce((sum, arr) => sum + arr.length, 0) - updated;
         const bulkOps = Object.keys(sectionAddMap);
 
-        ok(res, { assigned, skipped, sections: bulkOps.length });
+        ok(res, { assigned, updated, skipped, sections: bulkOps.length });
     } catch (e) { err(res, e); }
 };
 
@@ -1807,7 +1876,12 @@ exports.getAssignableStudents = async (req, res) => {
                 rollNumber:      y.rollNumber || '',
                 gender:          p.gender || '',
                 enrolledIn:      held,
+                // Free this year. A student another section holds can still be
+                // picked — adding them MOVES them here for this year (their
+                // placement in other years is untouched) — but is never part
+                // of a "select all".
                 assignable:      !held,
+                movable:         !!held,
                 reason:          held ? `Already in ${held}` : '',
                 // Students admitted to this class but never placed are the ones
                 // the admin is nearly always looking for — surfaced first below.
@@ -1858,11 +1932,15 @@ exports.assignStudentToSection = async (req, res) => {
             academicYear:     section.academicYear,
             enrolledStudents: { $in: requested },
             _id:              { $ne: section._id },
-        }, '_id sectionName enrolledStudents').lean();
+        }, '_id sectionName class enrolledStudents').lean();
+        const clashClass = new Map((clashes.length
+            ? await Class.find({ _id: { $in: [...new Set(clashes.map((c) => String(c.class)))] } }, 'className').lean()
+            : []).map((c) => [String(c._id), c.className]));
         const heldBy = new Map();
         for (const c of clashes) {
+            const label = clashClass.get(String(c.class)) ? `${clashClass.get(String(c.class))} – ${c.sectionName}` : c.sectionName;
             for (const id of c.enrolledStudents || []) {
-                if (requested.includes(String(id)) && !heldBy.has(String(id))) heldBy.set(String(id), c.sectionName);
+                if (requested.includes(String(id)) && !heldBy.has(String(id))) heldBy.set(String(id), label);
             }
         }
 
@@ -1889,18 +1967,20 @@ exports.assignStudentToSection = async (req, res) => {
             }, 0);
         }
 
-        const enrolled = [], skipped = [], failed = [];
+        const enrolled = [], skipped = [], failed = [], moved = [];
 
         for (const studentId of requested) {
             const name = names[studentId] || 'Student';
             if (!names[studentId]) { failed.push({ _id: studentId, name, reason: 'Student not found' }); continue; }
             if (roster.has(studentId)) { skipped.push({ _id: studentId, name, reason: 'Already in this section' }); continue; }
 
+            // Placed in another section of THIS year: the new choice replaces
+            // it (one placement per student per year — enrollment.place moves
+            // the year's row and takes them off the old roster). It used to be
+            // refused with "remove them from it first", so changing a student's
+            // class within a year meant two separate steps by hand. Other years
+            // are never touched.
             const held = heldBy.get(studentId);
-            if (held) {
-                failed.push({ _id: studentId, name, reason: `Already enrolled in section "${held}" — remove them from it first` });
-                continue;
-            }
             if (!unlimited && free <= 0) {
                 failed.push({ _id: studentId, name, reason: `Section ${section.sectionName} is full` });
                 continue;
@@ -1937,7 +2017,8 @@ exports.assignStudentToSection = async (req, res) => {
                 rollNumber: assignedRoll ?? undefined,
                 actorId:    req.userId,
             });
-            enrolled.push({ _id: studentId, name, rollNumber: assignedRoll ?? (placed.rollNumber || null) });
+            enrolled.push({ _id: studentId, name, rollNumber: assignedRoll ?? (placed.rollNumber || null), movedFrom: held || null });
+            if (held) moved.push({ _id: studentId, name, from: held });
         }
 
         // A single-student call that could not be honoured still reads as an
@@ -1945,13 +2026,15 @@ exports.assignStudentToSection = async (req, res) => {
         if (requested.length === 1 && failed.length === 1) return err(res, { message: failed[0].reason }, 400);
 
         const parts = [];
-        if (enrolled.length) parts.push(`${enrolled.length} student${enrolled.length === 1 ? '' : 's'} enrolled`);
+        const fresh = enrolled.length - moved.length;
+        if (fresh) parts.push(`${fresh} student${fresh === 1 ? '' : 's'} enrolled`);
+        if (moved.length) parts.push(`${moved.length} moved from another section`);
         if (skipped.length)  parts.push(`${skipped.length} already in this section`);
         if (failed.length)   parts.push(`${failed.length} could not be enrolled`);
 
         ok(res, {
             message: parts.join(', ') || 'Nothing to do',
-            enrolled, skipped, failed,
+            enrolled, skipped, failed, moved,
             // Kept for callers written against the old single-student response
             rollNumber: enrolled.length === 1 ? enrolled[0].rollNumber : null,
         });

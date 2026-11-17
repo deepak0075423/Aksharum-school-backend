@@ -2085,6 +2085,7 @@ exports.createTeacher = async (req, res) => {
         const b     = req.body;
         const files = req.files || {};
         const { name, email, phone, designation } = b;
+        if (b.gender !== undefined) b.gender = canonicalGender(b.gender);
 
         const problem = validateTeacherIntake(b, files);
         if (problem) return res.status(400).json({ success: false, message: problem });
@@ -2152,10 +2153,15 @@ exports.updateTeacherFull = async (req, res) => {
         if (!user) return res.status(404).json({ success: false, message: 'Teacher not found' });
         const existing = await TeacherProfile.findOne({ user: user._id, school: req.schoolId }).lean();
 
+        if (b.gender !== undefined) b.gender = canonicalGender(b.gender);
         // Validated against the merged record, so paperwork already on file
-        // satisfies the intake rules.
+        // satisfies the intake rules. A stored "male" is Male here too, or a
+        // partial save from another screen would be refused for a field it
+        // never touched.
+        const merged = { ...(existing || {}), ...b };
+        merged.gender = canonicalGender(merged.gender);
         const problem = validateTeacherIntake(
-            { ...(existing || {}), ...b },
+            merged,
             { ...fileStubsFor(existing), ...files },
             { current: { name: user.name, fatherOrHusbandName: existing?.fatherOrHusbandName, emergencyContactName: existing?.emergencyContactName } },
         );
@@ -2495,6 +2501,12 @@ const TEACHING_DEGREES = ['B.Ed.', 'D.El.Ed.', 'M.Ed.', 'NTT'];
 const SCHOOL_BOARDS  = ['CBSE', 'ICSE', 'State Board', 'IB', 'Cambridge (IGCSE)', 'NIOS', 'Other'];
 const SCHOOL_MEDIUMS = ['English', 'Hindi', 'Marathi', 'Gujarati', 'Bengali', 'Tamil', 'Telugu', 'Kannada', 'Malayalam', 'Urdu', 'Other'];
 const GENDERS        = ['Male', 'Female', 'Other'];
+// "male" (older imports and app builds) is Male: matched whatever its case and
+// stored as the list spells it, instead of refusing the whole save at the end.
+const canonicalGender = (raw) => {
+    const typed = String(raw ?? '').trim();
+    return GENDERS.find((g) => g.toLowerCase() === typed.toLowerCase()) || typed;
+};
 
 // Sheet dates arrive as dd/mm/yyyy text (the templates force the column to
 // text so Excel cannot silently reformat them). Returns null on anything else,
