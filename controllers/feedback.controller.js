@@ -38,6 +38,7 @@ const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 
 const fb = require('../services/feedbackService');
 const pool = require('../db/pool');
+const yearScope = require('../services/yearScope');
 const { notify, schoolAdminIds } = require('../services/notifyService');
 const { buildFeedbackReportPDF } = require('../utils/feedbackReportPdf');
 
@@ -585,6 +586,15 @@ exports.getCampaign = async (req, res) => {
  * against it rather than trusted from the form.
  */
 async function currentYearScope(schoolId) {
+    // The school's REAL active year, read with the header's year switcher out
+    // of the way: while an admin looks at another year, that year stands in
+    // for the active one in every read — and the form would then offer last
+    // year's classes for a campaign that create() homes to this year (every
+    // target dropped, the campaign silently widened to the whole school).
+    return yearScope.allYears(() => scopeOfActiveYear(schoolId));
+}
+
+async function scopeOfActiveYear(schoolId) {
     const year = await fb.activeAcademicYear(schoolId);
     if (!year) return { year: null };
     const yearId = sid(year._id);
@@ -1149,6 +1159,8 @@ exports.getCampaignAssignments = async (req, res) => {
         const c = await FeedbackCampaign.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!c) return bad(res, 'Campaign not found.', 404);
 
+        if (req.query.groupBy === 'student') return studentRegister(req, res, c);
+
         const filter = { campaign: c._id };
         if (req.query.status)  filter.status  = str(req.query.status, 20);
         if (req.query.teacher) filter.teacher = str(req.query.teacher, 40);
@@ -1183,6 +1195,92 @@ exports.getCampaignAssignments = async (req, res) => {
         });
     } catch (e) { fail(res, e); }
 };
+
+/**
+ * "Who responded", one row per STUDENT (Nov 2026). A student owes one
+ * evaluation per teacher, so the per-assignment register listed each student
+ * once per teacher; the school chases students, not pairs. Each row carries how
+ * many of their teachers they have answered, and the teachers themselves for
+ * the expanded row — status only, never an answer, so it is the same submission
+ * register an anonymous campaign already shows.
+ *
+ *   status   complete | partial | none   (all, some, or none of their teachers)
+ *   q        a piece of the student's name
+ */
+const SUBMITTED = `count(*) FILTER (WHERE a."status" = 'submitted')`;
+const REGISTER_STATE = {
+    complete: `${SUBMITTED} = count(*)`,
+    partial:  `${SUBMITTED} BETWEEN 1 AND count(*) - 1`,
+    none:     `${SUBMITTED} = 0`,
+};
+async function studentRegister(req, res, c) {
+    const { page, limit, skip } = paginate(req, 10);
+    const params = [sid(c._id)];
+    let where = 'a."campaign" = $1';
+    const q = str(req.query.q, 80);
+    if (q) {
+        params.push(`%${q.replace(/[%_\\]/g, (m) => `\\${m}`)}%`);
+        where += ` AND u."name" ILIKE $${params.length}`;
+    }
+    const having = REGISTER_STATE[req.query.status] ? `HAVING ${REGISTER_STATE[req.query.status]}` : '';
+    const T = `"${FeedbackAssignment.tableName}"`;
+    const grouped = `
+        SELECT a."student", u."name",
+               count(*)::int AS total,
+               ${SUBMITTED}::int AS submitted,
+               count(*) FILTER (WHERE a."status" = 'in_progress')::int AS started,
+               count(*) FILTER (WHERE a."status" = 'expired')::int     AS expired,
+               max(a."submittedAt") AS "lastSubmittedAt",
+               (array_agg(a."section"::text ORDER BY a."section"::text))[1] AS section
+          FROM ${T} a LEFT JOIN "users" u ON u."_id" = a."student"
+         WHERE ${where}
+         GROUP BY a."student", u."name" ${having}`;
+    const [{ rows }, { rows: [{ n }] }, { rows: [tally] }] = await Promise.all([
+        // Who still owes something first — this register is for chasing.
+        pool.query(`${grouped}
+            ORDER BY CASE WHEN ${SUBMITTED} = 0 THEN 0 WHEN ${SUBMITTED} < count(*) THEN 1 ELSE 2 END,
+                     u."name" NULLS LAST, a."student"
+            LIMIT ${limit} OFFSET ${skip}`, params),
+        pool.query(`SELECT count(*)::int AS n FROM (${grouped}) g`, params),
+        // The three states over the whole campaign (unfiltered), for the filter's counts.
+        pool.query(`SELECT count(*) FILTER (WHERE submitted = total)::int AS complete,
+                           count(*) FILTER (WHERE submitted > 0 AND submitted < total)::int AS partial,
+                           count(*) FILTER (WHERE submitted = 0)::int AS none
+                      FROM (SELECT count(*) AS total, count(*) FILTER (WHERE "status" = 'submitted') AS submitted
+                              FROM ${T} WHERE "campaign" = $1 GROUP BY "student") s`, [sid(c._id)]),
+    ]);
+
+    const students = rows.map((r) => r.student);
+    const detail = students.length ? (await pool.query(`
+        SELECT a."student", a."status", a."submittedAt", t."name" AS teacher, sj."subjectName" AS subject
+          FROM ${T} a
+          LEFT JOIN "users" t ON t."_id" = a."teacher"
+          LEFT JOIN "subjects" sj ON sj."_id" = a."subject"
+         WHERE a."campaign" = $1 AND a."student" = ANY($2::uuid[])
+         ORDER BY t."name" NULLS LAST, sj."subjectName" NULLS LAST`, [sid(c._id), students])).rows : [];
+    const labels = await fb.sectionLabels([...new Set(rows.map((r) => r.section).filter(Boolean))]);
+
+    ok(res, {
+        data: rows.map((r) => {
+            const sec = labels.get(String(r.section));
+            return {
+                _id: sid(r.student),
+                student: { _id: sid(r.student), name: r.name || '' },
+                section: sec ? `${sec.className || ''} ${sec.sectionName || ''}`.trim() : '',
+                total: r.total, submitted: r.submitted, started: r.started, expired: r.expired,
+                lastSubmittedAt: r.lastSubmittedAt,
+                state: r.submitted === r.total ? 'complete' : r.submitted > 0 ? 'partial' : 'none',
+                teachers: detail.filter((d) => sid(d.student) === sid(r.student)).map((d) => ({
+                    teacher: d.teacher || 'Teacher', subject: d.subject || '',
+                    status: d.status, submittedAt: d.submittedAt,
+                })),
+            };
+        }),
+        counts: tally,
+        isAnonymous: !!c.isAnonymous,
+        page, limit, total: n, pages: Math.max(1, Math.ceil(n / limit)),
+    });
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  DASHBOARD (spec §16 admin / §17 principal)
@@ -1461,10 +1559,15 @@ async function buildReport(req) {
 
     const campaignById = new Map(campaigns.map((c) => [sid(c._id), c]));
     const aFilter = { campaign: { $in: campaigns.map((c) => c._id) } };
-    if (req.query.teacher) aFilter.teacher = str(req.query.teacher, 40);
-    if (req.query.subject) aFilter.subject = str(req.query.subject, 40);
-    if (req.query.class)   aFilter.class   = str(req.query.class, 40);
-    if (req.query.section) aFilter.section = str(req.query.section, 40);
+    // A class, section or subject is one row per academic year, so "Class 5"
+    // across all years is several ids: each of these takes a comma list.
+    const ids = (v) => [...new Set(String(v || '').split(',').map((x) => str(x, 40))
+        .filter((x) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(x)))].slice(0, 50);
+    const oneOrMany = (list) => (list.length === 1 ? list[0] : { $in: list });
+    for (const key of ['teacher', 'subject', 'class', 'section']) {
+        const list = ids(req.query[key]);
+        if (list.length) aFilter[key] = oneOrMany(list);
+    }
 
     const assignments = await FeedbackAssignment.find(aFilter)
         .select('campaign teacher subject class section status overallRating categoryScores').lean();

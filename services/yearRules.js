@@ -89,7 +89,9 @@ module.exports = {
 
     // ── Feedback ─────────────────────────────────────────────────────────────
     FeedbackCampaign:   { id: 'academicYear', at: ['startDate', 'createdAt'] },
-    FeedbackAssignment: { at: ['assignedAt', 'createdAt'] },
+    // An assignment is of its campaign's year (copied on to the row); the date
+    // is only the fallback for a row written before the column existed.
+    FeedbackAssignment: { id: 'academicYear', at: ['assignedAt', 'createdAt'] },
     FeedbackAuditLog:   AUDIT,
 
     // ── Staff attendance & leave paperwork ───────────────────────────────────

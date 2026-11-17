@@ -402,6 +402,7 @@ async function generateAssignments(campaign) {
                     subject: subjectId || null,
                     class: sid(section.class) || null,
                     section: sid(section._id),
+                    academicYear: sid(campaign.academicYear) || null,
                     isAnonymous: !!campaign.isAnonymous,
                 });
             }
@@ -421,7 +422,8 @@ async function bulkInsertAssignments(rows) {
     const T = `"${FeedbackAssignment.tableName}"`;
     const cols = ['_id', 'school', 'campaign', 'student', 'respondent', 'teacher', 'subject',
         'class', 'section', 'status', 'isAnonymous', 'assignedAt', 'startedAt', 'submittedAt',
-        'overallRating', 'categoryScores', 'hasComment', 'submissionCount', 'createdAt', 'updatedAt'];
+        'overallRating', 'categoryScores', 'hasComment', 'submissionCount', 'createdAt', 'updatedAt',
+        'academicYear'];
     const colSql = cols.map((c) => `"${c}"`).join(', ');
     const BATCH = 500;
     let created = 0;
@@ -435,10 +437,11 @@ async function bulkInsertAssignments(rows) {
                 require('crypto').randomUUID(), r.school, r.campaign, r.student, r.respondent,
                 r.teacher, r.subject, r.class, r.section, 'pending', r.isAnonymous,
                 now, null, null, null, JSON.stringify({}), false, 0, now, now,
+                r.academicYear || null,
             ];
             const casts = ['uuid', 'uuid', 'uuid', 'uuid', 'uuid', 'uuid', 'uuid', 'uuid', 'uuid',
                 'text', 'boolean', 'timestamptz', 'timestamptz', 'timestamptz',
-                'float8', 'jsonb', 'boolean', 'float8', 'timestamptz', 'timestamptz'];
+                'float8', 'jsonb', 'boolean', 'float8', 'timestamptz', 'timestamptz', 'uuid'];
             return `(${vals.map((v, j) => { params.push(v); return `$${params.length}::${casts[j]}`; }).join(', ')})`;
         });
         const { rowCount } = await pool.query(

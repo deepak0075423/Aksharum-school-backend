@@ -53,6 +53,15 @@ const FeedbackAssignmentSchema = new db.Schema({
         ref: 'ClassSection',
         default: null,
     },
+    // The campaign's academic year, copied on to every row (Nov 2026). It is
+    // what puts an assignment in a year (services/yearRules.js): dating it by
+    // when it was created put a campaign of a year that had not started yet —
+    // or one run late — in the wrong year, and its students never saw it.
+    academicYear: {
+        type: db.Types.UUID,
+        ref: 'AcademicYear',
+        default: null,
+    },
     status: {
         type: String,
         enum: ASSIGNMENT_STATUSES,

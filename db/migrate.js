@@ -332,6 +332,19 @@ const ONCE = [
     },
 ];
 
+ONCE.push({
+    // Feedback assignments were put in a year by the day they were created, so
+    // a campaign of a year that had not started yet (or one run late) landed
+    // in another year and its students never saw it. Each row now carries its
+    // campaign's year; this fills it in for the rows made before.
+    name: 'feedback: assignments carry their campaign\'s academic year (Nov 2026)',
+    run: async () => {
+        const r = await pool.query(`UPDATE "feedbackassignments" a SET "academicYear" = c."academicYear"
+            FROM "feedbackcampaigns" c WHERE a."campaign" = c."_id" AND a."academicYear" IS NULL AND c."academicYear" IS NOT NULL`);
+        return `${r.rowCount} assignments given their campaign's year`;
+    },
+});
+
 async function runOnce() {
     try {
         await pool.query(`CREATE TABLE IF NOT EXISTS "datamigrations" ("name" text PRIMARY KEY, "ranAt" timestamptz NOT NULL DEFAULT now(), "result" text)`);
