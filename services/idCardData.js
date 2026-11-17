@@ -30,6 +30,7 @@ const AcademicYear = require('../models/AcademicYear');
 const SectionSubjectTeacher = require('../models/SectionSubjectTeacher');
 const { FIELDS } = require('./idCardDesign');
 const { dayKey } = require('./idCardRules');
+const { photoOf } = require('../utils/webImage');
 
 const T = {
     users: `"${User.tableName}"`,
@@ -107,7 +108,7 @@ async function studentsOfYear(schoolId, yearId, { holderIds } = {}) {
         _id: r._id,
         name: r.name || '',
         isActive: r.isActive !== false,
-        photoSource: r.photoFile ? `/uploads/student-docs/${r.photoFile}` : (r.profileImage || ''),
+        photoSource: photoOf(r.photoFile && `/uploads/student-docs/${r.photoFile}`, r.profileImage),
         admissionNumber: r.admissionNumber || '',
         // Only this year's roll is on record: the profile's, when its section is this year's.
         // The roll held that year, in that section — not the active year's.
@@ -137,7 +138,7 @@ async function studentsById(schoolId, holderIds) {
          WHERE u."school" = $1::uuid AND u."role" = 'student' AND u."_id" = ANY($2::uuid[])`, [String(schoolId), only]);
     return rows.map((r) => ({
         _id: r._id, name: r.name || '', isActive: r.isActive !== false,
-        photoSource: r.photoFile ? `/uploads/student-docs/${r.photoFile}` : (r.profileImage || ''),
+        photoSource: photoOf(r.photoFile && `/uploads/student-docs/${r.photoFile}`, r.profileImage),
         admissionNumber: r.admissionNumber || '',
     }));
 }
@@ -264,7 +265,7 @@ async function parents(schoolId, { holderIds } = {}) {
             _id: r._id,
             name: r.name || block.name || '',
             isActive: r.isActive !== false,
-            photoSource: r.profileImage || (block.photoFile ? `/uploads/student-docs/${block.photoFile}` : ''),
+            photoSource: photoOf(r.profileImage, block.photoFile && `/uploads/student-docs/${block.photoFile}`),
             relationship: rel === 'Guardian' && block.relation ? `Guardian (${block.relation})` : rel,
             phone: r.phone || block.phone || '',
             children: (Array.isArray(r.children) ? r.children : []).map((c) => ({

@@ -48,6 +48,7 @@ const events = require('./events');
 const notify = require('./notify');
 const workflow = require('./workflow');
 const { refuse, isId, str } = require('./util');
+const { isDocument } = require('../../utils/webImage');
 
 const STUDENT_DOCS = path.join(__dirname, '..', '..', 'uploads', 'student-docs');
 const RELATIONS = ['Father', 'Mother', 'Guardian'];
@@ -435,7 +436,8 @@ async function convert(req, app, input = {}) {
                 const { sql, params } = buildInsert(User, {
                     name: studentName, email: studentEmail, phone: isPhone(m['student.phone']) ? normalizePhone(m['student.phone']) : '',
                     password: studentHash, role: 'student', school: app.school, isFirstLogin: true, isActive: immediate, createdBy: req.userId,
-                    ...(staged.fields.photoFile ? { profileImage: `/uploads/student-docs/${staged.fields.photoFile}` } : {}),
+                    // A document never becomes the profile picture (utils/webImage).
+                    ...(staged.fields.photoFile && !isDocument(staged.fields.photoFile) ? { profileImage: `/uploads/student-docs/${staged.fields.photoFile}` } : {}),
                 });
                 studentId = (await q(sql, params)).rows[0]._id;
             }

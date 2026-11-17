@@ -35,6 +35,7 @@ const AcademicYear        = require('../models/AcademicYear');
 const { notify, withParents } = require('../services/notifyService');
 const { occupancyByVehicle, syncOccupancy } = require('../services/transportSeats');
 const { byClass, bySection } = require('../utils/listOrder');
+const { photoOf } = require('../utils/webImage');
 
 // ── replies ──────────────────────────────────────────────────────────────────
 const ok   = (res, data)            => res.json({ success: true, data });
@@ -235,7 +236,7 @@ async function studentIndex(ids = []) {
         return [String(u._id), {
             _id: u._id,
             name: u.name || '',
-            photo: p?.photoFile || u.profileImage || '',
+            photo: photoOf(p?.photoFile, u.profileImage),
             admissionNumber: p?.admissionNumber || '',
             rollNumber: p?.rollNumber || '',
             className,
@@ -282,7 +283,7 @@ async function personIndex(ids = []) {
         const t = byTeacher.get(String(u._id)) || {};
         return [String(u._id), {
             _id: u._id, personType: 'teacher', name: u.name || '', email: u.email || '',
-            phone: u.phone || '', photo: t.photoFile || u.profileImage || '',
+            phone: u.phone || '', photo: photoOf(t.photoFile, u.profileImage),
             employeeId: t.employeeId || '', designation: t.designation || '', department: t.department || '',
             // So a teacher row can use the same column as a student's class.
             classLabel: [t.designation, t.department].filter(Boolean).join(' · ') || 'Staff',

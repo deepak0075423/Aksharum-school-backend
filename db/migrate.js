@@ -356,6 +356,20 @@ ONCE.push({
     },
 });
 
+ONCE.push({
+    // A student's photo slot took any admission paper, so some students' profile
+    // picture is a PDF — drawn as an image in every list, which Chrome blocks
+    // cross-origin (CORB). A document is not a picture: the profile picture is
+    // cleared (initials show instead). The uploaded file itself stays on the
+    // student's record as the paper it is (studentprofiles.photoFile).
+    name: 'users: a document is never a profile picture (Nov 2026)',
+    run: async () => {
+        const { DOCUMENT } = require('../utils/webImage');
+        const r = await pool.query(`UPDATE "users" SET "profileImage" = '' WHERE "profileImage" ~* $1`, [DOCUMENT.source]);
+        return `${r.rowCount} profile pictures that were documents cleared`;
+    },
+});
+
 async function runOnce() {
     try {
         await pool.query(`CREATE TABLE IF NOT EXISTS "datamigrations" ("name" text PRIMARY KEY, "ranAt" timestamptz NOT NULL DEFAULT now(), "result" text)`);

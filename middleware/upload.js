@@ -74,7 +74,23 @@ const uploadStaffDoc = multer({ storage: diskStorage('staff-docs'), fileFilter: 
 
 // Admission paperwork: the student's own certificates plus the parents' /
 // guardian's Aadhaar, PAN and passport photos.
-const uploadStudentDoc = multer({ storage: diskStorage('student-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024 } });
+//
+// A PHOTO slot (the student's, and each parent's) takes a picture only (Nov
+// 2026): a PDF in it became the student's profile picture, and every list then
+// asked the browser to draw a PDF as an image — blocked cross-origin (CORB), a
+// broken avatar. A document is refused by its name; the phone app's image
+// picker may send a picture with no precise type, so the type alone decides
+// nothing unless it says image.
+const PHOTO_FIELD = /^(photo|fatherPhoto|motherPhoto|guardianPhoto)$/;
+const studentDocFilter = (req, file, cb) => {
+    if (!PHOTO_FIELD.test(file.fieldname)) return docFilter(req, file, cb);
+    const named = /\.(jpe?g|png|webp)$/i.test(file.originalname);
+    const typed = /^image\//.test(file.mimetype || '');
+    const document = /\.(pdf|docx?|xlsx?|pptx?|txt)$/i.test(file.originalname);
+    const ok = !document && (named || typed);
+    cb(ok ? null : Object.assign(new Error('A photo must be a picture — upload a JPG, PNG or WebP image, not a document.'), { status: 400 }), ok);
+};
+const uploadStudentDoc = multer({ storage: diskStorage('student-docs'), fileFilter: studentDocFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
 // Hostel paperwork: admission documents, undertakings, visitor ID proofs and
 // photos, incident/complaint attachments.

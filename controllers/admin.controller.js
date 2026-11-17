@@ -20,6 +20,7 @@ const { PRESETS, renderReceipt, defaultTemplate, sampleReceipt } = require('../s
 // One address is one person, who may hold posts at several schools — see the
 // header of services/accountIdentity.js.
 const identity        = require('../services/accountIdentity');
+const { isDocument } = require('../utils/webImage');
 
 // The design fields a school may set; everything else on the row is bookkeeping.
 const TEMPLATE_FIELDS = [
@@ -1568,7 +1569,7 @@ exports.updateStudentFull = async (req, res) => {
         if (phone !== undefined) userUpdate.phone = normalizePhone(phone);
         // Only a freshly uploaded photo replaces the avatar — an edit that
         // leaves the photo alone must not clobber one the student set themselves
-        if (uploads.photo) userUpdate.profileImage = `/uploads/student-docs/${uploads.photo}`;
+        if (uploads.photo && !isDocument(uploads.photo)) userUpdate.profileImage = `/uploads/student-docs/${uploads.photo}`;
         if (phone && !isPhone(phone))
             return res.status(400).json({ success: false, message: 'Phone number must be a valid 10-digit mobile number' });
         const rollValue = rollNumber !== undefined ? String(rollNumber).trim() : undefined;
@@ -2321,7 +2322,7 @@ exports.createStudent = async (req, res) => {
         const otp = generateOTP();
         // The passport photo doubles as the account avatar
         const user = await createUserHelper(
-            { name, email, phone, password: otp, ...(uploads.photo ? { profileImage: `/uploads/student-docs/${uploads.photo}` } : {}) },
+            { name, email, phone, password: otp, ...(uploads.photo && !isDocument(uploads.photo) ? { profileImage: `/uploads/student-docs/${uploads.photo}` } : {}) },
             'student', req.schoolId,
         );
         const profileData = { user: user._id, school: req.schoolId, ...buildStudentProfile(profile, uploads) };
