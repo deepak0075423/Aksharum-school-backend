@@ -763,7 +763,15 @@ exports.reviewSubmission = async (req, res) => {
         const scores = Array.isArray(req.body.questionScores) ? req.body.questionScores : null;
         const questions = doc.questions || [];
 
-        if (scores && questions.length) {
+        // Set with no "Out of", it is marked in words only (Nov 2026): the
+        // person who set it chose no marks, so nobody may give any. An empty
+        // marks field is not a mark, and marks already on the row stay as
+        // they are — this refuses new ones, it does not erase old ones.
+        if (total == null) {
+            const giving = num(req.body.marks) != null
+                || (scores || []).some((q) => num(q?.score) != null);
+            if (giving) return bad('This assignment was set without marks — give feedback only');
+        } else if (scores && questions.length) {
             const byLabel = Object.fromEntries(scores.map((q) => [String(q?.label ?? ''), q?.score]));
             const out = [];
             for (const q of questions) {
@@ -803,7 +811,7 @@ exports.reviewSubmission = async (req, res) => {
         if (req.body.feedback !== undefined) next.feedback = String(req.body.feedback).trim().slice(0, 2000);
 
         const reviewed = next.marks != null || !!next.feedback;
-        if (!sub && !reviewed) return bad('Enter marks or feedback to record');
+        if (!sub && !reviewed) return bad(total == null ? 'Write some feedback to record' : 'Enter marks or feedback to record');
 
         let saved;
         if (sub) {
@@ -1142,6 +1150,9 @@ exports.listComments = async (req, res) => {
         const me = String(req.userId);
         const admin = isAdmin(req);
         const pins  = canPinOn(req, doc);
+        // A parent reads the thread and writes nothing in it — not even under
+        // a comment they wrote before it went read-only for them.
+        const reader = req.userRole === 'parent';
         const shape = (r) => {
             const mine = String(r.authorId) === me;
             // Deleted by its author, kept only for the replies under it.
@@ -1170,8 +1181,8 @@ exports.listComments = async (req, res) => {
                 // and deleteComment enforce, so the page offers only what works:
                 // your own words to edit or delete; anyone's to delete if you
                 // are an admin; pinning for an admin or the sharing teacher.
-                canEdit: mine,
-                canDelete: mine || admin,
+                canEdit: mine && !reader,
+                canDelete: (mine && !reader) || admin,
                 canPin: pins && !r.parent,
                 // Staff-only is the author's call, or an admin's, and only on
                 // what staff wrote — a student's own comment is never hidden

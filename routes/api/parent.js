@@ -68,13 +68,11 @@ router.get('/documents',      docGuard, docViewer.parentGetDocuments);
 router.get('/documents/:id',  docGuard, docCtrl.parentGetDocument);
 router.post('/documents/read',     docGuard, docViewer.markRead);
 router.post('/documents/:id/read', docGuard, docViewer.markRead);
-// The discussion under a document that reaches one of their children: what is
-// marked for everyone, a question of their own, and their own words to edit or
-// take back. (Parents could read a document and not ask about it.)
+// The discussion under a document that reaches one of their children — read
+// only (Nov 2026, the school's call): a parent reads what is marked for
+// everyone and writes nothing there. Asking, editing and deleting are the
+// student's and the staff's; there is no write route for a parent at all.
 router.get('/documents/:id/comments',  docGuard, docViewer.parentDocumentAccess, docDetail.listComments);
-router.post('/documents/:id/comments', docGuard, docViewer.parentDocumentAccess, docDetail.addComment);
-router.patch('/documents/comments/:commentId',  docGuard, docDetail.updateComment);
-router.delete('/documents/comments/:commentId', docGuard, docDetail.deleteComment);
 
 // Holidays
 router.get('/holidays', holidayGuard, holidayCtrl.parentGetHolidays);

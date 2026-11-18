@@ -489,7 +489,6 @@ exports.parentGetDocuments = async (req, res) => {
             });
         };
         const shelf = await perChildOf(rows.map((r) => ({ ...lightRow(r), reaches: r.reaches || [] })));
-        const shape = (full) => (i) => ({ ...shapeDoc(full[String(i._id)]), forChildren: i.forChildren, perChild: i.perChild });
 
         // One child's shelf, or everyone's. Across all of them there is no
         // single state, so a document stands where its most urgent child does —
@@ -497,6 +496,13 @@ exports.parentGetDocuments = async (req, res) => {
         const child  = childIds.includes(String(req.query.child || '')) ? String(req.query.child) : '';
         const scoped = child ? shelf.filter((d) => d.forChildren.includes(child)) : shelf;
         const stand  = (d) => (child ? d.perChild[child]?.state : worstState(d.perChild));
+
+        // Where it stands travels on the row too (Nov 2026). Rows used to carry
+        // the per-child detail alone, so a parent of one child — who never picks
+        // a child — saw "Due in 2 days" on work already handed in.
+        const shape = (full) => (i) => ({
+            ...shapeDoc(full[String(i._id)]), forChildren: i.forChildren, perChild: i.perChild, state: stand(i) ?? null,
+        });
 
         const filtered = order(narrow(scoped, req.query, stand), req.query.sort);
         const { rows: slice, meta } = pageOf(filtered, req.query);

@@ -16,7 +16,7 @@ const resultPortal   = require('../../controllers/resultPortal.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
-const { uploadDocument, uploadAttendanceDoc } = require('../../middleware/upload');
+const { uploadSubmission, uploadAttendanceDoc } = require('../../middleware/upload');
 
 // Up to three files on a correction request or reply. multer's own errors are
 // answers to the student ("too big"), not server faults.
@@ -72,7 +72,9 @@ router.get('/exams/:id/result',          examGuard, examCtrl.getStudentResult);
 // Documents
 router.get('/documents',              docGuard, docViewer.studentGetDocuments);
 router.get('/documents/:id',          docGuard, docCtrl.studentGetDocument);
-router.post('/documents/:id/submit',  docGuard, uploadDocument.array('files', 5), checkUploads, docCtrl.studentSubmitAssignment);
+// A hand-in is PDF only (middleware/upload.js, uploadSubmission); checkUploads
+// then checks each file really is one.
+router.post('/documents/:id/submit',  docGuard, uploadSubmission.array('files', 5), checkUploads, docCtrl.studentSubmitAssignment);
 router.post('/documents/read',        docGuard, docViewer.markRead);
 router.post('/documents/:id/read',    docGuard, docViewer.markRead);
 // The discussion under a document — only what is marked for everyone, and only

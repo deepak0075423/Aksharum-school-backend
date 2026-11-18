@@ -703,6 +703,8 @@ function applyAssignment(doc, b) {
             doc.assignmentType = b.assignmentType;
         }
         if (b.questions !== undefined) doc.questions = parseQuestions(b.questions);
+        // No "Out of", no marks — so no breakdown of them either.
+        if (doc.totalMarks == null) doc.questions = [];
     }
     // Read after the flag, so "not an assignment any more" cannot keep the type.
     if (b.docType !== undefined || b.isAssignment !== undefined) {
@@ -796,7 +798,9 @@ exports.adminUpload = async (req, res) => {
             academicYear:    await currentAcademicYearId(req.schoolId),
             isAssignment:    assigned,
             assignmentType:  assigned && ASSIGNMENT_TYPES.includes(b.assignmentType) ? b.assignmentType : 'homework',
-            questions:       assigned ? parseQuestions(b.questions) : [],
+            // A breakdown splits the "Out of" — with none there are no marks to
+            // split (an assignment set without marks takes feedback only).
+            questions:       assigned && total != null ? parseQuestions(b.questions) : [],
             dueDate:         due,
             // Open unless the form says otherwise. This compared the text
             // 'false' with the boolean, so it was always open.
@@ -1102,7 +1106,9 @@ exports.teacherUpload = async (req, res) => {
             academicYear:    await currentAcademicYearId(req.schoolId),
             isAssignment:    assigned,
             assignmentType:  assigned && ASSIGNMENT_TYPES.includes(b.assignmentType) ? b.assignmentType : 'homework',
-            questions:       assigned ? parseQuestions(b.questions) : [],
+            // A breakdown splits the "Out of" — with none there are no marks to
+            // split (an assignment set without marks takes feedback only).
+            questions:       assigned && total != null ? parseQuestions(b.questions) : [],
             dueDate:         due,
             allowSubmission: assigned ? (b.allowSubmission === undefined ? true : flag(b.allowSubmission)) : false,
             marksEnabled:    assigned && total != null,

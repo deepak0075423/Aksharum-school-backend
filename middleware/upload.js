@@ -42,6 +42,15 @@ const sharedDocFilter = (req, file, cb) => {
     cb(ok ? null : new Error(`${file.originalname} cannot be attached — use a PDF, a Word, Excel or PowerPoint file, a text file or a photo`), ok);
 };
 
+// What a student hands in for an assignment is a PDF and nothing else (Nov
+// 2026) — one kind of file every teacher can open, mark and print the same
+// way. A teacher's or the office's own attachments still take every kind
+// above. Read off the name here; checkUploads then checks it really IS a PDF.
+const submissionFilter = (req, file, cb) => {
+    const ok = /\.pdf$/i.test(file.originalname);
+    cb(ok ? null : Object.assign(new Error(`${file.originalname} is not a PDF — assignments are handed in as PDF files only`), { status: 400, code: 'NOT_PDF' }), ok);
+};
+
 const excelFilter = (req, file, cb) => {
     const ok = /\.(xlsx|xls|csv)$/i.test(file.originalname);
     cb(ok ? null : new Error('Only Excel/CSV files allowed'), ok);
@@ -62,6 +71,7 @@ const videoFilter = (req, file, cb) => {
 
 const uploadProfile  = multer({ storage: diskStorage('profiles'),  fileFilter: imageFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 const uploadDocument = multer({ storage: diskStorage('documents'), fileFilter: sharedDocFilter, limits: { fileSize: 10 * 1024 * 1024 } });
+const uploadSubmission = multer({ storage: diskStorage('documents'), fileFilter: submissionFilter, limits: { fileSize: 10 * 1024 * 1024 } });
 const uploadExcel    = multer({ storage: multer.memoryStorage(),   fileFilter: excelFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 const uploadImage    = multer({ storage: diskStorage('images'),    fileFilter: imageFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 const uploadLeaveDoc = multer({ storage: diskStorage('leave-docs'), fileFilter: docFilter,  limits: { fileSize: 5 * 1024 * 1024 } });
@@ -194,7 +204,7 @@ const withPhoneCheck = (instance) => {
     }
     return instance;
 };
-[uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo,
+[uploadProfile, uploadDocument, uploadSubmission, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo,
     uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc, uploadAdmissionDoc, uploadLmsImage, uploadLmsRequestDoc].forEach(withPhoneCheck);
 
-module.exports = { DOCUMENT_TYPES, uploadLmsImage, uploadLmsRequestDoc, uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
+module.exports = { DOCUMENT_TYPES, uploadSubmission, uploadLmsImage, uploadLmsRequestDoc, uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
