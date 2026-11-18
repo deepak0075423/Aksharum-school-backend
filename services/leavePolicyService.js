@@ -23,7 +23,9 @@ const { schoolAdminIds } = require('./notifyService');
 // Named `designationSvc`, not `designations`: two functions below use that
 // word for the policy's own approverDesignations list.
 const designationSvc     = require('./designationService');
-const { utcMidnight }    = require('../utils/leaveDays');
+const {
+    utcMidnight, localToday, addDays, dayKinds, onlyOffDaysBetween,
+} = require('../utils/leaveDays');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const sid = (v) => String(v?._id ?? v);
@@ -183,6 +185,15 @@ async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
         isActive: bool(patch.isActive, current.isActive),
     };
 
+    // "Cannot be combined with" may only name other leave types of this school.
+    // A foreign id never matched anything; the type's own id made it refuse
+    // to sit next to itself.
+    if (next.blockedLeaveTypes.length) {
+        const own = await LeaveType.find({ school: schoolId, _id: { $in: next.blockedLeaveTypes } }).select('_id').lean();
+        const ok = new Set(own.map((t) => sid(t._id)));
+        next.blockedLeaveTypes = next.blockedLeaveTypes.filter((id) => ok.has(id) && id !== sid(leaveTypeId));
+    }
+
     // A minimum longer than the maximum can never be satisfied — clamp rather
     // than store a rule that rejects every application.
     if (next.maxConsecutiveDays > 0 && next.minDaysPerApplication > next.maxConsecutiveDays) {
@@ -211,25 +222,31 @@ async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
  * { ok: false, message }.
  *
  * @param {Boolean} onBehalf true when an admin files for someone else — the
- *        notice-period and backdating rules are the employee's obligation, not
- *        the admin's, so they are skipped.
+ *        notice period is the employee's obligation, not the admin's, so it is
+ *        skipped. Back-dating binds everyone.
+ * @param {Object}  ctx      { leaveSettings, holidayModule, year: {startDate,endDate} }
+ *        — what a "working day" is (for "do these two leaves touch?") and the
+ *        academic year the leave belongs to (for the per-year cap).
  */
 async function validateApplication({
     schoolId, policy, teacherId, from, to, totalDays, leaveMode,
-    hasDocument = false, excludeId = null, onBehalf = false,
+    hasDocument = false, excludeId = null, onBehalf = false, ctx = {},
 }) {
     if (!policy.isActive) {
         return { ok: false, message: `${policy.leaveType?.name || 'This leave type'} is not accepting applications` };
     }
 
-    const today = utcMidnight(new Date());
+    const today = localToday();
+    const leaveSettings = ctx.leaveSettings || {};
+    const holidayModule = !!ctx.holidayModule;
 
     // ── Who ────────────────────────────────────────────────────────────────
     const [user, profile] = await Promise.all([
-        User.findOne({ _id: teacherId, school: schoolId }).select('role name').lean(),
+        User.findOne({ _id: teacherId, school: schoolId }).select('role name isActive').lean(),
         TeacherProfile.findOne({ user: teacherId, school: schoolId }).select('designation gender joiningDate').lean(),
     ]);
     if (!user) return { ok: false, message: 'Employee not found' };
+    if (user.isActive === false) return { ok: false, message: 'This employee is no longer active' };
 
     if (policy.eligibleRoles.length && !policy.eligibleRoles.includes(user.role)) {
         return { ok: false, message: 'This leave type is not available to your employee type' };
@@ -251,15 +268,12 @@ async function validateApplication({
     }
 
     // ── When ───────────────────────────────────────────────────────────────
-    // A range that ends before it starts is nonsense whoever files it.
     if (to < from) {
         return { ok: false, message: 'To date must be on or after From date' };
     }
 
-    // Back-dating binds everyone. It is a statement about which dates the
-    // school will accept leave for at all, so an admin filing on someone's
-    // behalf is bound by it too — unlike the notice period below, which is an
-    // obligation on the employee and is waived for `onBehalf`.
+    // Back-dating binds everyone: it is a statement about which dates the
+    // school accepts leave for at all.
     if (from < today) {
         if (!policy.allowBackdated) {
             return { ok: false, message: 'Cannot apply for past dates' };
@@ -281,12 +295,53 @@ async function validateApplication({
     if (leaveMode === 'half_day' && !policy.halfDayAllowed) {
         return { ok: false, message: 'Half-day leave is not allowed for this leave type' };
     }
-    if (leaveMode !== 'half_day') {
-        if (policy.maxConsecutiveDays > 0 && totalDays > policy.maxConsecutiveDays) {
-            return { ok: false, message: `Max consecutive days for this leave type is ${policy.maxConsecutiveDays}` };
+    if (leaveMode !== 'half_day' && policy.minDaysPerApplication > 0 && totalDays < policy.minDaysPerApplication) {
+        return { ok: false, message: `This leave type must be applied for at least ${policy.minDaysPerApplication} day(s) at a time` };
+    }
+
+    const countable = ['pending', 'approved'];
+    const typeId = sid(policy.leaveType._id);
+
+    // Every live application of this employee near these dates — the
+    // consecutive-day run and the clubbing rules both read from it.
+    const near = await LeaveApplication.find({
+        teacher: teacherId, school: schoolId, status: { $in: countable },
+        fromDate: { $lte: addDays(to, 60) }, toDate: { $gte: addDays(from, -60) },
+        ...(excludeId ? { _id: { $ne: excludeId } } : {}),
+    }).select('leaveType fromDate toDate totalDays').lean();
+    const touches = (a, b) => onlyOffDaysBetween(a, b, schoolId, leaveSettings, holidayModule);
+
+    // The longest stretch is one absence, however many applications it was
+    // filed as: Mon–Wed and Thu–Fri of the same type is a five-day leave.
+    // Chained through weekends and holidays, as an absence would be.
+    if (policy.maxConsecutiveDays > 0) {
+        const same = near.filter((a) => sid(a.leaveType) === typeId);
+        let run = Number(totalDays) || 0;
+        let lo = from;
+        let hi = to;
+        const used = new Set();
+        for (let guard = 0; guard < 40; guard += 1) {
+            let grew = false;
+            for (const a of same) {
+                if (used.has(sid(a._id))) continue;
+                const before = utcMidnight(a.toDate) < lo && await touches(a.toDate, lo);
+                const after  = utcMidnight(a.fromDate) > hi && await touches(hi, a.fromDate);
+                if (!before && !after) continue;
+                used.add(sid(a._id));
+                run += Number(a.totalDays) || 0;
+                if (before) lo = utcMidnight(a.fromDate);
+                if (after)  hi = utcMidnight(a.toDate);
+                grew = true;
+            }
+            if (!grew) break;
         }
-        if (policy.minDaysPerApplication > 0 && totalDays < policy.minDaysPerApplication) {
-            return { ok: false, message: `This leave type must be applied for at least ${policy.minDaysPerApplication} day(s) at a time` };
+        if (run > policy.maxConsecutiveDays) {
+            return {
+                ok: false,
+                message: used.size
+                    ? `Max consecutive days for this leave type is ${policy.maxConsecutiveDays} — together with your leave next to these dates this would be ${run}`
+                    : `Max consecutive days for this leave type is ${policy.maxConsecutiveDays}`,
+            };
         }
     }
 
@@ -304,32 +359,43 @@ async function validateApplication({
     }
 
     // ── Frequency caps ─────────────────────────────────────────────────────
-    const countable = ['pending', 'approved'];
+    // A leave that runs across a month end counts in each month it touches,
+    // with its days split by the working days it holds in each.
     if (policy.maxApplicationsPerMonth > 0 || policy.maxDaysPerMonth > 0) {
-        const mStart = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
-        const mEnd   = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth() + 1, 0, 23, 59, 59));
-        const q = {
-            teacher: teacherId, school: schoolId, leaveType: sid(policy.leaveType._id),
-            status: { $in: countable }, fromDate: { $gte: mStart, $lte: mEnd },
+        const daysIn = async (a0, a1, total, m0, m1) => {
+            if (utcMidnight(a0) >= m0 && utcMidnight(a1) <= m1) return Number(total) || 0;
+            const all = await dayKinds(a0, a1, schoolId, leaveSettings, holidayModule);
+            const inMonth = all.filter((d) => { const t = new Date(`${d.iso}T00:00:00.000Z`); return t >= m0 && t <= m1; });
+            const w = all.reduce((s, d) => s + d.weight, 0);
+            const wm = inMonth.reduce((s, d) => s + d.weight, 0);
+            return w > 0 ? Math.round(((Number(total) || 0) * wm / w) * 100) / 100 : 0;
         };
-        if (excludeId) q._id = { $ne: excludeId };
-        const rows = await LeaveApplication.find(q).select('totalDays').lean();
-
-        if (policy.maxApplicationsPerMonth > 0 && rows.length + 1 > policy.maxApplicationsPerMonth) {
-            return { ok: false, message: `Only ${policy.maxApplicationsPerMonth} application(s) of this type are allowed per month` };
-        }
-        if (policy.maxDaysPerMonth > 0) {
-            const already = rows.reduce((s, r) => s + (Number(r.totalDays) || 0), 0);
-            if (already + totalDays > policy.maxDaysPerMonth) {
-                return { ok: false, message: `Only ${policy.maxDaysPerMonth} day(s) of this type are allowed per month; ${already} already applied for` };
+        const mine = near.filter((a) => sid(a.leaveType) === typeId);
+        const firstMonth = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
+        for (let m0 = firstMonth; m0 <= to; m0 = new Date(Date.UTC(m0.getUTCFullYear(), m0.getUTCMonth() + 1, 1))) {
+            const m1 = new Date(Date.UTC(m0.getUTCFullYear(), m0.getUTCMonth() + 1, 0));
+            const label = m0.toLocaleDateString('en-IN', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+            const inMonth = mine.filter((a) => utcMidnight(a.fromDate) <= m1 && utcMidnight(a.toDate) >= m0);
+            if (policy.maxApplicationsPerMonth > 0 && inMonth.length + 1 > policy.maxApplicationsPerMonth) {
+                return { ok: false, message: `Only ${policy.maxApplicationsPerMonth} application(s) of this type are allowed per month (${label})` };
+            }
+            if (policy.maxDaysPerMonth > 0) {
+                let already = 0;
+                for (const a of inMonth) already += await daysIn(a.fromDate, a.toDate, a.totalDays, m0, m1);
+                const mineNow = await daysIn(from, to, totalDays, m0, m1);
+                if (already + mineNow > policy.maxDaysPerMonth) {
+                    return { ok: false, message: `Only ${policy.maxDaysPerMonth} day(s) of this type are allowed per month; ${Math.round(already * 100) / 100} already applied for in ${label}` };
+                }
             }
         }
     }
+    // Per year means per ACADEMIC year — the year balances are kept in. A school
+    // with no year on record falls back to the calendar year.
     if (policy.maxApplicationsPerYear > 0) {
-        const yStart = new Date(Date.UTC(from.getUTCFullYear(), 0, 1));
-        const yEnd   = new Date(Date.UTC(from.getUTCFullYear(), 11, 31, 23, 59, 59));
+        const yStart = ctx.year?.startDate ? utcMidnight(ctx.year.startDate) : new Date(Date.UTC(from.getUTCFullYear(), 0, 1));
+        const yEnd   = ctx.year?.endDate   ? utcMidnight(ctx.year.endDate)   : new Date(Date.UTC(from.getUTCFullYear(), 11, 31));
         const q = {
-            teacher: teacherId, school: schoolId, leaveType: sid(policy.leaveType._id),
+            teacher: teacherId, school: schoolId, leaveType: typeId,
             status: { $in: countable }, fromDate: { $gte: yStart, $lte: yEnd },
         };
         if (excludeId) q._id = { $ne: excludeId };
@@ -340,28 +406,27 @@ async function validateApplication({
     }
 
     // ── Clubbing with other leave types ────────────────────────────────────
-    const restricted = !policy.allowCombineWithOtherLeaves || policy.blockedLeaveTypes.length;
-    if (restricted) {
-        // Overlaps are already refused for every type; what is left to catch is
-        // a different leave butting straight up against this one.
-        const q = {
-            teacher: teacherId, school: schoolId,
-            leaveType: { $ne: sid(policy.leaveType._id) },
-            status: { $in: countable },
-            fromDate: { $lte: new Date(to.getTime() + DAY_MS) },
-            toDate:   { $gte: new Date(from.getTime() - DAY_MS) },
-        };
-        if (excludeId) q._id = { $ne: excludeId };
-        const neighbours = await LeaveApplication.find(q).select('leaveType').lean();
-
-        if (neighbours.length) {
-            if (!policy.allowCombineWithOtherLeaves) {
-                return { ok: false, message: 'This leave type cannot be combined with another leave type' };
+    // Both sides' rules apply — a type that refuses to sit next to Earned
+    // Leave refuses it whichever of the two was filed second — and "next to"
+    // looks across a weekend or holiday, which is how the two would actually
+    // be taken.
+    const others = near.filter((a) => sid(a.leaveType) !== typeId);
+    const neighbours = [];
+    for (const a of others) {
+        const before = utcMidnight(a.toDate) < from && await touches(a.toDate, from);
+        const after  = utcMidnight(a.fromDate) > to && await touches(to, a.fromDate);
+        if (before || after) neighbours.push(a);
+    }
+    if (neighbours.length) {
+        const mineBlocks = new Set((policy.blockedLeaveTypes || []).map(String));
+        for (const n of neighbours) {
+            const theirs = await getPolicy(schoolId, n.leaveType);
+            const theirName = theirs?.leaveType?.name || 'another leave type';
+            if (!policy.allowCombineWithOtherLeaves || mineBlocks.has(sid(n.leaveType))) {
+                return { ok: false, message: `${policy.leaveType?.name || 'This leave type'} cannot be combined with ${theirName}` };
             }
-            const blocked = new Set(policy.blockedLeaveTypes.map(String));
-            if (neighbours.some((n) => blocked.has(sid(n.leaveType)))) {
-                const names = await LeaveType.find({ _id: { $in: policy.blockedLeaveTypes } }).select('name').lean();
-                return { ok: false, message: `This leave type cannot be combined with ${names.map((x) => x.name).join(', ')}` };
+            if (theirs && (!theirs.allowCombineWithOtherLeaves || (theirs.blockedLeaveTypes || []).map(String).includes(typeId))) {
+                return { ok: false, message: `${theirName} cannot be combined with ${policy.leaveType?.name || 'this leave type'}` };
             }
         }
     }
@@ -369,11 +434,20 @@ async function validateApplication({
     return { ok: true };
 }
 
-/** How much balance an application may draw, allowing for a configured overdraft. */
-function spendableFrom(policy, remaining) {
-    return policy.allowNegativeBalance
-        ? remaining + (policy.maxNegativeDays || Infinity)
-        : remaining;
+/**
+ * How much balance an application may draw, allowing for a configured overdraft.
+ *
+ * `rawRemaining` is the balance BEFORE flooring at zero (utils/leaveDays
+ * rawRemainingOf), so an overdraft already taken counts against the cap: with
+ * a 2-day overdraft and nothing allocated, the first 2-day application uses it
+ * all and the next one finds nothing — instead of every application getting a
+ * fresh 2 days.
+ */
+function spendableFrom(policy, rawRemaining) {
+    const r = Number(rawRemaining) || 0;
+    if (!policy.allowNegativeBalance) return Math.max(0, r);
+    if (!(policy.maxNegativeDays > 0)) return Infinity;      // 0 = no limit
+    return Math.max(0, r + policy.maxNegativeDays);
 }
 
 /**
@@ -423,11 +497,16 @@ function splitPaidAndLop(policy, leaveType, totalDays, spendable) {
  *        of leave, not the school_admin role: a designation granting admin on
  *        the leave module puts a teacher on the module's admin screens, and
  *        without this they would be refused by every action on them.
+ * @param opts.applicantId the employee the application belongs to. Nobody signs
+ *        off their own leave — a principal who approves leave by designation,
+ *        or a teacher who administers the module, is an applicant like any
+ *        other when it is theirs.
  */
 async function canApprove(userId, userRole, schoolId, policy, opts = {}) {
-    const { designation, moduleAdmin = false } = typeof opts === 'string'
+    const { designation, moduleAdmin = false, applicantId = null } = typeof opts === 'string'
         ? { designation: opts }          // legacy positional form
         : opts;
+    if (applicantId && String(applicantId) === String(userId)) return false;
     const mode = policy.approval.mode;
     const isAdmin = userRole === 'school_admin' || moduleAdmin === true;
     if (mode === 'admin') return isAdmin;
@@ -457,7 +536,7 @@ async function designationOf(userId, schoolId) {
  * teacher an administrator of leave, and canApprove has treated them as one
  * since the module-admin fix.
  */
-async function approverIds(schoolId, policy) {
+async function approverIds(schoolId, policy, { exclude = null } = {}) {
     const ids = new Set();
     const mode = policy.approval.mode;
     if (mode === 'admin' || mode === 'both') {
@@ -467,11 +546,18 @@ async function approverIds(schoolId, policy) {
     if ((mode === 'designation' || mode === 'both') && designations.length) {
         const profiles = await TeacherProfile.find({ school: schoolId, designation: { $in: designations } })
             .select('user').lean();
-        profiles.forEach((p) => ids.add(String(p.user)));
+        // Only people who can still sign in — a designation held by someone who
+        // has left would otherwise collect the requests nobody else sees.
+        const active = profiles.length
+            ? await User.find({ _id: { $in: profiles.map((p) => String(p.user)) }, school: schoolId, isActive: true }).select('_id').lean()
+            : [];
+        active.forEach((u) => ids.add(String(u._id)));
     }
+    // The applicant never decides their own request, so is never asked to.
+    if (exclude) ids.delete(String(exclude));
     // Misconfigured — nobody named, or a designation nobody holds. The
     // administrators keep the keys, the same fallback canApprove applies.
-    if (!ids.size) (await leaveAdminIds(schoolId)).forEach((id) => ids.add(String(id)));
+    if (!ids.size) (await leaveAdminIds(schoolId)).forEach((id) => { if (String(id) !== String(exclude)) ids.add(String(id)); });
     return [...ids];
 }
 

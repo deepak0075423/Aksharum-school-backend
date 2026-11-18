@@ -84,6 +84,15 @@ async function markAttendanceForLeave(app, schoolId, ctx = null) {
         const byDate = new Map(existing.map(r => [isoDay(r.date), r]));
 
         const status = app.leaveMode === 'half_day' ? 'Half-Day' : 'Leave';
+        // The register says THAT the teacher is on leave and which kind — never
+        // why. The reason (often medical) was copied here, where everyone who
+        // reads attendance could see it.
+        const LeaveType = require('../models/LeaveType');
+        const lt = app.leaveType && typeof app.leaveType === 'object' && app.leaveType.name
+            ? app.leaveType
+            : await LeaveType.findById(app.leaveType?._id || app.leaveType).select('name').lean().catch(() => null);
+        const half = app.leaveMode === 'half_day' ? ` (${app.halfDaySession === 'second' ? 'second' : 'first'} half)` : '';
+        const remarks = `On leave — ${lt?.name || 'approved leave'}${half}`.slice(0, 200);
         let marked = 0;
         for (const d of dates) {
             // Never overwrite a real presence record — if someone actually
@@ -93,7 +102,7 @@ async function markAttendanceForLeave(app, schoolId, ctx = null) {
             await TeacherAttendance.findOneAndUpdate(
                 { teacher: app.teacher, school: schoolId, date: { $gte: dayStart(d), $lte: dayEnd(d) } },
                 {
-                    $set: { status, remarks: `Leave: ${app.reason || ''}`.slice(0, 200) },
+                    $set: { status, remarks },
                     $setOnInsert: { teacher: app.teacher, school: schoolId, date: dayStart(d) },
                 },
                 { upsert: true },
@@ -143,7 +152,12 @@ async function clearAttendanceForLeave(app, schoolId, ctx = null) {
 // ── Substitute cover ─────────────────────────────────────────────────────────
 
 /**
- * Ask the substitute engine to find cover for the days an approval just freed.
+ * Ask the substitute engine to (re)consider the days of a leave.
+ *
+ * After an approval it raises cover for them; after a reversal, a withdrawal
+ * or a leave cut short it is called again over the dropped days, and the
+ * engine's own retire pass cancels the auto-raised rows whose teacher is no
+ * longer away — so cover is never left booked for a leave that is gone.
  *
  * Substitute cover lives inside the Timetable module and has no flag of its
  * own, so that is what gates this. Previously the engine only ever pulled —

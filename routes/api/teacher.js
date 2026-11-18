@@ -150,7 +150,10 @@ router.post('/leave/compoff/:id/approve', leaveGuard, compOffCtrl.approve);
 router.post('/leave/compoff/:id/reject',  leaveGuard, compOffCtrl.reject);
 router.delete('/leave/compoff/:id',       leaveGuard, compOffCtrl.cancelOwn);
 
+// Withdraws a pending request, or approved leave that has not started yet
 router.delete('/leave/:id',    leaveGuard, leaveCtrl.teacherCancelLeave);
+// Back early from approved leave — gives back the days from today onwards
+router.post('/leave/:id/end-early', leaveGuard, leaveCtrl.teacherEndLeaveEarly);
 
 // ── Document Categories (read-only for teachers) ──────────────────────────────
 const DocumentCategory = require('../../models/DocumentCategory');

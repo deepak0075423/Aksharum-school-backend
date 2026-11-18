@@ -197,6 +197,10 @@ const SchoolSchema = new db.Schema({
         saturdayMode:     { type: String, enum: ['all', '1_3_5', '2_4'], default: 'all' },
         saturdayHalfDay:  { type: Boolean, default: false },
     },
+    // Academic years whose leave has been closed (Leave → Allocations → Close
+    // Year). A closed year's remainder has lapsed and its figures are final, so
+    // it takes no new applications, allocations or carry-ins.
+    leaveClosedYears: { type: [String], default: [] },
     // How student attendance is registered — see services/studentAttendance.js.
     //   day      one register per section per day, taken by the class teacher
     //            or vice class teacher

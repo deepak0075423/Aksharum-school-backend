@@ -11,10 +11,10 @@
  *      an active leave type with category 'compoff'. `resolveContext()` is the
  *      single gate — every entry point goes through it.
  *
- *   2. Balance is credited ONLY from `creditApproved()`, which is reachable
- *      from exactly one place: `approveRequest()` once the final sign-off
- *      lands. Creating, drafting, submitting or half-approving a claim never
- *      touches LeaveBalance.
+ *   2. Balance is credited ONLY by `approveRequest()` once the final sign-off
+ *      lands, in the same transaction that marks the request approved.
+ *      Creating, drafting, submitting or half-approving a claim never touches
+ *      LeaveBalance.
  *
  * Comp off deliberately owns no balance table of its own — it credits the
  * school's existing LeaveBalance row for the COMPOFF leave type, and spending
@@ -35,8 +35,10 @@ const { notify } = require('./notifyService');
 const leavePolicy = require('./leavePolicyService');
 const {
     normalizeLeaveSettings, isSaturdayWorking, staffHolidaysInRange,
-    getActiveAcademicYearLabel, remainingOf, utcMidnight,
+    getActiveAcademicYearLabel, remainingOf, utcMidnight, localToday,
 } = require('../utils/leaveDays');
+const tx = require('./leaveBalanceTx');
+const { patch } = require('../db/patch');
 
 const fmtDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 const DAY_MS  = 24 * 60 * 60 * 1000;
@@ -273,9 +275,12 @@ async function earnedInWindow(teacherId, schoolId, from, to) {
 async function checkEligibility({ ctx, teacherId, workDate, compOffDays, workedHours, classification, excludeId = null }) {
     const { policy } = ctx;
     const day   = utcMidnight(workDate);
-    const today = utcMidnight(new Date());
+    const today = localToday();
 
     if (isNaN(day.getTime())) return { ok: false, message: 'Invalid work date' };
+    if (compOffDays != null && compOffDays > 1) {
+        return { ok: false, message: 'One work date earns at most one day of Comp Off' };
+    }
 
     // Who — role + designation
     const user = await User.findOne({ _id: teacherId, school: ctx.school._id }).select('role name isActive').lean();
@@ -377,11 +382,12 @@ function snapshotPolicy(policy) {
  *
  * `moduleAdmin` is true when the caller holds ADMINISTRATIVE access to the leave
  * module (comp off lives inside it). "Admin" in an approval mode means an
- * administrator of leave, not the school_admin role — a designation granting
- * admin on leave puts a teacher on the module's admin screens, and without this
- * every action on them is refused.
+ * administrator of leave, not the school_admin role.
+ *
+ * `applicantId`, when given, is the claimant — nobody signs off their own claim.
  */
-async function canApprove(userId, userRole, schoolId, policy, moduleAdmin = false) {
+async function canApprove(userId, userRole, schoolId, policy, moduleAdmin = false, applicantId = null) {
+    if (applicantId && String(applicantId) === String(userId)) return false;
     const mode = policy.approval.mode;
     const isAdmin = userRole === 'school_admin' || moduleAdmin === true;
     if (mode === 'admin')       return isAdmin;
@@ -394,14 +400,10 @@ async function canApprove(userId, userRole, schoolId, policy, moduleAdmin = fals
 }
 
 /**
- * Everyone who should see "a new comp off request needs your attention".
- *
- * "Admin" here means an administrator of the LEAVE module — comp off lives
- * inside it — not the school_admin role, which is the same rule canApprove
- * applies. So a designation granting admin on leave is told about the queue it
- * is allowed to work.
+ * Everyone who should see "a new comp off request needs your attention" —
+ * the same people canApprove lets decide, minus the claimant.
  */
-async function approverIds(schoolId, policy) {
+async function approverIds(schoolId, policy, { exclude = null } = {}) {
     const ids = new Set();
     const mode = policy.approval.mode;
     const admins = () => leavePolicy.leaveAdminIds(schoolId);
@@ -413,239 +415,158 @@ async function approverIds(schoolId, policy) {
         const profiles = await TeacherProfile.find({
             school: schoolId, designation: { $in: designations },
         }).select('user').lean();
-        profiles.forEach(p => ids.add(String(p.user)));
+        const active = profiles.length
+            ? await User.find({ _id: { $in: profiles.map((p) => String(p.user)) }, school: schoolId, isActive: true }).select('_id').lean()
+            : [];
+        active.forEach(u => ids.add(String(u._id)));
     }
-    if (!ids.size) (await admins()).forEach(id => ids.add(String(id)));
+    if (exclude) ids.delete(String(exclude));
+    if (!ids.size) (await admins()).forEach(id => { if (String(id) !== String(exclude)) ids.add(String(id)); });
     return [...ids];
 }
 
 // ── Ledger + balance ──────────────────────────────────────────────────────────
+//
+// Every balance and lot movement goes through services/leaveBalanceTx — one
+// transaction per move, under the balance's lock, with its ledger row. The
+// ORM's read-modify-write `$inc` used to lose concurrent updates here.
 
-const DELTA_SIGN = {
-    EARNED: +1, REVERSED: +1,
-    USED: -1, EXPIRED: -1, CANCELLED: -1,
-};
-
-async function currentBalance(teacherId, schoolId, leaveTypeId, academicYear) {
-    const bal = await LeaveBalance.findOne({
-        teacher: teacherId, school: schoolId, leaveType: leaveTypeId, academicYear,
-    }).lean();
-    return remainingOf(bal);
-}
+const keyOf = (r) => ({ schoolId: r.school, teacherId: r.teacher, leaveTypeId: r.leaveType, academicYear: r.academicYear });
 
 /**
- * Append one ledger row. `delta` is derived from entryType except for
- * ADJUSTMENT, where the caller supplies the sign.
- */
-async function writeLedger({ schoolId, teacherId, leaveTypeId, academicYear, entryType, days,
-                             delta, expiresAt = null, remainingDays = null, source = 'compoff',
-                             referenceType = 'Manual', referenceId = null, description = '', createdBy = null }) {
-    const magnitude = Math.abs(Number(days) || 0);
-    const signed = entryType === 'ADJUSTMENT'
-        ? Number(delta) || 0
-        : magnitude * (DELTA_SIGN[entryType] || 0);
-
-    const balanceAfter = await currentBalance(teacherId, schoolId, leaveTypeId, academicYear);
-
-    return LeaveLedger.create({
-        school: schoolId, teacher: teacherId, leaveType: leaveTypeId, academicYear,
-        entryType, days: magnitude, delta: signed, balanceAfter,
-        expiresAt,
-        remainingDays: remainingDays == null ? (entryType === 'EARNED' ? magnitude : 0) : remainingDays,
-        source, referenceType, referenceId, description, createdBy,
-    });
-}
-
-/**
- * Credit an approved comp off request. THE ONLY place comp off days enter a
- * balance — and it refuses to run for anything that is not `approved`.
- * Idempotent: a second call on an already-credited request is a no-op.
- */
-async function creditApproved(request, ctx, actorId = null) {
-    if (request.status !== 'approved') {
-        throw new Error('Refusing to credit a Comp Off request that is not approved');
-    }
-    if (request.creditedAt) return { credited: 0, alreadyCredited: true };
-
-    const days = Number(request.compOffDays) || 0;
-    if (!(days > 0)) return { credited: 0 };
-
-    const ay = request.academicYear || await getActiveAcademicYearLabel(request.school);
-    if (!ay) throw new Error('No active academic year — cannot credit Comp Off');
-
-    const expiresAt = ctx.policy.validityDays > 0
-        ? new Date(Date.now() + ctx.policy.validityDays * DAY_MS)
-        : null;
-
-    // Balance first, then the ledger row — writeLedger snapshots the resulting
-    // position into balanceAfter.
-    await LeaveBalance.findOneAndUpdate(
-        { teacher: request.teacher, school: request.school, leaveType: request.leaveType, academicYear: ay },
-        { $inc: { totalAllocated: days },
-          $setOnInsert: { carriedForward: 0, used: 0, pending: 0, expired: 0 } },
-        { upsert: true, new: true },
-    );
-
-    const entry = await writeLedger({
-        schoolId: request.school, teacherId: request.teacher, leaveTypeId: request.leaveType,
-        academicYear: ay, entryType: 'EARNED', days, expiresAt, remainingDays: days,
-        source: 'compoff', referenceType: 'CompOffRequest', referenceId: request._id,
-        description: `Comp Off earned for ${fmtDate(request.workDate)}${request.dayLabel ? ` (${request.dayLabel})` : ''}`,
-        createdBy: actorId,
-    });
-
-    request.creditedDays = days;
-    request.creditedAt   = new Date();
-    request.academicYear = ay;
-    request.expiresAt    = expiresAt;
-    request.ledgerEntry  = entry._id;
-    await request.save();
-
-    return { credited: days, expiresAt, ledgerEntry: entry._id };
-}
-
-/**
- * Claw a credit back (admin cancels an approved comp off, or it is reversed).
- * Refuses when the days have already been spent — those must be reversed on the
- * leave side first, so the ledger can never go negative behind the user's back.
+ * Withdraw an approved credit (an admin cancels an approved comp off).
+ *
+ * Refused when the days have been spent — the leave has to be reversed first —
+ * and when they are HELD by a comp off leave still awaiting a decision: taking
+ * them away under a pending application would let that leave be approved
+ * against days that no longer exist.
  */
 async function reverseCredit(request, { entryType = 'CANCELLED', actorId = null, comment = '' } = {}) {
     if (!request.creditedAt || !(request.creditedDays > 0)) return { reversed: 0 };
-
-    const ay = request.academicYear;
-    const lot = request.ledgerEntry ? await LeaveLedger.findById(request.ledgerEntry) : null;
-    const stillUnused = lot ? Number(lot.remainingDays) || 0 : Number(request.creditedDays) || 0;
-
-    if (stillUnused < request.creditedDays) {
-        const spent = round2(request.creditedDays - stillUnused);
-        throw Object.assign(
-            new Error(`${spent} day(s) of this Comp Off have already been used — reverse the leave first`),
-            { status: 400 },
-        );
-    }
-    if (!(stillUnused > 0)) return { reversed: 0 };
-
-    await LeaveBalance.updateOne(
-        { teacher: request.teacher, school: request.school, leaveType: request.leaveType, academicYear: ay },
-        { $inc: { totalAllocated: -stillUnused } },
-    );
-    if (lot) { lot.remainingDays = 0; await lot.save(); }
-
-    await writeLedger({
-        schoolId: request.school, teacherId: request.teacher, leaveTypeId: request.leaveType,
-        academicYear: ay, entryType, days: stillUnused,
-        source: 'compoff', referenceType: 'CompOffRequest', referenceId: request._id,
-        description: `Comp Off for ${fmtDate(request.workDate)} withdrawn${comment ? ` — ${comment}` : ''}`,
-        createdBy: actorId,
+    const k = keyOf(request);
+    return tx.withTransaction(async (q) => {
+        await tx.lock(q, tx.balanceKey(k.schoolId, k.teacherId, k.leaveTypeId, k.academicYear));
+        const lot = request.ledgerEntry
+            ? (await q(`SELECT * FROM "${LeaveLedger.tableName}" WHERE "_id" = $1::uuid FOR UPDATE`, [String(request.ledgerEntry)])).rows[0]
+            : null;
+        const stillUnused = lot ? Number(lot.remainingDays) || 0 : Number(request.creditedDays) || 0;
+        if (stillUnused < request.creditedDays) {
+            const spent = round2(request.creditedDays - stillUnused);
+            throw Object.assign(new Error(`${spent} day(s) of this Comp Off have already been used — reverse the leave first`), { status: 400 });
+        }
+        if (!(stillUnused > 0)) return { reversed: 0 };
+        const bal = await tx.balanceRow(q, k);
+        if (remainingOf(bal) < stillUnused) {
+            throw Object.assign(new Error(
+                `${round2(stillUnused - remainingOf(bal))} day(s) of this Comp Off are held by a pending Comp Off leave — decide that leave first`,
+            ), { status: 400 });
+        }
+        const after = await tx.writeBalance(q, k, { inc: { totalAllocated: -stillUnused } });
+        if (lot) await q(`UPDATE "${LeaveLedger.tableName}" SET "remainingDays" = 0 WHERE "_id" = $1::uuid`, [String(lot._id)]);
+        await tx.writeLedger(q, k, {
+            entryType, days: stillUnused, delta: -stillUnused,
+            source: 'compoff', referenceType: 'CompOffRequest', referenceId: request._id,
+            description: `Comp Off for ${fmtDate(request.workDate)} withdrawn${comment ? ` — ${comment}` : ''}`,
+            createdBy: actorId,
+        }, after);
+        await patch(CompOffRequest, request._id, { creditedDays: 0, ledgerEntry: null }, { q });
+        return { reversed: stillUnused };
     });
-
-    request.creditedDays = 0;
-    request.ledgerEntry  = null;
-    await request.save();
-    return { reversed: stillUnused };
 }
 
 /**
- * Spend comp off days against an approved leave, oldest-expiry lot first, so
- * the days closest to lapsing leave the account before the fresh ones.
- * LeaveBalance.used is moved by the leave controller — this records the trail
- * and drains the FIFO lots.
+ * A manual correction of one employee's comp off balance. A positive one opens
+ * a lot (spendable, and lapsing with the policy's validity like any credit); a
+ * negative one is taken from the lots, oldest expiry first — it used to leave
+ * the lots full, and the expiry sweep then lapsed the same days a second time.
  */
-async function consumeForLeave(leaveApp, { actorId = null, academicYear } = {}) {
-    const days = Number(leaveApp.totalDays) || 0;
-    if (!(days > 0)) return { consumed: 0 };
-
-    const ay = academicYear || await getActiveAcademicYearLabel(leaveApp.school);
-    const lots = await LeaveLedger.find({
-        teacher: leaveApp.teacher, school: leaveApp.school, leaveType: leaveApp.leaveType,
-        academicYear: ay, entryType: 'EARNED', remainingDays: { $gt: 0 },
-    }).sort({ expiresAt: 1, createdAt: 1 });
-
-    let left = days;
-    for (const lot of lots) {
-        if (left <= 0) break;
-        const take = Math.min(Number(lot.remainingDays) || 0, left);
-        if (take <= 0) continue;
-        lot.remainingDays = round2(lot.remainingDays - take);
-        await lot.save();
-        left = round2(left - take);
-    }
-
-    await writeLedger({
-        schoolId: leaveApp.school, teacherId: leaveApp.teacher, leaveTypeId: leaveApp.leaveType,
-        academicYear: ay, entryType: 'USED', days,
-        source: 'compoff', referenceType: 'LeaveApplication', referenceId: leaveApp._id,
-        description: `Comp Off leave ${fmtDate(leaveApp.fromDate)} – ${fmtDate(leaveApp.toDate)}`,
-        createdBy: actorId,
+async function adjust({ ctx, schoolId, teacherId, academicYear, delta, description, actorId }) {
+    const k = { schoolId, teacherId, leaveTypeId: ctx.leaveType._id, academicYear };
+    return tx.withTransaction(async (q) => {
+        await tx.lock(q, tx.balanceKey(k.schoolId, k.teacherId, k.leaveTypeId, k.academicYear));
+        const bal = await tx.balanceRow(q, k);
+        if (delta < 0 && remainingOf(bal) < Math.abs(delta)) {
+            throw Object.assign(new Error(`Cannot deduct ${Math.abs(delta)} day(s) — only ${remainingOf(bal)} available`), { status: 400 });
+        }
+        const after = await tx.writeBalance(q, k, { inc: { totalAllocated: delta } });
+        if (delta < 0) await tx.drainLots(q, k, Math.abs(delta));
+        return tx.writeLedger(q, k, {
+            entryType: 'ADJUSTMENT', days: Math.abs(delta), delta,
+            remainingDays: delta > 0 ? delta : 0,
+            expiresAt: delta > 0 && ctx.policy.validityDays > 0
+                ? new Date(Date.now() + ctx.policy.validityDays * DAY_MS) : null,
+            source: 'compoff', referenceType: 'Manual',
+            description, createdBy: actorId,
+        }, after);
     });
-
-    // `left > 0` means the lots did not cover the leave — only reachable when a
-    // balance was seeded outside the ledger (legacy rows). Recorded, not fatal.
-    return { consumed: round2(days - left), unbacked: left };
 }
 
-/** Undo a consumption — puts the days back into the newest drained lots. */
-async function reverseConsumption(leaveApp, { actorId = null, academicYear, reason = '' } = {}) {
-    const days = Number(leaveApp.totalDays) || 0;
-    if (!(days > 0)) return { restored: 0 };
-
-    const ay = academicYear || await getActiveAcademicYearLabel(leaveApp.school);
-    const now = new Date();
-    // Refill the lots that are still valid, latest-expiry first: an expired lot
-    // must not spring back to life just because a leave was reversed.
-    const lots = await LeaveLedger.find({
-        teacher: leaveApp.teacher, school: leaveApp.school, leaveType: leaveApp.leaveType,
-        academicYear: ay, entryType: 'EARNED',
-    }).sort({ expiresAt: -1, createdAt: -1 });
-
-    let left = days;
-    for (const lot of lots) {
-        if (left <= 0) break;
-        if (lot.expiresAt && new Date(lot.expiresAt) < now) continue;
-        const capacity = round2((Number(lot.days) || 0) - (Number(lot.remainingDays) || 0));
-        const give = Math.min(capacity, left);
-        if (give <= 0) continue;
-        lot.remainingDays = round2((Number(lot.remainingDays) || 0) + give);
-        await lot.save();
-        left = round2(left - give);
-    }
-
-    await writeLedger({
-        schoolId: leaveApp.school, teacherId: leaveApp.teacher, leaveTypeId: leaveApp.leaveType,
-        academicYear: ay, entryType: 'REVERSED', days,
-        source: 'compoff', referenceType: 'LeaveApplication', referenceId: leaveApp._id,
-        description: `Comp Off leave reversed${reason ? ` — ${reason}` : ''}`,
-        createdBy: actorId,
-    });
-    return { restored: round2(days - left) };
+/**
+ * Hours worked on `day` as the attendance register recorded them — what "Auto
+ * Calculate" on the apply form means. null when there is no usable record.
+ */
+async function recordedHours(teacherId, schoolId, day) {
+    try {
+        const TeacherAttendance = require('../models/TeacherAttendance');
+        const d = utcMidnight(day);
+        const rec = await TeacherAttendance.findOne({
+            teacher: teacherId, school: schoolId,
+            date: { $gte: d, $lte: new Date(d.getTime() + DAY_MS - 1) },
+        }).select('checkIn checkOut status').lean();
+        if (!rec?.checkIn || !rec?.checkOut) return null;
+        const hours = hoursBetween(rec.checkIn, rec.checkOut);
+        return hours > 0 ? { hours, checkIn: rec.checkIn, checkOut: rec.checkOut, attendanceId: rec._id } : null;
+    } catch { return null; }
 }
 
 // ── Submission / approval ─────────────────────────────────────────────────────
 
 /**
  * Create a comp off claim.
- * @param {String} mode 'submit' → status 'pending' (awaiting approval)
- *                      'draft'  → status 'draft'   (ready-to-apply, scenario 3)
+ * @param {String}  mode     'submit' → status 'pending' (awaiting approval)
+ *                           'draft'  → status 'draft'   (ready-to-apply, scenario 3)
+ * @param {Boolean} byAdmin  only an administrator raising a claim by hand may
+ *                           name the days (0.5 or 1). For everyone else the
+ *                           figure is the POLICY's, from the hours worked —
+ *                           the employee's own request body used to set it, so
+ *                           one Sunday could be claimed as five days.
  * Neither touches the balance.
  */
 async function createRequest({ ctx, teacherId, workDate, checkIn = '', checkOut = '', workedHours,
                                compOffDays, reason = '', document = null, source = 'manual',
-                               attendanceId = null, mode = 'submit', actorId = null }) {
+                               attendanceId = null, mode = 'submit', actorId = null, byAdmin = false }) {
     const day = utcMidnight(workDate);
+    if (isNaN(day.getTime())) return { ok: false, message: 'Invalid work date' };
     const classification = await classifyWorkDate(ctx.school._id, day, ctx);
 
-    let hours = workedHours;
-    if (hours == null || hours === '') hours = checkIn && checkOut ? hoursBetween(checkIn, checkOut) : 0;
+    // Hours: typed times, or — when none were typed — what the attendance
+    // register recorded for that day ("Auto Calculate").
+    let hours = byAdmin && workedHours != null && workedHours !== '' ? Number(workedHours) : null;
+    if (hours == null && checkIn && checkOut) hours = hoursBetween(checkIn, checkOut);
+    let attendance = attendanceId;
+    if (hours == null || !(hours > 0)) {
+        const rec = await recordedHours(teacherId, ctx.school._id, day);
+        if (rec) {
+            hours = rec.hours; checkIn = rec.checkIn; checkOut = rec.checkOut;
+            attendance = attendance || rec.attendanceId;
+        }
+    }
     hours = round2(Number(hours) || 0);
 
-    let days = compOffDays == null || compOffDays === ''
-        ? computeCompOffDays(hours, ctx.policy)
-        : Number(compOffDays);
-
-    // Scenario 1 runs without attendance data: no hours recorded means the
-    // school is judging the claim by hand, so a full day is the sensible
-    // starting figure and the policy's hour rules simply have nothing to test.
-    if (!hours && (compOffDays == null || compOffDays === '')) days = 1;
+    const named = byAdmin && compOffDays != null && compOffDays !== '';
+    if (named && ![0.5, 1].includes(Number(compOffDays))) {
+        return { ok: false, message: 'Comp Off for one work date is either a half day (0.5) or a full day (1)' };
+    }
+    let days;
+    if (named) days = Number(compOffDays);
+    else if (hours > 0) days = computeCompOffDays(hours, ctx.policy);
+    else if (byAdmin) days = 1;        // an administrator judging a claim by hand, with nothing recorded
+    else {
+        return {
+            ok: false,
+            message: 'Enter the times you worked that day — there is no attendance record to work them out from',
+        };
+    }
 
     const check = await checkEligibility({
         ctx, teacherId, workDate: day, compOffDays: days,
@@ -662,7 +583,7 @@ async function createRequest({ ctx, teacherId, workDate, checkIn = '', checkOut 
         leaveType: ctx.leaveType._id,
         workDate: day,
         source,
-        attendance: attendanceId,
+        attendance,
         holiday:    classification.holiday,
         dayCategory: classification.category,
         dayLabel:    classification.label,
@@ -687,15 +608,16 @@ async function createRequest({ ctx, teacherId, workDate, checkIn = '', checkOut 
     return { ok: true, request };
 }
 
-/** Move a ready-to-apply draft to pending — the employee's "Apply" click. */
-async function submitDraft(request, ctx, { reason, compOffDays } = {}) {
+/**
+ * Move a ready-to-apply draft to pending — the employee's "Apply" click. The
+ * days are the ones the draft was generated with from the attendance record;
+ * the employee adds a reason, not a figure.
+ */
+async function submitDraft(request, ctx, { reason } = {}) {
     if (request.status !== 'draft') {
         return { ok: false, message: 'Only ready-to-apply Comp Off requests can be submitted' };
     }
-    const days = compOffDays == null || compOffDays === ''
-        ? Number(request.compOffDays)
-        : Number(compOffDays);
-
+    const days = Number(request.compOffDays);
     const classification = {
         category: request.dayCategory,
         label:    request.dayLabel,
@@ -708,104 +630,152 @@ async function submitDraft(request, ctx, { reason, compOffDays } = {}) {
     });
     if (!check.ok) return { ok: false, message: check.message };
 
-    request.compOffDays = days;
-    request.compOffMode = days <= 0.5 ? 'half_day' : 'full_day';
-    if (reason != null) request.reason = String(reason).trim();
-    request.status    = 'pending';
-    request.appliedAt = new Date();
-    request.approvalsRequired = ctx.policy.approval.twoLevel ? 2 : 1;
-    request.policySnapshot = snapshotPolicy(ctx.policy);
-    await request.save();
+    // Only if it is still a draft — a double-tapped Apply submits once.
+    const saved = await patch(CompOffRequest, request._id, {
+        reason: reason != null ? String(reason).trim() : request.reason,
+        status: 'pending',
+        appliedAt: new Date(),
+        approvalsRequired: ctx.policy.approval.twoLevel ? 2 : 1,
+        policySnapshot: snapshotPolicy(ctx.policy),
+    }, { where: { status: 'draft' } });
+    if (!saved) return { ok: false, message: 'This request was already submitted' };
 
-    await notifyNewRequest(request, ctx);
-    return { ok: true, request };
+    await notifyNewRequest(saved, ctx);
+    return { ok: true, request: saved };
 }
 
 /**
  * Record one sign-off. Credit happens only when the last required level lands —
  * a first-of-two approval leaves the balance untouched.
+ *
+ * The whole decision is one transaction on the request's row: its status and
+ * level are re-read under the lock, the approval is appended, and on the final
+ * sign-off the balance, the EARNED lot and the request's credited fields are
+ * written with it. Two approvers pressing at once used to both credit.
  */
 async function approveRequest(request, ctx, { actorId, actorName, actorRole, moduleAdmin = false, comment = '' }) {
     if (request.status !== 'pending') {
         return { ok: false, message: 'Only pending Comp Off requests can be approved' };
     }
-    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin);
-    if (!allowed) return { ok: false, message: 'You are not an approver for Comp Off requests' };
+    if (String(request.teacher) === String(actorId)) {
+        return { ok: false, forbidden: true, message: 'You cannot decide your own Comp Off request' };
+    }
+    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin, request.teacher);
+    if (!allowed) return { ok: false, forbidden: true, message: 'You are not an approver for Comp Off requests' };
 
-    const already = (request.approvals || []).some(a => String(a.by) === String(actorId));
-    if (already) return { ok: false, message: 'You have already approved this request — a second sign-off must come from someone else' };
+    const out = await tx.withTransaction(async (q) => {
+        await tx.lock(q, `compoff:request:${request._id}`);
+        const { rows } = await q(`SELECT * FROM "${CompOffRequest.tableName}" WHERE "_id" = $1::uuid FOR UPDATE`, [String(request._id)]);
+        const cur = rows[0];
+        if (!cur || cur.status !== 'pending') return { ok: false, message: `This request was ${cur?.status || 'removed'} a moment ago` };
+        const approvals = Array.isArray(cur.approvals) ? cur.approvals : [];
+        if (approvals.some(a => String(a.by) === String(actorId))) {
+            return { ok: false, message: 'You have already approved this request — a second sign-off must come from someone else' };
+        }
+        const level = approvals.length + 1;
+        const entry = { level, by: String(actorId), byName: actorName || '', at: new Date().toISOString(), comment };
+        const required = Number(cur.approvalsRequired) || 1;
 
-    const approvals = [...(request.approvals || []), {
-        level: (request.approvalLevel || 0) + 1,
-        by: String(actorId), byName: actorName || '', at: new Date().toISOString(), comment,
-    }];
-    request.approvals     = approvals;
-    request.approvalLevel = approvals.length;
-    request.adminComment  = comment || request.adminComment;
+        if (level < required) {
+            const saved = await patch(CompOffRequest, request._id,
+                { approvalLevel: level, adminComment: comment || cur.adminComment || '' },
+                { q, push: { approvals: entry } });
+            return { ok: true, request: saved, credited: 0, pendingLevels: required - level, required };
+        }
 
-    const required = request.approvalsRequired || 1;
-    if (request.approvalLevel < required) {
-        await request.save();
+        // Final sign-off — and only now does anything reach the balance.
+        const days = Number(cur.compOffDays) || 0;
+        const ay = cur.academicYear || await getActiveAcademicYearLabel(request.school);
+        if (!ay) throw new Error('No active academic year — cannot credit Comp Off');
+        const expiresAt = ctx.policy.validityDays > 0 ? new Date(Date.now() + ctx.policy.validityDays * DAY_MS) : null;
+        let lot = null;
+        if (days > 0) {
+            const k = { schoolId: request.school, teacherId: request.teacher, leaveTypeId: request.leaveType, academicYear: ay };
+            await tx.lock(q, tx.balanceKey(k.schoolId, k.teacherId, k.leaveTypeId, k.academicYear));
+            const after = await tx.writeBalance(q, k, { inc: { totalAllocated: days } });
+            lot = await tx.writeLedger(q, k, {
+                entryType: 'EARNED', days, delta: days, remainingDays: days, expiresAt,
+                source: 'compoff', referenceType: 'CompOffRequest', referenceId: request._id,
+                description: `Comp Off earned for ${fmtDate(cur.workDate)}${cur.dayLabel ? ` (${cur.dayLabel})` : ''}`,
+                createdBy: actorId,
+            }, after);
+        }
+        const saved = await patch(CompOffRequest, request._id, {
+            status: 'approved', approvedBy: String(actorId), approvedAt: new Date(),
+            approvalLevel: level, adminComment: comment || cur.adminComment || '',
+            creditedDays: days, creditedAt: new Date(), academicYear: ay, expiresAt: days > 0 ? expiresAt : null,
+            ledgerEntry: lot ? lot._id : null,
+        }, { q, push: { approvals: entry } });
+        return { ok: true, request: saved, credited: days, expiresAt, final: true };
+    });
+    if (!out.ok) return out;
+
+    if (!out.final) {
         notify({
             school: request.school, sender: actorId, senderRole: actorRole,
             title: '🕓 Comp Off — first approval recorded',
-            body: `Your Comp Off request for ${fmtDate(request.workDate)} cleared level ${request.approvalLevel} of ${required}. No balance is credited until the final approval.`,
+            body: `Your Comp Off request for ${fmtDate(request.workDate)} cleared level ${out.request.approvalLevel} of ${out.required}. No balance is credited until the final approval.`,
             recipients: [request.teacher],
             link: { type: 'compoff.mine', entityId: request._id },
         });
-        return { ok: true, request, credited: 0, pendingLevels: required - request.approvalLevel };
+        approverIds(request.school, ctx.policy, { exclude: request.teacher }).then((recipients) => notify({
+            school: request.school, sender: actorId, senderRole: actorRole,
+            title: '⏳ Comp Off still needs a sign-off',
+            body: `A Comp Off request for ${fmtDate(request.workDate)} cleared level ${out.request.approvalLevel} of ${out.required} and is waiting on its final approval.`,
+            recipients,
+            link: { type: 'compoff.approvals', entityId: request._id },
+        })).catch(() => {});
+        return out;
     }
-
-    request.status     = 'approved';
-    request.approvedBy = actorId;
-    request.approvedAt = new Date();
-    await request.save();
-
-    // Final sign-off — and only now does anything reach the balance.
-    const credit = await creditApproved(request, ctx, actorId);
 
     notify({
         school: request.school, sender: actorId, senderRole: actorRole,
         title: '✅ Comp Off approved',
         body: `Your Comp Off for ${fmtDate(request.workDate)}${request.dayLabel ? ` (${request.dayLabel})` : ''} has been approved. `
-            + `${credit.credited} day(s) credited to your Comp Off balance`
-            + `${credit.expiresAt ? `, valid until ${fmtDate(credit.expiresAt)}` : ''}.`
+            + `${out.credited} day(s) credited to your Comp Off balance`
+            + `${out.expiresAt ? `, valid until ${fmtDate(out.expiresAt)}` : ''}.`
             + `${comment ? `\nComment: ${comment}` : ''}`,
         recipients: [request.teacher],
         email: true,
         link: { type: 'compoff.mine', entityId: request._id },
     });
-    return { ok: true, request, credited: credit.credited };
+    return out;
 }
 
 async function rejectRequest(request, ctx, { actorId, actorRole, moduleAdmin = false, comment = '' }) {
     if (!['pending', 'draft'].includes(request.status)) {
         return { ok: false, message: 'Only pending Comp Off requests can be rejected' };
     }
-    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin);
-    if (!allowed) return { ok: false, message: 'You are not an approver for Comp Off requests' };
+    if (String(request.teacher) === String(actorId)) {
+        return { ok: false, forbidden: true, message: 'You cannot decide your own Comp Off request' };
+    }
+    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin, request.teacher);
+    if (!allowed) return { ok: false, forbidden: true, message: 'You are not an approver for Comp Off requests' };
+    const why = String(comment || '').trim();
+    if (!why) return { ok: false, message: 'Give a reason for rejecting this request' };
 
-    request.status       = 'rejected';
-    request.rejectedAt   = new Date();
-    request.adminComment = comment || '';
-    request.creditedDays = 0;     // explicit: rejection credits nothing
-    await request.save();
+    // Only if it is still undecided: a reject that lost the race to an approval
+    // used to overwrite it as "rejected" with the days already credited.
+    const saved = await patch(CompOffRequest, request._id, {
+        status: 'rejected', rejectedAt: new Date(), adminComment: why,
+    }, { where: { status: ['pending', 'draft'] } });
+    if (!saved) return { ok: false, message: 'This request was decided a moment ago — refresh to see it' };
 
     notify({
         school: request.school, sender: actorId, senderRole: actorRole,
         title: '❌ Comp Off rejected',
-        body: `Your Comp Off request for ${fmtDate(request.workDate)} was rejected. No balance has been credited.${comment ? `\nReason: ${comment}` : ''}`,
+        body: `Your Comp Off request for ${fmtDate(request.workDate)} was rejected. No balance has been credited.\nReason: ${why}`,
         recipients: [request.teacher],
         email: true,
         link: { type: 'compoff.mine', entityId: request._id },
     });
-    return { ok: true, request };
+    return { ok: true, request: saved };
 }
 
 async function notifyNewRequest(request, ctx) {
     try {
         const [recipients, teacher] = await Promise.all([
-            approverIds(request.school, ctx.policy),
+            approverIds(request.school, ctx.policy, { exclude: request.teacher }),
             User.findById(request.teacher).select('name').lean(),
         ]);
         notify({
@@ -905,75 +875,100 @@ async function generateFromAttendance(attendanceRecord, { actorId = null } = {})
 // ── Expiry ────────────────────────────────────────────────────────────────────
 
 /**
- * Lapse comp off that outlived its validity window. Writes EXPIRED for the
- * unused remainder of each stale lot and parks the days in LeaveBalance.expired
- * so allocated/used history stays readable.
+ * Lapse comp off that outlived its validity window.
+ *
+ * Per employee and year, in one transaction under the balance's lock: walk the
+ * lots oldest-expiry first — the order a leave spends them in — and keep back
+ * as many days as that employee's PENDING comp off leave is holding, because
+ * those are exactly the days the pending leave will spend when it is approved.
+ * Only the rest of an expired lot lapses. (Lapsing them anyway used to let the
+ * same days be both expired and then spent.)
+ *
+ * A request is marked 'expired' only when days of ITS lot actually lapsed — a
+ * claim that was fully spent before its date stays 'approved'.
  */
 async function runExpirySweep(schoolId) {
     const ctx = await resolveContext(schoolId);
     if (!ctx.enabled) return { expired: 0 };
 
     const now = new Date();
-    const lots = await LeaveLedger.find({
-        school: schoolId, leaveType: ctx.leaveType._id, entryType: 'EARNED',
+    const due = await LeaveLedger.find({
+        school: schoolId, leaveType: ctx.leaveType._id, entryType: { $in: ['EARNED', 'ADJUSTMENT'] },
         remainingDays: { $gt: 0 }, expiresAt: { $ne: null, $lte: now },
-    });
+    }).select('teacher academicYear').lean();
+    const groups = new Map();
+    for (const l of due) groups.set(`${l.teacher}|${l.academicYear}`, { teacher: l.teacher, academicYear: l.academicYear });
 
     let expiredDays = 0;
+    let lotsLapsed = 0;
     const perTeacher = new Map();
+    const lapsedLots = new Set();
 
-    for (const lot of lots) {
-        const days = Number(lot.remainingDays) || 0;
-        if (!(days > 0)) continue;
-
-        await LeaveBalance.updateOne(
-            { teacher: lot.teacher, school: schoolId, leaveType: lot.leaveType, academicYear: lot.academicYear },
-            { $inc: { expired: days } },
-        );
-        lot.remainingDays = 0;
-        await lot.save();
-
-        await writeLedger({
-            schoolId, teacherId: lot.teacher, leaveTypeId: lot.leaveType,
-            academicYear: lot.academicYear, entryType: 'EXPIRED', days,
-            source: 'compoff', referenceType: 'LeaveLedger', referenceId: lot._id,
-            description: `Comp Off lapsed — validity ended ${fmtDate(lot.expiresAt)}`,
+    for (const g of groups.values()) {
+        const k = { schoolId, teacherId: g.teacher, leaveTypeId: ctx.leaveType._id, academicYear: g.academicYear };
+        const lapsed = await tx.withTransaction(async (q) => {
+            await tx.lock(q, tx.balanceKey(k.schoolId, k.teacherId, k.leaveTypeId, k.academicYear));
+            const bal = await tx.balanceRow(q, k);
+            let protect = Number(bal?.pending) || 0;
+            const { rows: lots } = await q(
+                `SELECT "_id", "remainingDays", "expiresAt" FROM "${LeaveLedger.tableName}"
+                  WHERE "school" = $1::uuid AND "teacher" = $2::uuid AND "leaveType" = $3::uuid AND "academicYear" = $4
+                    AND "entryType" IN ('EARNED', 'ADJUSTMENT') AND COALESCE("delta", 0) > 0 AND COALESCE("remainingDays", 0) > 0
+                  ORDER BY "expiresAt" ASC NULLS LAST, "createdAt" ASC FOR UPDATE`,
+                [String(k.schoolId), String(k.teacherId), String(k.leaveTypeId), String(k.academicYear)]);
+            let total = 0;
+            for (const lot of lots) {
+                const left = Number(lot.remainingDays) || 0;
+                const held = Math.min(left, protect);
+                protect = round2(protect - held);
+                if (!lot.expiresAt || new Date(lot.expiresAt) > now) continue;
+                const lapse = round2(left - held);
+                if (lapse <= 0) continue;
+                await q(`UPDATE "${LeaveLedger.tableName}" SET "remainingDays" = $2 WHERE "_id" = $1::uuid`, [String(lot._id), round2(left - lapse)]);
+                const after = await tx.writeBalance(q, k, { inc: { expired: lapse } });
+                await tx.writeLedger(q, k, {
+                    entryType: 'EXPIRED', days: lapse, delta: -lapse,
+                    source: 'compoff', referenceType: 'LeaveLedger', referenceId: lot._id,
+                    description: `Comp Off lapsed — validity ended ${fmtDate(lot.expiresAt)}`,
+                }, after);
+                lapsedLots.add(String(lot._id));
+                lotsLapsed += 1;
+                total = round2(total + lapse);
+            }
+            return total;
         });
-
-        expiredDays += days;
-        perTeacher.set(String(lot.teacher), (perTeacher.get(String(lot.teacher)) || 0) + days);
-    }
-
-    // Mark the originating requests so the employee's history reads correctly
-    if (expiredDays > 0) {
-        const stale = await CompOffRequest.find({
-            school: schoolId, status: 'approved',
-            expiresAt: { $ne: null, $lte: now },
-        });
-        for (const r of stale) {
-            const lot = r.ledgerEntry ? await LeaveLedger.findById(r.ledgerEntry).lean() : null;
-            if (lot && (Number(lot.remainingDays) || 0) > 0) continue;   // partly/fully spent in time
-            r.status    = 'expired';
-            r.expiredAt = now;
-            await r.save();
+        if (lapsed > 0) {
+            expiredDays = round2(expiredDays + lapsed);
+            perTeacher.set(String(g.teacher), round2((perTeacher.get(String(g.teacher)) || 0) + lapsed));
         }
     }
 
-    for (const [teacherId, days] of perTeacher) {
+    // Mark the originating requests whose own lot lapsed, so the employee's
+    // history reads correctly — and only those.
+    if (lapsedLots.size) {
+        const stale = await CompOffRequest.find({
+            school: schoolId, status: 'approved', ledgerEntry: { $in: [...lapsedLots] },
+        }).select('_id').lean();
+        for (const r of stale) {
+            await patch(CompOffRequest, r._id, { status: 'expired', expiredAt: now }, { where: { status: 'approved' } });
+        }
+    }
+
+    for (const [teacherId, d] of perTeacher) {
         // System-originated: notify() drops a senderless message and always
         // filters the sender out of the recipients, so the employee is both
         // ends of their own expiry notice.
         notify({
             school: schoolId, sender: teacherId, senderRole: 'system',
             title: '⌛ Comp Off expired',
-            body: `${round2(days)} day(s) of your Comp Off balance lapsed today without being used.`,
+            body: `${round2(d)} day(s) of your Comp Off balance lapsed today without being used.`,
             recipients: [teacherId],
             includeSender: true,
             link: { type: 'compoff.mine' },
         });
     }
 
-    return { expired: round2(expiredDays), lots: lots.length };
+    return { expired: round2(expiredDays), lots: lotsLapsed };
 }
 
 /** "Your comp off lapses in N days" nudge, per policy.expiryNotification. */
@@ -1006,8 +1001,7 @@ async function runExpiryNotifications(schoolId) {
             includeSender: true,
             link: { type: 'compoff.mine', entityId: r._id },
         });
-        r.expiryNotifiedAt = now;
-        await r.save();
+        await patch(CompOffRequest, r._id, { expiryNotifiedAt: now });
         notified++;
     }
     return { notified };
@@ -1016,39 +1010,86 @@ async function runExpiryNotifications(schoolId) {
 /**
  * Comp off carry-forward. The rule comes from the COMPOFF type's LeavePolicy —
  * the same place every other leave type's carry forward is configured — and is
- * passed in by the caller. This function exists only so the roll-over lands in
- * the leave ledger as an ADJUSTMENT rather than a bare balance edit.
+ * passed in by the caller.
+ *
+ * Comp off is carried LOT BY LOT, oldest expiry first: each lot's unspent days
+ * leave the old year's lot and open a lot in the new year with the SAME expiry
+ * date. A carried day therefore still lapses when it was always going to, and
+ * can still be spent (a bare carried-in figure used to be neither spendable
+ * from a lot nor ever lapse). Recorded as carried out of the old year, so a
+ * second run carries nothing twice. Days held by a pending comp off leave in
+ * the old year stay behind with it.
  */
-async function carryForward(schoolId, fromYear, toYear, rule) {
+async function carryForward(schoolId, fromYear, toYear, rule, actorId = null) {
     const ctx = await resolveContext(schoolId);
-    if (!ctx.enabled || !rule?.enabled) return { processed: 0 };
+    if (!ctx.enabled || !rule?.enabled) return { processed: 0, carried: [] };
 
     const balances = await LeaveBalance.find({
         school: schoolId, leaveType: ctx.leaveType._id, academicYear: fromYear,
-    }).lean();
+    }).select('teacher').lean();
+    const cap = Number(rule.maxDays) || 0;
 
     let processed = 0;
-    for (const bal of balances) {
-        const rem  = remainingOf(bal);
-        const cap  = rule.maxDays || rem;
-        const days = Math.min(rem, cap);
-        if (days <= 0) continue;
+    const carried = [];
+    for (const b of balances) {
+        const src = { schoolId, teacherId: b.teacher, leaveTypeId: ctx.leaveType._id, academicYear: fromYear };
+        const dst = { ...src, academicYear: toYear };
+        const moved = await tx.withTransaction(async (q) => {
+            await tx.lock(q, tx.balanceKey(src.schoolId, src.teacherId, src.leaveTypeId, fromYear));
+            await tx.lock(q, tx.balanceKey(dst.schoolId, dst.teacherId, dst.leaveTypeId, toYear));
+            const bal = await tx.balanceRow(q, src);
+            const remaining = remainingOf(bal);
+            const room = cap > 0 ? Math.max(0, cap - (Number(bal?.carriedOut) || 0)) : remaining;
+            let amt = round2(Math.min(remaining, room));
+            if (!(amt > 0)) return 0;
 
-        await LeaveBalance.findOneAndUpdate(
-            { teacher: bal.teacher, school: schoolId, leaveType: ctx.leaveType._id, academicYear: toYear },
-            { $inc: { carriedForward: days },
-              $setOnInsert: { totalAllocated: 0, used: 0, pending: 0, expired: 0 } },
-            { upsert: true },
-        );
-        await writeLedger({
-            schoolId, teacherId: bal.teacher, leaveTypeId: ctx.leaveType._id,
-            academicYear: toYear, entryType: 'ADJUSTMENT', days, delta: days,
-            source: 'compoff', referenceType: 'System',
-            description: `Comp Off carried forward from ${fromYear}`,
+            // Lots in spending order; the first `pending` days stay behind for
+            // the leave that is holding them.
+            let skip = Number(bal?.pending) || 0;
+            const { rows: lots } = await q(
+                `SELECT * FROM "${LeaveLedger.tableName}"
+                  WHERE "school" = $1::uuid AND "teacher" = $2::uuid AND "leaveType" = $3::uuid AND "academicYear" = $4
+                    AND "entryType" IN ('EARNED', 'ADJUSTMENT') AND COALESCE("delta", 0) > 0 AND COALESCE("remainingDays", 0) > 0
+                    AND ("expiresAt" IS NULL OR "expiresAt" > now())
+                  ORDER BY "expiresAt" ASC NULLS LAST, "createdAt" ASC FOR UPDATE`,
+                [String(src.schoolId), String(src.teacherId), String(src.leaveTypeId), fromYear]);
+            let total = 0;
+            for (const lot of lots) {
+                if (amt <= 0) break;
+                let avail = Number(lot.remainingDays) || 0;
+                const kept = Math.min(avail, skip);
+                skip = round2(skip - kept);
+                avail = round2(avail - kept);
+                const take = Math.min(avail, amt);
+                if (take <= 0) continue;
+                await q(`UPDATE "${LeaveLedger.tableName}" SET "remainingDays" = $2 WHERE "_id" = $1::uuid`,
+                    [String(lot._id), round2(Number(lot.remainingDays) - take)]);
+                const after = await tx.writeBalance(q, dst, { inc: { carriedForward: take } });
+                await tx.writeLedger(q, dst, {
+                    entryType: 'ADJUSTMENT', days: take, delta: take, remainingDays: take,
+                    expiresAt: lot.expiresAt || null,
+                    source: 'compoff', referenceType: 'LeaveLedger', referenceId: lot._id, createdBy: actorId,
+                    description: `Comp Off carried forward from ${fromYear}`,
+                }, after);
+                amt = round2(amt - take);
+                total = round2(total + take);
+            }
+            if (total > 0) {
+                const after = await tx.writeBalance(q, src, { inc: { carriedOut: total } });
+                await tx.writeLedger(q, src, {
+                    entryType: 'ADJUSTMENT', days: total, delta: -total, remainingDays: 0,
+                    source: 'compoff', referenceType: 'System', createdBy: actorId,
+                    description: `Comp Off carried forward to ${toYear}`,
+                }, after);
+            }
+            return total;
         });
-        processed++;
+        if (moved > 0) {
+            processed++;
+            carried.push({ teacher: b.teacher, days: moved });
+        }
     }
-    return { processed };
+    return { processed, carried };
 }
 
 module.exports = {
@@ -1068,13 +1109,11 @@ module.exports = {
     submitDraft,
     approveRequest,
     rejectRequest,
-    creditApproved,
     reverseCredit,
-    consumeForLeave,
-    reverseConsumption,
+    adjust,
+    recordedHours,
     generateFromAttendance,
     runExpirySweep,
     runExpiryNotifications,
     carryForward,
-    writeLedger,
 };

@@ -2,6 +2,7 @@
 const User           = require('../models/User');
 const yearScope = require('../services/yearScope');
 const TeacherProfile = require('../models/TeacherProfile');
+const { getActiveAcademicYearLabel, remainingOf } = require('../utils/leaveDays');
 const { ownSections, primarySection } = require('../services/teacherOwnSections');
 const { released } = require('../services/resultExams');
 
@@ -40,8 +41,12 @@ exports.getDashboard = async (req, res) => {
                 ? FormalExam.countDocuments({ section: mySection._id, school: req.schoolId, status: 'SUBMITTED', archivedAt: null }).catch(() => 0)
                 : 0,
             TimetableEntry.find({ teacher: req.userId }).distinct('timetable').catch(() => []),
-            LeaveBalance.find({ teacher: req.userId, school: req.schoolId })
-                .populate('leaveType', 'name').lean().catch(() => []),
+            // This year's balances only — every year's rows used to be summed,
+            // so last year's (lapsed or carried) days were counted again.
+            getActiveAcademicYearLabel(req.schoolId)
+                .then((ay) => LeaveBalance.find({ teacher: req.userId, school: req.schoolId, academicYear: ay })
+                    .populate('leaveType', 'name').lean())
+                .catch(() => []),
         ]);
 
         // Today's periods across every section timetable this teacher appears in
@@ -175,7 +180,7 @@ exports.getDashboard = async (req, res) => {
             }
         } catch { classPerformance = []; }
 
-        const leaveRemaining = balances.reduce((s, b) => s + Math.max(0, (b.totalAllocated || 0) + (b.carriedForward || 0) - (b.used || 0) - (b.pending || 0)), 0);
+        const leaveRemaining = balances.reduce((s, b) => s + remainingOf(b), 0);
 
         res.json({ success: true, data: {
             profile,

@@ -192,14 +192,23 @@ async function leaveLopDaysFor(schoolId, year, month) {
         }).select('teacher lopDays fromDate toDate totalDays').lean();
 
         const out = {};
+        const { dayKinds, normalizeLeaveSettings } = require('../utils/leaveDays');
+        const settings = await School.findById(schoolId).select('leaveSettings modules').lean();
+        const ls = normalizeLeaveSettings(settings?.leaveSettings);
+        const hol = !!settings?.modules?.holiday;
         for (const a of apps) {
-            // A leave spanning a month boundary is charged pro-rata to the part
-            // inside this pay month, so no day is deducted twice.
-            const from = new Date(Math.max(new Date(a.fromDate), monthStart));
-            const to   = new Date(Math.min(new Date(a.toDate), monthEnd));
-            const inMonth = Math.max(0, Math.round((to - from) / 86400000) + 1);
-            const span    = Math.max(1, Math.round((new Date(a.toDate) - new Date(a.fromDate)) / 86400000) + 1);
-            const share   = span > 0 ? (a.lopDays * inMonth) / span : a.lopDays;
+            // A leave spanning a month boundary is charged to each month by the
+            // WORKING days it holds there — loss-of-pay days are working days,
+            // so splitting them by calendar days moved pay between months.
+            let share = a.lopDays;
+            if (new Date(a.fromDate) < monthStart || new Date(a.toDate) > monthEnd) {
+                const all = await dayKinds(a.fromDate, a.toDate, schoolId, ls, hol);
+                const w = all.reduce((t, d) => t + d.weight, 0);
+                const lo = monthStart.toISOString().slice(0, 10);
+                const hi = monthEnd.toISOString().slice(0, 10);
+                const wIn = all.filter((d) => d.iso >= lo && d.iso <= hi).reduce((t, d) => t + d.weight, 0);
+                share = w > 0 ? (a.lopDays * wIn) / w : 0;
+            }
             out[String(a.teacher)] = r2((out[String(a.teacher)] || 0) + share);
         }
         return out;
@@ -4667,21 +4676,36 @@ async function encashableLeave(schoolId, employeeId) {
         const school = await School.findById(schoolId).select('modules').lean();
         if (!schoolModuleFlags(school).leave) return out;
         const LeaveBalance = require('../models/LeaveBalance');
-        const LeaveType = require('../models/LeaveType');
-        const { getActiveAcademicYearLabel } = require('../utils/leaveDays');
+        const LeaveLedger = require('../models/LeaveLedger');
+        const { getActiveAcademicYearLabel, remainingOf } = require('../utils/leaveDays');
+        const leavePolicy = require('../services/leavePolicyService');
 
         out.source = 'leave module';
-        const types = await LeaveType.find({ school: schoolId, encashable: true, isActive: { $ne: false } }).lean();
+        // Encashment is a POLICY rule (Leave → Policies). The LeaveType columns
+        // this read are only the seed for a type never given a policy, so
+        // ticking "Encashable" on the policy never reached the settlement.
+        const types = (await leavePolicy.getAllPolicies(schoolId, { activeOnly: true }))
+            .filter((p) => p.encashable)
+            .map((p) => ({ _id: p.leaveType._id, name: p.leaveType.name, maxEncashableDays: p.maxEncashableDays }));
         if (!types.length) return { ...out, note: 'No leave type is marked encashable' };
         const label = await getActiveAcademicYearLabel(schoolId);
-        const balances = await LeaveBalance.find({
-            school: schoolId, teacher: employeeId, academicYear: label, leaveType: { $in: types.map(t => t._id) },
-        }).lean();
+        const typeIds = types.map(t => t._id);
+        const [balances, exitLapsed] = await Promise.all([
+            LeaveBalance.find({ school: schoolId, teacher: employeeId, academicYear: label, leaveType: { $in: typeIds } }).lean(),
+            // The leave module's own exit settlement closes the balance out —
+            // those days were the employee's, so they still count here.
+            LeaveLedger.find({
+                school: schoolId, teacher: employeeId, academicYear: label, leaveType: { $in: typeIds },
+                entryType: 'EXPIRED', description: { $regex: '^Final settlement on exit' },
+            }).select('leaveType days').lean(),
+        ]);
+        const lapsedBy = new Map();
+        for (const l of exitLapsed) lapsedBy.set(String(l.leaveType), (lapsedBy.get(String(l.leaveType)) || 0) + num(l.days));
         const typeById = new Map(types.map(t => [String(t._id), t]));
         for (const b of balances) {
             const type = typeById.get(String(b.leaveType));
             // Days applied for but not yet taken are still theirs to cash in.
-            const unused = Math.max(0, num(b.totalAllocated) + num(b.carriedForward) - num(b.used) - num(b.expired));
+            const unused = Math.max(0, remainingOf(b) + num(b.pending) + (lapsedBy.get(String(b.leaveType)) || 0));
             const days = r2(num(type.maxEncashableDays) > 0 ? Math.min(unused, num(type.maxEncashableDays)) : unused);
             if (days > 0) out.lines.push({ type: type.name, days });
         }

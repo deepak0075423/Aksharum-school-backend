@@ -18,6 +18,7 @@ const compOff        = require('../services/compOffService');
 const designations   = require('../services/designationService');
 const { getActiveAcademicYearLabel, remainingOf, utcMidnight } = require('../utils/leaveDays');
 const { resolvePage } = require('../utils/focusPage');
+const { patch } = require('../db/patch');
 
 const ok  = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const bad = (res, message, status = 400) => res.status(status).json({ success: false, message });
@@ -76,7 +77,10 @@ exports.myCompOff = async (req, res) => {
             return ok(res, { enabled: false, reason: ctx.reason, requests: [], drafts: [], balance: null });
         }
 
-        const { status, page = 1, limit = 20 } = req.query;
+        const { status, page = 1 } = req.query;
+        // An employee's own history is a few dozen rows a year; the tab filters
+        // and pages it on screen, so it asks for all of it (capped).
+        const limit = Math.min(500, Math.max(1, +req.query.limit || 20));
         const filter = { teacher: req.userId, school: req.schoolId };
         if (status) filter.status = status;
         else filter.status = { $ne: 'draft' };   // drafts ride in their own list
@@ -131,15 +135,28 @@ exports.previewWorkDate = async (req, res) => {
         const day = utcMidnight(date);
         if (isNaN(day.getTime())) return bad(res, 'Invalid date');
 
+        // Only an administrator asks about someone else. A teacher passing
+        // another teacher's id used to learn whether that colleague had a claim
+        // on the date.
+        const onAdminRoute = req.baseUrl.endsWith('/admin');
+        const teacherId = onAdminRoute && req.query.teacherId ? req.query.teacherId : req.userId;
+
         const classification = await compOff.classifyWorkDate(req.schoolId, day, ctx);
-        const hours = workedHours != null && workedHours !== ''
+        let hours = workedHours != null && workedHours !== '' && onAdminRoute
             ? Number(workedHours)
             : compOff.hoursBetween(checkIn, checkOut);
+        // No times typed: what the attendance register recorded that day — the
+        // figure the submit will use ("Auto Calculate").
+        let recorded = null;
+        if (!(hours > 0)) {
+            recorded = await compOff.recordedHours(teacherId, req.schoolId, day);
+            if (recorded) hours = recorded.hours;
+        }
         const days = hours > 0 ? compOff.computeCompOffDays(hours, ctx.policy) : null;
 
         const check = await compOff.checkEligibility({
             ctx,
-            teacherId: req.query.teacherId || req.userId,
+            teacherId,
             workDate: day,
             compOffDays: days == null ? 1 : days,
             workedHours: hours,
@@ -153,8 +170,14 @@ exports.previewWorkDate = async (req, res) => {
             dayLabel:    classification.label,
             workedHours: hours || 0,
             compOffDays: days,
-            eligible: check.ok,
-            message:  check.ok ? '' : check.message,
+            // Where the hours came from, so the form can say "from your
+            // attendance" — and when there are none, that times are needed.
+            hoursSource: recorded ? 'attendance' : (hours > 0 ? 'typed' : null),
+            checkIn: recorded?.checkIn || null,
+            checkOut: recorded?.checkOut || null,
+            eligible: check.ok && (onAdminRoute || hours > 0),
+            message:  !check.ok ? check.message
+                : (!onAdminRoute && !(hours > 0) ? 'Enter the times you worked — there is no attendance record for this date' : ''),
             holidayModule: ctx.holidayModule,
         });
     } catch (e) { bad(res, e.message, 500); }
@@ -166,7 +189,7 @@ exports.applyCompOff = async (req, res) => {
         const ctx = await compOff.resolveContext(req.schoolId);
         if (!ctx.enabled) return bad(res, ctx.reason, 403);
 
-        const { workDate, checkIn, checkOut, workedHours, compOffDays, reason } = req.body;
+        const { workDate, checkIn, checkOut, reason } = req.body;
         if (!workDate) return bad(res, 'workDate is required');
         if (!String(reason || '').trim()) return bad(res, 'reason is required');
 
@@ -176,8 +199,8 @@ exports.applyCompOff = async (req, res) => {
             workDate,
             checkIn:  checkIn  || '',
             checkOut: checkOut || '',
-            workedHours,
-            compOffDays,
+            // The employee states WHEN they worked; the policy decides what it
+            // earns. Days or hours sent in the body are ignored.
             reason,
             document: req.file ? req.file.filename : null,
             source: 'manual',
@@ -200,10 +223,7 @@ exports.submitDraft = async (req, res) => {
         });
         if (!request) return bad(res, 'Comp Off request not found', 404);
 
-        const result = await compOff.submitDraft(request, ctx, {
-            reason: req.body.reason,
-            compOffDays: req.body.compOffDays,
-        });
+        const result = await compOff.submitDraft(request, ctx, { reason: req.body.reason });
         if (!result.ok) return bad(res, result.message);
         ok(res, result.request);
     } catch (e) { fail(res, e); }
@@ -219,10 +239,21 @@ exports.cancelOwn = async (req, res) => {
         if (!['draft', 'pending'].includes(request.status)) {
             return bad(res, 'Only draft or pending Comp Off requests can be cancelled');
         }
-        request.status      = 'cancelled';
-        request.cancelledAt = new Date();
-        await request.save();
-        ok(res, request);
+        const saved = await patch(CompOffRequest, request._id,
+            { status: 'cancelled', cancelledAt: new Date() }, { where: { status: ['draft', 'pending'] } });
+        if (!saved) return bad(res, 'This request was decided a moment ago — refresh to see it', 409);
+        if (request.status === 'pending') {
+            const ctx = await compOff.resolveContext(req.schoolId);
+            if (ctx.policy) {
+                compOff.approverIds(req.schoolId, ctx.policy, { exclude: req.userId }).then((recipients) => require('../services/notifyService').notify({
+                    school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                    title: '🚫 Comp Off request withdrawn',
+                    body: `${req.user?.name || 'A teacher'} withdrew their Comp Off request for ${fmtDate(request.workDate)}.`,
+                    recipients, link: { type: 'compoff.approvals', entityId: request._id },
+                })).catch(() => {});
+            }
+        }
+        ok(res, saved);
     } catch (e) { bad(res, e.message, 500); }
 };
 
@@ -250,10 +281,20 @@ exports.listRequests = async (req, res) => {
             return ok(res, { enabled: false, reason: ctx.reason, items: [], total: 0, page: 1, pages: 0 });
         }
 
+        // The teacher router serves designation approvers. Anyone else asking it
+        // used to receive every claim in the school — names, hours, reasons.
+        const moduleAdmin = await designations.isModuleAdmin(req, 'leave');
+        const isApprover = await compOff.canApprove(req.userId, req.userRole, req.schoolId, ctx.policy, moduleAdmin);
+        const onAdminRoute = req.baseUrl.endsWith('/admin');
+        if (!onAdminRoute && !isApprover) return bad(res, 'You are not an approver for Comp Off requests', 403);
+
         const { status, teacherId, dayCategory, source, fromDate, toDate, page = 1, limit = 20, focus } = req.query;
         const filter = { school: req.schoolId };
+        // An approver's queue never holds their own claims.
+        if (!onAdminRoute) filter.teacher = { $ne: req.userId };
         if (status)      filter.status      = status;
-        if (teacherId)   filter.teacher     = teacherId;
+        if (teacherId && String(teacherId) !== String(req.userId)) filter.teacher = teacherId;
+        else if (teacherId && onAdminRoute) filter.teacher = teacherId;
         if (dayCategory) filter.dayCategory = dayCategory;
         if (source)      filter.source      = source;
         if (fromDate || toDate) {
@@ -268,8 +309,7 @@ exports.listRequests = async (req, res) => {
         const { page: effectivePage, focusFound } =
             await resolvePage(CompOffRequest, filter, sort, +limit, focus, page);
 
-        const moduleAdmin = await designations.isModuleAdmin(req, 'leave');
-        const [items, total, isApprover] = await Promise.all([
+        const [items, total] = await Promise.all([
             CompOffRequest.find(filter)
                 .populate('teacher', 'name email')
                 .populate('holiday', 'name type')
@@ -279,7 +319,6 @@ exports.listRequests = async (req, res) => {
                 .limit(+limit)
                 .lean(),
             CompOffRequest.countDocuments(filter),
-            compOff.canApprove(req.userId, req.userRole, req.schoolId, ctx.policy, moduleAdmin),
         ]);
 
         // The screen's designation line, and the counts behind its tiles.
@@ -321,6 +360,9 @@ exports.listRequests = async (req, res) => {
                 r.teacher.designation = pr?.designation || '';
                 r.teacher.department  = pr?.department  || '';
             }
+            // Whether THIS user may decide the row — never their own claim.
+            r.canDecide = isApprover && ['pending', 'draft'].includes(r.status)
+                && String(r.teacher?._id || r.teacher) !== String(req.userId);
         });
 
         const stat = (k) => byStatus.rows.find((x) => x.status === k)?.n || 0;
@@ -366,7 +408,7 @@ exports.approve = async (req, res) => {
             moduleAdmin: await designations.isModuleAdmin(req, 'leave'),
             comment:   req.body.adminComment || req.body.comment || '',
         });
-        if (!result.ok) return bad(res, result.message, result.message?.includes('not an approver') ? 403 : 400);
+        if (!result.ok) return bad(res, result.message, result.forbidden ? 403 : 409);
 
         ok(res, {
             request: result.request,
@@ -389,7 +431,7 @@ exports.reject = async (req, res) => {
             moduleAdmin: await designations.isModuleAdmin(req, 'leave'),
             comment: req.body.adminComment || req.body.comment || '',
         });
-        if (!result.ok) return bad(res, result.message, result.message?.includes('not an approver') ? 403 : 400);
+        if (!result.ok) return bad(res, result.message, result.forbidden ? 403 : 400);
         ok(res, result.request);
     } catch (e) { bad(res, e.message, 500); }
 };
@@ -405,9 +447,13 @@ exports.adminApplyFor = async (req, res) => {
         const { teacherId, workDate, checkIn, checkOut, workedHours, compOffDays, reason } = req.body;
         if (!teacherId) return bad(res, 'teacherId is required');
         if (!workDate)  return bad(res, 'workDate is required');
+        if (String(teacherId) === String(req.userId)) return bad(res, 'Claim your own Comp Off from My Leave', 403);
+        const staff = await User.findOne({ _id: teacherId, school: req.schoolId, role: 'teacher', isActive: true }).select('_id').lean();
+        if (!staff) return bad(res, 'Pick a current teacher of this school');
 
         const result = await compOff.createRequest({
             ctx,
+            byAdmin: true,
             teacherId,
             workDate,
             checkIn: checkIn || '', checkOut: checkOut || '',
@@ -434,16 +480,16 @@ exports.adminCancelApproved = async (req, res) => {
         if (!request) return bad(res, 'Comp Off request not found', 404);
         if (request.status !== 'approved') return bad(res, 'Only approved Comp Off requests can be withdrawn');
 
-        const comment = req.body.adminComment || req.body.comment || '';
+        if (String(request.teacher) === String(req.userId)) return bad(res, 'You cannot withdraw your own Comp Off', 403);
+
+        const comment = String(req.body.adminComment || req.body.comment || '').trim();
         const result  = await compOff.reverseCredit(request, {
             entryType: req.body.entryType === 'REVERSED' ? 'REVERSED' : 'CANCELLED',
             actorId: req.userId, comment,
         });
 
-        request.status       = 'cancelled';
-        request.cancelledAt  = new Date();
-        request.adminComment = comment;
-        await request.save();
+        await patch(CompOffRequest, request._id,
+            { status: 'cancelled', cancelledAt: new Date(), adminComment: comment }, { where: { status: 'approved' } });
 
         const { notify } = require('../services/notifyService');
         notify({
@@ -466,42 +512,23 @@ exports.adminAdjust = async (req, res) => {
         const { teacherId, days, description } = req.body;
         const delta = Number(days);
         if (!teacherId)   return bad(res, 'teacherId is required');
-        if (!delta)       return bad(res, 'days must be a non-zero number (negative to deduct)');
+        if (!delta || !Number.isFinite(delta) || Math.round(delta * 2) !== delta * 2 || Math.abs(delta) > 30)
+            return bad(res, 'days must be a non-zero number of whole or half days (negative to deduct)');
         if (!String(description || '').trim()) return bad(res, 'description is required for an adjustment');
+        if (String(teacherId) === String(req.userId)) return bad(res, 'You cannot adjust your own Comp Off', 403);
+        // A balance is only ever written for a teacher of this school.
+        const staff = await User.findOne({ _id: teacherId, school: req.schoolId, role: 'teacher' }).select('_id').lean();
+        if (!staff) return bad(res, 'Pick a teacher of this school');
 
         const ay = await getActiveAcademicYearLabel(req.schoolId);
         if (!ay) return bad(res, 'No active academic year');
 
-        if (delta < 0) {
-            const bal = await LeaveBalance.findOne({
-                teacher: teacherId, school: req.schoolId, leaveType: ctx.leaveType._id, academicYear: ay,
-            }).lean();
-            if (remainingOf(bal) < Math.abs(delta)) {
-                return bad(res, `Cannot deduct ${Math.abs(delta)} day(s) — only ${remainingOf(bal)} available`);
-            }
-        }
-
-        await LeaveBalance.findOneAndUpdate(
-            { teacher: teacherId, school: req.schoolId, leaveType: ctx.leaveType._id, academicYear: ay },
-            { $inc: { totalAllocated: delta },
-              $setOnInsert: { carriedForward: 0, used: 0, pending: 0, expired: 0 } },
-            { upsert: true },
-        );
-
-        const entry = await compOff.writeLedger({
-            schoolId: req.schoolId, teacherId, leaveTypeId: ctx.leaveType._id, academicYear: ay,
-            entryType: 'ADJUSTMENT', days: Math.abs(delta), delta,
-            // A positive adjustment is spendable, so it needs a lot to draw from;
-            // a negative one takes days away and opens no lot.
-            remainingDays: delta > 0 ? delta : 0,
-            expiresAt: delta > 0 && ctx.policy.validityDays > 0
-                ? new Date(Date.now() + ctx.policy.validityDays * 24 * 60 * 60 * 1000)
-                : null,
-            source: 'compoff', referenceType: 'Manual',
-            description: String(description).trim(), createdBy: req.userId,
+        const entry = await compOff.adjust({
+            ctx, schoolId: req.schoolId, teacherId, academicYear: ay, delta,
+            description: String(description).trim(), actorId: req.userId,
         });
         ok(res, entry, 201);
-    } catch (e) { bad(res, e.message, 500); }
+    } catch (e) { bad(res, e.message, e.status || 500); }
 };
 
 exports.getPolicy = async (req, res) => {
@@ -723,11 +750,15 @@ exports.adminGenerateFromAttendance = async (req, res) => {
     } catch (e) { bad(res, e.message, 500); }
 };
 
-/** Staff list for the admin Comp Off pickers — teachers and admins alike. */
+/**
+ * Staff list for the admin Comp Off pickers. Teachers only: comp off is spent
+ * as leave, and leave is filed for teachers — a school admin credited comp off
+ * could never use it.
+ */
 exports.adminEmployees = async (req, res) => {
     try {
         const users = await User.find({
-            school: req.schoolId, role: { $in: ['teacher', 'school_admin'] }, isActive: true,
+            school: req.schoolId, role: 'teacher', isActive: true,
         }).select('name email role').sort({ name: 1 }).lean();
         if (!users.length) return ok(res, []);
 

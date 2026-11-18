@@ -370,6 +370,19 @@ ONCE.push({
     },
 });
 
+ONCE.push({
+    // Approving leave wrote "Leave: <the employee's reason>" into the attendance
+    // register's remarks — often a medical reason, readable by everyone who
+    // reads attendance. The register now says only that the teacher was on
+    // leave; this takes the reason out of the rows written before.
+    name: 'teacher attendance: leave reasons taken out of register remarks (Nov 2026)',
+    run: async () => {
+        const r = await pool.query(`UPDATE "teacherattendances" SET "remarks" = 'On leave'
+            WHERE "remarks" LIKE 'Leave: %' AND "status" IN ('Leave', 'Half-Day')`);
+        return `${r.rowCount} register remarks cleared of a leave reason`;
+    },
+});
+
 async function runOnce() {
     try {
         await pool.query(`CREATE TABLE IF NOT EXISTS "datamigrations" ("name" text PRIMARY KEY, "ranAt" timestamptz NOT NULL DEFAULT now(), "result" text)`);
