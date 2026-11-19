@@ -254,7 +254,7 @@ exports.teacherDocumentAccess = (mode = 'read') => async (req, res, next) => {
 
 /** The header strip: what this document is, in one object both tabs read. */
 async function header(doc, req) {
-    const [uploader, sections, classes, year, people, readers] = await Promise.all([
+    const [uploader, sections, classes, year, people, readers, commentCount] = await Promise.all([
         doc.uploadedBy ? User.findById(doc.uploadedBy).select('name role profileImage').lean() : null,
         (doc.targetSections || []).length
             ? pool.query(
@@ -285,6 +285,16 @@ async function header(doc, req) {
         pool.query(
             `SELECT count(*)::int AS n FROM ${qt(DocumentRead)} WHERE "document" = $1 AND "user" <> $2`,
             [String(doc._id), String(doc.uploadedBy)],
+        ).then((r) => r.rows[0]?.n || 0).catch(() => 0),
+        // The discussion's size, so the Comments tab carries its count before
+        // it is opened (Nov 2026 — it used to appear only once the thread had
+        // loaded). The same comments the thread counts: none deleted, and a
+        // staff-only one only for staff.
+        pool.query(
+            `SELECT count(*)::int AS n FROM ${qt(DocumentComment)}
+              WHERE "document" = $1 AND NOT COALESCE("isDeleted", false)
+                ${isStaff(req) ? '' : `AND COALESCE("visibility", 'all') = 'all'`}`,
+            [String(doc._id)],
         ).then((r) => r.rows[0]?.n || 0).catch(() => 0),
     ]);
 
@@ -333,6 +343,7 @@ async function header(doc, req) {
         currentVersion: doc.currentVersion || 1,
         isArchived: !!doc.isArchived,
         isDraft: !!doc.isDraft,
+        commentCount,
         // The last "remind everyone", and when the next may go (null: now).
         remindedAt: doc.lastReminderAt || null,
         remindAgainAt: remindAllAgainAt(doc.lastReminderAt),
