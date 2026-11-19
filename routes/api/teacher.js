@@ -187,7 +187,9 @@ router.get('/documents/:id',                      docGuard, canRead, docCtrl.tea
 router.get('/documents/:id/assignment',           docGuard, canRead, docDetail.getAssignment);
 router.get('/documents/:id/assignment/analytics', docGuard, canRead, docDetail.getAssignmentAnalytics);
 router.get('/documents/:id/comments',             docGuard, canRead, docDetail.listComments);
-router.post('/documents/:id/comments',            docGuard, canRead, uploadDocument.array('files', 4), checkUploads, docDetail.addComment);
+// Comments are words only (Nov 2026) — no files: the document itself is
+// where files go. Earlier comments keep the files they were posted with.
+router.post('/documents/:id/comments',            docGuard, canRead, docDetail.addComment);
 
 router.post('/documents/:id/submissions/:studentId/review', docGuard, canOwn, docDetail.reviewSubmission);
 router.post('/documents/:id/remind',              docGuard, canOwn, docDetail.remindPending);

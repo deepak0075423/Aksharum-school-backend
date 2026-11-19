@@ -610,7 +610,9 @@ router.post('/documents/:id/remind',               docGuard, docDetail.remindPen
 router.post('/documents/:id/duplicate',            docGuard, docDetail.duplicate);
 
 router.get('/documents/:id/comments',              docGuard, docDetail.listComments);
-router.post('/documents/:id/comments',             docGuard, uploadDocument.array('files', 4), checkUploads, docDetail.addComment);
+// Comments are words only (Nov 2026) — no files: the document itself is
+// where files go. Earlier comments keep the files they were posted with.
+router.post('/documents/:id/comments',             docGuard, docDetail.addComment);
 router.patch('/documents/comments/:commentId',     docGuard, docDetail.updateComment);
 router.delete('/documents/comments/:commentId',    docGuard, docDetail.deleteComment);
 router.post('/documents/comments/:commentId/like', docGuard, docDetail.toggleLike);

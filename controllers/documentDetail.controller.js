@@ -333,6 +333,9 @@ async function header(doc, req) {
         currentVersion: doc.currentVersion || 1,
         isArchived: !!doc.isArchived,
         isDraft: !!doc.isDraft,
+        // The last "remind everyone", and when the next may go (null: now).
+        remindedAt: doc.lastReminderAt || null,
+        remindAgainAt: remindAllAgainAt(doc.lastReminderAt),
         status,
         readCount: readers,
         lastReminderAt: doc.lastReminderAt || null,
@@ -486,6 +489,21 @@ exports.getAssignment = async (req, res) => {
         const pct = (n) => (total ? Math.round((n / total) * 100) : 0);
         const shown = count.rows[0]?.n || 0;
 
+        // When each student on this page was last reminded, so their bell can
+        // wait out its ten minutes instead of being pressed and refused.
+        const pageIds = rows.rows.map((r) => String(r.studentId));
+        const reminded = pageIds.length
+            ? Object.fromEntries((await pool.query(
+                `SELECT "student", "sentAt" FROM ${qt(DocumentReminder)}
+                  WHERE "document" = $1 AND "student" = ANY($2::uuid[])`,
+                [String(doc._id), pageIds],
+            )).rows.map((r) => [String(r.student), r.sentAt]))
+            : {};
+        const withReminder = (r) => {
+            const sentAt = reminded[String(r.studentId)] || null;
+            return { ...shapeStudent(r), remindedAt: sentAt, remindAgainAt: remindOneAgainAt(sentAt) };
+        };
+
         res.json({
             success: true,
             data: {
@@ -519,7 +537,7 @@ exports.getAssignment = async (req, res) => {
                         submitted: r.submitted,
                         average: r.average == null ? null : Math.round(r.average * 10) / 10,
                     })),
-                    students: rows.rows.map(shapeStudent),
+                    students: rows.rows.map(withReminder),
                     page,
                     limit,
                     shown,
@@ -865,6 +883,20 @@ const REMIND_ALL_EVERY = 60 * 60 * 1000;
 const REMIND_ONE_MINUTES = 10;
 const clock = (d) => new Date(d).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 
+/**
+ * When the next reminder may go, for the page to hold its buttons until then
+ * (Nov 2026): it used to offer them freely and only refuse once pressed. Null
+ * when it may go now.
+ */
+const remindAllAgainAt = (last) => {
+    const at = last ? new Date(last).getTime() + REMIND_ALL_EVERY : 0;
+    return at > Date.now() ? new Date(at) : null;
+};
+const remindOneAgainAt = (sent) => {
+    const at = sent ? new Date(sent).getTime() + REMIND_ONE_MINUTES * 60 * 1000 : 0;
+    return at > Date.now() ? new Date(at) : null;
+};
+
 /** Nudge everyone the assignment is still waiting on — and their parents. */
 exports.remindPending = async (req, res) => {
     try {
@@ -895,10 +927,12 @@ exports.remindPending = async (req, res) => {
             );
             if (!claim.rowCount) {
                 const last = (await Document.findById(doc._id).select('lastReminderAt').lean())?.lastReminderAt || doc.lastReminderAt;
-                return bad(
-                    `A reminder already went to everyone at ${clock(last)}. `
-                    + `The next one can go after ${clock(new Date(last).getTime() + REMIND_ALL_EVERY)}.`,
-                    429, 'REMINDED_RECENTLY');
+                return res.status(429).json({
+                    success: false, code: 'REMINDED_RECENTLY',
+                    message: `A reminder already went to everyone at ${clock(last)}. `
+                        + `The next one can go after ${clock(new Date(last).getTime() + REMIND_ALL_EVERY)}.`,
+                    remindAgainAt: remindAllAgainAt(last),
+                });
             }
         }
         // Nothing went out after all: the hour is given back.
@@ -942,6 +976,18 @@ exports.remindPending = async (req, res) => {
             await release();
             return res.json({ success: true, sent: 0, message: 'Everyone has already submitted' });
         }
+        if (!only) {
+            // Everyone just reminded has been reminded: each one's own bell
+            // waits out the same ten minutes a single reminder starts, rather
+            // than offering a second nudge a minute after the first.
+            await pool.query(
+                `INSERT INTO ${qt(DocumentReminder)} ("_id", "document", "student", "school", "sentAt", "createdAt", "updatedAt")
+                 SELECT gen_random_uuid(), $1::uuid, s::uuid, $2::uuid, now(), now(), now()
+                   FROM unnest($3::text[]) s
+                 ON CONFLICT ("document", "student") DO UPDATE SET "sentAt" = now(), "updatedAt" = now()`,
+                [String(doc._id), String(doc.school), students],
+            );
+        }
 
         const due  = doc.dueDate ? new Date(doc.dueDate) : null;
         const day  = due ? due.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
@@ -956,7 +1002,9 @@ exports.remindPending = async (req, res) => {
             link: { type: 'documents.item', entityId: doc._id },
         });
 
-        res.json({ success: true, sent: students.length });
+        // When this button may be pressed again, for the page to hold it.
+        const at = new Date();
+        res.json({ success: true, sent: students.length, remindAgainAt: only ? remindOneAgainAt(at) : remindAllAgainAt(at) });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
@@ -1100,7 +1148,6 @@ const isAdmin = (req) => req.userRole === 'school_admin'
 const canPinOn = (req, doc) => isAdmin(req)
     || (doc && String(doc.uploadedBy) === String(req.userId));
 
-const buildFiles = access.storedFiles;
 const STAFF_ROLES = ['school_admin', 'teacher'];
 const MAX_COMMENT = 2000;
 
@@ -1245,9 +1292,11 @@ exports.addComment = async (req, res) => {
         const doc = await loadDoc(req, res);
         if (!doc) { access.discardUploads(req); return; }
 
-        const body  = String(req.body.body || '').trim();
-        const files = buildFiles(req.files);
-        if (!body && !files.length) return bad('Write something, or attach a file');
+        // Words only (Nov 2026): no route takes a file with a comment any more,
+        // so a comment is its text and nothing else.
+        const body  = String(req.body?.body || '').trim();
+        const files = [];
+        if (!body) return bad('Write something first');
         if (body.length > MAX_COMMENT) return bad(`A comment can be up to ${MAX_COMMENT.toLocaleString('en-IN')} characters`);
 
         // `answered` is the comment actually being replied to; `root` is the
