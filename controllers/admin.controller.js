@@ -21,6 +21,7 @@ const { PRESETS, renderReceipt, defaultTemplate, sampleReceipt } = require('../s
 // header of services/accountIdentity.js.
 const identity        = require('../services/accountIdentity');
 const { isDocument } = require('../utils/webImage');
+const { naturalSql } = require('../utils/listOrder');
 
 // The design fields a school may set; everything else on the row is bookkeeping.
 const TEMPLATE_FIELDS = [
@@ -883,7 +884,14 @@ const STUDENT_ORDER = {
     oldest:   'u."createdAt" ASC, u."name" ASC',
     roll:     `CASE WHEN pl."rollNumber" ~ '^[0-9]{1,9}$' THEN pl."rollNumber"::int END ASC NULLS LAST,
                NULLIF(pl."rollNumber", '') ASC NULLS LAST, u."name" ASC`,
-    class:    `COALESCE(csc."className", ocl."className") ASC NULLS LAST, cs."sectionName" ASC NULLS LAST, u."name" ASC`,
+    // By class LEVEL, not class name (Nov 2026): Playgroup / Pre-Nursery,
+    // Nursery, LKG / KG1, UKG / KG2, Class 1, Class 2 … Class 12 — the
+    // classNumber every other list orders by (utils/classLevels: −3…12). A–Z
+    // of the names gave Class 1, Class 10, Class 2 … KG1, LKG, Nursery.
+    // Sections in natural order (A2 before A10), then the student's name.
+    class:    `COALESCE(csc."classNumber", ocl."classNumber") ASC NULLS LAST,
+               ${naturalSql('COALESCE(csc."className", ocl."className")')},
+               ${naturalSql('cs."sectionName"')}, u."name" ASC`,
 };
 
 /**

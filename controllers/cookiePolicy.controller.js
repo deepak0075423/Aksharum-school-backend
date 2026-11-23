@@ -5,6 +5,7 @@
  *   /api/admin/cookie-policy …              the school admin sets the policy up
  *   /api/admission/public/portals/:slug/…   the portal's banner, page and consent log
  *   /api/profile/cookie-policy              a signed-in person's school's policy
+ *                                           (404 unless the school runs Admission)
  *   /api/public/cookie-policy               the platform's own, before anyone signs in
  *
  * The school is always the session's (admin, profile) or the one behind the
@@ -13,6 +14,7 @@
 const svc = require('../services/cookiePolicy');
 const AdmissionSetting = require('../models/AdmissionSetting');
 const { clientIp } = require('../middleware/rateLimit');
+const designations = require('../services/designationService');
 
 const FRONTEND = () => String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
 
@@ -91,9 +93,20 @@ exports.portalConsent = wrap(async (req, res) => {
 
 // ── The app ──────────────────────────────────────────────────────────────────
 
-/** A signed-in person's school's policy; the platform's own for someone with no school. */
+/**
+ * A signed-in person's school's policy — only where the school runs the
+ * Admission module (Nov 2026). The cookie policy is set up and shown as part
+ * of Admission (School settings → Privacy & cookies only appears with it), so
+ * without it there is no page: 404, whatever the caller's role. The school's
+ * own switch decides, not a teacher's designation. Someone with no school
+ * (super admin) has no Admission either.
+ */
 exports.mine = wrap(async (req, res) => {
-    const { policy, school } = await svc.getPolicy(req.schoolId || null);
+    const access = req.schoolId ? await designations.requestAccess(req) : null;
+    if (!access?.moduleFlags?.admission) {
+        return res.status(404).json({ success: false, code: 'MODULE_DISABLED', message: 'There is no cookie policy page for this school' });
+    }
+    const { policy, school } = await svc.getPolicy(req.schoolId);
     res.json({ success: true, data: { banner: svc.bannerView(policy), page: svc.pageView(policy, school) } });
 });
 

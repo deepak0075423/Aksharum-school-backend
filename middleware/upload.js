@@ -80,7 +80,21 @@ const uploadChat     = multer({ storage: diskStorage('chat'),      fileFilter: c
 const uploadVideo    = multer({ storage: diskStorage('videos'),    fileFilter: videoFilter, limits: { fileSize: 2 * 1024 * 1024 * 1024 } }); // 2 GB
 
 // Staff paperwork: Aadhaar / PAN scans, experience, resignation & joining letters
-const uploadStaffDoc = multer({ storage: diskStorage('staff-docs'), fileFilter: docFilter, limits: { fileSize: 5 * 1024 * 1024 } });
+// Identity and record scans — Aadhaar, PAN, certificates, letters — for staff
+// and students: a PDF or a photo, nothing else (Nov 2026). They are reviewed on
+// screen (Verification draws <img>/<iframe>), and docFilter let an Excel sheet
+// or a Word file into the Aadhaar slot. Leave, hostel and attendance papers
+// keep docFilter.
+const SCAN_TYPES = /\.(pdf|jpe?g|png)$/i;
+const scanFilter = (req, file, cb) => {
+    const ok = SCAN_TYPES.test(file.originalname || '');
+    cb(ok ? null : Object.assign(
+        new Error(`${file.originalname} cannot be uploaded — use a PDF or an image (JPG or PNG)`),
+        { status: 400, code: 'BAD_FILE_TYPE' },
+    ), ok);
+};
+
+const uploadStaffDoc = multer({ storage: diskStorage('staff-docs'), fileFilter: scanFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
 // Admission paperwork: the student's own certificates plus the parents' /
 // guardian's Aadhaar, PAN and passport photos.
@@ -93,7 +107,7 @@ const uploadStaffDoc = multer({ storage: diskStorage('staff-docs'), fileFilter: 
 // nothing unless it says image.
 const PHOTO_FIELD = /^(photo|fatherPhoto|motherPhoto|guardianPhoto)$/;
 const studentDocFilter = (req, file, cb) => {
-    if (!PHOTO_FIELD.test(file.fieldname)) return docFilter(req, file, cb);
+    if (!PHOTO_FIELD.test(file.fieldname)) return scanFilter(req, file, cb);
     const named = /\.(jpe?g|png|webp)$/i.test(file.originalname);
     const typed = /^image\//.test(file.mimetype || '');
     const document = /\.(pdf|docx?|xlsx?|pptx?|txt)$/i.test(file.originalname);
