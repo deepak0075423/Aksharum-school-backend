@@ -187,6 +187,8 @@ async function _notify({ school, sender, senderRole, title, body, recipients = [
         link:       notificationLinks.normalize(link) || undefined,
         priority:   notificationLinks.PRIORITIES.includes(priority) ? priority : null,
         recipientCount: ids.length,
+        // The year it was sent in — its mailbox (notification.controller yearWindow).
+        academicYear: school ? await require('./yearScope').runningYearId(school) : null,
     });
 
     // The inserted receipts already carry the ids each reader's link is built

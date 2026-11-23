@@ -115,6 +115,16 @@ function runningYear(years, now = Date.now()) {
         || null;
 }
 
+/**
+ * The id of the school's running year as it really is — never the year a
+ * switcher is showing. For a write that records which year it happened in
+ * (a notification is stamped with the year it was sent in).
+ */
+async function runningYearId(schoolId) {
+    if (!schoolId) return null;
+    try { return runningYear(await yearsOf(schoolId))?._id || null; } catch { return null; }
+}
+
 /** [from, to) for one year among its school's — see the header comment. */
 function windowOf(year, years, zone) {
     if (!year) return { from: null, to: null };
@@ -660,5 +670,5 @@ module.exports = {
     within, isYear, thisYear,
     middleware, enter, now, allYears, narrow, table, and, conditionFor, sqlFor, ruleOf,
     standIn, familyYear, yearStatus, yearsSource, profilesSource, rewriteProfiles, picked,
-    of, resolve, current, yearsOf, runningYear, windowOf, viewing, forget, shape, askedBy, HEADER,
+    of, resolve, current, yearsOf, runningYear, runningYearId, windowOf, viewing, forget, shape, askedBy, HEADER,
 };

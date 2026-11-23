@@ -52,6 +52,15 @@ const NotificationSchema = new db.Schema({
     priority: { type: String, enum: ['high', 'medium', 'low'], default: null },
     recipientCount: { type: Number, default: 0 },
     emailSent:      { type: Boolean, default: false },
+    // The academic year it was sent in (Nov 2026): the school's running year at
+    // that moment. A notification belongs to that year's mailbox and no other,
+    // whatever the years' dates say. NULL on rows written before the column
+    // (and on a platform-wide send, which has no one school): those fall back
+    // to the date rule — the year whose window the moment falls in.
+    academicYear:   { type: db.Types.UUID, ref: 'AcademicYear', default: null },
+    // Removed from the sender's Sent list (Nov 2026). The people it reached
+    // keep their copy — this only takes it off the sender's own list.
+    senderRemovedAt: { type: Date, default: null },
 }, { timestamps: true });
 
 NotificationSchema.index({ sender: 1, createdAt: -1 });

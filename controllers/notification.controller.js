@@ -273,6 +273,8 @@ exports.send = async (req, res) => {
             channels,
             target,
             priority,
+            // The year it is sent in — its mailbox, whatever the years' dates say.
+            academicYear: req.schoolId ? await yearScope.runningYearId(req.schoolId) : null,
         });
 
         if (channels.inApp && recipients.length) {
@@ -464,11 +466,18 @@ async function childScope(req) {
 /**
  * Which academic year's notifications are on screen (Nov 2026).
  *
- * A notification stores no academic year, so it belongs to the year it arrived
- * in — and a year runs from its own start date to the NEXT year's start date,
- * so nothing that arrived in the gap between one year's end and the next one's
- * start falls out of both. The earliest year reaches back to the beginning and
- * the latest has no end.
+ * A notification belongs to the academic year it was SENT in, and is shown in
+ * that year only (the user's rule, Nov 24 2026). Since Nov 24 it stores that
+ * year (`academicYear`, the school's running year at the moment it was sent),
+ * so the mailbox goes by the stored year — not by dates, which put a
+ * notification sent in 2026-27 under another year whenever the years' dates
+ * did not line up with which year was running.
+ *
+ * Rows written before the column (and platform-wide sends) have no stored
+ * year and fall back to the date rule: the year it arrived in, a year running
+ * from its own start date to the NEXT year's start date, so nothing in the gap
+ * between one year's end and the next one's start falls out of both. The
+ * earliest year reaches back to the beginning and the latest has no end.
  *
  * `year` (query or body): absent → no narrowing at all (the phone app and the
  * bell still read the whole mailbox); 'current' → the school's active year;
@@ -487,19 +496,17 @@ async function yearWindow(req) {
     const { query } = require('../db/pool');
     const { yearOrderSql } = require('../utils/listOrder');
     const { rows } = await query(
-        `SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate" FROM "academicyears"
+        `SELECT "_id", "yearName", ${yearScope.yearStatus()} AS "status", "startDate", "endDate" FROM "academicyears"
           WHERE "school" = $1 ORDER BY ${yearOrderSql()}`,
         [String(req.schoolId)],
     );
     const years = rows.map((r) => ({ _id: String(r._id), name: r.yearName, status: r.status }));
 
+    // 'current' is the running year by the same rule a new notification is
+    // stamped with (yearScope.runningYear) — or the year a switcher is showing.
     const pick = wanted === 'all' ? null
         : wanted === 'current'
-            ? rows.find((r) => r.status === 'active')
-              // No year marked active: the one today falls in, by start date.
-              || [...rows].filter((r) => r.startDate && new Date(r.startDate) <= new Date())
-                  .sort((a, b) => new Date(b.startDate) - new Date(a.startDate))[0]
-              || null
+            ? yearScope.runningYear(rows.map((r) => ({ ...r, _id: String(r._id) })))
             : rows.find((r) => String(r._id) === wanted) || null;
 
     if (!pick) {
@@ -514,12 +521,21 @@ async function yearWindow(req) {
     return {
         years,
         selected: String(pick._id),
-        clause: (col, next) => {
-            const parts = [];
-            const params = [];
-            if (from) { params.push(from); parts.push(`${col} >= $${next + params.length - 1}::timestamptz`); }
-            if (to)   { params.push(to);   parts.push(`${col} <  $${next + params.length - 1}::timestamptz`); }
-            return { sql: parts.length ? parts.join(' AND ') : '', params };
+        // `col` is the arrival time ('r."createdAt"', 'n."createdAt"'); the
+        // stored year is read from the same alias's notification — `yearCol`
+        // names it when the statement has it to hand, else a receipt reaches
+        // it through its notification.
+        clause: (col, next, yearCol) => {
+            const alias = col.slice(0, col.indexOf('.'));
+            const stored = yearCol || (alias === 'r'
+                ? `(SELECT ny."academicYear" FROM "${Notification.tableName}" ny WHERE ny._id = r.notification)`
+                : `${alias}."academicYear"`);
+            const params = [String(pick._id)];
+            const byDate = [];
+            if (from) { params.push(from); byDate.push(`${col} >= $${next + params.length - 1}::timestamptz`); }
+            if (to)   { params.push(to);   byDate.push(`${col} <  $${next + params.length - 1}::timestamptz`); }
+            // The stored year decides; only a row without one goes by its date.
+            return { sql: `COALESCE(${stored} = $${next}::uuid, ${byDate.length ? byDate.join(' AND ') : 'TRUE'})`, params };
         },
     };
 }
@@ -610,6 +626,15 @@ const BULK_ACTIONS = {
     archive: { isCleared: true,  clearedAt: () => new Date() },
     restore: { isCleared: false, clearedAt: () => null },
 };
+// Only the rows the action actually changes (Nov 2026): ticking ten with one
+// read and choosing "Unread" makes ONE unread, and the answer has to say 1 —
+// it said "10 notifications marked as unread", counting nine that already were.
+const BULK_ONLY = {
+    read:    'NOT COALESCE("isRead", false)',
+    unread:  'COALESCE("isRead", false)',
+    archive: 'NOT COALESCE("isCleared", false)',
+    restore: 'COALESCE("isCleared", false)',
+};
 
 exports.bulk = async (req, res) => {
     try {
@@ -634,7 +659,7 @@ exports.bulk = async (req, res) => {
             const sets  = Object.entries(shape).map(([k, v], i) => `"${k}" = $${i + 3}`).join(', ');
             const vals  = Object.values(shape).map((v) => (typeof v === 'function' ? v() : v));
             ({ rowCount } = await query(
-                `UPDATE "${R}" SET ${sets} WHERE recipient = $1 AND _id = ANY($2::uuid[])`,
+                `UPDATE "${R}" SET ${sets} WHERE recipient = $1 AND _id = ANY($2::uuid[]) AND ${BULK_ONLY[action]}`,
                 [req.userId, ids, ...vals],
             ));
         }
@@ -677,6 +702,33 @@ exports.deleteAll = async (req, res) => {
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
+/**
+ * The tab badges. Counted over the whole mailbox, never the filter — "Inbox 3"
+ * must not drop to 0 because the reader searched for a word. Sent is counted
+ * here too, so the tab carries its number before anybody has opened it; and
+ * the Sent list returns them as well, so a send seen from the Sent tab moves
+ * its badge without a trip back to the inbox.
+ */
+async function boxCounts(req, kid, win) {
+    const { query } = require('../db/pool');
+    const N = Notification.tableName;
+    const R = NotificationReceipt.tableName;
+    const bp = [req.userId, ...(kid ? kid.params : [])];
+    const yr = yearAnd(win, 'r."createdAt"', bp.length);
+    const ys = yearAnd(win, 'sn."createdAt"', bp.length + yr.params.length);
+    const { rows } = await query(
+        `SELECT COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false))::int AS inbox,
+                COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false)
+                                   AND NOT COALESCE(r."isRead", false))::int AS unread,
+                COUNT(*) FILTER (WHERE COALESCE(r."isCleared", false))::int AS archived,
+                (SELECT COUNT(*)::int FROM "${N}" sn
+                  WHERE sn.sender = $1 AND sn."senderRemovedAt" IS NULL${ys.sql}) AS sent
+           FROM "${R}" r WHERE r.recipient = $1${kid ? ` AND ${kid.sql('r', 2)}` : ''}${yr.sql}`,
+        [...bp, ...yr.params, ...ys.params],
+    );
+    return rows[0] || { inbox: 0, unread: 0, archived: 0, sent: 0 };
+}
+
 // ── Sent ──────────────────────────────────────────────────────────────────────
 /**
  * What this account has sent, and whether anybody read it.
@@ -706,7 +758,8 @@ exports.getSent = async (req, res) => {
         const R = NotificationReceipt.tableName;
 
         const params = [req.userId];
-        const where  = ['n.sender = $1'];
+        // Not what the sender has removed from their own list.
+        const where  = ['n.sender = $1', 'n."senderRemovedAt" IS NULL'];
 
         if (req.query.audience) { params.push(String(req.query.audience)); where.push(`n.target->>'type' = $${params.length}`); }
         // "What did I actually broadcast", as against everything a module
@@ -732,7 +785,7 @@ exports.getSent = async (req, res) => {
         const whereSql = `WHERE ${where.join(' AND ')}`;
         const order    = SENT_SORTS[req.query.sort] || SENT_SORTS.newest;
 
-        const [rowsRes, countRes] = await Promise.all([
+        const [rowsRes, countRes, boxes] = await Promise.all([
             query(
                 `SELECT n._id, n.title, n.body, n."createdAt", n.channels, n.target, n.link,
                         n."senderRole", COALESCE(n."recipientCount", 0)::int AS "recipientCount",
@@ -743,6 +796,7 @@ exports.getSent = async (req, res) => {
                 params,
             ),
             query(`SELECT COUNT(*)::int AS n FROM "${N}" n ${whereSql}`, params),
+            boxCounts(req, null, win),
         ]);
 
         const ids = rowsRes.rows.map((r) => r._id);
@@ -774,8 +828,29 @@ exports.getSent = async (req, res) => {
             success: true, data,
             total: countRes.rows[0]?.n || 0,
             page, pages: Math.max(1, Math.ceil((countRes.rows[0]?.n || 0) / limit)),
+            boxes,
             ...(win ? { years: win.years, year: win.selected } : {}),
         });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+/**
+ * POST /notifications/sent/remove { ids } — take notifications off the
+ * sender's own Sent list (Nov 2026). Only the sender's own rows; the people
+ * who received them keep their copies, exactly as deleting a sent email does
+ * not unsend it. `affected` counts only rows that were still on the list.
+ */
+exports.removeSent = async (req, res) => {
+    try {
+        const { query } = require('../db/pool');
+        const ids = [...new Set((req.body.ids || []).map(String).filter(Boolean))];
+        if (!ids.length) return res.status(400).json({ success: false, message: 'Nothing was selected' });
+        const { rowCount } = await query(
+            `UPDATE "${Notification.tableName}" SET "senderRemovedAt" = NOW()
+              WHERE sender = $1 AND _id = ANY($2::uuid[]) AND "senderRemovedAt" IS NULL`,
+            [req.userId, ids],
+        );
+        res.json({ success: true, affected: rowCount });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -977,7 +1052,7 @@ exports.getAllNotifications = async (req, res) => {
         // shown rather than a filter within it, so the tab badges follow it.
         const win = await yearWindow(req);
         if (win) {
-            const c = win.clause('r."createdAt"', params.length + 1);
+            const c = win.clause('r."createdAt"', params.length + 1, 'n."academicYear"');
             if (c.sql) { where.push(c.sql); params.push(...c.params); }
         }
 
@@ -1017,24 +1092,7 @@ exports.getAllNotifications = async (req, res) => {
                 params,
             ),
             query(`SELECT COUNT(*)::int AS n ${from} ${whereSql}`, params),
-            // The tab badges. Counted over the whole mailbox, never the filter —
-            // "Inbox 3" must not drop to 0 because the reader searched for a word.
-            // Sent is counted here too, so the tab carries its number before
-            // anybody has opened it.
-            (() => {
-                const bp = [req.userId, ...(kid ? kid.params : [])];
-                const yr = yearAnd(win, 'r."createdAt"', bp.length);
-                const ys = yearAnd(win, 'sn."createdAt"', bp.length + yr.params.length);
-                return query(
-                    `SELECT COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false))::int AS inbox,
-                            COUNT(*) FILTER (WHERE NOT COALESCE(r."isCleared", false)
-                                               AND NOT COALESCE(r."isRead", false))::int AS unread,
-                            COUNT(*) FILTER (WHERE COALESCE(r."isCleared", false))::int AS archived,
-                            (SELECT COUNT(*)::int FROM "${N}" sn WHERE sn.sender = $1${ys.sql}) AS sent
-                       FROM "${R}" r WHERE r.recipient = $1${kid ? ` AND ${kid.sql('r', 2)}` : ''}${yr.sql}`,
-                    [...bp, ...yr.params, ...ys.params],
-                );
-            })(),
+            boxCounts(req, kid, win),
             // Who the switch offers. Only a parent has one, and it travels with
             // the list so the page needs no second request to draw it.
             req.userRole === 'parent'
@@ -1043,7 +1101,7 @@ exports.getAllNotifications = async (req, res) => {
         ]);
 
         const total = countRes.rows[0]?.n || 0;
-        const boxes = boxRes.rows[0] || { inbox: 0, unread: 0, archived: 0, sent: 0 };
+        const boxes = boxRes;
 
         const data = rowsRes.rows.map((row) => ({
             _id:       row._id,
