@@ -1196,7 +1196,7 @@ exports.listComments = async (req, res) => {
 
         const { rows } = await pool.query(
             `SELECT c."_id", c."body", c."files", c."parent", c."isPinned", c."visibility",
-                    c."likes", c."isEdited", c."isDeleted", c."authorRole", c."createdAt", c."updatedAt",
+                    c."isEdited", c."isDeleted", c."authorRole", c."createdAt", c."updatedAt",
                     u."_id" AS "authorId", u."name" AS "authorName", u."profileImage" AS "authorPhoto"
                FROM ${qt(DocumentComment)} c
                LEFT JOIN ${qt(User)} u ON u."_id" = c."author"
@@ -1218,7 +1218,7 @@ exports.listComments = async (req, res) => {
                 return {
                     _id: r._id, deleted: true, body: '', files: [], parent: r.parent,
                     isPinned: false, visibility: r.visibility || 'all', isEdited: false,
-                    createdAt: r.createdAt, likes: 0, likedByMe: false, mine: false,
+                    createdAt: r.createdAt, mine: false,
                     canEdit: false, canDelete: admin, canPin: false,
                     author: { _id: null, name: '', role: '', photo: '' },
                 };
@@ -1232,8 +1232,6 @@ exports.listComments = async (req, res) => {
                 visibility: r.visibility || 'all',
                 isEdited: !!r.isEdited,
                 createdAt: r.createdAt,
-                likes: (r.likes || []).length,
-                likedByMe: (r.likes || []).map(String).includes(me),
                 mine,
                 // What this reader may do with it — the same rules updateComment
                 // and deleteComment enforce, so the page offers only what works:
@@ -1501,26 +1499,6 @@ exports.deleteComment = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-exports.toggleLike = async (req, res) => {
-    try {
-        if (!isUuid(req.params.commentId)) return res.status(404).json({ success: false, message: 'Comment not found' });
-        // One statement, so two people liking at once cannot each overwrite the
-        // other's array with a copy read a moment earlier.
-        const { rows } = await pool.query(
-            `UPDATE ${qt(DocumentComment)}
-                SET "likes" = CASE
-                      WHEN "likes" @> to_jsonb($2::text) THEN "likes" - $2::text
-                      ELSE COALESCE("likes", '[]'::jsonb) || to_jsonb($2::text)
-                    END
-              WHERE "_id" = $1 AND "school" = $3
-                AND ($4::boolean OR COALESCE("visibility", 'all') = 'all')
-                AND NOT COALESCE("isDeleted", false)
-          RETURNING "likes"`,
-            [req.params.commentId, String(req.userId), String(req.schoolId), isStaff(req)],
-        );
-        if (!rows.length) return res.status(404).json({ success: false, message: 'Comment not found' });
-
-        const likes = rows[0].likes || [];
-        res.json({ success: true, likes: likes.length, likedByMe: likes.map(String).includes(String(req.userId)) });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-};
+// Comments have no likes (Nov 23 2026, the user's call): the like routes and
+// their handler are gone, and the list no longer reports any. The `likes`
+// column is left in place, unread.

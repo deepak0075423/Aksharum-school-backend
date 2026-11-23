@@ -506,7 +506,39 @@ async function audience(doc) {
     if (doc.targetType === 'whole_school') {
         return { recipients: [...new Set([...recipients, ...(await teachers())])], about: null };
     }
-    return { recipients, about: students };
+    // The teachers of those classes or sections are told too — the document is
+    // on their shelf (teacherCanRead), and only students and parents used to
+    // hear of it: a teacher saw school-wide and all-staff notices arrive, never
+    // one aimed at the class they teach.
+    return { recipients: [...new Set([...recipients, ...(await sectionTeachers(doc))])], about: students };
+}
+
+/**
+ * The teachers a class or section document lands in front of: the class
+ * teacher, the vice class teacher and every subject teacher of a section it is
+ * aimed at (for "whole classes", of every section of those classes). The same
+ * literal ids teacherCanRead tests, so whoever is told can open it.
+ */
+async function sectionTeachers(doc) {
+    const sections = doc.targetType === 'class_sections' ? ids(doc.targetSections).filter(isUuid) : [];
+    const classes  = doc.targetType === 'class'          ? ids(doc.targetClasses).filter(isUuid)  : [];
+    if (!sections.length && !classes.length) return [];
+    const { rows } = await pool.query(
+        `WITH sec AS (
+           SELECT s."_id", s."classTeacher", s."substituteTeacher"
+             FROM ${qt(ClassSection)} s
+            WHERE s."school" = $1
+              AND (s."_id"::text = ANY($2::text[]) OR s."class"::text = ANY($3::text[])))
+         SELECT DISTINCT u."_id"
+           FROM (SELECT "classTeacher" AS t FROM sec
+                 UNION ALL SELECT "substituteTeacher" FROM sec
+                 UNION ALL SELECT st."teacher" FROM ${qt(SectionSubjectTeacher)} st
+                             JOIN sec ON sec."_id" = st."section") x
+           JOIN ${qt(User)} u ON u."_id" = x.t
+          WHERE u."school" = $1 AND u."role" = 'teacher' AND COALESCE(u."isActive", true)`,
+        [String(doc.school), sections, classes],
+    );
+    return rows.map((r) => String(r._id));
 }
 
 module.exports = {

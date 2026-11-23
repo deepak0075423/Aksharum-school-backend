@@ -615,7 +615,6 @@ router.get('/documents/:id/comments',              docGuard, docDetail.listComme
 router.post('/documents/:id/comments',             docGuard, docDetail.addComment);
 router.patch('/documents/comments/:commentId',     docGuard, docDetail.updateComment);
 router.delete('/documents/comments/:commentId',    docGuard, docDetail.deleteComment);
-router.post('/documents/comments/:commentId/like', docGuard, docDetail.toggleLike);
 
 // ── Holidays ──────────────────────────────────────────────────────────────────
 router.get('/holiday-types',       holidayGuard, holidayCtrl.getHolidayTypes);

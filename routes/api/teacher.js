@@ -170,6 +170,8 @@ router.post('/documents',                            docGuard, uploadDocument.ar
 router.post('/documents/read',                       docGuard, docViewer.markRead);
 router.post('/documents/:id/read',                   docGuard, docViewer.markRead);
 router.put('/documents/:id',                         docGuard, uploadDocument.array('files', 10), checkUploads, docCtrl.teacherEditDocument);
+// Before '/documents/:id', or Express reads 'bulk-delete' as an id.
+router.delete('/documents/bulk-delete',              docGuard, docCtrl.teacherBulkDelete);
 router.delete('/documents/:id',                      docGuard, docCtrl.teacherDeleteDocument);
 // The two old submission routes are gone: the review one let any teacher mark
 // any submission in the school by its id. Marking is
@@ -207,7 +209,6 @@ router.post('/documents/:id/versions/:versionId/restore', docGuard, canOwn, docC
 // so they need no document-level check of their own.
 router.patch('/documents/comments/:commentId',     docGuard, docDetail.updateComment);
 router.delete('/documents/comments/:commentId',    docGuard, docDetail.deleteComment);
-router.post('/documents/comments/:commentId/like', docGuard, docDetail.toggleLike);
 
 // ── Holidays ──────────────────────────────────────────────────────────────────
 router.get('/holidays',        holidayGuard, holidayCtrl.teacherGetHolidays);

@@ -968,18 +968,27 @@ exports.adminBulkArchive = async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
 
-exports.adminBulkDelete = async (req, res) => {
+/**
+ * Delete several documents at once. The office: any of the school's. A teacher
+ * (their own route, Nov 23 2026): only what they shared — anything else among
+ * the ids is left alone and not counted.
+ */
+const bulkDeleteBy = (own) => async (req, res) => {
     try {
         const wanted = (Array.isArray(req.body?.ids) ? req.body.ids : []).map(String).filter(isUuid);
         if (!wanted.length) return res.status(400).json({ success: false, message: 'ids are required' });
         // Only what is this school's. The submissions, comments and read marks
         // used to be deleted by the ids as posted — another school's with them.
-        const docs = await Document.find({ _id: { $in: wanted }, school: req.schoolId }).select('files').lean();
-        await Document.deleteMany({ _id: { $in: docs.map((d) => d._id) }, school: req.schoolId });
+        const mine = { school: req.schoolId, ...(own ? { uploadedBy: req.userId } : {}) };
+        const docs = await Document.find({ _id: { $in: wanted }, ...mine }).select('files').lean();
+        if (!docs.length) return res.status(404).json({ success: false, message: 'None of those documents could be deleted' });
+        await Document.deleteMany({ _id: { $in: docs.map((d) => d._id) }, ...mine });
         await wipe(docs);
-        res.json({ success: true, deleted: docs.length });
+        res.json({ success: true, deleted: docs.length, skipped: wanted.length - docs.length });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };
+exports.adminBulkDelete   = bulkDeleteBy(false);
+exports.teacherBulkDelete = bulkDeleteBy(true);
 
 // ── Versions ─────────────────────────────────────────────────────────────────
 
