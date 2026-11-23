@@ -7,7 +7,7 @@
  *   teacher   GET /teacher/id-cards          (teachers and every other employee)
  *             GET /teacher/id-cards/:id/pdf
  *   parent    GET /parent/id-cards           my card, and each child's cards
- *             GET /parent/id-cards/:id/pdf   mine, or one of my children's (at any of their schools)
+ *             GET /parent/id-cards/:id/pdf   mine, or one of my children's — at this school only
  *   public    GET /public/id-card/:code      what a scanned QR proves
  *             GET /public/id-card/:code/qr.svg | qr.png
  */
@@ -16,7 +16,7 @@ const IdCard = require('../models/IdCard');
 const views = require('../services/idCardViews');
 const rules = require('../services/idCardRules');
 const service = require('../services/idCardService');
-const { childrenAcrossSchools } = require('../services/parentChildren');
+const { childrenOf } = require('../services/parentChildren');
 const { renderIdCards, pdfName } = require('../utils/idCardPdf');
 
 const handle = (fn) => async (req, res) => {
@@ -61,9 +61,11 @@ exports.studentPdf = handle(async (req, res) => sendPdf(req, res, async (c) => c
 exports.teacherPdf = handle(async (req, res) => sendPdf(req, res, async (c) => (c.kind === 'teacher' || c.kind === 'staff') && own(req)(c)));
 exports.parentPdf = handle(async (req, res) => sendPdf(req, res, async (c) => {
     if (c.kind === 'parent') return own(req)(c);
-    if (c.kind !== 'student') return false;
-    const kids = await childrenAcrossSchools(req.userId, req.schoolId);
-    return kids.some((k) => String(k._id) === String(c.holder) && String(k.schoolId) === String(c.school) && k.modules?.idCard);
+    // A child's card at the school this sign-in is for — not a child at
+    // another school the same person is also a parent at.
+    if (c.kind !== 'student' || String(c.school) !== String(req.schoolId)) return false;
+    const kids = await childrenOf(req.userId, req.schoolId);
+    return kids.some((k) => String(k._id) === String(c.holder));
 }));
 
 /* ── Public ──────────────────────────────────────────────────────────────── */

@@ -8,10 +8,12 @@
  *
  *   card    one card face per page, the page the size of the card — what a
  *           PVC card printer takes, and what a holder downloads to keep
- *   sheet   A4, nine portrait cards (or ten landscape) per page, with crop
- *           marks; with both sides, every page of fronts is followed by its
- *           backs mirrored left-to-right, so a duplex print (long-edge flip)
- *           lands each back behind its own front
+ *   sheet   A4 with crop marks. Front and back: each card's two faces side
+ *           by side, four cards to a sheet, printed on ONE side of the paper
+ *           (Nov 2026 — the user's rule: a holder's front and back belong on
+ *           the same page; the old layout put nine fronts on one page and
+ *           their mirrored backs on the next, for duplex printers). One side
+ *           only: nine portrait cards (or ten landscape) to a sheet.
  *
  * The face is laid out in "u" — one hundredth of the card's width — exactly
  * as the screen draws it (school-frontend pages/idcards/IdCardFace.jsx), so a
@@ -680,6 +682,52 @@ function renderIdCards(res, { cards, layout = 'card', sides = 'both', filename =
         cards.filter((c) => cardDesign(c.kind, c.design).layout !== 'landscape'),
         cards.filter((c) => cardDesign(c.kind, c.design).layout === 'landscape'),
     ];
+    const footer = (paper, text) => put(doc, text, 0, paper.h - 5 * MM, { f: 'S', size: 6.5, color: SOFT, width: paper.w, align: 'center' });
+
+    if (sides === 'both') {
+        // Front and back of the same card side by side, at true size. Portrait
+        // cards: two pairs across a landscape A4, two rows. Landscape cards:
+        // one pair across a portrait A4, four rows. Four cards a sheet either way.
+        groups.forEach((group, gi) => {
+            if (!group.length) return;
+            const g = geometry(gi === 0 ? 'portrait' : 'landscape');
+            const paper = gi === 0 ? { w: A4.h, h: A4.w } : A4;
+            const across = gi === 0 ? 2 : 1;           // pairs per row
+            const rows = gi === 0 ? 2 : 4;
+            const inner = 4 * MM;                       // front ↔ back
+            const between = 20 * MM;                    // pair ↔ pair
+            const rowGap = 12 * MM;                     // room for the next row's caption
+            const pairW = g.w * 2 + inner;
+            const gridW = across * pairW + (across - 1) * between;
+            const gridH = rows * g.h + (rows - 1) * rowGap;
+            const ox = (paper.w - gridW) / 2;
+            const oy = (paper.h - gridH) / 2;
+            const per = across * rows;
+            for (let at = 0; at < group.length; at += per) {
+                const page = group.slice(at, at + per);
+                doc.addPage({ size: [paper.w, paper.h], margin: 0 });
+                page.forEach((card, i) => {
+                    const x = ox + (i % across) * (pairW + between);
+                    const y = oy + Math.floor(i / across) * (g.h + rowGap);
+                    // Whose card this is, above the pair and clear of its crop
+                    // marks (they reach 3.3 mm out) — cut away with the margin.
+                    setFont(doc, 'S', 6.5);
+                    put(doc, clip(doc, [card.snapshot?.name, card.number].filter(Boolean).join(' · '), pairW), x, y - 6.4 * MM,
+                        { f: 'S', size: 6.5, color: MUTED, width: pairW });
+                    ['front', 'back'].forEach((side, k) => {
+                        const fx = x + k * (g.w + inner);
+                        drawFace(doc, cache, card, side, fx, y);
+                        if (marks) cropMarks(doc, fx, y, g.w, g.h);
+                    });
+                });
+                footer(paper, `Front and back · ${page.length} card${page.length === 1 ? '' : 's'} · print one-sided at actual size (100%) · cut along the marks`);
+            }
+        });
+        doc.end();
+        return;
+    }
+
+    // One side only: a full grid of that side.
     groups.forEach((group, gi) => {
         if (!group.length) return;
         const g = geometry(gi === 0 ? 'portrait' : 'landscape');
@@ -693,21 +741,14 @@ function renderIdCards(res, { cards, layout = 'card', sides = 'both', filename =
         const per = cols * rows;
         for (let at = 0; at < group.length; at += per) {
             const page = group.slice(at, at + per);
-            for (const side of faces) {
-                doc.addPage({ size: [A4.w, A4.h], margin: 0 });
-                page.forEach((card, i) => {
-                    const row = Math.floor(i / cols);
-                    let col = i % cols;
-                    // Backs mirror left-to-right so a long-edge duplex flip lines them up.
-                    if (side === 'back' && sides === 'both') col = cols - 1 - col;
-                    const x = ox + col * (g.w + gap);
-                    const y = oy + row * (g.h + gap);
-                    drawFace(doc, cache, card, side, x, y);
-                    if (marks) cropMarks(doc, x, y, g.w, g.h);
-                });
-                put(doc, `${side === 'front' ? 'Fronts' : 'Backs'} · ${page.length} card${page.length === 1 ? '' : 's'} · print at actual size (100%)${side === 'back' && sides === 'both' ? ' · duplex, flip on long edge' : ''}`,
-                    0, A4.h - 5 * MM, { f: 'S', size: 6.5, color: SOFT, width: A4.w, align: 'center' });
-            }
+            doc.addPage({ size: [A4.w, A4.h], margin: 0 });
+            page.forEach((card, i) => {
+                const x = ox + (i % cols) * (g.w + gap);
+                const y = oy + Math.floor(i / cols) * (g.h + gap);
+                drawFace(doc, cache, card, sides, x, y);
+                if (marks) cropMarks(doc, x, y, g.w, g.h);
+            });
+            footer(A4, `${sides === 'front' ? 'Fronts' : 'Backs'} · ${page.length} card${page.length === 1 ? '' : 's'} · print at actual size (100%)`);
         }
     });
     doc.end();

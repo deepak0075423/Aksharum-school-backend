@@ -188,20 +188,66 @@ async function classOptions(schoolId, yearId) {
 
 const yearBrief = (y) => (y ? { _id: y._id, yearName: y.yearName, phase: y.phase, startDate: y.startDate, endDate: y.endDate } : null);
 
+/** The value `year=past` stands for: every previous year in one list. */
+const PAST = 'past';
+
+/**
+ * Every previous year's rows in one list (Nov 2026) — what the dashboard's
+ * "Expired cards" tile counts is the cards of ALL earlier years, and a list of
+ * one year could not show that figure. A student appears once per year, so a
+ * row's `_id` is holder:year here; `holderId` is the person.
+ */
+async function pastRows(schoolId, kind, yc, past) {
+    const out = [];
+    for (const y of [...past].sort(byYear)) {
+        for (const r of await rowsFor(schoolId, kind, yc, y)) {
+            out.push({ ...r, _id: `${r._id}:${y._id}`, holderId: r._id, yearId: y._id, yearName: y.yearName });
+        }
+    }
+    return out;
+}
+
+/** Class and section pickers across several years: one entry per class NAME (each year has its own class rows). */
+async function pastClassOptions(schoolId, past) {
+    const byName = new Map();
+    for (const y of past) {
+        for (const c of await classOptions(schoolId, y._id)) {
+            if (!byName.has(c.className)) byName.set(c.className, { _id: `name:${c.className}`, className: c.className, classNumber: c.classNumber, sections: new Map() });
+            const into = byName.get(c.className).sections;
+            for (const sec of c.sections) if (!into.has(sec.sectionName)) into.set(sec.sectionName, { _id: `name:${sec.sectionName}`, sectionName: sec.sectionName });
+        }
+    }
+    return [...byName.values()]
+        .map((c) => ({ ...c, sections: [...c.sections.values()].sort((a, b) => String(a.sectionName).localeCompare(String(b.sectionName))) }))
+        .sort((a, b) => Number(a.classNumber ?? 999) - Number(b.classNumber ?? 999) || String(a.className).localeCompare(String(b.className)));
+}
+
+/** A class/section filter value: an id, or (all previous years) `name:<name>`. */
+const matches = (value, id, name) => (String(value).startsWith('name:') ? String(name || '') === String(value).slice(5) : String(id) === String(value));
+
 /**
  * GET /admin/id-cards/list?kind=&year=&tab=&q=&classId=&sectionId=&sort=&page=&limit=
+ * `year=past` (students) lists every previous year at once.
  */
 async function list(schoolId, query = {}) {
     const kind = design.KINDS.includes(query.kind) ? query.kind : 'student';
     const yc = await rules.yearContext(schoolId);
     let year = null;
+    let past = null;
     if (kind === 'student') {
-        year = (query.year && yc.byId.get(String(query.year))) || yc.current || yc.years[yc.years.length - 1] || null;
+        if (query.year === PAST) {
+            const earlier = yc.years.filter((y) => y.phase === 'past');
+            if (earlier.length) {
+                past = earlier;
+                year = { _id: PAST, yearName: 'All previous years', phase: 'past', startDate: null, endDate: null };
+            }
+        }
+        if (!year) year = (query.year && yc.byId.get(String(query.year))) || yc.current || yc.years[yc.years.length - 1] || null;
         if (!year) {
             return { kind, year: null, years: [], rows: [], total: 0, page: 1, pages: 1, limit: 20, counts: {}, classes: [], noYear: true };
         }
     }
-    let rows = await rowsFor(schoolId, kind, yc, year);
+    let rows = past ? await pastRows(schoolId, kind, yc, past) : await rowsFor(schoolId, kind, yc, year);
 
     // Search, class and section narrow everything, tab counts included.
     const q = String(query.q || '').trim().toLowerCase();
@@ -209,13 +255,15 @@ async function list(schoolId, query = {}) {
         rows = rows.filter((r) => r.name.toLowerCase().includes(q) || String(r.code).toLowerCase().includes(q)
             || String(r.card?.number || '').toLowerCase().includes(q) || String(r.line).toLowerCase().includes(q));
     }
-    if (kind === 'student' && query.classId) rows = rows.filter((r) => String(r.classId) === String(query.classId));
-    if (kind === 'student' && query.sectionId) rows = rows.filter((r) => String(r.sectionId) === String(query.sectionId));
+    if (kind === 'student' && query.classId) rows = rows.filter((r) => matches(query.classId, r.classId, r.className));
+    if (kind === 'student' && query.sectionId) rows = rows.filter((r) => matches(query.sectionId, r.sectionId, r.sectionName));
 
     const counts = Object.fromEntries(TABS.map((t) => [t, rows.filter((r) => inTab(r, t)).length]));
     const tab = TABS.includes(query.tab) ? query.tab : 'all';
     rows = rows.filter((r) => inTab(r, tab));
-    rows.sort(SORTS[query.sort] || (kind === 'student' ? SORTS.class : SORTS.name));
+    const order = SORTS[query.sort] || (kind === 'student' ? SORTS.class : SORTS.name);
+    // Every previous year at once: by class means year by year, then by class.
+    rows.sort(past && order === SORTS.class ? (a, b) => byYear(a, b) || order(a, b) : order);
 
     const limit = Math.min(100, Math.max(5, Number(query.limit) || 20));
     const total = rows.length;
@@ -230,7 +278,8 @@ async function list(schoolId, query = {}) {
         // Every id on every page — "select all N" in the bulk bar.
         ids: rows.map((r) => ({ _id: r._id, card: r.card?._id || null, state: r.state })),
         total, page, pages, limit, counts,
-        classes: kind === 'student' ? await classOptions(schoolId, year._id) : [],
+        classes: kind !== 'student' ? [] : past ? await pastClassOptions(schoolId, past) : await classOptions(schoolId, year._id),
+        pastYears: kind === 'student' ? yc.years.filter((y) => y.phase === 'past').length : 0,
     };
 }
 
@@ -263,7 +312,8 @@ async function overview(schoolId) {
     ]);
     const pastYears = yc.years.filter((y) => y.phase === 'past').map((y) => y._id);
     const { rows: [exp] } = await pool.query(`
-        SELECT COUNT(*)::int AS "expired", COUNT(DISTINCT "academicYear")::int AS "years"
+        SELECT COUNT(*)::int AS "expired", COUNT(DISTINCT "academicYear")::int AS "years",
+               COALESCE(array_agg(DISTINCT "academicYear"::text), '{}') AS "yearIds"
           FROM ${CARDS} WHERE "school" = $1::uuid AND "kind" = 'student' AND "status" = 'active' AND "academicYear" = ANY($2::uuid[])`,
     [String(schoolId), pastYears]);
     const { rows: [all] } = await pool.query(`
@@ -357,6 +407,9 @@ async function overview(schoolId) {
         parents: p,
         expired: exp?.expired || 0,
         expiredYears: exp?.years || 0,
+        // Which years they are, so the tile can open the one year's list — or,
+        // when they span several, every previous year at once (list year=past).
+        expiredYearIds: exp?.yearIds || [],
         totals: all || { students: 0, total: 0, lastMonth: 0 },
         attention,
         recent: recent.map((r) => ({

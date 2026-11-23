@@ -6,8 +6,8 @@
  *   cardView      one card as every client draws it — the frozen snapshot and
  *                 design, the status as it stands today, the QR inline
  *   holderCards   a holder's own cards: the one in force first, then history
- *   familyCards   a parent's own card and every child's, at every school the
- *                 person is a parent at
+ *   familyCards   a parent's own card and their children's, at the school
+ *                 they are signed in to
  *   verify        what a QR scan proves — public, and only what the card prints
  *   lookup        the same answer at the office's verification desk
  */
@@ -18,7 +18,7 @@ const User = require('../models/User');
 const IdCard = require('../models/IdCard');
 const design = require('./idCardDesign');
 const rules = require('./idCardRules');
-const { childrenAcrossSchools } = require('./parentChildren');
+const { childCards } = require('./parentChildren');
 const schoolClock = require('./schoolClock');
 
 const CARDS = `"${IdCard.tableName}"`;
@@ -116,27 +116,32 @@ async function schoolBrief(schoolId) {
 }
 
 /**
- * Everything a parent sees: their own card at this school, and each child's
- * cards at whichever school the child is at (a parent can hold posts at more
- * than one — services/parentChildren.childrenAcrossSchools decides which).
- * A child whose school has the module switched off is listed with that said.
+ * Everything a parent sees: their own card at this school, and the cards of
+ * their children AT THIS SCHOOL.
+ *
+ * A person can be a parent at several schools (services/accountIdentity), but
+ * a sign-in is one school (Nov 2026, the user's report): the page used to
+ * gather children from every school the person is a parent at, so a parent
+ * signed in to school A was shown the ID cards of a child at school B. A
+ * child at another school is reached by switching to that school.
  */
 async function familyCards(schoolId, parentUserId) {
-    const [mine, kids] = await Promise.all([
+    const [mine, kids, school] = await Promise.all([
         holderCards(schoolId, parentUserId, ['parent']),
-        childrenAcrossSchools(parentUserId, schoolId),
+        childCards(parentUserId, schoolId),
+        School.findById(schoolId).select('name').lean(),
     ]);
     const children = [];
     for (const k of kids) {
-        const on = !!k.modules?.idCard;
-        const cards = on ? await holderCards(k.schoolId, k._id, ['student']) : { current: null, upcoming: null, pending: null, cards: [] };
+        const cards = await holderCards(schoolId, k._id, ['student']);
         const photo = await User.findById(k._id).select('profileImage').lean();
         children.push({
             _id: k._id, name: k.name, className: k.className, sectionName: k.sectionName,
             photo: photo?.profileImage || '',
-            schoolId: k.schoolId, schoolName: k.schoolName,
-            otherSchool: String(k.schoolId) !== String(schoolId),
-            idCardOn: on,
+            schoolId: String(schoolId), schoolName: school?.name || '',
+            otherSchool: false,
+            // The route is only reached with the module on at this school.
+            idCardOn: true,
             ...cards,
         });
     }
