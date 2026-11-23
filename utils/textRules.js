@@ -18,6 +18,9 @@
  *   title    the name of a thing: English letters, digits, spaces and . , - & ' ( ) / + : # %
  *   words    a label with no symbols (a leave type's name): letters, digits, spaces
  *   sentence a line of description with no symbols: letters, digits, spaces and . , ' - ( ) /
+ *   phrase   a holiday's name or description (Nov 2026): letters, digits, spaces
+ *            and . , ' - ( ) / & — at least one letter (never only a number),
+ *            starting with a letter or a digit
  *   code     an ID: English letters, digits and - / _ .
  *   upper    capital letters and digits
  *   digits   digits only;  decimal  a number with one decimal point
@@ -39,6 +42,7 @@ const KINDS = {
     title:   { ok: /^[A-Za-z0-9 .,&'()/+:#%-]+$/,     msg: (l) => `${l} can only have English letters, numbers, spaces and . , - & ' ( ) / + : # %` },
     words:   { ok: /^[A-Za-z][A-Za-z0-9 ]*$/,         msg: (l) => `${l} must start with a letter and can only have English letters, numbers and spaces` },
     sentence: { ok: /^[A-Za-z0-9][A-Za-z0-9 .,'()/-]*$/, msg: (l) => `${l} must start with a letter or a number and can only have English letters, numbers, spaces and . , ' - ( ) /` },
+    phrase:  { ok: /^(?=[^A-Za-z]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9 .,'()\/&-]*$/, msg: (l, v = '') => (!/[A-Za-z]/.test(v) ? `${l} must have at least one letter — it cannot be only numbers or symbols` : /^[^A-Za-z0-9]/.test(v) ? `${l} must start with a letter or a number` : `${l} can only have English letters, numbers, spaces and . , ' - ( ) / &`) },
     code:    { ok: /^[A-Za-z0-9/._-]+$/,              msg: (l) => `${l} can only have English letters, numbers and - / _ .` },
     author:  { ok: /^[A-Za-z][A-Za-z .,'-]*$/,          msg: (l) => `${l} can only have English letters, spaces and . ' - (commas between names)` },
     isbn:    { ok: /^[0-9Xx -]+$/,                 msg: (l) => `${l} can only have digits, hyphens, spaces and X` },
@@ -72,7 +76,7 @@ function textProblem(value, label = 'This field', kind = 'text') {
     const rule = KINDS[kind];
     if (!rule) return null;
     const t = rule.upper ? v.trim().toUpperCase() : v.trim();
-    return rule.ok.test(t) ? null : rule.msg(label);
+    return rule.ok.test(t) ? null : rule.msg(label, t);
 }
 
 /**

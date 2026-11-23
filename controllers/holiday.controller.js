@@ -8,6 +8,23 @@ const XLSX         = require('xlsx');
 const School = require('../models/School');
 const { sheetTextProblem } = require('../middleware/textSafety');
 const { withTransaction, lock } = require('../services/dbTx');
+const { zoneOf } = require('../services/schoolClock');
+const { textProblem } = require('../utils/textRules');
+
+/**
+ * A holiday's name and description (Nov 24 2026, the user: "restrict special
+ * characters, allow only a few, and never only a number"): English letters,
+ * digits, spaces and . , ' - ( ) / & — with at least one letter
+ * (utils/textRules 'phrase'). `field` says which box to mark.
+ */
+function holidayTextProblem({ name, description }) {
+    const n = name !== undefined ? textProblem(String(name).trim(), 'Holiday name', 'phrase') : null;
+    if (n) return { field: 'name', message: n };
+    const d = description !== undefined ? textProblem(String(description).trim(), 'Description', 'phrase') : null;
+    if (d) return { field: 'description', message: d };
+    return null;
+}
+const refuseText = (res, bad) => res.status(400).json({ success: false, code: 'INVALID_TEXT', field: bad.field, message: bad.message });
 
 // Legacy slugs kept working alongside the school's own configured list
 const LEGACY_TYPES = ['public', 'school_specific', 'optional', 'exam_break'];
@@ -60,13 +77,27 @@ async function holidayRecipients(holiday, schoolId) {
         if (depts.includes('teaching_staff')) roles.push('teacher');
         if (depts.includes('admin_staff'))    roles.push('school_admin');
         if (!roles.length) return [];
-        return User.find({ school: schoolId, role: { $in: roles }, isActive: true }, '_id').lean();
+        return withoutBlockedTeachers(schoolId,
+            await User.find({ school: schoolId, role: { $in: roles }, isActive: true }, '_id role').lean());
     }
 
-    return User.find(
+    return withoutBlockedTeachers(schoolId, await User.find(
         { school: schoolId, role: { $in: ['teacher', 'student', 'parent'] }, isActive: true },
-        '_id'
-    ).lean();
+        '_id role'
+    ).lean());
+}
+
+/**
+ * A teacher whose designation gives "No access" to Holidays is not told about
+ * new holidays (Nov 24 2026) — the notification, the push and the dashboard's
+ * Announcements panel (which lists the inbox) all followed from it.
+ */
+async function withoutBlockedTeachers(schoolId, users) {
+    const teacherIds = users.filter((u) => u.role === 'teacher').map((u) => String(u._id));
+    if (!teacherIds.length) return users;
+    const { teachersWithAccess } = require('../services/designationService');
+    const allowed = new Set(await teachersWithAccess(schoolId, 'holiday', teacherIds));
+    return users.filter((u) => u.role !== 'teacher' || allowed.has(String(u._id)));
 }
 
 async function sendHolidayNotification(holiday, schoolId, creatorId) {
@@ -137,24 +168,97 @@ function parseDate(val) {
     return isNaN(d) ? null : d;
 }
 
+// ── Which academic year a holiday belongs to ─────────────────────────────────
 /**
- * Which academic year a holiday belongs to.
+ * A holiday belongs to ONE academic year and lies inside it (Nov 24 2026, the
+ * user's rule: "if I am adding a holiday of academic year 2028-2029, restrict
+ * me to the dates from its start to its end"). The form names the year and
+ * its date pickers stop at the year's first and last day; the server holds
+ * every write — add, edit, import — to the same rule, so a holiday is always
+ * listed under the year its days are in.
  *
- * Every holiday used to be written with `academicYear: null`, which made the
- * year filter on the admin screen filter nothing and left the student/parent
- * read path leaning on the null branch of its own year scoping. The year a
- * holiday sits in is a fact about its start date, so it is derived from that —
- * falling back to the running year for a date outside every configured one.
+ * It used to be derived from the first day alone, falling back to the RUNNING
+ * year for a date no year covered — so a holiday dated in a year not yet set
+ * up was filed under this one, and a range could run on into the next year.
+ *
+ * Compared as calendar days (YYYY-MM-DD). A holiday is stored at UTC midnight;
+ * a year's dates are read as the day they are at the school, because some
+ * years were saved at the school's midnight instead (18:30 UTC the day
+ * before), which a UTC reading would put a day early.
  */
-async function yearForDate(schoolId, date) {
-    const years = await AcademicYear.find({ school: schoolId }).select('startDate endDate status').lean();
-    if (!years.length) return null;
-    const t = new Date(date).getTime();
-    const containing = years.find(y =>
-        y.startDate && y.endDate && t >= new Date(y.startDate).getTime() && t <= new Date(y.endDate).getTime());
-    if (containing) return containing._id;
-    return years.find(y => y.status === 'active')?._id || null;
+const dayAt = (d, zone) => (d
+    ? new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(d))
+    : '');
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const fmtKey = (k) => (k ? `${Number(k.slice(8, 10))} ${MONTHS[Number(k.slice(5, 7)) - 1]} ${k.slice(0, 4)}` : '');
+
+/** The school's years with their first and last day: [{ _id, name, start, end }], earliest first. */
+async function yearSpans(schoolId) {
+    const zone = zoneOf(schoolId);
+    const years = await AcademicYear.find({ school: schoolId }).select('yearName startDate endDate').lean();
+    return years
+        .map((y) => ({ _id: String(y._id), name: y.yearName, start: dayAt(y.startDate, zone), end: dayAt(y.endDate, zone) }))
+        .sort((a, b) => String(a.start).localeCompare(String(b.start)));
 }
+
+/**
+ * The year a holiday from `startKey` to `endKey` goes in — the one asked for
+ * (`wantedId`), else the one its first day falls in — or why it cannot go in.
+ * A school with no years at all holds nobody to anything (year null).
+ *   → { year: span | null } | { error }
+ */
+function placeHoliday(spans, startKey, endKey, wantedId) {
+    if (!spans.length) return { year: null };
+    if (wantedId) {
+        const y = spans.find((s) => s._id === String(wantedId));
+        if (!y) return { error: 'Choose one of this school’s academic years.' };
+        if ((y.start && startKey < y.start) || (y.end && endKey > y.end)) {
+            return { error: `A holiday of ${y.name} must fall between ${fmtKey(y.start)} and ${fmtKey(y.end)}.`, year: y };
+        }
+        return { year: y };
+    }
+    const y = spans.find((s) => s.start && s.end && s.start <= startKey && startKey <= s.end);
+    if (!y) return { error: `${fmtKey(startKey)} is not inside any academic year. Add that year under Academics → Academic Years first.` };
+    if (endKey > y.end) return { error: `It runs past the end of ${y.name} (${fmtKey(y.end)}). A holiday has to fall within one academic year.`, year: y };
+    return { year: y };
+}
+/**
+ * A holiday cannot begin or end on a day the school is closed anyway (Nov 24
+ * 2026, the user: "a holiday can't be added on Sundays and Saturdays (working
+ * Saturday)") — every Sunday, and a Saturday the school does not work by its
+ * Saturday setting (School Settings: Saturdays off, or only the 1st/3rd/5th or
+ * 2nd/4th worked). A working Saturday can be made a holiday. A break that RUNS
+ * over a weekend is fine; only its first and last day are held to this.
+ *   → null, or why the day cannot be used
+ */
+async function weekSettings(schoolId) {
+    const { normalizeLeaveSettings } = require('../utils/leaveDays');
+    const school = await School.findById(schoolId).select('leaveSettings').lean();
+    return normalizeLeaveSettings(school?.leaveSettings || {});
+}
+function offDayProblem(startKey, endKey, week) {
+    const { isSaturdayWorking } = require('../utils/leaveDays');
+    const why = (k) => {
+        const d = new Date(`${k}T00:00:00Z`);
+        if (d.getUTCDay() === 0) return 'a Sunday';
+        if (d.getUTCDay() === 6 && !isSaturdayWorking(d, week)) return 'a Saturday the school does not work';
+        return null;
+    };
+    const a = why(startKey);
+    if (startKey === endKey) {
+        return a ? `${fmtKey(startKey)} is ${a} — the school is already closed that day. Pick a working day.` : null;
+    }
+    if (a) return `The first day, ${fmtKey(startKey)}, is ${a} — the school is already closed. Start the holiday on a working day.`;
+    const b = why(endKey);
+    if (b) return `The last day, ${fmtKey(endKey)}, is ${b} — the school is already closed. End the holiday on a working day.`;
+    return null;
+}
+const refuseOffDay = (res, message) => res.status(400).json({ success: false, code: 'HOLIDAY_ON_OFF_DAY', message });
+
+const refuseYear = (res, placed) => res.status(400).json({
+    success: false, code: 'OUTSIDE_ACADEMIC_YEAR', message: placed.error,
+    ...(placed.year ? { year: { _id: placed.year._id, name: placed.year.name, start: placed.year.start, end: placed.year.end } } : {}),
+});
 
 /**
  * The school's academic years, in order, and which one is "this year" — the
@@ -170,12 +274,15 @@ async function schoolYears(schoolId) {
         [String(schoolId)],
     );
     const now = Date.now();
+    const zone = zoneOf(schoolId);
     const current = rows.find((y) => y.status === 'active')
         || rows.find((y) => y.startDate && y.endDate
             && new Date(y.startDate).getTime() <= now && now <= new Date(y.endDate).getTime())
         || null;
     return {
-        years: rows.map((y) => ({ _id: String(y._id), name: y.yearName, status: y.status })),
+        // `start`/`end`: the year's first and last day — the add/edit form's
+        // date pickers stop there.
+        years: rows.map((y) => ({ _id: String(y._id), name: y.yearName, status: y.status, start: dayAt(y.startDate, zone), end: dayAt(y.endDate, zone) })),
         currentYear: current ? String(current._id) : null,
     };
 }
@@ -246,7 +353,11 @@ exports.adminGetHolidays = async (req, res) => {
             .lean();
         // Every year the school has, and which is this one: the screen opens on
         // this year and can switch to any other, or to all of them.
-        res.json({ success: true, data: holidays, ...(await schoolYears(req.schoolId)) });
+        res.json({
+            success: true, data: holidays, ...(await schoolYears(req.schoolId)),
+            // Which Saturdays the school works — the form refuses an off day.
+            week: await weekSettings(req.schoolId),
+        });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -256,6 +367,8 @@ exports.adminCreateHoliday = async (req, res) => {
         const { name, startDate, endDate, type, description, isRecurring, academicYear, applicability } = req.body;
 
         if (!name?.trim())               return res.status(400).json({ success: false, message: 'Holiday name is required' });
+        const badText = holidayTextProblem({ name, description });
+        if (badText) return refuseText(res, badText);
         if (!startDate)                  return res.status(400).json({ success: false, message: 'Start date is required' });
         if (!endDate)                    return res.status(400).json({ success: false, message: 'End date is required' });
         const typeErr = await invalidType(req.schoolId, type);
@@ -264,6 +377,12 @@ exports.adminCreateHoliday = async (req, res) => {
         const start = new Date(startDate);
         const end   = new Date(endDate);
         if (end < start) return res.status(400).json({ success: false, message: 'End date must be on or after start date' });
+        // Inside the academic year it is for, start to end.
+        const placed = placeHoliday(await yearSpans(req.schoolId), dayKeyOf(start), dayKeyOf(end), academicYear || null);
+        if (placed.error) return refuseYear(res, placed);
+        // Not on a Sunday, or a Saturday the school does not work.
+        const offDay = offDayProblem(dayKeyOf(start), dayKeyOf(end), await weekSettings(req.schoolId));
+        if (offDay) return refuseOffDay(res, offDay);
 
         const doc = {
             school:       req.schoolId,
@@ -273,7 +392,7 @@ exports.adminCreateHoliday = async (req, res) => {
             type,
             description:  description?.trim() || '',
             isRecurring:  !!isRecurring,
-            academicYear: academicYear || await yearForDate(req.schoolId, start),
+            academicYear: placed.year?._id || null,
             createdBy:    req.userId,
             applicability: {
                 // 'specific_departments' was removed from the form; anything
@@ -326,10 +445,32 @@ exports.adminUpdateHoliday = async (req, res) => {
 
         const current = await Holiday.findOne({ _id: req.params.id, school: req.schoolId }).lean();
         if (!current) return res.status(404).json({ success: false, message: 'Holiday not found' });
+        // A name or description left as it was is not re-judged: a holiday
+        // saved before the rule can still be moved or renamed.
+        if (name !== undefined && !String(name).trim()) return res.status(400).json({ success: false, field: 'name', message: 'Holiday name is required' });
+        const badText = holidayTextProblem({
+            name: name !== undefined && String(name).trim() !== String(current.name || '').trim() ? name : undefined,
+            description: description !== undefined && String(description).trim() !== String(current.description || '').trim() ? description : undefined,
+        });
+        if (badText) return refuseText(res, badText);
         // What it will be once saved — which must not be a holiday already there.
         const next = { ...current, ...update };
         if (new Date(next.endDate) < new Date(next.startDate)) {
             return res.status(400).json({ success: false, message: 'End date must be on or after start date' });
+        }
+        // Moved, or moved to another year: it must still lie inside its year —
+        // and is filed under the year it now lies in. (A rename alone leaves an
+        // old holiday where it is.)
+        if (startDate !== undefined || endDate !== undefined || academicYear !== undefined) {
+            const spans = await yearSpans(req.schoolId);
+            const placed = placeHoliday(spans, dayKeyOf(next.startDate), dayKeyOf(next.endDate), academicYear || null);
+            if (placed.error) return refuseYear(res, placed);
+            if (spans.length) update.academicYear = placed.year._id;
+        }
+        if ((startDate !== undefined && dayKeyOf(startDate) !== dayKeyOf(current.startDate))
+            || (endDate !== undefined && dayKeyOf(endDate) !== dayKeyOf(current.endDate))) {
+            const offDay = offDayProblem(dayKeyOf(next.startDate), dayKeyOf(next.endDate), await weekSettings(req.schoolId));
+            if (offDay) return refuseOffDay(res, offDay);
         }
         // Asked only when the edit moves it — its type, its days or who it is
         // for. Renaming one of two look-alikes entered before this rule
@@ -388,6 +529,8 @@ exports.adminImportHolidays = async (req, res) => {
             const description = (row.description || row.Description || '').toString().trim();
 
             if (!name)       { errors.push(`Row ${lineNo}: name is required`); return; }
+            const badText = holidayTextProblem({ name, description });
+            if (badText) { errors.push(`Row ${lineNo}: ${badText.message}`); return; }
             const startDate = parseDate(rawStart);
             if (!startDate) { errors.push(`Row ${lineNo}: invalid or missing startDate`); return; }
             const endDate = parseDate(rawEnd) || startDate;
@@ -412,8 +555,19 @@ exports.adminImportHolidays = async (req, res) => {
                 errors.push(`Row ${d._line}: “${d.name}” has the same date and type as “${(inFile || onCalendar).name}”, which is ${inFile ? `row ${inFile._line} of this file` : 'already on the calendar'}`);
             } else fresh.push(d);
         }
+        // Each row inside one academic year, and filed under it — the same
+        // rule as the form.
+        const spans = await yearSpans(req.schoolId);
+        const week = await weekSettings(req.schoolId);
         docs.length = 0;
-        docs.push(...fresh);
+        for (const d of fresh) {
+            const placed = placeHoliday(spans, dayKeyOf(d.startDate), dayKeyOf(d.endDate), null);
+            if (placed.error) { errors.push(`Row ${d._line}: “${d.name}” — ${placed.error}`); continue; }
+            const offDay = offDayProblem(dayKeyOf(d.startDate), dayKeyOf(d.endDate), week);
+            if (offDay) { errors.push(`Row ${d._line}: “${d.name}” — ${offDay}`); continue; }
+            d.academicYear = placed.year?._id || null;
+            docs.push(d);
+        }
         docs.forEach((d) => { delete d._line; });
 
         // A preview parses and reports, and writes nothing. It is the same code
@@ -434,7 +588,6 @@ exports.adminImportHolidays = async (req, res) => {
         if (!docs.length)
             return res.status(400).json({ success: false, message: 'No valid rows to import', errors });
 
-        for (const d of docs) d.academicYear = await yearForDate(req.schoolId, d.startDate);
         const created = await Holiday.insertMany(docs, { ordered: false });
 
         // Fire-and-forget in-app notification (pushed live over the WebSocket Gateway)
@@ -687,7 +840,10 @@ async function getApplicableHolidays(req, res) {
         // name and colour a type the same way the admin screen does, and the
         // types endpoint is admin-only — so teacher and student views used to
         // fall back to a hardcoded list of four that no school actually had.
-        res.json({ success: true, data: visible, types: await schoolHolidayTypes(req.schoolId) });
+        // The school's years and which is this one: the student and parent
+        // pages have their own year picker (Nov 2026) — they have no header
+        // switcher — and ask for a year with ?year=.
+        res.json({ success: true, data: visible, types: await schoolHolidayTypes(req.schoolId), ...(await schoolYears(req.schoolId)) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 }
 
@@ -759,6 +915,7 @@ exports.parentGetHolidays = async (req, res) => {
             data: visible,
             children: children.map(({ classIds, ...c }) => c),
             types: await schoolHolidayTypes(req.schoolId),
+            ...(await schoolYears(req.schoolId)),
         });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };

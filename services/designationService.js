@@ -388,6 +388,27 @@ async function isModuleAdmin(req, moduleKey) {
  * route guards. A failure returns [] rather than throwing: a notification is
  * never worth failing the request that triggered it.
  */
+/**
+ * Of these teacher ids, the ones whose designation lets them use `moduleKey`
+ * at all (user or admin) on a school that has it switched on (Nov 2026). For
+ * a module's notifications: a teacher whose designation gives "No access" to
+ * Holidays must not be told about new holidays either.
+ */
+async function teachersWithAccess(schoolId, moduleKey, teacherIds = []) {
+    const ids = [...new Set((teacherIds || []).map(String).filter(Boolean))];
+    if (!ids.length || !schoolId || !isModuleKey(moduleKey)) return [];
+    const snapshot = await getSnapshot(schoolId);
+    if (!snapshot?.moduleFlags?.[moduleKey]) return [];
+    const profiles = await TeacherProfile.find({ user: { $in: ids }, school: schoolId }).select('user designation').lean();
+    const designationOf = new Map(profiles.map((p) => [String(p.user), p.designation]));
+    const verdict = new Map();
+    return ids.filter((id) => {
+        const k = key(designationOf.get(id));
+        if (!verdict.has(k)) verdict.set(k, resolveFromSnapshot(snapshot, designationOf.get(id)).permissions[moduleKey] !== NONE);
+        return verdict.get(k);
+    });
+}
+
 async function moduleAdminIds(schoolId, moduleKey) {
     if (!schoolId || !isModuleKey(moduleKey)) return [];
 
@@ -567,7 +588,7 @@ module.exports = {
     ADMIN, USER, NONE, LEVELS, RANK, DEFAULT_DESIGNATIONS, CACHE_TTL,
     sanitizePermissions, storedPermissions, defaultPermissionsFor, emptyPermissions, gate,
     getSnapshot, invalidate, resolveDesignation, resolveFromSnapshot,
-    requestAccess, resolveRequestAccess, meets, isModuleAdmin, moduleAdminIds, teacherDesignation,
+    requestAccess, resolveRequestAccess, meets, isModuleAdmin, moduleAdminIds, teachersWithAccess, teacherDesignation,
     invalidateUser, invalidateUsers,
     ensureSeeded, listWithPermissions, renameProfiles, countTeachers,
     teacherCountsByDesignation, holderCountsByDesignation, syncSchoolNames,
