@@ -1620,12 +1620,25 @@ function departmentName(raw) {
     return { name };
 }
 
-/** A head has to be somebody who works here now. Returns the id, null, or `undefined` when refused. */
-async function headFor(req, raw) {
+/**
+ * A head has to be somebody who works here now, and — since Nov 24 2026 — one
+ * of the department's own staff (`name` is the department as it is written on
+ * their records). `kept` is the head it already has: left unchanged it stays,
+ * as long as the account is live, so a department headed before this rule can
+ * still be renamed. Returns the id, null, or `{ refused }` with the reason.
+ */
+async function headFor(req, raw, name, kept = null) {
     const id = trim(raw);
     if (!id) return null;
     const u = await User.findOne({ _id: id, school: req.schoolId, isActive: true }).select('role').lean().catch(() => null);
-    return u && ['teacher', 'school_admin'].includes(u.role) ? id : undefined;
+    if (!(u && ['teacher', 'school_admin'].includes(u.role))) {
+        return { refused: 'The head of a department has to be an active member of staff' };
+    }
+    if (kept && id === String(kept)) return id;
+    const members = await profilesIn(req.schoolId, name);
+    return members.some((m) => String(m.user) === id)
+        ? id
+        : { refused: `The head of ${name} has to be one of its own staff` };
 }
 
 /** The profile rows whose department is `name`, whatever its capitals. */
@@ -1640,8 +1653,8 @@ exports.createDepartment = async (req, res) => {
         if (error) return fail(res, error, 400);
         const listed = await EmployeeDepartment.find({ school: req.schoolId }).select('name').lean();
         if (listed.some((d) => low(d.name) === low(name))) return fail(res, `${name} is already on the list`, 409);
-        const head = await headFor(req, req.body?.head);
-        if (head === undefined) return fail(res, 'The head of a department has to be an active member of staff', 400);
+        const head = await headFor(req, req.body?.head, name);
+        if (head?.refused) return fail(res, head.refused, 400);
 
         const row = await EmployeeDepartment.create({
             school: req.schoolId, name, description: trim(req.body?.description).slice(0, 200), head, createdBy: req.userId,
@@ -1677,8 +1690,9 @@ exports.updateDepartment = async (req, res) => {
         }
         if (req.body?.description !== undefined) patch.description = trim(req.body.description).slice(0, 200);
         if (req.body?.head !== undefined) {
-            const head = await headFor(req, req.body.head);
-            if (head === undefined) return fail(res, 'The head of a department has to be an active member of staff', 400);
+            // The members are the ones under its current name; a rename takes them along.
+            const head = await headFor(req, req.body.head, row.name, row.head);
+            if (head?.refused) return fail(res, head.refused, 400);
             patch.head = head;
         }
         if (!Object.keys(patch).length) return ok(res, { _id: String(row._id), moved: 0 });
