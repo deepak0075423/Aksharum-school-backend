@@ -217,13 +217,27 @@ async function onlyOffDaysBetween(a, b, schoolId, leaveSettings, holidayModule) 
  * Returns { label, startDate, endDate } or { error }. A school that has never
  * recorded an academic year falls back to the active label (none → error).
  */
+/**
+ * A year's first or last day as the calendar day it is AT THE SCHOOL, as a
+ * UTC midnight (Nov 2026). Most years are stored at UTC midnight, but some
+ * were saved at the school's midnight (18:30 UTC the day before in India),
+ * and reading those in UTC put the year a day early — its first day outside
+ * it, a day after its end inside it.
+ */
+function yearDay(d, schoolId) {
+    if (!d) return null;
+    const { zoneOf } = require('../services/schoolClock');
+    const key = new Intl.DateTimeFormat('en-CA', { timeZone: zoneOf(schoolId), year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(d));
+    return new Date(`${key}T00:00:00Z`);
+}
+
 async function leaveYearFor(schoolId, from, to) {
     const rows = await AcademicYear.find({ school: schoolId }).lean();
     if (!rows.length) return { error: 'No active academic year' };
     const f = utcMidnight(from);
     const t = utcMidnight(to || from);
     const holding = (d) => rows.find((y) => y.startDate && y.endDate
-        && utcMidnight(y.startDate) <= d && utcMidnight(y.endDate) >= d);
+        && yearDay(y.startDate, schoolId) <= d && yearDay(y.endDate, schoolId) >= d);
     const yr = holding(f);
     if (!yr) {
         return { error: `No academic year covers ${f.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })} — add the year first` };
@@ -232,7 +246,7 @@ async function leaveYearFor(schoolId, from, to) {
     const end = holding(t);
     if (!end || academicYearLabel(end) !== label) {
         return {
-            error: `This leave runs past the end of ${label} (${isoDay(yr.endDate)}). `
+            error: `This leave runs past the end of ${label} (${isoDay(yearDay(yr.endDate, schoolId))}). `
                 + 'Apply for the days in each academic year separately.',
         };
     }
@@ -266,4 +280,5 @@ module.exports = {
     onlyOffDaysBetween,
     leaveYearFor,
     yearWindow,
+    yearDay,
 };

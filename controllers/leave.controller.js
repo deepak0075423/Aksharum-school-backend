@@ -27,7 +27,7 @@ const { textProblem } = require('../utils/textRules');
 // two can never disagree about whether a given Saturday is a working day.
 const {
     getActiveAcademicYearLabel, academicYearLabel, normalizeLeaveSettings, remainingOf, rawRemainingOf,
-    utcMidnight, localToday, addDays, dayKinds, onlyOffDaysBetween, leaveYearFor, yearWindow,
+    utcMidnight, localToday, addDays, dayKinds, onlyOffDaysBetween, leaveYearFor, yearWindow, yearDay,
 } = require('../utils/leaveDays');
 
 const fmtDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
@@ -60,16 +60,53 @@ function withReportWindow(filter, { fromDate, toDate }, academicYearRange) {
  * `years` is the picker's list, newest first.
  */
 async function leaveYearScope(schoolId, wanted) {
-    const rows = await AcademicYear.find({ school: schoolId }).lean();
+    const [rows, closed] = await Promise.all([AcademicYear.find({ school: schoolId }).lean(), closedYearsOf(schoolId)]);
     const years = rows
-        .map((y) => ({ label: academicYearLabel(y), startDate: y.startDate, endDate: y.endDate, status: y.status }))
+        .map((y) => ({
+            label: academicYearLabel(y), startDate: y.startDate, endDate: y.endDate, status: y.status,
+            // The year's first and last day as the school reads them — the apply
+            // forms' date pickers stop there (Nov 2026) — and whether leave in
+            // it has been closed.
+            start: dayKey(yearDay(y.startDate, schoolId)), end: dayKey(yearDay(y.endDate, schoolId)),
+            closed: closed.has(academicYearLabel(y)),
+        }))
         .sort((a, b) => new Date(b.startDate) - new Date(a.startDate));
     const active = years.find((y) => y.status === 'active')?.label || null;
     if (wanted === 'all') return { label: 'all', active, years, from: null, to: null };
     const row = years.find((y) => y.label === (wanted || active));
     // A school with no year on record yet sees everything rather than nothing.
     if (!row) return { label: wanted || null, active, years, from: null, to: null };
-    return { label: row.label, active, years, from: row.startDate ? new Date(row.startDate) : null, to: row.endDate ? new Date(row.endDate) : null };
+    // The window by the year's first and last DAY as the school reads them, so
+    // a leave on the year's last day is listed in it (see yearDay).
+    return { label: row.label, active, years, from: row.start ? new Date(`${row.start}T00:00:00Z`) : null, to: row.end ? new Date(`${row.end}T00:00:00Z`) : null };
+}
+
+const dayKey = (d) => (d ? new Date(d).toISOString().slice(0, 10) : '');
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const fmtKey = (k) => (k ? `${Number(k.slice(8, 10))} ${MONTHS_SHORT[Number(k.slice(5, 7)) - 1]} ${k.slice(0, 4)}` : '');
+
+/**
+ * The academic year an application names (Nov 24 2026, the user: "if I am
+ * applying a leave — or the office for me — in 2028-29, restrict me to the
+ * dates from its start to its end, and show it there"). The forms send the
+ * year chosen on them; the dates must lie inside it. Returns null when the
+ * dates fit (or no year was named), else why not. `yr` is leaveYearFor's
+ * answer for the dates.
+ */
+async function namedYearProblem(schoolId, wanted, yr) {
+    if (!wanted) return null;
+    const scope = await leaveYearScope(schoolId, String(wanted));
+    const named = scope.years.find((y) => y.label === String(wanted));
+    if (!named) return `"${wanted}" is not an academic year of this school`;
+    if (yr && !yr.error && yr.label === named.label) return null;
+    return `A leave in ${named.label} must fall between ${fmtKey(named.start)} and ${fmtKey(named.end)}.`;
+}
+
+/** `label` when it is one of this school's academic years, else null. */
+async function knownYearLabel(schoolId, label) {
+    if (!label || label === 'all') return null;
+    const rows = await AcademicYear.find({ school: schoolId }).lean();
+    return rows.some((y) => academicYearLabel(y) === String(label)) ? String(label) : null;
 }
 
 /** The list's own From/To dates, narrowed to the year in force (their overlap). */
@@ -1202,7 +1239,7 @@ exports.adminGetRequests = async (req, res) => {
  * Returns { status, body } for the caller to send.
  */
 async function fileLeave(req, { teacherId, onBehalf }) {
-    const { leaveTypeId, fromDate, toDate, leaveMode: modeIn, halfDaySession, reason } = req.body;
+    const { leaveTypeId, fromDate, toDate, leaveMode: modeIn, halfDaySession, reason, academicYear: namedYear } = req.body;
     const bad = (message, status = 400) => ({ status, body: { success: false, message } });
     if (!teacherId || !leaveTypeId || !fromDate || !toDate || !String(reason || '').trim())
         return bad(onBehalf
@@ -1229,6 +1266,9 @@ async function fileLeave(req, { teacherId, onBehalf }) {
     if (lt.isActive === false) return bad(`${lt.name} is switched off and is not accepting applications`);
 
     const yr = await leaveYearFor(req.schoolId, from, to);
+    // The year the form was filling in: the dates must lie inside it.
+    const outside = await namedYearProblem(req.schoolId, namedYear, yr);
+    if (outside) return bad(outside);
     if (yr.error) return bad(yr.error);
     if ((await closedYearsOf(req.schoolId)).has(yr.label))
         return bad(`${yr.label} has been closed for leave — no new applications can be filed in it`);
@@ -1342,7 +1382,8 @@ exports.adminGetTeacherBalance = async (req, res) => {
     try {
         const { teacherId } = req.query;
         if (!teacherId) return res.status(400).json({ success: false, message: 'teacherId is required' });
-        const ay = await getActiveAcademicYearLabel(req.schoolId);
+        // A year the apply form names (Nov 2026), else the active one.
+        const ay = (await knownYearLabel(req.schoolId, req.query.academicYear)) || await getActiveAcademicYearLabel(req.schoolId);
         const balances = await LeaveBalance.find({ teacher: teacherId, school: req.schoolId, academicYear: ay })
             .populate('leaveType', 'name code')
             .lean();
@@ -1364,7 +1405,7 @@ exports.adminGetTeacherBalance = async (req, res) => {
  * Date problems come back as `days.error` inside a 200 rather than a 400: this
  * is a preview the form paints while the user is still typing.
  */
-async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, toDate, leaveMode = 'full_day', onBehalf }) {
+async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, toDate, leaveMode = 'full_day', onBehalf, academicYear: namedYear }) {
         if (!teacherId || !leaveTypeId)
             return { status: 400, body: { success: false, message: 'teacherId and leaveTypeId are required' } };
 
@@ -1390,13 +1431,18 @@ async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, t
             else if (to < from) dateError = 'To date must be on or after From date';
             else {
                 yr = await leaveYearFor(schoolId, from, to);
-                if (yr.error) { dateError = yr.error; yr = null; }
+                const outside = await namedYearProblem(schoolId, namedYear, yr);
+                if (outside) { dateError = outside; yr = null; }
+                else if (yr.error) { dateError = yr.error; yr = null; }
                 else if ((school?.leaveClosedYears || []).includes(yr.label)) {
                     dateError = `${yr.label} has been closed for leave`;
                 }
             }
         }
-        const ay = yr?.label || activeAy;
+        // The balance of the year the dates are in — else the year the form
+        // names (Nov 2026), else the active one.
+        const named = await knownYearLabel(schoolId, namedYear);
+        const ay = yr?.label || named || activeAy;
 
         // Read-only: an unallocated employee must not get a balance row just for
         // opening the form, so this looks the row up instead of creating it.
@@ -1516,9 +1562,9 @@ async function buildApplyPreview({ schoolId, teacherId, leaveTypeId, fromDate, t
 /** Preview for an admin filing on someone else's behalf. */
 exports.adminApplyPreview = async (req, res) => {
     try {
-        const { teacherId, leaveTypeId, fromDate, toDate, leaveMode } = req.query;
+        const { teacherId, leaveTypeId, fromDate, toDate, leaveMode, academicYear } = req.query;
         const r = await buildApplyPreview({
-            schoolId: req.schoolId, teacherId, leaveTypeId, fromDate, toDate, leaveMode, onBehalf: true,
+            schoolId: req.schoolId, teacherId, leaveTypeId, fromDate, toDate, leaveMode, onBehalf: true, academicYear,
         });
         res.status(r.status).json(r.body);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -1527,9 +1573,9 @@ exports.adminApplyPreview = async (req, res) => {
 /** The same preview for the employee's own application. */
 exports.teacherApplyPreview = async (req, res) => {
     try {
-        const { leaveTypeId, fromDate, toDate, leaveMode } = req.query;
+        const { leaveTypeId, fromDate, toDate, leaveMode, academicYear } = req.query;
         const r = await buildApplyPreview({
-            schoolId: req.schoolId, teacherId: req.userId, leaveTypeId, fromDate, toDate, leaveMode, onBehalf: false,
+            schoolId: req.schoolId, teacherId: req.userId, leaveTypeId, fromDate, toDate, leaveMode, onBehalf: false, academicYear,
         });
         res.status(r.status).json(r.body);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -3072,7 +3118,8 @@ exports.teacherGetMyLeaves = async (req, res) => {
 
 exports.teacherGetLeaveBalance = async (req, res) => {
     try {
-        const ay = await getActiveAcademicYearLabel(req.schoolId);
+        // A year the apply form names (Nov 2026), else the active one.
+        const ay = (await knownYearLabel(req.schoolId, req.query.academicYear)) || await getActiveAcademicYearLabel(req.schoolId);
         const [balances, leaveTypes, school] = await Promise.all([
             LeaveBalance.find({ teacher: req.userId, school: req.schoolId, academicYear: ay })
                 .populate('leaveType', 'name code category annualAllocation isPaid')
