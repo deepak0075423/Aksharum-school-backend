@@ -557,7 +557,11 @@ exports.adminDocumentTeachers = async (req, res) => {
 
 const TARGET_TYPES  = ['whole_school', 'all_teachers', 'specific_teachers', 'class', 'class_sections'];
 const STAFF_TARGETS = ['all_teachers', 'specific_teachers'];
-const STAFF_ONLY    = 'Only students hand work in — an assignment cannot be shared with teachers alone';
+// An assignment is set for classes or sections (Nov 24 2026). Not for teachers
+// alone — they hand nothing in — and not for the whole school either: that is
+// every parent and teacher too, and the work belongs to nobody's class.
+const NO_ASSIGNMENT = ['whole_school', ...STAFF_TARGETS];
+const CLASSES_ONLY  = 'An assignment is set for classes or sections — pick whole classes or specific sections';
 
 /** A refusal takes the files the request brought with it: multer has already written them. */
 const refuse = (req, res, message, status = 400, code = null) => {
@@ -687,7 +691,7 @@ function applyAssignment(doc, b) {
             doc.totalMarks = null;
         }
     } else {
-        if (STAFF_TARGETS.includes(doc.targetType)) return STAFF_ONLY;
+        if (NO_ASSIGNMENT.includes(doc.targetType)) return CLASSES_ONLY;
         if (b.allowSubmission !== undefined) doc.allowSubmission = flag(b.allowSubmission);
         else if (!was) doc.allowSubmission = true;
         if (b.dueDate !== undefined) {
@@ -768,7 +772,7 @@ exports.adminUpload = async (req, res) => {
         const files    = buildFileObjects(req.files);
         const assigned = flag(b.isAssignment);
         if (assigned && !files.length)                      return refuse(req, res, NEEDS_FILE, 400, 'NEEDS_FILE');
-        if (assigned && STAFF_TARGETS.includes(b.targetType)) return refuse(req, res, STAFF_ONLY);
+        if (assigned && NO_ASSIGNMENT.includes(b.targetType)) return refuse(req, res, CLASSES_ONLY);
         const due = assigned ? dueAt(b.dueDate) : null;
         if (due === undefined)                              return refuse(req, res, 'That due date is not a date');
 
