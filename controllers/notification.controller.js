@@ -835,7 +835,7 @@ exports.getSent = async (req, res) => {
 };
 
 /**
- * POST /notifications/sent/remove { ids } — take notifications off the
+ * POST /notifications/sent/remove { ids } | { all: true, year } — take notifications off the
  * sender's own Sent list (Nov 2026). Only the sender's own rows; the people
  * who received them keep their copies, exactly as deleting a sent email does
  * not unsend it. `affected` counts only rows that were still on the list.
@@ -843,6 +843,24 @@ exports.getSent = async (req, res) => {
 exports.removeSent = async (req, res) => {
     try {
         const { query } = require('../db/pool');
+        // { all: true } — the Sent tab's "Delete all" (Nov 25 2026): everything
+        // on the sender's list for the academic year on screen (`year`), as the
+        // inbox's "Delete all" empties only the year on screen. Filters and the
+        // search do not narrow it, the same as the inbox's.
+        if (req.body.all === true) {
+            // A year asked for that this school does not have resolves to no
+            // year at all — which would empty every year's Sent list. Refuse.
+            const win = await yearWindow(req);
+            if (win && !win.selected) return res.status(400).json({ success: false, message: 'That academic year was not found' });
+            // The year clause reads the stored year off the alias it is given.
+            const y = yearAnd(win, 'n."createdAt"', 1);
+            const { rowCount } = await query(
+                `UPDATE "${Notification.tableName}" n SET "senderRemovedAt" = NOW()
+                  WHERE n.sender = $1 AND n."senderRemovedAt" IS NULL${y.sql}`,
+                [req.userId, ...y.params],
+            );
+            return res.json({ success: true, affected: rowCount });
+        }
         const ids = [...new Set((req.body.ids || []).map(String).filter(Boolean))];
         if (!ids.length) return res.status(400).json({ success: false, message: 'Nothing was selected' });
         const { rowCount } = await query(
