@@ -520,6 +520,7 @@ router.get('/leave/allocations/export',            leaveGuard, leaveCtrl.adminEx
 router.get('/leave/reports',                       leaveGuard, leaveCtrl.adminGetReports);
 router.get('/leave/reports/export',                leaveGuard, leaveCtrl.adminExportReports);
 router.post('/leave/requests/:id/reverse',         leaveGuard, leaveCtrl.adminReverseApproved);
+router.post('/leave/requests/:id/withdrawal',      leaveGuard, leaveCtrl.adminDecideWithdrawal);
 // Cut an approved leave short — it ends on a new, earlier day
 router.post('/leave/requests/:id/shorten',         leaveGuard, leaveCtrl.adminShortenApproved);
 

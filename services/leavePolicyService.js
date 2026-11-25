@@ -136,7 +136,8 @@ async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
         gender:               ['any', 'Male', 'Female'].includes(patch.gender) ? patch.gender : current.gender,
         minServiceDays:       num(patch.minServiceDays, current.minServiceDays),
 
-        minDaysPerApplication: num(patch.minDaysPerApplication, current.minDaysPerApplication),
+        // Retired (Nov 26 2026): every application is at least a day anyway.
+        minDaysPerApplication: 0,
         maxConsecutiveDays:    num(patch.maxConsecutiveDays,    current.maxConsecutiveDays),
         advanceNoticeDays:     num(patch.advanceNoticeDays,     current.advanceNoticeDays),
         allowBackdated:        bool(patch.allowBackdated,       current.allowBackdated),
@@ -192,12 +193,6 @@ async function savePolicy(schoolId, leaveTypeId, patch = {}, userId = null) {
         const own = await LeaveType.find({ school: schoolId, _id: { $in: next.blockedLeaveTypes } }).select('_id').lean();
         const ok = new Set(own.map((t) => sid(t._id)));
         next.blockedLeaveTypes = next.blockedLeaveTypes.filter((id) => ok.has(id) && id !== sid(leaveTypeId));
-    }
-
-    // A minimum longer than the maximum can never be satisfied — clamp rather
-    // than store a rule that rejects every application.
-    if (next.maxConsecutiveDays > 0 && next.minDaysPerApplication > next.maxConsecutiveDays) {
-        next.minDaysPerApplication = next.maxConsecutiveDays;
     }
 
     // Accrual switched on but crediting 0 days a month is a rule that does
@@ -295,9 +290,8 @@ async function validateApplication({
     if (leaveMode === 'half_day' && !policy.halfDayAllowed) {
         return { ok: false, message: 'Half-day leave is not allowed for this leave type' };
     }
-    if (leaveMode !== 'half_day' && policy.minDaysPerApplication > 0 && totalDays < policy.minDaysPerApplication) {
-        return { ok: false, message: `This leave type must be applied for at least ${policy.minDaysPerApplication} day(s) at a time` };
-    }
+    // No minimum-days check: the rule was retired (Nov 26 2026), and a value
+    // saved before then must not go on refusing applications unseen.
 
     const countable = ['pending', 'approved'];
     const typeId = sid(policy.leaveType._id);

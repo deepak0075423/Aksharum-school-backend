@@ -63,6 +63,13 @@ const CompOffPolicySchema = new db.Schema({
         // Two sign-offs before anything is credited; the second approver must
         // be a different person from the first.
         twoLevel:             { type: Boolean, default: false },
+        // Who gives the SECOND sign-off when twoLevel is on (Nov 26 2026):
+        // 'any' (any approver but the first), or the holders of named
+        // designations / departments, or named teachers (user ids).
+        secondApprover: {
+            kind:   { type: String, enum: ['any', 'designation', 'department', 'teacher'], default: 'any' },
+            values: { type: [String], default: [] },
+        },
     },
 
     // ── Automation (scenario 3) ─────────────────────────────────────────────

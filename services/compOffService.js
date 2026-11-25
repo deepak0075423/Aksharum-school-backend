@@ -63,7 +63,7 @@ const POLICY_DEFAULTS = {
     validityDays:       90,
     halfDayAllowed:              true,
     advanceCompOffAllowed:       false,
-    approval: { mode: 'admin', approverDesignations: [], twoLevel: false },
+    approval: { mode: 'admin', approverDesignations: [], twoLevel: false, secondApprover: { kind: 'any', values: [] } },
     autoGenerateFromAttendance: true,
     expiryNotification: { enabled: true, daysBefore: 7 },
     isActive: true,
@@ -111,10 +111,16 @@ async function savePolicy(schoolId, patch, userId) {
     if (patch.approval) {
         const mode = ['admin', 'designation', 'both'].includes(patch.approval.mode)
             ? patch.approval.mode : 'admin';
+        const second = patch.approval.secondApprover || {};
+        const kind = ['designation', 'department', 'teacher'].includes(second.kind) ? second.kind : 'any';
+        const values = kind === 'any' ? [] : (list(second.values) || []).map(String).filter(Boolean);
         clean.approval = {
             mode,
             approverDesignations: list(patch.approval.approverDesignations) || [],
             twoLevel: !!patch.approval.twoLevel,
+            // A rule naming nobody would block every second sign-off: it is
+            // stored as 'any' instead.
+            secondApprover: { kind: values.length ? kind : 'any', values },
         };
     }
     if (patch.expiryNotification) {
@@ -399,6 +405,84 @@ async function canApprove(userId, userRole, schoolId, policy, moduleAdmin = fals
     return designations.includes(profile?.designation || '');
 }
 
+// ── The second sign-off (Nov 26 2026) ───────────────────────────────────────
+// With two sign-offs on, the policy may name who gives the second: holders of
+// a designation, a department, or named teachers. They give ONLY the second
+// (spending it on the first would leave nobody to give the second), and only
+// they may give it — unless nobody active matches any more, when school
+// admins may, so a request can never be stranded.
+
+/** The rule in force, or null when the second sign-off is anyone's. */
+function secondRule(policy) {
+    const a = policy?.approval || {};
+    const r = a.secondApprover || {};
+    const values = Array.isArray(r.values) ? r.values.map(String).filter(Boolean) : [];
+    if (!a.twoLevel || !['designation', 'department', 'teacher'].includes(r.kind) || !values.length) return null;
+    return { kind: r.kind, values };
+}
+
+/** Whether this user is one the rule names. */
+async function isSecondApprover(userId, schoolId, policy) {
+    const rule = secondRule(policy);
+    if (!rule) return false;
+    if (rule.kind === 'teacher') return rule.values.includes(String(userId));
+    const p = await TeacherProfile.findOne({ user: userId, school: schoolId }).select('designation department').lean();
+    return rule.values.includes(String((rule.kind === 'designation' ? p?.designation : p?.department) || ''));
+}
+
+/** Everyone (still active) the rule names, less `exclude`. */
+async function secondApproverIds(schoolId, policy, { exclude = null } = {}) {
+    const rule = secondRule(policy);
+    if (!rule) return [];
+    let ids = rule.values;
+    if (rule.kind !== 'teacher') {
+        const profiles = await TeacherProfile.find({ school: schoolId, [rule.kind]: { $in: rule.values } }).select('user').lean();
+        ids = profiles.map((p) => String(p.user));
+    }
+    const active = ids.length
+        ? await User.find({ _id: { $in: ids }, school: schoolId, isActive: true }).select('_id').lean()
+        : [];
+    return active.map((u) => String(u._id)).filter((id) => id !== String(exclude || ''));
+}
+
+/** "the Vice Principal designation", "the Science department", "Priya Sharma". */
+async function describeSecond(schoolId, policy) {
+    const rule = secondRule(policy);
+    if (!rule) return 'another approver';
+    if (rule.kind === 'teacher') {
+        const users = await User.find({ _id: { $in: rule.values }, school: schoolId }).select('name').lean();
+        return users.map((u) => u.name).join(', ') || 'the named teacher';
+    }
+    return `the ${rule.values.join(' / ')} ${rule.kind === 'designation' ? 'designation' : 'department'}`;
+}
+
+/**
+ * May this user give the NEXT sign-off on this request? { ok, message }.
+ * `level` is the sign-off they would give (1 = first).
+ */
+async function mayDecide(request, policy, { actorId, actorRole, moduleAdmin = false, level = null }) {
+    if (String(request.teacher?._id || request.teacher) === String(actorId)) {
+        return { ok: false, message: 'You cannot decide your own Comp Off request' };
+    }
+    const required = Number(request.approvalsRequired) || 1;
+    const next = level || (Array.isArray(request.approvals) ? request.approvals.length : Number(request.approvalLevel) || 0) + 1;
+    const rule = required >= 2 ? secondRule(policy) : null;
+    if (rule) {
+        const second = await isSecondApprover(actorId, request.school, policy);
+        if (next >= required) {
+            if (second) return { ok: true };
+            const left = await secondApproverIds(request.school, policy, { exclude: request.teacher?._id || request.teacher });
+            if (!left.length && actorRole === 'school_admin') return { ok: true };
+            return { ok: false, message: `The second sign-off on this request is for ${await describeSecond(request.school, policy)}` };
+        }
+        if (second) {
+            return { ok: false, message: 'You give the second sign-off — this request needs its first approval from another approver first' };
+        }
+    }
+    const allowed = await canApprove(actorId, actorRole, request.school, policy, moduleAdmin, request.teacher?._id || request.teacher);
+    return allowed ? { ok: true } : { ok: false, message: 'You are not an approver for Comp Off requests' };
+}
+
 /**
  * Everyone who should see "a new comp off request needs your attention" —
  * the same people canApprove lets decide, minus the claimant.
@@ -660,8 +744,9 @@ async function approveRequest(request, ctx, { actorId, actorName, actorRole, mod
     if (String(request.teacher) === String(actorId)) {
         return { ok: false, forbidden: true, message: 'You cannot decide your own Comp Off request' };
     }
-    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin, request.teacher);
-    if (!allowed) return { ok: false, forbidden: true, message: 'You are not an approver for Comp Off requests' };
+    // Who may give THIS sign-off — the second may be reserved (secondRule).
+    const may = await mayDecide(request, ctx.policy, { actorId, actorRole, moduleAdmin });
+    if (!may.ok) return { ok: false, forbidden: true, message: may.message };
 
     const out = await tx.withTransaction(async (q) => {
         await tx.lock(q, `compoff:request:${request._id}`);
@@ -718,7 +803,10 @@ async function approveRequest(request, ctx, { actorId, actorName, actorRole, mod
             recipients: [request.teacher],
             link: { type: 'compoff.mine', entityId: request._id },
         });
-        approverIds(request.school, ctx.policy, { exclude: request.teacher }).then((recipients) => notify({
+        // The second sign-off goes to whoever the policy names for it.
+        secondApproverIds(request.school, ctx.policy, { exclude: request.teacher })
+            .then((named) => (named.length ? named : approverIds(request.school, ctx.policy, { exclude: request.teacher })))
+            .then((recipients) => notify({
             school: request.school, sender: actorId, senderRole: actorRole,
             title: '⏳ Comp Off still needs a sign-off',
             body: `A Comp Off request for ${fmtDate(request.workDate)} cleared level ${out.request.approvalLevel} of ${out.required} and is waiting on its final approval.`,
@@ -749,7 +837,10 @@ async function rejectRequest(request, ctx, { actorId, actorRole, moduleAdmin = f
     if (String(request.teacher) === String(actorId)) {
         return { ok: false, forbidden: true, message: 'You cannot decide your own Comp Off request' };
     }
-    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin, request.teacher);
+    // Any approver may turn a request down; so may whoever the policy names
+    // for the second sign-off, once it is their turn.
+    const allowed = await canApprove(actorId, actorRole, request.school, ctx.policy, moduleAdmin, request.teacher)
+        || (await mayDecide(request, ctx.policy, { actorId, actorRole, moduleAdmin })).ok;
     if (!allowed) return { ok: false, forbidden: true, message: 'You are not an approver for Comp Off requests' };
     const why = String(comment || '').trim();
     if (!why) return { ok: false, message: 'Give a reason for rejecting this request' };
@@ -1105,6 +1196,10 @@ module.exports = {
     findDuplicate,
     canApprove,
     approverIds,
+    secondRule,
+    isSecondApprover,
+    secondApproverIds,
+    mayDecide,
     createRequest,
     submitDraft,
     approveRequest,

@@ -67,6 +67,15 @@ const LeaveApplicationSchema = new db.Schema({
         default: [],   // [{ level, by, byName, at, comment }]
     },
 
+    // ── Withdrawing APPROVED leave (Nov 26 2026) ────────────────────────────
+    // The employee asks; the office confirms (the days go back) or declines
+    // (the leave stands). Open = requested and not yet decided.
+    withdrawalRequestedAt: { type: Date, default: null },
+    withdrawalDecision:    { type: String, default: '' },   // '' | 'confirmed' | 'declined'
+    withdrawalDecidedAt:   { type: Date, default: null },
+    withdrawalDecidedBy:   { type: db.Types.UUID, ref: 'User', default: null },
+    withdrawalComment:     { type: String, default: '' },
+
     appliedAt: { type: Date, default: Date.now },
     approvedAt: { type: Date, default: null },
     rejectedAt: { type: Date, default: null },

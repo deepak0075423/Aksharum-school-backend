@@ -86,7 +86,10 @@ exports.myCompOff = async (req, res) => {
         else filter.status = { $ne: 'draft' };   // drafts ride in their own list
 
         const [requests, total, drafts, balance] = await Promise.all([
+            // The employee named on every row (the drawer said "Unknown
+            // employee" — the row carried only the id, Nov 26 2026).
             CompOffRequest.find(filter)
+                .populate('teacher', 'name email')
                 .populate('holiday', 'name type')
                 .populate('approvedBy', 'name')
                 .sort({ workDate: -1 })
@@ -95,16 +98,29 @@ exports.myCompOff = async (req, res) => {
                 .lean(),
             CompOffRequest.countDocuments(filter),
             CompOffRequest.find({ teacher: req.userId, school: req.schoolId, status: 'draft' })
+                .populate('teacher', 'name email')
                 .populate('holiday', 'name type')
                 .sort({ workDate: -1 })
                 .lean(),
             balanceFor(req.userId, ctx),
         ]);
 
+        // Whoever the policy names for the second sign-off decides too, so
+        // they get the approvals tab even if they approve nothing else.
         const isApprover = await compOff.canApprove(
             req.userId, req.userRole, req.schoolId, ctx.policy,
             await designations.isModuleAdmin(req, 'leave'),
-        );
+        ) || await compOff.isSecondApprover(req.userId, req.schoolId, ctx.policy);
+        // Their own record's number and post, as the office's rows carry them.
+        const me = await TeacherProfile.findOne({ user: req.userId, school: req.schoolId })
+            .select('employeeId designation department').lean();
+        for (const r of [...requests, ...drafts]) {
+            if (r.teacher && typeof r.teacher === 'object') {
+                r.teacher.employeeId  = me?.employeeId  || '';
+                r.teacher.designation = me?.designation || '';
+                r.teacher.department  = me?.department  || '';
+            }
+        }
 
         ok(res, {
             enabled: true,
@@ -285,13 +301,16 @@ exports.listRequests = async (req, res) => {
         // used to receive every claim in the school — names, hours, reasons.
         const moduleAdmin = await designations.isModuleAdmin(req, 'leave');
         const isApprover = await compOff.canApprove(req.userId, req.userRole, req.schoolId, ctx.policy, moduleAdmin);
+        // Named for the second sign-off only: sees the claims past their first.
+        const secondOnly = !isApprover && await compOff.isSecondApprover(req.userId, req.schoolId, ctx.policy);
         const onAdminRoute = req.baseUrl.endsWith('/admin');
-        if (!onAdminRoute && !isApprover) return bad(res, 'You are not an approver for Comp Off requests', 403);
+        if (!onAdminRoute && !isApprover && !secondOnly) return bad(res, 'You are not an approver for Comp Off requests', 403);
 
         const { status, teacherId, dayCategory, source, fromDate, toDate, page = 1, limit = 20, focus } = req.query;
         const filter = { school: req.schoolId };
         // An approver's queue never holds their own claims.
         if (!onAdminRoute) filter.teacher = { $ne: req.userId };
+        if (secondOnly) filter.approvalLevel = { $gte: 1 };
         if (status)      filter.status      = status;
         if (teacherId && String(teacherId) !== String(req.userId)) filter.teacher = teacherId;
         else if (teacherId && onAdminRoute) filter.teacher = teacherId;
@@ -360,17 +379,25 @@ exports.listRequests = async (req, res) => {
                 r.teacher.designation = pr?.designation || '';
                 r.teacher.department  = pr?.department  || '';
             }
-            // Whether THIS user may decide the row — never their own claim.
-            r.canDecide = isApprover && ['pending', 'draft'].includes(r.status)
-                && String(r.teacher?._id || r.teacher) !== String(req.userId);
         });
+        // Whether THIS user may decide each row — never their own claim, and
+        // the second sign-off only by whoever the policy names for it.
+        const moduleAdminFlag = moduleAdmin;
+        await Promise.all(items.map(async (r) => {
+            if (!['pending', 'draft'].includes(r.status) || String(r.teacher?._id || r.teacher) === String(req.userId)) {
+                r.canDecide = false; return;
+            }
+            r.canDecide = compOff.secondRule(ctx.policy) && (Number(r.approvalsRequired) || 1) >= 2
+                ? (await compOff.mayDecide(r, ctx.policy, { actorId: req.userId, actorRole: req.userRole, moduleAdmin: moduleAdminFlag })).ok
+                : isApprover;
+        }));
 
         const stat = (k) => byStatus.rows.find((x) => x.status === k)?.n || 0;
         const thisMonth = months.rows[0]?.this || 0;
         const prevMonth = months.rows[0]?.prev || 0;
 
         ok(res, {
-            enabled: true, isApprover, policy: publicPolicy(ctx.policy),
+            enabled: true, isApprover: isApprover || secondOnly, policy: publicPolicy(ctx.policy),
             items, total, page: effectivePage, pages: Math.ceil(total / +limit),
             counts: {
                 total:     byStatus.rows.reduce((n, x) => n + x.n, 0),

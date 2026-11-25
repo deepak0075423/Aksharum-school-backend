@@ -985,7 +985,9 @@ exports.adminGetLeaveOverview = async (req, res) => {
                 `SELECT "status",
                         count(*)::int                          AS "requests",
                         coalesce(sum("totalDays"), 0)::float    AS "days",
-                        coalesce(sum("lopDays"),   0)::float    AS "lop"
+                        coalesce(sum("lopDays"),   0)::float    AS "lop",
+                        count(*) FILTER (WHERE "withdrawalRequestedAt" IS NOT NULL
+                                           AND coalesce("withdrawalDecision", '') = '')::int AS "withdrawals"
                    FROM ${qt(LeaveApplication)}
                   WHERE "school" = $1 AND "fromDate" >= $2 AND "fromDate" <= $3
                   GROUP BY "status"`,
@@ -1065,6 +1067,8 @@ exports.adminGetLeaveOverview = async (req, res) => {
             approved:  stat('approved').requests,
             rejected:  stat('rejected').requests,
             cancelled: stat('cancelled').requests,
+            // Approved leave its employee asked to withdraw — the office confirms.
+            withdrawals: stat('approved').withdrawals || 0,
         };
 
         const since = oldest.rows[0]?.since;
@@ -1149,7 +1153,12 @@ exports.adminGetRequests = async (req, res) => {
         const { status, teacherId, leaveType, fromDate, toDate, page = 1, limit = 20, focus,
                 q, sort: sortKey, mode, department, academicYear } = req.query;
         const filter = { school: req.schoolId };
-        if (status)    filter.status    = status;
+        // "withdrawal" = approved leave whose employee asked to withdraw it.
+        if (status === 'withdrawal') {
+            filter.status = 'approved';
+            filter.withdrawalRequestedAt = { $ne: null };
+            filter.withdrawalDecision = { $in: ['', null] };
+        } else if (status) filter.status = status;
         if (teacherId) filter.teacher   = teacherId;
         if (leaveType) filter.leaveType = leaveType;
         await narrowToDepartment(filter, req.schoolId, department);
@@ -1785,6 +1794,57 @@ async function undoApproved(req, app, { status = 'cancelled', comment = '', byEm
         .catch(e => console.error('[leave→substitute]', e.message));
     return { ...moved, paid };
 }
+
+/**
+ * Confirm or decline an employee's request to withdraw approved leave.
+ * Confirm = the approval is undone exactly as a reversal (days back, register
+ * rows and cover cleared); decline = the leave stands, with the reason.
+ */
+exports.adminDecideWithdrawal = async (req, res) => {
+    try {
+        const action  = String(req.body.action || '');
+        const comment = String(req.body.adminComment || '').trim().slice(0, 1000);
+        if (!['confirm', 'decline'].includes(action))
+            return res.status(400).json({ success: false, message: 'Choose to confirm or decline the withdrawal' });
+        const app = await LeaveApplication.findOne({ _id: req.params.id, school: req.schoolId }).lean();
+        if (!app) return res.status(404).json({ success: false, message: 'Leave request not found' });
+        if (app.status !== 'approved' || !app.withdrawalRequestedAt || app.withdrawalDecision)
+            return res.status(400).json({ success: false, message: 'There is no withdrawal waiting on this leave' });
+        if (String(app.teacher) === String(req.userId))
+            return res.status(403).json({ success: false, message: 'You cannot decide your own withdrawal' });
+
+        const decided = { withdrawalDecidedAt: new Date(), withdrawalDecidedBy: req.userId, withdrawalComment: comment };
+        if (action === 'decline') {
+            if (!comment) return res.status(400).json({ success: false, message: 'Say why the withdrawal is declined' });
+            const row = await patch(LeaveApplication, app._id, { ...decided, withdrawalDecision: 'declined' },
+                { where: { status: ['approved'] } });
+            if (!row) return res.status(409).json({ success: false, message: 'This leave changed a moment ago — refresh' });
+            notify({
+                school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                title: 'Leave withdrawal declined',
+                body: `Your request to withdraw your leave for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)} was declined — the leave stands.\nReason: ${comment}`,
+                recipients: [app.teacher], email: true,
+                link: { type: 'leave.mine', entityId: app._id },
+            });
+            return res.json({ success: true, data: row });
+        }
+
+        const moved = await undoApproved(req, app, { comment, byEmployee: true });
+        if (!moved.applied)
+            return res.status(409).json({ success: false, message: `Already ${moved.currentStatus || 'processed'} by someone else` });
+        const row = await patch(LeaveApplication, app._id, { ...decided, withdrawalDecision: 'confirmed' });
+        notify({
+            school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+            title: '↩️ Leave withdrawal confirmed',
+            body: `Your leave for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)} is withdrawn`
+                + (moved.paid > 0 ? ` and ${days(moved.paid)} returned to your balance` : '')
+                + `.${comment ? `\nNote: ${comment}` : ''}`,
+            recipients: [app.teacher], email: true,
+            link: { type: 'leave.mine', entityId: app._id },
+        });
+        res.json({ success: true, data: row || moved.app, restored: moved.paid });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+};
 
 exports.adminReverseApproved = async (req, res) => {
     try {
@@ -2802,6 +2862,13 @@ exports.adminGetReports = async (req, res) => {
         // rejected, cancelled and still-pending requests made "days taken" the
         // days anybody ever asked for. Request counts still cover every status.
         const TAKEN = `coalesce(sum(la."totalDays") FILTER (WHERE la."status" = 'approved'), 0)::float`;
+        // With a status chosen, the figures are that status's days — "Pending"
+        // showed every teacher at 0 days (Nov 26 2026: "casual = 0, total = 0
+        // but the teacher had many leaves"). Unfiltered they stay days taken,
+        // and the pending days ride alongside so a teacher whose leave is all
+        // still waiting is not listed as having none.
+        const DAYS = status ? `coalesce(sum(la."totalDays"), 0)::float` : TAKEN;
+        const PENDING = `coalesce(sum(la."totalDays") FILTER (WHERE la."status" = 'pending'), 0)::float`;
         const [byStatus, trend, byType, perTeacher, lastYear, depts] = await Promise.all([
             pool.query(
                 `SELECT la."status", count(*)::int AS "n", coalesce(sum(la."totalDays"),0)::float AS "days"
@@ -2811,12 +2878,12 @@ exports.adminGetReports = async (req, res) => {
             // months in between are filled in below so the axis has no gaps.
             pool.query(
                 `SELECT to_char(la."fromDate" AT TIME ZONE 'UTC', 'YYYY-MM') AS "month",
-                        count(*)::int AS "n", ${TAKEN} AS "days"
+                        count(*)::int AS "n", ${DAYS} AS "days"
                    FROM ${qt(LeaveApplication)} la ${WHERE}
                   GROUP BY 1 ORDER BY 1`, params),
             pool.query(
                 `SELECT lt."_id", lt."name", lt."code",
-                        count(*)::int AS "n", ${TAKEN} AS "days"
+                        count(*)::int AS "n", ${DAYS} AS "days"
                    FROM ${qt(LeaveApplication)} la
                    JOIN ${qt(LeaveType)} lt ON lt."_id" = la."leaveType" ${WHERE}
                   GROUP BY lt."_id", lt."name", lt."code"
@@ -2825,7 +2892,7 @@ exports.adminGetReports = async (req, res) => {
             // because the column set is the school's own list of leave types.
             pool.query(
                 `SELECT u."_id" AS "teacher", u."name", tp."employeeId", tp."department",
-                        la."leaveType", ${TAKEN} AS "days",
+                        la."leaveType", ${DAYS} AS "days", ${PENDING} AS "pendingDays",
                         count(*)::int AS "n"
                    FROM ${qt(LeaveApplication)} la
                    JOIN ${qt(User)} u ON u."_id" = la."teacher"
@@ -2883,12 +2950,13 @@ exports.adminGetReports = async (req, res) => {
             if (!teachers.has(id)) {
                 teachers.set(id, {
                     _id: id, name: r.name, employeeId: r.employeeId || '',
-                    department: r.department || '', perType: {}, days: 0, applications: 0,
+                    department: r.department || '', perType: {}, days: 0, pendingDays: 0, applications: 0,
                 });
             }
             const t = teachers.get(id);
             t.perType[String(r.leaveType)] = r.days;
             t.days += r.days;
+            t.pendingDays += r.pendingDays || 0;
             t.applications += r.n;
         });
 
@@ -3196,13 +3264,28 @@ exports.teacherCancelLeave = async (req, res) => {
         if (app.status === 'approved') {
             if (utcMidnight(app.fromDate) <= localToday())
                 return res.status(400).json({ success: false, message: 'This leave has already started — use "End early" to come back sooner' });
-            const moved = await undoApproved(req, app, { status: 'cancelled', byEmployee: true });
-            if (!moved.applied)
-                return res.status(409).json({ success: false, message: `Already ${moved.currentStatus || 'changed'} — refresh and try again` });
-            tellApprovers('🚫 Approved leave withdrawn',
-                `${req.user?.name || 'A teacher'} withdrew their approved leave for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)}`
-                + `${moved.paid > 0 ? `; ${days(moved.paid)} returned to their balance` : ''}.`);
-            return res.json({ success: true, data: moved.app, restored: moved.paid });
+            // Approved leave is not withdrawn on the employee's word alone
+            // (Nov 26 2026): it becomes a request the office confirms. Until
+            // then the leave stands and its days stay used.
+            if (app.withdrawalRequestedAt && !app.withdrawalDecision)
+                return res.status(400).json({ success: false, message: 'You have already asked to withdraw this leave — the office will confirm it' });
+            const row = await patch(LeaveApplication, app._id, {
+                withdrawalRequestedAt: new Date(), withdrawalDecision: '',
+                withdrawalDecidedAt: null, withdrawalDecidedBy: null, withdrawalComment: '',
+            }, { where: { status: ['approved'] } });
+            if (!row)
+                return res.status(409).json({ success: false, message: 'This leave changed a moment ago — refresh and try again' });
+            leavePolicy.leaveAdminIds(req.schoolId)
+                .then((ids) => notify({
+                    school: req.schoolId, sender: req.userId, senderRole: req.userRole,
+                    title: '↩️ Leave withdrawal to confirm',
+                    body: `${req.user?.name || 'A teacher'} asks to withdraw their approved leave for ${fmtDate(app.fromDate)} – ${fmtDate(app.toDate)}. `
+                        + 'Confirm it to return the days, or decline to keep the leave.',
+                    recipients: ids.filter((id) => String(id) !== String(req.userId)),
+                    link: { type: 'leave.manage', entityId: app._id },
+                }))
+                .catch(() => {});
+            return res.json({ success: true, data: row, requested: true });
         }
 
         if (app.status !== 'pending')
