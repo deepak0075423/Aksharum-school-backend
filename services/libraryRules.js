@@ -20,6 +20,19 @@ const pool               = require('../db/pool');
 const { notify, withParents } = require('./notifyService');
 const { withTransaction, lock, buildInsert } = require('./dbTx');
 const designations       = require('./designationService');
+const yearScope          = require('./yearScope');
+
+/**
+ * Run a read across every academic year.
+ *
+ * Library loans, fines and reservations belong to the year they were made in
+ * (services/yearRules.js), so registers, tiles and reports for a year show that
+ * year only. But a book borrowed last year and still out is still out, and a
+ * fine raised last year and unpaid is still owed: the reads that ACT on what
+ * somebody holds or owes right now — the return desk, a scan, member search,
+ * the borrowing limits, a member's own books and fines — go through this.
+ */
+const everyYear = (fn) => yearScope.allYears(fn);
 
 const fmtLibDate = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 
@@ -424,9 +437,11 @@ async function attachFineSummary(issuances) {
     const rows = Array.isArray(issuances) ? issuances : [];
     if (!rows.length) return rows;
 
-    const fines = await LibraryFine.find({ issuance: { $in: rows.map((i) => String(i._id)) } })
+    // Every fine on these loans, whichever year it was raised in — a book
+    // borrowed in March and returned late in June is fined in the new year.
+    const fines = await everyYear(() => LibraryFine.find({ issuance: { $in: rows.map((i) => String(i._id)) } })
         .select('issuance fineType amount waivedAmount paidAmount paidAt paymentMode receiptNumber')
-        .lean();
+        .lean());
     if (!fines.length) return rows.map((i) => ({ ...i, fineSummary: null }));
 
     const byIssuance = new Map();
@@ -688,7 +703,11 @@ async function expireStaleHolds(schoolId, bookId = null, { actor, actorRole } = 
  * a promotion always has a person behind it even when it happens as a side
  * effect of a page load.
  */
-async function promoteQueue(schoolId, bookId, policy, { actor, actorRole } = {}) {
+async function promoteQueue(schoolId, bookId, policy, opts = {}) {
+    // The queue is the shelf as it stands, not a year's records.
+    return everyYear(() => promoteQueueNow(schoolId, bookId, policy, opts));
+}
+async function promoteQueueNow(schoolId, bookId, policy, { actor, actorRole } = {}) {
     const [freeCopies, held] = await Promise.all([
         LibraryBookCopy.countDocuments({ school: schoolId, book: bookId, status: 'available' }),
         LibraryReservation.countDocuments({ school: schoolId, book: bookId, status: 'ready' }),
@@ -999,4 +1018,5 @@ module.exports = {
     borrowerAudience, backfillIssuedToRole, nextFineReceiptNumber,
     libraryStaffIds, notifyLibraryStaff,
     outstandingOf, fineStatusFor, backfillFineAmounts, attachFineSummary,
+    everyYear,
 };

@@ -9,14 +9,15 @@ const User               = require('../models/User');
 const {
     ACTIVE_ISSUANCE, getOrCreatePolicy, reindexQueue, activeReservation, placeReservation,
     sweepOverdue, expireStaleHolds, renewIssuance, fmtLibDate,
-    notifyLibraryStaff, attachFineSummary,
+    notifyLibraryStaff, attachFineSummary, everyYear,
 } = require('../services/libraryRules');
 const { notify } = require('../services/notifyService');
 
 // A dated library table as a list, tile or report should read it: the academic
-// year in view's rows (services/yearRules.js — an issue still out, a fine still
-// unpaid and a reservation still waiting stay in view until they are closed).
-// Opening one record, and every write, reads the table itself.
+// year in view's rows (services/yearRules.js — a loan, fine or reservation
+// belongs to the year it was made in). A member's own page is the exception:
+// what they still hold, owe or have queued for is theirs whichever year it
+// began in, so those reads go through everyYear.
 const Y = (Model) => yearScope.table(Model);
 
 // ── Student / Teacher shared endpoints ────────────────────────────────────────
@@ -49,13 +50,14 @@ exports.getDashboard = async (req, res) => {
             ? { $or: [{ status: { $in: ACTIVE_ISSUANCE } }, { issueDate: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }] }
             : {};
         const [myIssuances, myFines, myReservations, counts, cats, history] = await Promise.all([
-            LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, status: { $in: ACTIVE_ISSUANCE } })
+            // What the member holds, owes and has queued for now — from any year.
+            everyYear(() => LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, status: { $in: ACTIVE_ISSUANCE } })
                 .populate('book', 'title isbn authors category coverImage')
-                .lean(),
-            LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' }).lean(),
-            LibraryReservation.find({ school: req.schoolId, reservedBy: req.userId, status: { $in: ['pending','ready'] } })
+                .lean()),
+            everyYear(() => LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' }).lean()),
+            everyYear(() => LibraryReservation.find({ school: req.schoolId, reservedBy: req.userId, status: { $in: ['pending','ready'] } })
                 .populate('book', 'title')
-                .lean(),
+                .lean()),
             query(
                 `SELECT (SELECT count(*)::int FROM "${LibraryBook.tableName}"     WHERE "school" = $1) AS "totalBooks",
                         (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}" WHERE "school" = $1) AS "totalCopies",
@@ -73,9 +75,9 @@ exports.getDashboard = async (req, res) => {
             ),
             // The member's own last few movements, returns included — the live
             // list above only ever holds what they still have.
-            LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, ...inYear })
+            everyYear(() => LibraryIssuance.find({ school: req.schoolId, issuedTo: req.userId, ...inYear })
                 .populate('book', 'title')
-                .sort({ issueDate: -1 }).limit(8).lean(),
+                .sort({ issueDate: -1 }).limit(8).lean()),
         ]);
 
         res.json({
@@ -133,6 +135,23 @@ exports.search = async (req, res) => {
         // "Available" is about copies on the shelf, not about the title existing.
         if (availability === 'available') filter.availableCopies = { $gt: 0 };
         if (availability === 'out')       filter.availableCopies = { $lte: 0 };
+
+        // The two figures above the results that are not catalogue fields:
+        // titles with a copy out on loan right now, and titles this member is
+        // holding a place for. Each narrows to a set of book ids; both together
+        // keep only what is in both.
+        const narrowTo = [];
+        if (availability === 'issued') {
+            narrowTo.push((await LibraryBookCopy.distinct('book', { school: req.schoolId, status: 'issued' })).map(String));
+        }
+        if (req.query.reserved === 'mine') {
+            narrowTo.push((await everyYear(() => LibraryReservation.distinct('book', {
+                school: req.schoolId, reservedBy: req.userId, status: { $in: HELD },
+            }))).map(String));
+        }
+        if (narrowTo.length) {
+            filter._id = { $in: narrowTo.reduce((keep, ids) => keep.filter((id) => ids.includes(id))) };
+        }
         if (q) filter.$or = [
             { title:     { $regex: q, $options: 'i' } },
             { authors:   { $elemMatch: { $regex: q, $options: 'i' } } },
@@ -147,15 +166,20 @@ exports.search = async (req, res) => {
         const [rows, total, counts, facetRows] = await Promise.all([
             LibraryBook.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
             LibraryBook.countDocuments(filter),
+            // "Reserved" is the member's own: the books they are queued for or
+            // that are being held for them. It was every open reservation in
+            // the school, which never matched what the member could see.
             query(
                 `SELECT (SELECT count(*)::int FROM "${books}"                      WHERE "school" = $1) AS "totalBooks",
                         (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}"  WHERE "school" = $1
                            AND "status" = 'available')                                                 AS "availableCopies",
                         (SELECT count(*)::int FROM "${LibraryBookCopy.tableName}"  WHERE "school" = $1
                            AND "status" = 'issued')                                                    AS "issuedCopies",
-                        (SELECT count(*)::int FROM ${Y(LibraryReservation)} lx WHERE "school" = $1
-                           AND "status" = ANY($2::text[]))                                             AS "reserved"`,
-                [sid, HELD],
+                        (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+                           AND "reservedBy" = $3::uuid AND "status" = ANY($2::text[]))                 AS "reserved",
+                        (SELECT count(*)::int FROM "${LibraryReservation.tableName}" WHERE "school" = $1
+                           AND "reservedBy" = $3::uuid AND "status" = 'ready')                         AS "reservedReady"`,
+                [sid, HELD, String(req.userId)],
             ),
             // Every filterable value the collection actually contains. Subjects
             // are a jsonb array, so they are unnested rather than grouped whole.
@@ -180,9 +204,9 @@ exports.search = async (req, res) => {
         // The member's own place in the queue for anything on this page.
         const bookIds      = rows.map((b) => b._id);
         const reservations = bookIds.length
-            ? await LibraryReservation.find({
+            ? await everyYear(() => LibraryReservation.find({
                 book: { $in: bookIds }, reservedBy: req.userId, status: { $in: HELD },
-            }).lean()
+            }).lean())
             : [];
         const resMap = Object.fromEntries(reservations.map((r) => [String(r.book), r]));
 
@@ -303,19 +327,25 @@ exports.getMyBooks = async (req, res) => {
         await sweepOverdue(req.schoolId);
 
         const { status } = req.query;
+        // This academic year's loans, plus anything still out from an earlier
+        // one — a book borrowed last year and not yet back is still theirs to
+        // return, but last year's returned loans are last year's.
+        const yr = await require('../utils/activeYear').activeYearWindow(req.schoolId);
         const filter = { school: req.schoolId, issuedTo: req.userId };
+        if (yr) filter.$or = [{ status: { $in: ACTIVE_ISSUANCE } }, { issueDate: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }];
         if (status) filter.status = status;
 
         const [issuances, year, fines] = await Promise.all([
-            LibraryIssuance.find(filter)
+            everyYear(() => LibraryIssuance.find(filter)
                 .populate('book',    'title isbn authors category coverImage')
                 .populate('bookCopy','uniqueCode')
                 .sort({ issueDate: -1 })
-                .lean(),
+                .lean()),
             AcademicYear.findOne({ school: req.schoolId, status: 'active' })
                 .select('yearName startDate endDate').lean(),
-            LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' })
-                .select('amount waivedAmount paidAmount').lean(),
+            // Everything still owed, whichever year it was raised in.
+            everyYear(() => LibraryFine.find({ school: req.schoolId, user: req.userId, status: 'pending' })
+                .select('amount waivedAmount paidAmount').lean()),
         ]);
 
         const now = new Date();
@@ -339,13 +369,16 @@ exports.getMyBooks = async (req, res) => {
 exports.getMyFines = async (req, res) => {
     try {
         const { status } = req.query;
+        // This year's fines plus anything still unpaid from an earlier year.
+        const yr = await require('../utils/activeYear').activeYearWindow(req.schoolId);
         const filter = { school: req.schoolId, user: req.userId };
+        if (yr) filter.$or = [{ status: 'pending' }, { createdAt: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }];
         if (status) filter.status = status;
 
-        const fines = await LibraryFine.find(filter)
+        const fines = await everyYear(() => LibraryFine.find(filter)
             .populate('issuance', 'issueDate dueDate returnDate')
             .sort({ createdAt: -1 })
-            .lean();
+            .lean());
         res.json({ success: true, data: fines });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 };

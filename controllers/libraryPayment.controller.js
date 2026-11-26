@@ -24,7 +24,7 @@ const ReceiptTemplate = require('../models/ReceiptTemplate');
 const paymentGateway = require('../services/paymentGateway');
 const { renderReceipt, defaultTemplate } = require('../services/receiptRenderer');
 const { nextFineReceiptNumber, borrowerAudience, outstandingOf, fineStatusFor,
-        notifyLibraryStaff } = require('../services/libraryRules');
+        notifyLibraryStaff, everyYear } = require('../services/libraryRules');
 const { notify } = require('../services/notifyService');
 
 const FINE_LABEL = { late_return: 'Late return', lost: 'Lost book', damaged: 'Damaged book' };
@@ -116,10 +116,15 @@ exports.getMyFineSummary = async (req, res) => {
         const subject = await resolveSubject(req);
         if (!subject.ok) return res.status(subject.status).json({ success: false, message: subject.message });
 
+        // This year's fines, plus anything still unpaid from an earlier year —
+        // money still owed has to stay payable after the year turns, but last
+        // year's settled fines are last year's.
+        const yr = await require('../utils/activeYear').activeYearWindow(req.schoolId);
+        const fineFilter = { school: req.schoolId, user: subject.userId };
+        if (yr) fineFilter.$or = [{ status: 'pending' }, { createdAt: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }];
         const [school, fines, year, policy] = await Promise.all([
             School.findById(req.schoolId).select('paymentGateway').lean(),
-            LibraryFine.find({ school: req.schoolId, user: subject.userId })
-                .sort({ createdAt: -1 }).limit(200).lean(),
+            everyYear(() => LibraryFine.find(fineFilter).sort({ createdAt: -1 }).limit(200).lean()),
             AcademicYear.findOne({ school: req.schoolId, status: 'active' })
                 .select('yearName startDate endDate').lean(),
             getOrCreatePolicy(req.schoolId),

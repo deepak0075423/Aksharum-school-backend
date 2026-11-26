@@ -8,7 +8,7 @@ const User               = require('../models/User');
 const ClassSection       = require('../models/ClassSection');
 const Class              = require('../models/Class');
 const AcademicYear       = require('../models/AcademicYear');
-const { ACTIVE_ISSUANCE, sweepOverdue, attachFineSummary } = require('../services/libraryRules');
+const { ACTIVE_ISSUANCE, sweepOverdue, attachFineSummary, everyYear } = require('../services/libraryRules');
 
 const ACTIVE_HOLD = ['pending', 'ready'];
 
@@ -69,17 +69,24 @@ exports.getOverview = async (req, res) => {
         const inYear = yr
             ? { $or: [{ status: { $in: ACTIVE_ISSUANCE } }, { issueDate: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }] }
             : {};
-        const [loansRaw, fines, holds] = await Promise.all([
+        // The same for fines: this year's, plus anything still unpaid.
+        const finesInYear = yr
+            ? { $or: [{ status: 'pending' }, { createdAt: { $gte: yr.start, ...(yr.end ? { $lte: yr.end } : {}) } }] }
+            : {};
+        // Library records belong to the year they were made in, so these
+        // filters are the whole rule — read across every year, or a book
+        // borrowed last term and still at home would drop off the page.
+        const [loansRaw, fines, holds] = await everyYear(() => Promise.all([
             LibraryIssuance.find({ school: req.schoolId, issuedTo: { $in: ids }, ...inYear })
                 .populate('book', 'title isbn authors category coverImage')
                 .populate('bookCopy', 'uniqueCode')
                 .sort({ issueDate: -1 }).lean(),
-            LibraryFine.find({ school: req.schoolId, user: { $in: ids } })
+            LibraryFine.find({ school: req.schoolId, user: { $in: ids }, ...finesInYear })
                 .select('user amount waivedAmount paidAmount status paidAt').lean(),
             LibraryReservation.find({ school: req.schoolId, reservedBy: { $in: ids }, status: { $in: ACTIVE_HOLD } })
                 .populate('book', 'title authors coverImage')
                 .sort({ createdAt: -1 }).lean(),
-        ]);
+        ]));
 
         const loans = await attachFineSummary(loansRaw);
         const now   = Date.now();

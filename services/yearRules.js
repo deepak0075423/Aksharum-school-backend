@@ -73,9 +73,16 @@ module.exports = {
     HostelAuditLog:          AUDIT,
 
     // ── Library ──────────────────────────────────────────────────────────────
-    LibraryIssuance:    { at: ['issueDate', 'createdAt'], open: ['issued', 'overdue'] },
-    LibraryFine:        { at: 'createdAt', open: ['pending'] },
-    LibraryReservation: { at: ['reservedAt', 'createdAt'], open: ['pending', 'ready'] },
+    // No `open` carry-over (Nov 27 2026, the user's call): a loan, fine or
+    // reservation belongs to the year it was made in, and a later year's
+    // registers, tiles and reports never show it — "previous data in the
+    // current year" was exactly what they reported. What is still out or still
+    // owed is not lost: every read that ACTS on it (the return desk, scan,
+    // member search, eligibility, a member's own books and fines, a teacher's
+    // exit check) reads every year — see libraryRules.everyYear.
+    LibraryIssuance:    { at: ['issueDate', 'createdAt'] },
+    LibraryFine:        { at: 'createdAt' },
+    LibraryReservation: { at: ['reservedAt', 'createdAt'] },
     LibraryAuditLog:    { at: 'timestamp' },
 
     // ── Payroll ──────────────────────────────────────────────────────────────

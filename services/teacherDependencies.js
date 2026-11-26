@@ -110,12 +110,15 @@ async function collect(teacherId, schoolId) {
     // ── 2. Library ───────────────────────────────────────────────────────────
     let library = { enabled: !!modules.library, books: [], count: 0 };
     if (modules.library) {
-        const loans = await LibraryIssuance.find({
+        // Every book still out, whichever academic year it was borrowed in —
+        // library records belong to their own year, but a book borrowed last
+        // year still has to come back before the teacher leaves.
+        const loans = await require('./yearScope').allYears(() => LibraryIssuance.find({
             school: schoolId, issuedTo: teacherId, status: { $in: ACTIVE_ISSUANCE },
         })
             .populate('book', 'title authors isbn')
             .populate('bookCopy', 'uniqueCode')
-            .lean();
+            .lean());
         const now = Date.now();
         library.books = loans.map((l) => ({
             issuanceId: String(l._id),

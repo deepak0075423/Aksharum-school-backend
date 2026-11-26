@@ -32,13 +32,14 @@ const {
     sweepOverdue, expireStaleHolds, promoteQueue, fineApplies, renewIssuance,
     BORROWER_ROLES, commitIssue, commitReturn, borrowerAudience, nextFineReceiptNumber,
     outstandingOf, fineStatusFor, ACTIVE_RESERVATION, notifyLibraryStaff,
-    attachFineSummary, placeReservation,
+    attachFineSummary, placeReservation, everyYear,
 } = require('../services/libraryRules');
 
 // A dated library table as a list, tile or report should read it: the academic
-// year in view's rows (services/yearRules.js — an issue still out, a fine still
-// unpaid and a reservation still waiting stay in view until they are closed).
-// Opening one record, and every write, reads the table itself.
+// year in view's rows (services/yearRules.js — a loan, fine or reservation
+// belongs to the year it was made in; nothing carries into a later year).
+// Opening one record, every write, and the desk's reads about what somebody
+// holds or owes right now (everyYear) read the table itself.
 const Y = (Model) => yearScope.table(Model);
 
 // How a book can come back over the counter.
@@ -97,7 +98,7 @@ exports.getDashboard = async (req, res) => {
         // Per academic year in view: the tiles are that year's, and one
         // person looking at last year must not leave last year's figures in
         // the cache for everybody else.
-        const key   = `lib:dash:v5:${req.schoolId}:${yearScope.now()?.id || 'all'}`;
+        const key   = `lib:dash:v6:${req.schoolId}:${yearScope.now()?.id || 'all'}`;
         let tiles = null;
         if (redis) {
             try {
@@ -117,7 +118,10 @@ exports.getDashboard = async (req, res) => {
                     `SELECT
                    (SELECT count(*) FROM "${LibraryBook.tableName}"        WHERE "school" = $1)                                  AS "totalBooks",
                    (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1)                                  AS "totalCopies",
-                   (SELECT count(*) FROM "${LibraryBookCopy.tableName}"    WHERE "school" = $1 AND "status" = 'issued')          AS "issuedCopies",
+                   -- The year's loans still out, so the tile and the register it
+                   -- opens count the same rows (a copy still out from an
+                   -- earlier year is that year's loan).
+                   (SELECT count(*) FROM ${Y(LibraryIssuance)} lx    WHERE "school" = $1 AND "status" = ANY('{issued,overdue}'::text[])) AS "issuedCopies",
                    (SELECT count(*) FROM ${Y(LibraryIssuance)} lx    WHERE "school" = $1 AND "status" = 'overdue')         AS "overdue",
                    (SELECT count(*) FROM ${Y(LibraryReservation)} lx WHERE "school" = $1 AND "status" = ANY($2::text[]))    AS "reservations",
                    (SELECT count(*) FROM ${Y(LibraryFine)} lx        WHERE "school" = $1 AND "status" = 'pending')         AS "pendingFines",
@@ -1105,7 +1109,7 @@ exports.searchCopies = async (req, res) => {
                FROM "${LibraryBookCopy.tableName}" c
                JOIN "${LibraryBook.tableName}" b ON b."_id" = c."book"
                LEFT JOIN LATERAL (
-                   SELECT ii."issuedTo", ii."dueDate" FROM ${Y(LibraryIssuance)} ii
+                   SELECT ii."issuedTo", ii."dueDate" FROM "${LibraryIssuance.tableName}" ii
                     WHERE ii."bookCopy" = c."_id" AND ii."status" = ANY($3::text[]) LIMIT 1
                ) i ON true
                LEFT JOIN "${User.tableName}" u ON u."_id" = i."issuedTo"
@@ -1134,8 +1138,9 @@ exports.scanCopy = async (req, res) => {
 
         const [book, issuance] = await Promise.all([
             LibraryBook.findById(copy.book).select('title authors isbn availableCopies totalCopies').lean(),
-            LibraryIssuance.findOne({ bookCopy: copy._id, status: { $in: ACTIVE_ISSUANCE } })
-                .populate('issuedTo', 'name email role').lean(),
+            // The loan on this copy now, whichever year it was made in.
+            everyYear(() => LibraryIssuance.findOne({ bookCopy: copy._id, status: { $in: ACTIVE_ISSUANCE } })
+                .populate('issuedTo', 'name email role').lean()),
         ]);
 
         res.json({
@@ -1200,8 +1205,10 @@ exports.searchMembers = async (req, res) => {
             StudentProfile.find({ user: { $in: ids } }).select('user admissionNumber currentClass currentSection')
                 .populate('currentClass', 'className classNumber').populate('currentSection', 'sectionName').lean(),
             TeacherProfile.find({ user: { $in: ids } }).select('user employeeId designation').lean(),
-            LibraryIssuance.find({ school: req.schoolId, issuedTo: { $in: ids }, status: { $in: ACTIVE_ISSUANCE } }).select('issuedTo dueDate').lean(),
-            LibraryFine.find({ school: req.schoolId, user: { $in: ids }, status: 'pending' }).select('user amount').lean(),
+            // What each person holds and owes now — every year's, since a book
+            // still out from last year still counts against their limit.
+            everyYear(() => LibraryIssuance.find({ school: req.schoolId, issuedTo: { $in: ids }, status: { $in: ACTIVE_ISSUANCE } }).select('issuedTo dueDate').lean()),
+            everyYear(() => LibraryFine.find({ school: req.schoolId, user: { $in: ids }, status: 'pending' }).select('user amount').lean()),
         ]);
 
         const byUser = (rows, key = 'user') => rows.reduce((m, r) => { (m[String(r[key])] ||= []).push(r); return m; }, {});
@@ -1403,11 +1410,12 @@ exports.getReturnForm = async (req, res) => {
             const copy = await LibraryBookCopy.findOne({ school: req.schoolId, uniqueCode: copyCode }).lean();
             if (copy) filter.bookCopy = copy._id;
         }
-        const issuances = await LibraryIssuance.find(filter)
+        // A book can come back in a later year than it went out in.
+        const issuances = await everyYear(() => LibraryIssuance.find(filter)
             .populate('book',    'title isbn')
             .populate('bookCopy','uniqueCode')
             .populate('issuedTo','name email')
-            .lean();
+            .lean());
         const policy = await getOrCreatePolicy(req.schoolId);
         res.json({ success: true, data: { issuances, policy } });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
