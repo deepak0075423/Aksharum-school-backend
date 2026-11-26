@@ -279,10 +279,21 @@ exports.myLedger = async (req, res) => {
         if (!ctx.enabled) return ok(res, { enabled: false, reason: ctx.reason, entries: [] });
 
         const ay = await getActiveAcademicYearLabel(req.schoolId);
+        // Named, as the office's ledger is — the drawer said "Unknown
+        // employee" when the entry carried only the id (Nov 26 2026).
         const entries = await LeaveLedger.find({
             teacher: req.userId, school: req.schoolId,
             leaveType: ctx.leaveType._id, academicYear: ay,
-        }).sort({ createdAt: -1 }).limit(200).lean();
+        }).populate('teacher', 'name email').sort({ createdAt: -1 }).limit(200).lean();
+        const me = await TeacherProfile.findOne({ user: req.userId, school: req.schoolId })
+            .select('employeeId designation department').lean();
+        for (const e of entries) {
+            if (e.teacher && typeof e.teacher === 'object') {
+                e.teacher.employeeId  = me?.employeeId  || '';
+                e.teacher.designation = me?.designation || '';
+                e.teacher.department  = me?.department  || '';
+            }
+        }
 
         ok(res, { enabled: true, academicYear: ay, entries });
     } catch (e) { bad(res, e.message, 500); }
