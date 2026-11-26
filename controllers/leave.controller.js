@@ -3149,7 +3149,10 @@ exports.teacherGetMyLeaves = async (req, res) => {
         const yearArgs = scope.from && scope.to ? [scope.from, scope.to] : [];
 
         const [apps, total, byStatus] = await Promise.all([
+            // The employee named on every row: the drawer read "Unknown teacher"
+            // when the row carried only the id (Nov 26 2026).
             LeaveApplication.find(filter)
+                .populate('teacher', 'name email')
                 .populate('leaveType', 'name code category')
                 .populate('approvedBy','name')
                 .sort({ appliedAt: -1 })
@@ -3168,6 +3171,17 @@ exports.teacherGetMyLeaves = async (req, res) => {
                 [String(req.userId), String(req.schoolId), ...yearArgs],
             ),
         ]);
+
+        // Their own number and post, as the office's rows carry them.
+        const me = await TeacherProfile.findOne({ user: req.userId, school: req.schoolId })
+            .select('employeeId designation department').lean();
+        for (const a of apps) {
+            if (a.teacher && typeof a.teacher === 'object') {
+                a.teacher.employeeId  = me?.employeeId  || '';
+                a.teacher.designation = me?.designation || '';
+                a.teacher.department  = me?.department  || '';
+            }
+        }
 
         const stat = (k) => byStatus.rows.find((r) => r.status === k)?.n || 0;
         res.json({
