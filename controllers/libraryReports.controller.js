@@ -435,10 +435,9 @@ exports.deadStock = async (req, res) => {
     try {
         const report = byKey('dead');
         const { page, limit, offset } = paging(req.query);
+        // No date is "all time": a title that has never been lent at all.
         const parsed = req.query.since ? new Date(`${req.query.since}T00:00:00.000Z`) : null;
-        const since = parsed && !Number.isNaN(parsed.getTime())
-            ? parsed
-            : new Date(Date.now() - 365 * 86400000);
+        const since = parsed && !Number.isNaN(parsed.getTime()) ? parsed : null;
 
         const values = [String(req.schoolId), since];
         const w = conditions(['b."school" = $1'], values);
@@ -457,7 +456,7 @@ exports.deadStock = async (req, res) => {
               ) cv ON true
              WHERE ${w.sql()}`;
         const GROUP  = `GROUP BY b."_id", b."title", b."isbn", b."category", b."totalCopies", cv."value"`;
-        const HAVING = `HAVING max(i."issueDate") IS NULL OR max(i."issueDate") < $2`;
+        const HAVING = `HAVING max(i."issueDate") IS NULL OR ($2::timestamptz IS NOT NULL AND max(i."issueDate") < $2)`;
 
         const rowLimit = wantsXlsx(req) ? EXPORT_CAP : limit;
         const { rows } = await pool.query(
@@ -502,12 +501,12 @@ exports.deadStock = async (req, res) => {
             })),
             total: num(a.titles), page, limit,
             summary: [
-                stat('Titles not moving', num(a.titles), 'num', `No loan since ${day(since)}`),
+                stat('Titles not moving', num(a.titles), 'num', since ? `No loan since ${day(since)}` : 'Never lent, all time'),
                 stat('Never borrowed', num(a.never), 'num', 'Not once since it was catalogued'),
                 stat('Copies on the shelf', num(a.copies), 'num'),
                 stat('Value tied up', money(a.value), 'money', 'What those copies cost'),
             ],
-            extra: { since: day(since) },
+            extra: { since: since ? day(since) : '' },
         });
     } catch (e) { fail(res, e); }
 };
@@ -874,9 +873,9 @@ exports.usageStatistics = async (req, res) => {
         const grain = req.query.grain === 'week' ? 'week' : 'month';
         const role  = BORROWER_ROLES.includes(req.query.role) ? req.query.role : null;
 
-        // Twelve periods back by default, so the page opens on a real series
-        // instead of everything the library has ever done.
-        const start = from || new Date(Date.now() - (grain === 'week' ? 12 * 7 : 365) * 86400000);
+        // No window is all time (the report opens on it): from the first
+        // record to now.
+        const start = from || new Date(0);
         const end   = to   || new Date();
         const values = [String(req.schoolId), start, end, grain, role];
 
@@ -1037,7 +1036,9 @@ const F = {
     // period that suits it — a month of fines, a year of accessions — and the
     // client should not have to carry a table of which is which.
     range:     (preset = 'last90') => ({ key: 'range', type: 'daterange', label: 'Period', preset }),
-    since:     { key: 'since',    type: 'date',      label: 'Not borrowed since', preset: 'year' },
+    // Blank = all time: a title nobody has ever borrowed (Nov 27 2026 — the
+    // reports open on all time, not on the last year).
+    since:     { key: 'since',    type: 'date',      label: 'Not borrowed since', preset: 'all' },
     member:    { key: 'userId',   type: 'member',    label: 'Member', required: true },
     search:    (placeholder) => ({ key: 'q', type: 'search', label: 'Search', placeholder }),
     class:     { key: 'classId',  type: 'select', label: 'Class',       all: 'All classes',   source: 'classes' },
@@ -1142,7 +1143,7 @@ const REPORTS = [
         name: 'Most Borrowed',
         blurb: 'The titles doing the work — and how hard each copy is working.',
         icon: 'trending', tone: 'indigo', path: '/library/reports/popular',
-        filters: [F.range('last90'), F.category, F.role, F.search('Search by title, author or ISBN…')],
+        filters: [F.range('all'), F.category, F.role, F.search('Search by title, author or ISBN…')],
         columns: [
             col('book',    'Book',      'title', { sub: 'isbn' }),
             col('isbn',    'ISBN',      'text',  { inline: true }),
@@ -1195,7 +1196,7 @@ const REPORTS = [
         name: 'Accession Register',
         blurb: 'What the library owns and what it was paid for, in accession order.',
         icon: 'fileCheck', tone: 'teal', path: '/library/reports/accession',
-        filters: [F.range('last365'), F.accessionStatus, F.vendor, F.search('Search by title, accession or bill no…')],
+        filters: [F.range('all'), F.accessionStatus, F.vendor, F.search('Search by title, accession or bill no…')],
         columns: [
             col('accession','Accession no', 'code'),
             col('book',     'Book',      'title', { sub: 'isbn' }),
@@ -1234,7 +1235,7 @@ const REPORTS = [
         name: 'Fine Ledger',
         blurb: 'Every fine raised, what was collected, waived and still owed.',
         icon: 'banknote', tone: 'green', path: '/library/reports/fines',
-        filters: [F.range('last90'), F.class, F.role, F.fineStatus, F.fineType, F.search('Search by member, book or receipt…')],
+        filters: [F.range('all'), F.class, F.role, F.fineStatus, F.fineType, F.search('Search by member, book or receipt…')],
         columns: [
             col('member', 'Member', 'person', { sub: 'class' }),
             col('class',  'Class',  'text',   { inline: true }),
@@ -1258,7 +1259,7 @@ const REPORTS = [
         name: 'Usage Statistics',
         blurb: 'The library period by period — loans, returns, readers and fines.',
         icon: 'chart', tone: 'indigo', path: '/library/reports/usage',
-        filters: [F.range('last365'), F.grain, F.role],
+        filters: [F.range('all'), F.grain, F.role],
         columns: [
             col('period',   'Period',  'text'),
             col('loans',    'Loans',   'num', { align: 'right' }),
