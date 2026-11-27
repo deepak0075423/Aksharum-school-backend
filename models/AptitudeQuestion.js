@@ -1,8 +1,11 @@
 const db = require('../db/orm');
 
+// An option is words, a picture, or both (Nov 2026) — `image` is an address
+// under /uploads/exam-images, checked by services/aptitudeExam.checkQuestion.
 const OptionSchema = new db.Schema({
     optionId: { type: String, required: true }, // 'a', 'b', 'c', 'd', 'true', 'false'
-    text:     { type: String, required: true, trim: true },
+    text:     { type: String, default: '', trim: true },
+    image:    { type: String, default: '' },
 }, { _id: false });
 
 const AptitudeQuestionSchema = new db.Schema({
@@ -16,10 +19,16 @@ const AptitudeQuestionSchema = new db.Schema({
         ref: 'School',
         required: true,
     },
+    // Any language (Nov 2026) — and x², 10⁻³, √, π. A question is words, a
+    // picture (`questionImage`, a screenshot or diagram), or both.
     questionText: {
         type: String,
-        required: true,
+        default: '',
         trim: true,
+    },
+    questionImage: {
+        type: String,
+        default: '',
     },
     questionType: {
         type: String,

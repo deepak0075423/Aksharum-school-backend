@@ -15,10 +15,12 @@ const ClassSection     = require('../models/ClassSection');
 const StudentProfile   = require('../models/StudentProfile');
 const ParentProfile    = require('../models/ParentProfile');
 
+const fs               = require('fs');
 const {
     shuffle, scoreAttempt, examSectionIds, reachesSection,
     checkQuestion, examStage, examWindow,
 } = require('../services/aptitudeExam');
+const aptitudeNotify = require('../services/aptitudeNotify');
 const { teacherExamScope, examPermissionError, scopeForForm } = require('../services/examPermissions');
 const {
     T, PASS_RATIO, fetchRows, CALENDAR_ORDER, readForm, windowError, formMeta, publishReadinessFor,
@@ -182,8 +184,9 @@ exports.createExam = async (req, res) => {
         const late = windowError(fields);
         if (late) return bad(res, late);
 
+        // `??`, not `||`: 0 tab switches is a setting, and `|| 3` turned it into 3.
         const exam = await AptitudeExam.create({
-            ...fields, maxViolations: fields.maxViolations || 3,
+            ...fields, maxViolations: fields.maxViolations ?? 3,
             school: req.schoolId, createdBy: req.userId, status: 'draft',
         });
         res.status(201).json({ success: true, data: exam });
@@ -280,6 +283,8 @@ exports.publishExam = async (req, res) => {
 
         exam.status = 'published';
         await exam.save();
+        // Every student it reaches, and their parents, hear when and what.
+        aptitudeNotify.published(exam, req);
         res.json({ success: true, data: exam });
     } catch (e) { fail(res, e); }
 };
@@ -332,6 +337,7 @@ exports.updateQuestion = async (req, res) => {
         const { question, error } = checkQuestion({
             questionText: pick('questionText'), questionType: pick('questionType'),
             options: pick('options'), correctAnswers: pick('correctAnswers'), marks: pick('marks'),
+            questionImage: pick('questionImage'),
         });
         if (error) return bad(res, error);
 
@@ -351,6 +357,39 @@ exports.deleteQuestion = async (req, res) => {
         if (!q) return notFound(res, 'Question not found');
         res.json({ success: true });
     } catch (e) { fail(res, e); }
+};
+
+/** What a file's first bytes say it is — the type a browser claims can be anything. */
+async function sniffImage(file) {
+    const fh = await fs.promises.open(file, 'r');
+    try {
+        const b = Buffer.alloc(12);
+        await fh.read(b, 0, 12, 0);
+        if (b[0] === 0x89 && b.toString('ascii', 1, 4) === 'PNG') return 'png';
+        if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'jpg';
+        if (b.toString('ascii', 0, 4) === 'GIF8') return 'gif';
+        if (b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP') return 'webp';
+        return null;
+    } finally { await fh.close(); }
+}
+
+/**
+ * A picture for a question or an option — a screenshot, a diagram (Nov 2026).
+ * Uploaded on its own, the moment it is chosen or pasted; the question then
+ * carries its address (`questionImage`, `options[].image`) like any other
+ * field, and checkQuestion() accepts only addresses handed out here.
+ */
+exports.uploadQuestionImage = async (req, res) => {
+    const drop = () => (req.file?.path ? fs.promises.unlink(req.file.path).catch(() => {}) : null);
+    try {
+        if (!req.file) return bad(res, 'Choose a picture to upload');
+        const exam = await AptitudeExam.findOne(ownExam(req)).lean();
+        if (!exam) { await drop(); return notFound(res); }
+        if (exam.status !== 'draft') { await drop(); return bad(res, 'Questions of a published exam can no longer change'); }
+        const kind = await sniffImage(req.file.path);
+        if (!kind) { await drop(); return bad(res, 'That file is not a picture — upload a PNG, JPG, WebP or GIF'); }
+        res.status(201).json({ success: true, data: { url: `/uploads/exam-images/${req.file.filename}`, size: req.file.size } });
+    } catch (e) { await drop(); fail(res, e); }
 };
 
 // ── Teacher: submissions & analytics ─────────────────────────────────────────
@@ -566,6 +605,8 @@ exports.subjectApproveResults = async (req, res) => {
         exam.subjectTeacherApprovedBy     = req.userId;
         exam.subjectTeacherApprovedAt     = new Date();
         await exam.save();
+        // The class teachers sign next.
+        aptitudeNotify.scoresConfirmed(exam, req);
         res.json({ success: true, data: exam });
     } catch (e) { fail(res, e); }
 };
@@ -592,6 +633,11 @@ exports.approveResults = async (req, res) => {
         if (authorIsTeacher && exam.subjectTeacherApprovalStatus !== 'approved')
             return bad(res, 'Subject teacher must approve first');
         if (action === 'reject' && !String(reason || '').trim()) return bad(res, 'Give a reason for rejecting');
+        // Once students and parents can see the results, taking them back is the
+        // school office's call alone, from the admin screen — and asked twice.
+        if (resultsOut(exam)) {
+            return res.status(403).json({ success: false, message: 'These results are already out. Only the school admin can withhold them now.' });
+        }
 
         const now = new Date();
         if (!authorIsTeacher && exam.subjectTeacherApprovalStatus !== 'approved') {
@@ -609,7 +655,10 @@ exports.approveResults = async (req, res) => {
             exam.resultApprovalStatus  = 'rejected';
             exam.resultRejectionReason = String(reason).trim();
         }
+        exam.resultsNotifiedAt = null;   // a later release is news again
         await exam.save();
+        if (action === 'approve') aptitudeNotify.resultsIfDue(exam._id, req);
+        else aptitudeNotify.resultsRejected(exam, req);
         res.json({ success: true, data: exam });
     } catch (e) { fail(res, e); }
 };
@@ -744,6 +793,7 @@ exports.getAttemptExam = async (req, res) => {
             return {
                 _id:          q._id,
                 questionText: q.questionText,
+                questionImage: q.questionImage || '',
                 questionType: q.questionType,
                 marks:        q.marks,
                 options:      optOrder ? optOrder.options : q.options,
@@ -802,7 +852,8 @@ exports.logViolation = async (req, res) => {
 
         const exam = await AptitudeExam.findById(req.params.id).lean();
         attempt.violationCount += 1;
-        const autoSubmit = attempt.violationCount >= (exam?.maxViolations || 3);
+        // 0 allowed switches means the first one submits; `|| 3` used to read 0 as 3.
+        const autoSubmit = attempt.violationCount >= Math.max(1, exam?.maxViolations ?? 3);
         if (autoSubmit) {
             attempt.status      = 'auto_submitted';
             attempt.submittedAt = new Date();

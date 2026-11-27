@@ -166,20 +166,49 @@ const QUESTION_TYPES = ['mcq_single', 'mcq_multiple', 'true_false'];
 const TF_OPTIONS = [{ optionId: 'true', text: 'True' }, { optionId: 'false', text: 'False' }];
 
 /**
+ * A picture on a question or an option: only an address this server handed
+ * out (POST …/exams/:id/questions/image) — never someone else's site, a
+ * data: URL or a script. '' for none; `false` for one that is not ours.
+ */
+const EXAM_IMAGE = /^\/uploads\/exam-images\/[0-9a-f-]{36}\.(png|jpg|webp|gif)$/i;
+function examImage(v) {
+    const s = String(v ?? '').trim();
+    if (!s) return '';
+    return EXAM_IMAGE.test(s) ? s : false;
+}
+
+/**
  * The rules one question must meet, whichever door it came in by — the form or
  * a spreadsheet. Returns `{ question }` or `{ error }`.
+ *
+ * Text is any language (Nov 2026) — maths with x², 10⁻³ and √ included. A
+ * question is words, a picture, or both; so is each option.
  */
-function checkQuestion({ questionText, questionType, options, correctAnswers, marks }) {
+function checkQuestion({ questionText, questionType, options, correctAnswers, marks, questionImage }) {
     const text = String(questionText || '').trim();
-    if (!text) return { error: 'Question text is required' };
+    const image = examImage(questionImage);
+    if (image === false) return { error: 'The question’s picture was not uploaded here — add it again' };
+    if (!text && !image) return { error: 'Write the question, or add a picture of it' };
+    if (text.length > 4000) return { error: 'The question is too long — keep it under 4,000 characters' };
     if (!QUESTION_TYPES.includes(questionType)) return { error: 'Type must be single choice, multiple choice or true/false' };
 
     const m = Number(marks);
     if (!Number.isFinite(m) || m < 0.5) return { error: 'Marks must be 0.5 or more' };
 
-    let opts = questionType === 'true_false'
-        ? TF_OPTIONS
-        : (options || []).map(o => ({ optionId: String(o.optionId), text: String(o.text || '').trim() })).filter(o => o.text);
+    let opts;
+    if (questionType === 'true_false') {
+        opts = TF_OPTIONS;
+    } else {
+        opts = [];
+        for (const o of (options || [])) {
+            const optText = String(o?.text || '').trim();
+            const optImage = examImage(o?.image);
+            if (optImage === false) return { error: `Option ${String(o?.optionId || '').toUpperCase()}’s picture was not uploaded here — add it again` };
+            if (optText.length > 1000) return { error: `Option ${String(o?.optionId || '').toUpperCase()} is too long — keep it under 1,000 characters` };
+            if (!optText && !optImage) continue;
+            opts.push({ optionId: String(o.optionId), text: optText, ...(optImage ? { image: optImage } : {}) });
+        }
+    }
     if (questionType !== 'true_false' && opts.length < 2) return { error: 'Give at least two options' };
 
     const ids = new Set(opts.map(o => o.optionId));
@@ -189,7 +218,7 @@ function checkQuestion({ questionText, questionType, options, correctAnswers, ma
     if (stray) return { error: `Correct answer "${stray.toUpperCase()}" is not one of the options` };
     if (questionType !== 'mcq_multiple' && correct.length !== 1) return { error: 'A single-answer question takes exactly one correct answer' };
 
-    return { question: { questionText: text, questionType, options: opts, correctAnswers: correct, marks: m } };
+    return { question: { questionText: text, questionImage: image, questionType, options: opts, correctAnswers: correct, marks: m } };
 }
 
 const LETTERS = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -345,5 +374,5 @@ module.exports = {
     shuffle, scoreAttempt, getActiveYear,
     examSectionIds, reachesSection, reachesAnySection,
     SERVER_TZ, examWindow, examStage, startSql, endSql, stageSql, sectionsSql, scoredAttemptsSql,
-    QUESTION_TYPES, checkQuestion, questionFromRow,
+    QUESTION_TYPES, checkQuestion, questionFromRow, examImage, EXAM_IMAGE,
 };

@@ -221,6 +221,27 @@ const ROUTES = {
         teacher:      { web: '/admin/results?exam={id}',         mobile: '/modules/admin/results' },
     },
 
+    // ── Aptitude exams ───────────────────────────────────────────────────────
+    // An exam published, open now, cancelled or withdrawn.
+    'aptitude.exam': {
+        student:      { web: '/student/exams',          mobile: '/modules/exams' },
+        parent:       { web: '/parent/exams',           mobile: '/modules/exams' },
+        teacher:      { web: '/teacher/exams/{id}',     mobile: '/modules/exam-workspace?id={id}' },
+        school_admin: { web: '/admin/exams',            mobile: '/modules/admin/exams' },
+    },
+    // Results out: the student's own marked paper; the parent's results list.
+    'aptitude.result': {
+        student:      { web: '/student/exams/{id}/result', mobile: '/modules/exam-result?id={id}' },
+        parent:       { web: '/parent/exams',              mobile: '/modules/exams' },
+        teacher:      { web: '/teacher/exams/{id}/results', mobile: '/modules/exam-workspace?id={id}&tab=results' },
+        school_admin: { web: '/admin/exams',               mobile: '/modules/admin/exams' },
+    },
+    // Results waiting on the reader's sign-off (confirm scores / final approval).
+    'aptitude.approvals': {
+        teacher:      { web: '/teacher/exams/{id}/results', mobile: '/modules/exam-workspace?id={id}&tab=results' },
+        school_admin: { web: '/admin/exams',               mobile: '/modules/admin/exams' },
+    },
+
     // ── Timetable ────────────────────────────────────────────────────────────
     'timetable': {
         teacher:      { web: '/teacher/timetable',  mobile: '/modules/timetable' },
@@ -749,6 +770,7 @@ const MODULE_OF = {
     medical: 'medical',
     admission: 'admission',
     directory: 'employeeDirectory',
+    aptitude: 'aptitudeExam',
 };
 
 const MODULE_LABELS = {
@@ -756,7 +778,7 @@ const MODULE_LABELS = {
     library: 'Library', results: 'Results', timetable: 'Timetable',
     calendar: 'Calendar', inventory: 'Inventory', transport: 'Transport',
     hostel: 'Hostel', video: 'Video Learning', feedback: 'Feedback',
-    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', admission: 'Admissions', employeeDirectory: 'Employee Directory', general: 'General',
+    academics: 'Academics', documents: 'Documents', idcards: 'ID Cards', medical: 'Medical Room', admission: 'Admissions', employeeDirectory: 'Employee Directory', aptitudeExam: 'Aptitude Exams', general: 'General',
 };
 
 // Somebody is waiting on the reader, or money is owed. These are the ones that
@@ -771,6 +793,7 @@ const HIGH_TYPES = [
     'documents.item',
     'directory.mydocs', 'directory.review', 'directory.requests',
     'medical.desk', 'medical.changes', 'medical.round',
+    'aptitude.approvals',
 ];
 
 // Nothing is being asked and nothing has changed for the reader personally —

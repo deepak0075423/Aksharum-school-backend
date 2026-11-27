@@ -60,7 +60,14 @@ function checkText(node, { english = true } = {}, key = null, depth = 0) {
     return null;
 }
 
-const optionsFor = (req) => ({ english: !/^\/api\/chat(\/|$)/.test(req.originalUrl || '') });
+// Where any language is welcome: chat (free conversation), and an aptitude
+// exam's questions and options — a paper may be set in Hindi, Bengali or any
+// other language, and maths needs x², 10⁻³, √, π. Markup is still refused.
+const ANY_LANGUAGE = [
+    /^\/api\/chat(\/|$)/,
+    /^\/api\/(teacher|admin)\/exams\/[^/?#]+\/questions(\/|\?|$)/,
+];
+const optionsFor = (req) => ({ english: !ANY_LANGUAGE.some(re => re.test(req.originalUrl || '')) });
 // Internal calls, and signed machine-to-machine webhooks (a mail provider's bounce report quotes the server verbatim).
 const exempt = (req) => /^\/internal(\/|$)|^\/api\/admission\/webhooks\//.test(req.originalUrl || '');
 
@@ -76,9 +83,9 @@ function textSafety(req, res, next) {
  * the first problem as "Row 7: Full name must be in English …", or null.
  * Row 1 is the sheet's header, so the first data row is 2.
  */
-function sheetTextProblem(rows = [], { firstRow = 2 } = {}) {
+function sheetTextProblem(rows = [], { firstRow = 2, english = true } = {}) {
     for (let i = 0; i < rows.length; i++) {
-        const bad = checkText(rows[i]);
+        const bad = checkText(rows[i], { english });
         if (bad) return `Row ${i + firstRow}: ${bad}`;
     }
     return null;

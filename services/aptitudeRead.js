@@ -375,10 +375,12 @@ async function readForm(req, { partial = false, allowedSections = null } = {}) {
     const numErr = num('duration', 'Duration (minutes)', 1, 600)
         || num('totalQuestions', 'Total questions', 1, 500)
         || num('totalMarks', 'Total marks', 1, 10000)
-        || (b.maxViolations === undefined || b.maxViolations === '' ? null : num('maxViolations', 'Allowed violations', 1, 20));
+        // 0 is allowed: no tab switching at all — the first switch submits the paper.
+        || (b.maxViolations === undefined || b.maxViolations === '' || b.maxViolations === null ? null : num('maxViolations', 'Allowed tab switches', 0, 20));
     if (numErr) return { error: numErr };
     if (fields.duration !== undefined && !Number.isInteger(fields.duration)) return { error: 'Duration is a whole number of minutes' };
     if (fields.totalQuestions !== undefined && !Number.isInteger(fields.totalQuestions)) return { error: 'Total questions is a whole number' };
+    if (fields.maxViolations !== undefined && !Number.isInteger(fields.maxViolations)) return { error: 'Allowed tab switches is a whole number' };
 
     return { fields };
 }

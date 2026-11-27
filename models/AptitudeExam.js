@@ -65,11 +65,13 @@ const AptitudeExamSchema = new db.Schema({
         required: true,
         min: 1,
     },
-    // Anti-cheating: auto-submit after this many violations
+    // Anti-cheating: the paper is submitted at this many tab switches. 0 is a
+    // real setting (Nov 2026) — no switching at all: the first one submits.
+    // It used to be read as `|| 3`, so a saved 0 came back as 3.
     maxViolations: {
         type: Number,
         default: 3,
-        min: 1,
+        min: 0,
     },
     status: {
         type: String,
@@ -118,6 +120,11 @@ const AptitudeExamSchema = new db.Schema({
         type: Date,
         default: null,
     },
+    // Who has been told what (services/aptitudeNotify). Each is claimed before
+    // anyone is told, so a restart or a second worker never sends one twice.
+    openNotifiedAt:    { type: Date, default: null },   // "the exam is open now" — students
+    closeNotifiedAt:   { type: Date, default: null },   // "sign off the results" — teachers
+    resultsNotifiedAt: { type: Date, default: null },   // "results are out" — students + parents
 }, { timestamps: true });
 
 AptitudeExamSchema.index({ section: 1, examDate: 1 });

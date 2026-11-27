@@ -25,7 +25,7 @@ const { verifyToken, requireRole, requirePasswordReset } = require('../../middle
 const { modulesHandler } = require('../../utils/moduleResponse');
 const { allowModuleAdmin } = require('../../middleware/moduleAccess');
 const desigCtrl      = require('../../controllers/designation.controller');
-const { uploadExcel, uploadDocument, uploadCsv, uploadLeaveDoc, uploadImage, uploadStaffDoc, uploadStudentDoc } = require('../../middleware/upload');
+const { uploadExcel, uploadDocument, uploadCsv, uploadLeaveDoc, uploadImage, uploadStaffDoc, uploadStudentDoc, uploadExamImage } = require('../../middleware/upload');
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('school_admin')];
 
@@ -398,6 +398,7 @@ router.post  ('/exams/:id/unpublish',          examGuard, aptAdmin.unpublishExam
 router.post  ('/exams/:id/cancel',             examGuard, aptAdmin.cancelExam);
 router.post  ('/exams/:id/results',            examGuard, aptAdmin.decideResults);
 router.get   ('/exams/:id/questions',          examGuard, schoolScope, examCtrl.getQuestions);
+router.post  ('/exams/:id/questions/image',    examGuard, schoolScope, uploadExamImage.single('image'), examCtrl.uploadQuestionImage);
 router.post  ('/exams/:id/questions',          examGuard, schoolScope, examCtrl.addQuestion);
 router.post  ('/exams/:id/questions/import',   examGuard, schoolScope, uploadCsv.single('file'), aptAdmin.importQuestions);
 router.put   ('/exams/:id/questions/:qid',     examGuard, schoolScope, examCtrl.updateQuestion);

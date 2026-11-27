@@ -162,6 +162,32 @@ const lmsRequestFilter = (req, file, cb) => {
 };
 const uploadLmsRequestDoc = multer({ storage: diskStorage('lms-requests'), fileFilter: lmsRequestFilter, limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
 
+// Aptitude exam pictures — a screenshot of a question, a diagram, a picture as
+// an option (Nov 2026). Public (uploads/exam-images) because every paper draws
+// them, but each is named by a random UUID, so an address cannot be guessed
+// before the exam hands it out. No SVG: a drawing can carry script. The name
+// is the server's own — the questions refuse any picture address that is not
+// one of these (services/aptitudeExam.checkQuestion).
+const examImageStorage = multer.diskStorage({
+    destination(req, file, cb) {
+        const dir = path.join(__dirname, '..', 'uploads', 'exam-images');
+        ensureDir(dir);
+        cb(null, dir);
+    },
+    filename(req, file, cb) {
+        const ext = ({ 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif' })[file.mimetype]
+            || (path.extname(file.originalname || '').toLowerCase().match(/^\.(png|jpe?g|webp|gif)$/)?.[0] ?? '.png');
+        cb(null, `${require('crypto').randomUUID()}${ext}`);
+    },
+});
+const examImageFilter = (req, file, cb) => {
+    // A pasted screenshot arrives as "image.png" or with no name at all — the type decides.
+    const ok = /^image\/(png|jpeg|webp|gif)$/.test(file.mimetype || '')
+        && !/\.(svg|svgz|html?|js)$/i.test(file.originalname || '');
+    cb(ok ? null : Object.assign(new Error('Upload a picture — PNG, JPG, WebP or GIF'), { status: 400 }), ok);
+};
+const uploadExamImage = multer({ storage: examImageStorage, fileFilter: examImageFilter, limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
+
 /**
  * A multipart form's text fields only exist once multer has read it, so the
  * rules server.js applies to every other body — phone numbers
@@ -219,6 +245,6 @@ const withPhoneCheck = (instance) => {
     return instance;
 };
 [uploadProfile, uploadDocument, uploadSubmission, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo,
-    uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc, uploadAdmissionDoc, uploadLmsImage, uploadLmsRequestDoc].forEach(withPhoneCheck);
+    uploadStaffDoc, uploadStudentDoc, uploadHostelDoc, uploadAttendanceDoc, uploadMedicalDoc, uploadAdmissionDoc, uploadLmsImage, uploadLmsRequestDoc, uploadExamImage].forEach(withPhoneCheck);
 
-module.exports = { DOCUMENT_TYPES, uploadSubmission, uploadLmsImage, uploadLmsRequestDoc, uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };
+module.exports = { DOCUMENT_TYPES, uploadExamImage, uploadSubmission, uploadLmsImage, uploadLmsRequestDoc, uploadAdmissionDoc, uploadMedicalDoc, uploadAttendanceDoc, uploadProfile, uploadDocument, uploadExcel, uploadImage, uploadLeaveDoc, uploadCsv, uploadChat, uploadVideo, uploadStaffDoc, uploadStudentDoc, uploadHostelDoc };

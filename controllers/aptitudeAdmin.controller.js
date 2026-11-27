@@ -33,8 +33,9 @@ const {
 
 const {
     T, PASS_RATIO, EXAM_BASE, averagesFor, fetchRows, CALENDAR_ORDER, listWhere,
-    readForm, windowError, formMeta, publishReadinessFor, resolveYear, yearOptions,
+    readForm, windowError, formMeta, publishReadinessFor, resolveYear, yearOptions, resultsOut,
 } = require('../services/aptitudeRead');
+const aptitudeNotify = require('../services/aptitudeNotify');
 
 const fail = (res, e) => res.status(500).json({ success: false, message: e.message });
 const bad  = (res, message, extra = {}) => res.status(400).json({ success: false, message, ...extra });
@@ -324,9 +325,10 @@ exports.createExam = async (req, res) => {
         const late = windowError(fields);
         if (late) return bad(res, late);
 
+        // `??`, not `||`: 0 tab switches is a setting, and `|| 3` turned it into 3.
         const exam = await AptitudeExam.create({
             ...fields,
-            maxViolations: fields.maxViolations || 3,
+            maxViolations: fields.maxViolations ?? 3,
             school: req.schoolId,
             createdBy: req.userId,
             status: 'draft',
@@ -418,7 +420,7 @@ exports.duplicateExam = async (req, res) => {
             duration: src.duration,
             totalQuestions: src.totalQuestions,
             totalMarks: src.totalMarks,
-            maxViolations: src.maxViolations || 3,
+            maxViolations: src.maxViolations ?? 3,
             status: 'draft',
         });
 
@@ -426,7 +428,7 @@ exports.duplicateExam = async (req, res) => {
         if (questions.length) {
             await AptitudeQuestion.insertMany(questions.map((q, i) => ({
                 exam: copy._id, school: req.schoolId,
-                questionText: q.questionText, questionType: q.questionType,
+                questionText: q.questionText || '', questionImage: q.questionImage || '', questionType: q.questionType,
                 options: q.options || [], correctAnswers: q.correctAnswers || [],
                 marks: q.marks, order: i + 1,
             })));
@@ -445,6 +447,8 @@ exports.unpublishExam = async (req, res) => {
         if (attempts) return bad(res, 'Students have already started this exam');
         exam.status = 'draft';
         await exam.save();
+        // They were told it was coming; tell them it is off for now.
+        aptitudeNotify.withdrawn(exam, req, 'draft');
         res.json({ success: true, data: exam });
     } catch (e) { fail(res, e); }
 };
@@ -457,6 +461,7 @@ exports.cancelExam = async (req, res) => {
         if (!['scheduled', 'live'].includes(examStage(exam))) return bad(res, 'Only a scheduled or live exam can be cancelled');
         exam.status = 'cancelled';
         await exam.save();
+        aptitudeNotify.withdrawn(exam, req, 'cancelled');
         res.json({ success: true, data: exam });
     } catch (e) { fail(res, e); }
 };
@@ -468,15 +473,32 @@ exports.cancelExam = async (req, res) => {
  * the admin wrote has no subject teacher to approve it first, and one a
  * teacher wrote can be released without waiting on them. Whoever signed is
  * recorded on both steps that were still open.
+ *
+ * Results already OUT (released, and their publish date reached) are taken
+ * back only by a school admin — not a teacher holding the module — and only
+ * with `confirm: true`, which the screen sends from its own "are you sure"
+ * step (Nov 2026). Before, Withhold sat beside released results like any
+ * other button.
  */
 exports.decideResults = async (req, res) => {
     try {
-        const { action, reason, publishDate } = req.body || {};
+        const { action, reason, publishDate, confirm } = req.body || {};
         if (!['release', 'withhold'].includes(action)) return bad(res, 'Choose release or withhold');
 
         const exam = await AptitudeExam.findOne({ _id: req.params.id, school: req.schoolId });
         if (!exam) return res.status(404).json({ success: false, message: 'Exam not found' });
         if (examStage(exam) !== 'completed') return bad(res, 'Results can be released once the exam has closed');
+
+        const out = resultsOut(exam);
+        if (action === 'release' && out) return bad(res, 'These results are already out');
+        if (action === 'withhold' && out) {
+            if (req.userRole !== 'school_admin') {
+                return res.status(403).json({ success: false, message: 'These results are already out. Only the school admin can withhold them now.' });
+            }
+            if (confirm !== true) {
+                return res.status(409).json({ success: false, code: 'CONFIRM_WITHHOLD', message: 'Students and parents can already see these results — confirm to withhold them' });
+            }
+        }
 
         const now = new Date();
         if (exam.subjectTeacherApprovalStatus !== 'approved') {
@@ -500,7 +522,10 @@ exports.decideResults = async (req, res) => {
             exam.resultApprovalStatus = 'rejected';
             exam.resultRejectionReason = String(reason || '').trim();
         }
+        exam.resultsNotifiedAt = null;   // a later release is news again
         await exam.save();
+        // Out now: told now. Out on a later date: the minute sweep tells them then.
+        if (action === 'release') aptitudeNotify.resultsIfDue(exam._id, req);
         res.json({ success: true, data: exam });
     } catch (e) { fail(res, e); }
 };
@@ -561,7 +586,8 @@ exports.importQuestions = async (req, res) => {
         rows = rows.filter(r => Object.values(r).some(v => String(v).trim() !== ''));
         if (!rows.length) return bad(res, 'The sheet has no rows');
         if (rows.length > 500) return bad(res, 'Import at most 500 questions at a time');
-        const textBad = sheetTextProblem(rows);
+        // Any language — a paper may be set in Hindi or Bengali; markup is still refused.
+        const textBad = sheetTextProblem(rows, { english: false });
         if (textBad) return bad(res, textBad);
 
         const existing = await AptitudeQuestion.find({ exam: exam._id }).select('questionText marks order').lean();

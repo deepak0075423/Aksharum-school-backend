@@ -400,6 +400,21 @@ if (isPrimaryWorker) {
         setInterval(tick, 60 * 1000);
     }());
 
+    // ── Aptitude exams: open now, closed, results out ───────────────────────
+    // Every minute, so "the exam is open" lands at the start time. Each notice
+    // is claimed on its exam row before anyone is told (services/aptitudeNotify).
+    (function scheduleAptitudeNotices() {
+        const { sweep } = require('./services/aptitudeNotify');
+        const tick = async () => {
+            try {
+                const n = await sweep();
+                if (n > 0) console.log(`[Aptitude] sent ${n} exam notice(s)`);
+            } catch (err) { console.error('[Aptitude] notice sweep error:', err.message); }
+        };
+        setTimeout(tick, 25 * 1000);
+        setInterval(tick, 60 * 1000);
+    }());
+
     // ── Library clock ─────────────────────────────────────────────────────────
     // Two things in the library happen because time passed, not because anyone
     // clicked: a loan falls overdue and an uncollected hold lapses. Both used to

@@ -24,7 +24,7 @@ const holidayCtrl    = require('../../controllers/holiday.controller');
 const { verifyToken, requireRole, requirePasswordReset } = require('../../middleware/auth');
 const { modulesHandler } = require('../../utils/moduleResponse');
 const requireModule  = require('../../middleware/requireModule');
-const { uploadExcel, uploadDocument, uploadLeaveDoc, uploadCsv } = require('../../middleware/upload');
+const { uploadExcel, uploadDocument, uploadLeaveDoc, uploadCsv, uploadExamImage } = require('../../middleware/upload');
 
 const guard            = [verifyToken, requirePasswordReset, requireRole('teacher')];
 const attendanceGuard  = [...guard, requireModule('attendance')];
@@ -111,6 +111,7 @@ router.put('/exams/:id',                       examGuard, examCtrl.updateExam);
 router.delete('/exams/:id',                    examGuard, examCtrl.deleteExam);
 router.post('/exams/:id/publish',              examGuard, examCtrl.publishExam);
 router.get('/exams/:id/questions',             examGuard, examCtrl.getQuestions);
+router.post('/exams/:id/questions/image',      examGuard, uploadExamImage.single('image'), examCtrl.uploadQuestionImage);
 router.post('/exams/:id/questions',            examGuard, examCtrl.addQuestion);
 router.put('/exams/:id/questions/:qid',        examGuard, examCtrl.updateQuestion);
 router.delete('/exams/:id/questions/:qid',     examGuard, examCtrl.deleteQuestion);

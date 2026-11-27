@@ -350,7 +350,8 @@ exports.getExamReport = async (req, res) => {
                 .map((o, j) => ({
                     optionId: o.optionId,
                     letter: q.questionType === 'true_false' ? (o.optionId === 'true' ? 'T' : 'F') : String.fromCharCode(65 + j),
-                    text: o.text,
+                    text: o.text || '',
+                    image: o.image || '',
                     isKey: (q.correctAnswers || []).includes(o.optionId),
                     chosen: its.filter(it => (it.selected || []).includes(o.optionId)).length,
                 }));
@@ -358,7 +359,8 @@ exports.getExamReport = async (req, res) => {
             return {
                 _id: qid,
                 number: i + 1,
-                questionText: q.questionText,
+                questionText: q.questionText || '',
+                questionImage: q.questionImage || '',
                 questionType: q.questionType,
                 marks: q.marks,
                 answered: its.length - blank,
@@ -368,7 +370,7 @@ exports.getExamReport = async (req, res) => {
                 successRate: its.length ? round((right / its.length) * 100) : null,
                 discrimination: n27 ? round(rightIn(upper, qid) - rightIn(lower, qid), 2) : null,
                 options: opts,
-                commonWrong: wrong ? { letter: wrong.letter, text: wrong.text, chosen: wrong.chosen } : null,
+                commonWrong: wrong ? { letter: wrong.letter, text: wrong.text || (wrong.image ? '(picture)' : ''), chosen: wrong.chosen } : null,
             };
         });
 
